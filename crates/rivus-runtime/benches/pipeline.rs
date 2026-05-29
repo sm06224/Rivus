@@ -161,6 +161,28 @@ fn bench_optimizer(c: &mut Criterion) {
     g.bench_function("two_reads_dedup", |b| {
         b.iter(|| black_box(run_source_opt(&src)))
     });
+
+    // Fusion: filter -> project. Fused gathers only the projected columns once.
+    let fp = format!("F:\n open {p}\n |? age >= 30\n |> name age\n;");
+    g.bench_function("filter_project_raw", |b| {
+        b.iter(|| black_box(run_source(&fp)))
+    });
+    g.bench_function("filter_project_fused", |b| {
+        b.iter(|| black_box(run_source_opt(&fp)))
+    });
+
+    // Execution-heavy: a chain of 4 filters + projection. Unfused, each filter
+    // gathers ALL six columns (incl. two string columns) for survivors; fused
+    // does one scan and gathers only the single projected column once.
+    let chain = format!(
+        "F:\n open {p}\n |? age >= 10\n |? age >= 20\n |? age < 80\n |? score >= 0\n |> name\n;"
+    );
+    g.bench_function("filter_chain_raw", |b| {
+        b.iter(|| black_box(run_source(&chain)))
+    });
+    g.bench_function("filter_chain_fused", |b| {
+        b.iter(|| black_box(run_source_opt(&chain)))
+    });
     g.finish();
 }
 

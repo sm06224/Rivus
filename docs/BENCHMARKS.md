@@ -91,14 +91,35 @@ gated by `tests/optimizer_equiv.rs`, which asserts the optimized graph produces
 byte-identical outputs to the unoptimized one. The CLI runs the optimizer by
 default (`--no-opt` to disable) and prints the applied rules.
 
+## Phase 0.3 — operator fusion (filter chains + projection)
+
+`fuse_linear` collapses a linear chain of `Filter` nodes and an optional trailing
+`Project` into one `FilterProject` node: predicates are evaluated in a single row
+scan and only the projected columns are gathered once.
+
+| scenario | raw | fused | result |
+|---|---:|---:|---|
+| `optimizer/filter_project` (1 filter → project) | 116 ms | 117 ms | **neutral** |
+| `optimizer/filter_chain` (4 filters → project) | 143 ms | **119 ms** | **1.20×** |
+
+**Honest reading:** after the Phase-0.1 CSV fix, *parsing dominates* the
+single-filter end-to-end, so fusing one filter+project is perf-neutral. The win
+appears when **execution** is non-trivial: a 4-filter chain unfused does four
+full-column gathers (copying both string columns each time); fused, it does one
+scan and a single-column gather → ~1.20×. Fusion is also a prerequisite for
+projection pushdown and the eventual SIMD kernels. Correctness is gated by
+`tests/optimizer_equiv.rs` (optimized == unoptimized, byte-for-byte).
+
 ### Optimization backlog (driven by these numbers)
 
 1. ~~**CSV reader, single-pass, zero owned-`String`**~~ — ✅ done (Phase 0.1).
 2. ~~**Avoid double source reads**~~ — ✅ done (Phase 0.2, `dedup_sources`).
-3. **Operator fusion** (filter→project) to drop intermediate chunks (doc 08).
-4. **Projection pushdown** into the CSV reader: skip building unused columns.
-5. **Vectorized / SIMD predicate kernels** for `i64`/`f64` lanes (doc 09);
-   asm-level tuning where a bench proves the win.
+3. ~~**Operator fusion** (filter chains → project)~~ — ✅ done (Phase 0.3).
+4. **Projection pushdown** into the CSV reader: don't *build* unused columns.
+   Since parsing dominates, skipping construction of dropped columns should beat
+   fusion's execution-only win — the next high-value target.
+5. **Faster numeric parsing** (custom `i64`/`f64` from `&[u8]`); SIMD field
+   scanning. Parse is the hot path now; asm-level tuning where a bench proves it.
 6. **Reduce gather copies** (esp. string columns) via Arrow `ArrayRef` sharing.
 3. **Vectorized / SIMD predicate kernels** for the `i64`/`f64` lanes (Phase 1→2,
    design doc 09); asm-level tuning where a bench proves the win.

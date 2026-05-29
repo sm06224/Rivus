@@ -27,6 +27,14 @@ pub enum Op {
     Project { fields: Vec<String> },
     /// `|# key` — group / partition by key (MVP: group + count).
     GroupBy { key: String },
+    /// Fused linear chain of filters and an optional trailing projection,
+    /// produced by the optimizer (`fuse_linear`). All `preds` must pass (AND);
+    /// when `fields` is `Some`, only those columns are materialized — gathering
+    /// the projected columns once instead of filter-then-project's two passes.
+    FilterProject {
+        preds: Vec<Expr>,
+        fields: Option<Vec<String>>,
+    },
     /// `->` fan-out (tee): forwards each chunk to every outgoing edge.
     Branch,
     /// `+` merge: union of all incoming streams.
@@ -46,6 +54,7 @@ impl Op {
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Project { .. } => "project",
+            Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
             Op::Merge => "merge",
@@ -62,6 +71,13 @@ impl Op {
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
+            Op::FilterProject { preds, fields } => {
+                let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
+                if let Some(f) = fields {
+                    s.push_str(&format!("|> {}", f.join(" ")));
+                }
+                s.trim_end().to_string()
+            }
             Op::GroupBy { key } => format!("|# {key}"),
             Op::Branch => "-> branch".to_string(),
             Op::Merge => "+ merge".to_string(),

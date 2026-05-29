@@ -48,7 +48,157 @@ impl fmt::Display for OptReport {
 pub fn optimize(graph: PlanGraph) -> (PlanGraph, OptReport) {
     let mut report = OptReport::default();
     let graph = dedup_sources(graph, &mut report);
+    let graph = fuse_linear(graph, &mut report);
     (graph, report)
+}
+
+/// **Operator fusion.** Collapse a linear chain of consecutive `Filter` nodes
+/// (and an optional trailing `Project`) into a single `FilterProject` node, so
+/// predicates are evaluated in one row scan and only the projected columns are
+/// gathered once — eliminating intermediate chunks (design doc 08).
+///
+/// Conservative: only fuses across edges that are 1-in/1-out, where the
+/// absorbed (upstream) node is unlabeled and neither node carries hooks. This
+/// preserves every observable output and lifecycle hook.
+fn fuse_linear(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
+    let mut fused = 0usize;
+    while let Some((a, b)) = find_fusable_edge(&graph) {
+        graph = merge_fused(graph, a, b);
+        fused += 1;
+    }
+    if fused > 0 {
+        report.applied.push(format!(
+            "fuse_linear: fused {fused} adjacent filter/project node(s)"
+        ));
+    }
+    graph
+}
+
+fn find_fusable_edge(g: &PlanGraph) -> Option<(NodeId, NodeId)> {
+    g.edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Stream)
+        .map(|e| (e.from, e.to))
+        .find(|&(a, b)| can_fuse(g, a, b))
+}
+
+fn can_fuse(g: &PlanGraph, a: NodeId, b: NodeId) -> bool {
+    let out_a = g.outputs_of(a);
+    let in_b = g.inputs_of(b);
+    if out_a.len() != 1 || out_a[0] != b || in_b.len() != 1 || in_b[0] != a {
+        return false;
+    }
+    let na = &g.nodes[a];
+    let nb = &g.nodes[b];
+    if !na.hooks.is_empty() || !nb.hooks.is_empty() {
+        return false;
+    }
+    // The upstream node is absorbed; never drop a named (observable) output.
+    if na.label.is_some() {
+        return false;
+    }
+    matches!(
+        (&na.op, &nb.op),
+        (
+            Op::Filter { .. } | Op::FilterProject { fields: None, .. },
+            Op::Filter { .. } | Op::Project { .. }
+        )
+    )
+}
+
+/// Merge `b` into `a` (a fused-into-b edge), returning a compacted graph.
+fn merge_fused(g: PlanGraph, a: NodeId, b: NodeId) -> PlanGraph {
+    let fused_op = match (g.nodes[a].op.clone(), g.nodes[b].op.clone()) {
+        (Op::Filter { pred }, Op::Filter { pred: p2 }) => Op::FilterProject {
+            preds: vec![pred, p2],
+            fields: None,
+        },
+        (Op::Filter { pred }, Op::Project { fields }) => Op::FilterProject {
+            preds: vec![pred],
+            fields: Some(fields),
+        },
+        (
+            Op::FilterProject {
+                mut preds,
+                fields: None,
+            },
+            Op::Filter { pred },
+        ) => {
+            preds.push(pred);
+            Op::FilterProject {
+                preds,
+                fields: None,
+            }
+        }
+        (
+            Op::FilterProject {
+                preds,
+                fields: None,
+            },
+            Op::Project { fields },
+        ) => Op::FilterProject {
+            preds,
+            fields: Some(fields),
+        },
+        _ => unreachable!("can_fuse restricts op shapes"),
+    };
+    // `a` inherits `b`'s label (a was unlabeled); `b` is dropped.
+    let new_label = g.nodes[b].label.clone();
+
+    let mut new_id: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut nodes: Vec<Node> = Vec::with_capacity(g.nodes.len() - 1);
+    for n in &g.nodes {
+        if n.id == b {
+            continue;
+        }
+        let nid = nodes.len();
+        new_id.insert(n.id, nid);
+        let (op, label) = if n.id == a {
+            (fused_op.clone(), new_label.clone())
+        } else {
+            (n.op.clone(), n.label.clone())
+        };
+        nodes.push(Node {
+            id: nid,
+            label,
+            op,
+            hooks: n.hooks.clone(),
+        });
+    }
+
+    let mut out = PlanGraph {
+        nodes,
+        edges: Vec::new(),
+        labels: HashMap::new(),
+    };
+    let mut seen: HashSet<(NodeId, NodeId, bool)> = HashSet::new();
+    for e in &g.edges {
+        // Drop the now-internal fused edge a -> b.
+        if e.from == a && e.to == b {
+            continue;
+        }
+        // b's outgoing edges become a's; b has no other incoming (1-in == a).
+        let from = new_id[&if e.from == b { a } else { e.from }];
+        let to = new_id[&if e.to == b { a } else { e.to }];
+        if from == to {
+            continue;
+        }
+        let key = (from, to, e.kind == EdgeKind::Stream);
+        if seen.insert(key) {
+            out.edges.push(Edge {
+                from,
+                to,
+                kind: e.kind,
+            });
+        }
+    }
+    // Rebuild the label index from the (relabeled) nodes.
+    for n in &out.nodes {
+        if let Some(l) = &n.label {
+            out.labels.insert(l.clone(), n.id);
+        }
+    }
+    out
 }
 
 /// **Common-subexpression elimination for sources.** Two `open <same path>`
@@ -183,6 +333,60 @@ B:\n open data.csv\n |# country\n;";
         let (opt, report) = optimize(g);
         assert_eq!(count_opens(&opt), 2);
         assert!(report.is_empty());
+    }
+
+    fn count_fused(g: &PlanGraph) -> usize {
+        g.nodes
+            .iter()
+            .filter(|n| matches!(n.op, Op::FilterProject { .. }))
+            .count()
+    }
+
+    #[test]
+    fn fuses_filter_then_project() {
+        let src = "F:\n open d.csv\n |? age >= 20\n |> name age\n;";
+        let g = rivus_parser::parse(src).unwrap();
+        let (opt, report) = optimize(g);
+        assert_eq!(count_fused(&opt), 1);
+        // The fused node carries the tail label and the projection.
+        let n = &opt.nodes[opt.labels["F"]];
+        match &n.op {
+            Op::FilterProject { preds, fields } => {
+                assert_eq!(preds.len(), 1);
+                assert_eq!(
+                    fields.as_deref(),
+                    Some(&["name".to_string(), "age".to_string()][..])
+                );
+            }
+            other => panic!("expected FilterProject, got {other:?}"),
+        }
+        assert!(report.applied.iter().any(|l| l.contains("fuse_linear")));
+    }
+
+    #[test]
+    fn fuses_chain_of_filters_and_projection() {
+        let src = "F:\n open d.csv\n |? age >= 20\n |? age < 60\n |> name\n;";
+        let g = rivus_parser::parse(src).unwrap();
+        let (opt, _) = optimize(g);
+        assert_eq!(count_fused(&opt), 1);
+        // open -> fused: exactly two nodes remain.
+        assert_eq!(opt.nodes.len(), 2);
+        match &opt.nodes[opt.labels["F"]].op {
+            Op::FilterProject { preds, fields } => {
+                assert_eq!(preds.len(), 2);
+                assert!(fields.is_some());
+            }
+            _ => panic!("expected fused node"),
+        }
+    }
+
+    #[test]
+    fn hooks_block_fusion() {
+        // An `on error` hook on the filter must prevent it being absorbed.
+        let src = "F:\n open d.csv\n |? age >= 20\n on error: transition degraded ;\n |> name\n;";
+        let g = rivus_parser::parse(src).unwrap();
+        let (opt, _) = optimize(g);
+        assert_eq!(count_fused(&opt), 0, "hooked nodes must not fuse");
     }
 
     #[test]

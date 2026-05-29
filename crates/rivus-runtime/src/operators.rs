@@ -56,6 +56,10 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         Op::Project { fields } => Box::new(Project {
             fields: fields.clone(),
         }),
+        Op::FilterProject { preds, fields } => Box::new(FilterProject {
+            preds: preds.clone(),
+            fields: fields.clone(),
+        }),
         Op::GroupBy { key } => Box::new(GroupBy::new(key.clone())),
         Op::Merge => Box::new(Merge),
         Op::Branch => Box::new(Merge), // identity forwarder; fan-out is structural
@@ -237,6 +241,76 @@ impl Operator for Project {
                 vec![chunk]
             }
         }
+    }
+}
+
+// ------------------------------------------------------- fused filter+project
+
+/// Optimizer-produced fusion of consecutive filters and an optional trailing
+/// projection. Evaluates all predicates (AND) in one row scan, then gathers
+/// **only the projected columns** at the surviving indices — a single gather
+/// instead of filter-then-project's two, and unused columns are never copied.
+struct FilterProject {
+    preds: Vec<Expr>,
+    fields: Option<Vec<String>>,
+}
+
+impl Operator for FilterProject {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let mut keep = Vec::new();
+        for row in 0..chunk.len {
+            if self
+                .preds
+                .iter()
+                .all(|p| eval::eval_predicate(p, &chunk, row))
+            {
+                keep.push(row);
+            }
+        }
+        if keep.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(fields) = &self.fields else {
+            // Pure fused filter (no projection).
+            if keep.len() == chunk.len {
+                return vec![chunk];
+            }
+            return vec![chunk.gather(&keep)];
+        };
+
+        // Gather only the projected columns at the surviving rows (one pass).
+        let mut idx = Vec::with_capacity(fields.len());
+        for f in fields {
+            match chunk.schema.index_of(f) {
+                Some(i) => idx.push(i),
+                None => {
+                    // Missing field: warn, fall back to keeping all columns.
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Warn,
+                            ErrorScope::Chunk,
+                            format!("fused project: unknown field in {fields:?}"),
+                        )
+                        .at_node(ctx.label.clone())
+                        .at_chunk(chunk.meta.id),
+                    );
+                    return vec![chunk.gather(&keep)];
+                }
+            }
+        }
+        let columns: Vec<Column> = idx
+            .iter()
+            .map(|&i| chunk.columns[i].gather(&keep))
+            .collect();
+        let schema = Arc::new(Schema::new(
+            idx.iter()
+                .map(|&i| chunk.schema.fields[i].clone())
+                .collect(),
+        ));
+        let mut out = Chunk::new(chunk.meta.id, schema, columns);
+        out.meta = chunk.meta.clone(); // preserve provenance (id, mode, warnings)
+        vec![out]
     }
 }
 
