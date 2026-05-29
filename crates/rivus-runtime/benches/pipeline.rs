@@ -204,12 +204,42 @@ fn bench_optimizer(c: &mut Criterion) {
     g.finish();
 }
 
+/// Large-scale validation: does the parallel parser + arena strings hold up at
+/// millions of rows? Uses a small sample count to bound wall-clock time.
+fn bench_huge(c: &mut Criterion) {
+    const HUGE: usize = 2_000_000;
+    let data = gendata::clean(HUGE, SEED);
+    let fx = Fixture {
+        path: gendata::write_temp("huge", &data),
+    };
+    let p = fx.path.display();
+
+    let mut g = c.benchmark_group("huge");
+    g.sample_size(10);
+    g.throughput(Throughput::Elements(HUGE as u64));
+
+    // Build all 6 columns (two of them strings): the full wide-data path.
+    g.bench_function("filter_only_2M", |b| {
+        let src = format!("F:\n open {p}\n |? age >= 45\n;");
+        b.iter(|| black_box(run_source(&src)));
+    });
+
+    // With projection pushdown the reader builds only `age`.
+    g.bench_function("filter_project_age_2M", |b| {
+        let src = format!("F:\n open {p}\n |? age >= 45\n |> age\n;");
+        b.iter(|| black_box(run_source_opt(&src)));
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_large,
     bench_error_heavy,
     bench_mixed,
     bench_fanout,
-    bench_optimizer
+    bench_optimizer,
+    bench_huge
 );
 criterion_main!(benches);

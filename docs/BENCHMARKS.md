@@ -215,5 +215,20 @@ is locked by `tests/stress.rs::string_filter_matches_oracle`.
 with every step individually measured and semantics-preserving (correctness
 gated by `tests/stress.rs` + `tests/optimizer_equiv.rs`).
 
+### Scale validation (2,000,000 rows)
+
+Confirms the parallel parser + arena strings hold at millions of rows (no
+pathological blow-up); `cargo bench -- huge/` (10 samples):
+
+| scenario | time | throughput |
+|---|---:|---:|
+| `huge/filter_only_2M` (build all 6 cols) | ~650 ms | ~3.1 M rows/s |
+| `huge/filter_project_age_2M` (pushdown → only `age`) | ~336 ms | ~6.0 M rows/s |
+
+Wide-column throughput dips slightly vs 200k (memory bandwidth + string
+allocation at scale); the projected path stays high because it builds one
+column. This is the signal for the next items: filter pushdown (build fewer
+rows) and parallel pipeline execution.
+
 Every optimization PR must attach its before/after row from this table and must
 keep `tests/stress.rs` green (correctness is the gate, speed is the reward).
