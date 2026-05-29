@@ -11,6 +11,9 @@ mod eval;
 mod operators;
 mod telemetry;
 
+#[doc(hidden)]
+pub mod gendata;
+
 pub use engine::{run, Output, RunOptions, RunResult};
 pub use telemetry::NodeTelemetry;
 
