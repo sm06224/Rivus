@@ -10,7 +10,7 @@ use crate::eval;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
-use rivus_ir::{BinType, Expr, NodeId, Op};
+use rivus_ir::{BinType, Endian, Expr, NodeId, Op};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -55,9 +55,18 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         Op::OpenCsv { path, projection } => {
             Box::new(SourceCsv::new(path.clone(), projection.clone(), chunk_size))
         }
-        Op::OpenBinary { path, fields } => {
-            Box::new(SourceBinary::new(path.clone(), fields.clone(), chunk_size))
-        }
+        Op::OpenBinary {
+            path,
+            fields,
+            endian,
+            c_align,
+        } => Box::new(SourceBinary::new(
+            path.clone(),
+            fields.clone(),
+            *endian,
+            *c_align,
+            chunk_size,
+        )),
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Project { fields } => Box::new(Project {
@@ -182,6 +191,8 @@ impl Operator for SourceCsv {
 struct SourceBinary {
     path: String,
     fields: Vec<(String, BinType)>,
+    endian: Endian,
+    c_align: bool,
     chunk_size: usize,
     schema: Arc<Schema>,
     columns: Vec<Column>,
@@ -191,10 +202,18 @@ struct SourceBinary {
 }
 
 impl SourceBinary {
-    fn new(path: String, fields: Vec<(String, BinType)>, chunk_size: usize) -> Self {
+    fn new(
+        path: String,
+        fields: Vec<(String, BinType)>,
+        endian: Endian,
+        c_align: bool,
+        chunk_size: usize,
+    ) -> Self {
         SourceBinary {
             path,
             fields,
+            endian,
+            c_align,
             chunk_size: chunk_size.max(1),
             schema: Schema::empty(),
             columns: Vec::new(),
@@ -221,7 +240,25 @@ impl SourceBinary {
             }
         };
 
-        let rec_size: usize = self.fields.iter().map(|(_, t)| t.size()).sum();
+        // Per-field byte offsets and record size, honoring C natural alignment
+        // (repr(C)) when requested, otherwise packed.
+        let mut offsets = Vec::with_capacity(self.fields.len());
+        let mut acc = 0usize;
+        let mut max_align = 1usize;
+        for (_, t) in &self.fields {
+            if self.c_align {
+                let a = t.align();
+                max_align = max_align.max(a);
+                acc = round_up(acc, a);
+            }
+            offsets.push(acc);
+            acc += t.size();
+        }
+        let rec_size = if self.c_align {
+            round_up(acc, max_align)
+        } else {
+            acc
+        };
         if rec_size == 0 {
             ctx.raise(
                 ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, "empty binary layout")
@@ -244,14 +281,6 @@ impl SourceBinary {
             );
         }
 
-        // Per-field byte offset within a record (prefix sum).
-        let mut offsets = Vec::with_capacity(self.fields.len());
-        let mut acc = 0usize;
-        for (_, t) in &self.fields {
-            offsets.push(acc);
-            acc += t.size();
-        }
-
         let schema_fields = self
             .fields
             .iter()
@@ -265,10 +294,11 @@ impl SourceBinary {
             let sz = t.size();
             let cell =
                 |r: usize| -> &[u8] { &bytes[r * rec_size + foff..r * rec_size + foff + sz] };
+            let e = self.endian;
             let col = match t.lane() {
                 DataType::Bool => Column::Bool((0..n).map(|r| cell(r)[0] != 0).collect()),
-                DataType::F64 => Column::F64((0..n).map(|r| decode_f64(cell(r), *t)).collect()),
-                _ => Column::I64((0..n).map(|r| decode_int(cell(r), *t)).collect()),
+                DataType::F64 => Column::F64((0..n).map(|r| decode_f64(cell(r), *t, e)).collect()),
+                _ => Column::I64((0..n).map(|r| decode_int(cell(r), *t, e)).collect()),
             };
             columns.push(col);
         }
@@ -302,26 +332,41 @@ impl Operator for SourceBinary {
     }
 }
 
-/// Decode a little-endian integer field of any supported width into `i64`.
-fn decode_int(b: &[u8], t: BinType) -> i64 {
+/// Round `x` up to a multiple of `align` (a power of two ≥ 1).
+fn round_up(x: usize, align: usize) -> usize {
+    x.div_ceil(align) * align
+}
+
+macro_rules! from_bytes {
+    ($ty:ty, $b:expr, $e:expr, $n:literal) => {{
+        let arr: [u8; $n] = $b[..$n].try_into().unwrap();
+        match $e {
+            Endian::Little => <$ty>::from_le_bytes(arr),
+            Endian::Big => <$ty>::from_be_bytes(arr),
+        }
+    }};
+}
+
+/// Decode an integer field of any supported width into `i64`, honoring endian.
+fn decode_int(b: &[u8], t: BinType, e: Endian) -> i64 {
     match t {
         BinType::I8 => b[0] as i8 as i64,
         BinType::U8 | BinType::Bool => b[0] as i64,
-        BinType::I16 => i16::from_le_bytes([b[0], b[1]]) as i64,
-        BinType::U16 => u16::from_le_bytes([b[0], b[1]]) as i64,
-        BinType::I32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64,
-        BinType::U32 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64,
-        BinType::I64 => i64::from_le_bytes(b[..8].try_into().unwrap()),
+        BinType::I16 => from_bytes!(i16, b, e, 2) as i64,
+        BinType::U16 => from_bytes!(u16, b, e, 2) as i64,
+        BinType::I32 => from_bytes!(i32, b, e, 4) as i64,
+        BinType::U32 => from_bytes!(u32, b, e, 4) as i64,
+        BinType::I64 => from_bytes!(i64, b, e, 8),
         // u64 above i64::MAX wraps; documented limitation until a u64 lane exists.
-        BinType::U64 => u64::from_le_bytes(b[..8].try_into().unwrap()) as i64,
+        BinType::U64 => from_bytes!(u64, b, e, 8) as i64,
         BinType::F32 | BinType::F64 => 0, // not an integer lane
     }
 }
 
-fn decode_f64(b: &[u8], t: BinType) -> f64 {
+fn decode_f64(b: &[u8], t: BinType, e: Endian) -> f64 {
     match t {
-        BinType::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-        BinType::F64 => f64::from_le_bytes(b[..8].try_into().unwrap()),
+        BinType::F32 => from_bytes!(f32, b, e, 4) as f64,
+        BinType::F64 => from_bytes!(f64, b, e, 8),
         _ => 0.0,
     }
 }

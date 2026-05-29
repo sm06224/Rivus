@@ -174,6 +174,46 @@ fn binary_source_matches_oracle() {
 }
 
 #[test]
+fn binary_big_endian_decodes() {
+    // Two packed big-endian records: (i32 id, i32 age).
+    let mut bytes = Vec::new();
+    for (id, age) in [(1i32, 50i32), (2, 10)] {
+        bytes.extend_from_slice(&id.to_be_bytes());
+        bytes.extend_from_slice(&age.to_be_bytes());
+    }
+    let f = TempCsv(gendata::write_temp_bytes("be", &bytes));
+    let res = run_src(
+        &format!(
+            "F:\n readbin {} be (id:i32 age:i32)\n |? age >= 20\n;",
+            f.0.display()
+        ),
+        4096,
+    );
+    assert_eq!(res.total_rows_out(), 1); // only age 50 survives
+}
+
+#[test]
+fn binary_c_alignment_decodes() {
+    // C `struct { u8 flag; i32 v; }`: flag@0, 3 pad bytes, v@4, record size 8.
+    let mut bytes = Vec::new();
+    for (flag, v) in [(1u8, 100i32), (0u8, 200i32)] {
+        bytes.push(flag);
+        bytes.extend_from_slice(&[0, 0, 0]); // alignment padding
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let f = TempCsv(gendata::write_temp_bytes("aligned", &bytes));
+    // With `aligned`, the reader skips the padding and reads v at offset 4.
+    let res = run_src(
+        &format!(
+            "F:\n readbin {} aligned (flag:u8 v:i32)\n |? v >= 150\n;",
+            f.0.display()
+        ),
+        4096,
+    );
+    assert_eq!(res.total_rows_out(), 1); // only v=200 survives
+}
+
+#[test]
 fn fanout_merge_conserves_rows() {
     let rows = 20_000;
     let data = gendata::clean(rows, 99);

@@ -13,6 +13,13 @@ use std::fmt::Write as _;
 
 pub type NodeId = usize;
 
+/// Byte order for binary records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endian {
+    Little,
+    Big,
+}
+
 /// A fixed-width field type for binary (C-struct-dump) records. Integer widths
 /// all ride the `i64` execution lane; floats ride `f64`; `bool` is one byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +65,12 @@ impl BinType {
         }
     }
 
+    /// Natural alignment in bytes (for C `repr(C)` layout). For these
+    /// primitives alignment equals size.
+    pub fn align(&self) -> usize {
+        self.size()
+    }
+
     /// Which columnar execution lane this decodes into.
     pub fn lane(&self) -> DataType {
         match self {
@@ -95,11 +108,14 @@ pub enum Op {
         path: String,
         projection: Option<Vec<String>>,
     },
-    /// `readbin path (name:type ...)` — fixed-width binary records (a C struct
-    /// dump). Fields are packed in declaration order, little-endian.
+    /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
+    /// binary records (a C struct dump). `endian` selects byte order;
+    /// `c_align` true uses C `repr(C)` natural-alignment padding, false packs.
     OpenBinary {
         path: String,
         fields: Vec<(String, BinType)>,
+        endian: Endian,
+        c_align: bool,
     },
     /// `stream X` — replay of a named flow (and, internally, a reference edge).
     StreamRef { name: String },
@@ -154,12 +170,24 @@ impl Op {
                 Some(cols) => format!("open {path}  # read-only: {}", cols.join(",")),
                 None => format!("open {path}"),
             },
-            Op::OpenBinary { path, fields } => {
+            Op::OpenBinary {
+                path,
+                fields,
+                endian,
+                c_align,
+            } => {
                 let cols: Vec<String> = fields
                     .iter()
                     .map(|(n, t)| format!("{n}:{}", t.as_str()))
                     .collect();
-                format!("readbin {path} ({})", cols.join(" "))
+                let mut mods = String::new();
+                if *endian == Endian::Big {
+                    mods.push_str("be ");
+                }
+                if *c_align {
+                    mods.push_str("aligned ");
+                }
+                format!("readbin {path} {mods}({})", cols.join(" "))
             }
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),

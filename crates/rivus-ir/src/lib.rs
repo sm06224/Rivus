@@ -9,7 +9,7 @@ pub mod graph;
 
 pub use expr::{Access, CmpOp, Expr};
 pub use graph::{
-    BinType, Edge, EdgeKind, Hook, HookAction, HookEvent, Node, NodeId, Op, PlanGraph,
+    BinType, Edge, EdgeKind, Endian, Hook, HookAction, HookEvent, Node, NodeId, Op, PlanGraph,
 };
 
 #[cfg(test)]

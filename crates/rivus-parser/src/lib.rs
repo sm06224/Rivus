@@ -22,7 +22,8 @@ mod lexer;
 use lexer::{Lexer, Tok};
 use rivus_core::{Mode, RivusError, Severity, Value};
 use rivus_ir::{
-    Access, BinType, CmpOp, EdgeKind, Expr, Hook, HookAction, HookEvent, NodeId, Op, PlanGraph,
+    Access, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent, NodeId, Op,
+    PlanGraph,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -238,10 +239,33 @@ impl Parser {
                 let name = self.word()?;
                 Ok(self.g.add_node(Op::StreamRef { name }))
             }
-            // `readbin path (name:type ...)` — fixed-width binary records.
+            // `readbin path [le|be] [packed|aligned] (name:type ...)`.
             Tok::Word(w) if w == "readbin" => {
                 self.bump();
                 let path = self.word()?;
+                let mut endian = Endian::Little;
+                let mut c_align = false;
+                loop {
+                    match self.tok() {
+                        Tok::Word(m) if m == "le" => {
+                            endian = Endian::Little;
+                            self.bump();
+                        }
+                        Tok::Word(m) if m == "be" => {
+                            endian = Endian::Big;
+                            self.bump();
+                        }
+                        Tok::Word(m) if m == "packed" => {
+                            c_align = false;
+                            self.bump();
+                        }
+                        Tok::Word(m) if m == "aligned" => {
+                            c_align = true;
+                            self.bump();
+                        }
+                        _ => break,
+                    }
+                }
                 self.expect(&Tok::LParen)?;
                 let mut fields = Vec::new();
                 while !self.at(&Tok::RParen) && !self.at(&Tok::Eof) {
@@ -256,7 +280,12 @@ impl Parser {
                 if fields.is_empty() {
                     return Err(self.err("readbin requires at least one field"));
                 }
-                Ok(self.g.add_node(Op::OpenBinary { path, fields }))
+                Ok(self.g.add_node(Op::OpenBinary {
+                    path,
+                    fields,
+                    endian,
+                    c_align,
+                }))
             }
             // Reference to a named scope → merge (`+`) or join (`&`).
             Tok::Word(name) if self.g.labels.contains_key(&name) => {
