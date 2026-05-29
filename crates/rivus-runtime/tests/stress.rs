@@ -214,6 +214,42 @@ fn binary_c_alignment_decodes() {
 }
 
 #[test]
+fn jsonl_source_matches_oracle() {
+    // JSON Lines source: filter on a numeric field must match an oracle that
+    // replays the generator's PRNG, across chunk sizes. `.jsonl` extension
+    // selects the JSON reader automatically.
+    let rows = 40_000;
+    let seed = 55;
+    let data = gendata::jsonl_clean(rows, seed);
+    // write_temp names files `.csv`; rename to `.jsonl` so `open` selects the
+    // JSON reader by extension.
+    let raw = gendata::write_temp("stress_jsonl", &data);
+    let mut jpath = raw.clone();
+    jpath.set_extension("jsonl");
+    std::fs::rename(&raw, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+
+    let mut rng = Rng::new(seed);
+    let mut ge = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(90);
+        let _score = rng.below(10_000);
+        let _country = rng.below(5);
+        let _active = rng.below(2);
+        if age >= 50 {
+            ge += 1;
+        }
+    }
+
+    for cs in [1, 1000, 8192] {
+        let src = format!("F:\n open {}\n |? age >= 50\n;", jpath.display());
+        let res = run_src(&src, cs);
+        assert_eq!(res.total_rows_out(), ge, "jsonl filter chunk_size={cs}");
+        assert!(res.errors.is_empty(), "clean jsonl should not error");
+    }
+}
+
+#[test]
 fn fanout_merge_conserves_rows() {
     let rows = 20_000;
     let data = gendata::clean(rows, 99);

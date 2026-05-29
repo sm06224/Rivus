@@ -229,10 +229,17 @@ impl Parser {
             Tok::Word(w) if w == "open" => {
                 self.bump();
                 let path = self.word()?;
-                Ok(self.g.add_node(Op::OpenCsv {
-                    path,
-                    projection: None,
-                }))
+                // Dispatch by extension: .jsonl/.ndjson → JSON Lines, else CSV.
+                let lower = path.to_ascii_lowercase();
+                let op = if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
+                    Op::OpenJsonl { path }
+                } else {
+                    Op::OpenCsv {
+                        path,
+                        projection: None,
+                    }
+                };
+                Ok(self.g.add_node(op))
             }
             Tok::Word(w) if w == "stream" => {
                 self.bump();

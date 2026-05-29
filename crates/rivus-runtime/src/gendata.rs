@@ -125,6 +125,26 @@ pub fn bin_clean(rows: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// `rows` JSON Lines objects with the same logical fields as [`clean`]:
+/// `{"id":..,"name":"..","age":..,"score":..,"country":"..","active":..}`.
+/// PRNG draws per row match [`clean`]: `age=below(90)`, `score=below(10_000)`,
+/// `country=below(5)`, `active=below(2)`.
+pub fn jsonl_clean(rows: usize, seed: u64) -> String {
+    let mut rng = Rng::new(seed);
+    let mut s = String::with_capacity(rows * 64);
+    for i in 0..rows {
+        let age = rng.below(90);
+        let score = (rng.below(10_000) as f64) / 100.0;
+        let country = COUNTRIES[rng.below(COUNTRIES.len() as u64) as usize];
+        let active = rng.below(2) == 1;
+        s.push_str(&format!(
+            "{{\"id\":{i},\"name\":\"{}\",\"age\":{age},\"score\":{score},\"country\":\"{country}\",\"active\":{active}}}\n",
+            name(i)
+        ));
+    }
+    s
+}
+
 /// Like [`write_temp`] but for raw bytes (binary fixtures).
 pub fn write_temp_bytes(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

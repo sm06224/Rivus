@@ -7,6 +7,7 @@
 
 use crate::csv;
 use crate::eval;
+use crate::jsonl;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
@@ -67,6 +68,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
             *c_align,
             chunk_size,
         )),
+        Op::OpenJsonl { path } => Box::new(SourceJsonl::new(path.clone(), chunk_size)),
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Project { fields } => Box::new(Project {
@@ -368,6 +370,97 @@ fn decode_f64(b: &[u8], t: BinType, e: Endian) -> f64 {
         BinType::F32 => from_bytes!(f32, b, e, 4) as f64,
         BinType::F64 => from_bytes!(f64, b, e, 8),
         _ => 0.0,
+    }
+}
+
+// -------------------------------------------------------------- source (jsonl)
+
+/// Reads JSON Lines (one flat JSON object per line) into columns. See
+/// `jsonl.rs` for the parser and its continue-first behavior.
+struct SourceJsonl {
+    path: String,
+    chunk_size: usize,
+    schema: Arc<Schema>,
+    columns: Vec<Column>,
+    cursor: usize,
+    total: usize,
+    loaded: bool,
+}
+
+impl SourceJsonl {
+    fn new(path: String, chunk_size: usize) -> Self {
+        SourceJsonl {
+            path,
+            chunk_size: chunk_size.max(1),
+            schema: Schema::empty(),
+            columns: Vec::new(),
+            cursor: 0,
+            total: 0,
+            loaded: false,
+        }
+    }
+
+    fn load(&mut self, ctx: &mut OpCtx) {
+        self.loaded = true;
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Fatal,
+                        ErrorScope::Graph,
+                        format!("cannot open '{}': {e}", self.path),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+                return;
+            }
+        };
+        match jsonl::parse(&text) {
+            Ok(data) => {
+                if data.bad_rows > 0 {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Recoverable,
+                            ErrorScope::Item,
+                            format!("{} malformed JSONL line(s) skipped", data.bad_rows),
+                        )
+                        .at_node(ctx.label.clone()),
+                    );
+                }
+                self.total = data.columns.first().map(|c| c.len()).unwrap_or(0);
+                self.schema = Arc::new(data.schema);
+                self.columns = data.columns;
+            }
+            Err(e) => ctx.raise(
+                ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
+            ),
+        }
+    }
+}
+
+impl Operator for SourceJsonl {
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
+        if !self.loaded {
+            self.load(ctx);
+        }
+        if self.cursor >= self.total {
+            return None;
+        }
+        let end = (self.cursor + self.chunk_size).min(self.total);
+        let idx: Vec<usize> = (self.cursor..end).collect();
+        let columns = self.columns.iter().map(|c| c.gather(&idx)).collect();
+        let id = ctx.fresh_id();
+        self.cursor = end;
+        Some(Chunk::new(id, self.schema.clone(), columns))
+    }
+
+    fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        Vec::new()
     }
 }
 

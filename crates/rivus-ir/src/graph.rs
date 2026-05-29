@@ -117,6 +117,8 @@ pub enum Op {
         endian: Endian,
         c_align: bool,
     },
+    /// `open path.jsonl` — JSON Lines (one flat JSON object per line).
+    OpenJsonl { path: String },
     /// `stream X` — replay of a named flow (and, internally, a reference edge).
     StreamRef { name: String },
     /// `|? <pred>`
@@ -150,6 +152,7 @@ impl Op {
         match self {
             Op::OpenCsv { .. } => "open",
             Op::OpenBinary { .. } => "readbin",
+            Op::OpenJsonl { .. } => "open",
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Project { .. } => "project",
@@ -189,6 +192,7 @@ impl Op {
                 }
                 format!("readbin {path} {mods}({})", cols.join(" "))
             }
+            Op::OpenJsonl { path } => format!("open {path}"),
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
