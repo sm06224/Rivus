@@ -157,6 +157,29 @@ more parser tuning. Correctness across the parallel path is held by
 `tests/stress.rs` (exact counts, chunk-size independence, error-heavy, fan-out)
 and `tests/optimizer_equiv.rs`, all run at row counts that trigger parallelism.
 
+## Phase 0.6 — arena string columns (offsets + bytes)
+
+`Column::Str` changed from `Vec<String>` (one heap allocation per cell) to an
+Arrow-like `StrColumn` = one contiguous byte buffer + per-row `u32` offsets. A
+cell is a `&str` slice; building a column is two growing `Vec`s with **zero
+per-cell allocation**. This removes exactly the cross-thread allocator
+contention Phase 0.5 identified, so parallel parsing finally scales on wide,
+string-heavy data.
+
+Measured (4 vCPU), vs Phase-0.5:
+
+| scenario | before | after | change | cumulative vs baseline |
+|---|---:|---:|---|---:|
+| `large/filter_only` (6 cols) | 111 ms | **51 ms** | **−54%** | **~6.8×** (349→51 ms) |
+| `error_heavy/bad=0%` | 105 ms | 48 ms | −54% | ~6.3× |
+| `mixed_types/mix=0%` (1 str col) | 19.9 ms | 18.5 ms | −6% | ~2.5× |
+
+Wide data is now ~3.9 M rows/s end-to-end. The `unsafe { from_utf8_unchecked }`
+in `StrColumn::get` is guarded by the type's invariant (only `&str` is ever
+appended) and locked by a multibyte round-trip test
+(`str_column_roundtrips_including_multibyte`). All stress + equivalence tests
+stay green.
+
 ### Optimization backlog (driven by these numbers)
 
 1. ~~CSV reader, single-pass, zero owned-`String`~~ — ✅ Phase 0.1.
@@ -164,10 +187,11 @@ and `tests/optimizer_equiv.rs`, all run at row counts that trigger parallelism.
 3. ~~Operator fusion (filter chains → project)~~ — ✅ Phase 0.3.
 4. ~~Projection pushdown into the CSV reader~~ — ✅ Phase 0.4.
 5. ~~Parallel CSV parsing + inference fast-path~~ — ✅ Phase 0.5.
-6. **String storage: arena / `ArrayRef`** to kill per-cell allocation and its
-   cross-thread allocator contention (the wide-data ceiling above).
+6. ~~Arena string columns (offsets + bytes)~~ — ✅ Phase 0.6.
 7. **Filter pushdown** into the reader (skip building rows that won't survive).
 8. **Parallel pipeline execution** (chunk-split operators across workers) — doc 05.
+9. **Zero-copy `&str` predicate eval** (compare against the arena without
+   materializing a `String` per row) for string-keyed filters/joins.
 
 Every optimization PR must attach its before/after row from this table and must
 keep `tests/stress.rs` green (correctness is the gate, speed is the reward).

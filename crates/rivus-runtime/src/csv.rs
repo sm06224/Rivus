@@ -14,7 +14,7 @@
 //! overwhelmingly common case — split into pure borrows; quoted records fall
 //! back to an owned, escape-aware split.
 
-use rivus_core::{Column, DataType, Field, Schema};
+use rivus_core::{Column, DataType, Field, Schema, StrColumn};
 use std::borrow::Cow;
 
 pub struct CsvData {
@@ -246,7 +246,7 @@ fn append_column(a: &mut Column, b: Column) {
         (Column::Bool(x), Column::Bool(y)) => x.extend(y),
         (Column::I64(x), Column::I64(y)) => x.extend(y),
         (Column::F64(x), Column::F64(y)) => x.extend(y),
-        (Column::Str(x), Column::Str(y)) => x.extend(y),
+        (Column::Str(x), Column::Str(y)) => x.append(&y),
         _ => unreachable!("column dtype mismatch across slices"),
     }
 }
@@ -330,7 +330,7 @@ enum ColBuilder {
     Bool(Vec<bool>),
     I64(Vec<i64>),
     F64(Vec<f64>),
-    Str(Vec<String>),
+    Str(StrColumn),
 }
 
 impl ColBuilder {
@@ -339,7 +339,8 @@ impl ColBuilder {
             DataType::Bool => ColBuilder::Bool(Vec::with_capacity(cap)),
             DataType::I64 => ColBuilder::I64(Vec::with_capacity(cap)),
             DataType::F64 => ColBuilder::F64(Vec::with_capacity(cap)),
-            _ => ColBuilder::Str(Vec::with_capacity(cap)),
+            // Estimate ~8 bytes per string cell for the backing byte buffer.
+            _ => ColBuilder::Str(StrColumn::with_capacity(cap, cap * 8)),
         }
     }
 
@@ -349,7 +350,7 @@ impl ColBuilder {
             ColBuilder::Bool(v) => v.push(cell.trim() == "true"),
             ColBuilder::I64(v) => v.push(cell.trim().parse().unwrap_or(0)),
             ColBuilder::F64(v) => v.push(cell.trim().parse().unwrap_or(0.0)),
-            ColBuilder::Str(v) => v.push(cell.to_string()),
+            ColBuilder::Str(v) => v.push(cell),
         }
     }
 
@@ -446,11 +447,11 @@ mod tests {
     fn handles_quoted_fields_with_commas() {
         let data = parse_projected("name,note\n\"a,b\",\"he said \"\"hi\"\"\"\n", None).unwrap();
         match &data.columns[0] {
-            Column::Str(v) => assert_eq!(v[0], "a,b"),
+            Column::Str(v) => assert_eq!(v.get(0), "a,b"),
             _ => panic!("expected str"),
         }
         match &data.columns[1] {
-            Column::Str(v) => assert_eq!(v[0], "he said \"hi\""),
+            Column::Str(v) => assert_eq!(v.get(0), "he said \"hi\""),
             _ => panic!("expected str"),
         }
     }

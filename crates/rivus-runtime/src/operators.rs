@@ -7,7 +7,9 @@
 
 use crate::csv;
 use crate::eval;
-use rivus_core::{Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, Value};
+use rivus_core::{
+    Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
+};
 use rivus_ir::{Expr, NodeId, Op};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -361,7 +363,7 @@ impl Operator for GroupBy {
             return Vec::new();
         }
         self.emitted = true;
-        let keys: Vec<String> = self.counts.keys().cloned().collect();
+        let keys: StrColumn = self.counts.keys().map(String::as_str).collect();
         let vals: Vec<i64> = self.counts.values().copied().collect();
         let schema = Arc::new(Schema::new(vec![
             Field::new(self.key.clone(), DataType::Str),

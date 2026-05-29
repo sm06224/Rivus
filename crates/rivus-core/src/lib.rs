@@ -14,7 +14,7 @@ pub mod error;
 pub mod schema;
 pub mod value;
 
-pub use chunk::{Chunk, ChunkMeta, Column, Mode};
+pub use chunk::{Chunk, ChunkMeta, Column, Mode, StrColumn};
 pub use error::{ErrorEvent, ErrorScope, Result, RivusError, Severity};
 pub use schema::{Field, Schema};
 pub use value::{DataType, Value};
@@ -30,7 +30,7 @@ mod tests {
             Field::new("age", DataType::I64),
         ]));
         let columns = vec![
-            Column::Str(vec!["aki".into(), "ben".into(), "cho".into()]),
+            Column::Str(["aki", "ben", "cho"].into_iter().collect()),
             Column::I64(vec![30, 15, 40]),
         ];
         Chunk::new(0, schema, columns)
@@ -51,6 +51,28 @@ mod tests {
         let p = c.project(&["name".into()]).unwrap();
         assert_eq!(p.columns.len(), 1);
         assert_eq!(p.schema.field_names(), vec!["name"]);
+    }
+
+    #[test]
+    fn str_column_roundtrips_including_multibyte() {
+        // Locks the StrColumn unsafe-utf8 invariant: multibyte and empty cells.
+        let mut c = chunk::StrColumn::with_capacity(0, 0);
+        for s in ["", "ascii", "日本語", "café", ""] {
+            c.push(s);
+        }
+        assert_eq!(c.len(), 5);
+        assert_eq!(c.get(0), "");
+        assert_eq!(c.get(2), "日本語");
+        assert_eq!(c.get(3), "café");
+        // gather preserves contents and order.
+        let g = c.gather(&[2, 1]);
+        assert_eq!(g.get(0), "日本語");
+        assert_eq!(g.get(1), "ascii");
+        // append concatenates.
+        let mut a: chunk::StrColumn = ["x"].into_iter().collect();
+        a.append(&g);
+        assert_eq!(a.len(), 3);
+        assert_eq!(a.get(2), "ascii");
     }
 
     #[test]

@@ -60,13 +60,93 @@ impl ChunkMeta {
     }
 }
 
+/// An Arrow-like UTF-8 string column: one contiguous byte buffer plus per-row
+/// offsets. A cell is a `&str` slice — there is **no allocation per cell**,
+/// which both speeds the reader and removes the cross-thread allocator
+/// contention measured in `docs/BENCHMARKS.md` (Phase 0.5).
+#[derive(Debug, Clone, Default)]
+pub struct StrColumn {
+    /// `offsets.len() == rows + 1`, `offsets[0] == 0`, monotonically increasing.
+    offsets: Vec<u32>,
+    data: Vec<u8>,
+}
+
+impl StrColumn {
+    pub fn with_capacity(rows: usize, bytes: usize) -> Self {
+        let mut offsets = Vec::with_capacity(rows + 1);
+        offsets.push(0);
+        StrColumn {
+            offsets,
+            data: Vec::with_capacity(bytes),
+        }
+    }
+
+    pub fn push(&mut self, s: &str) {
+        self.data.extend_from_slice(s.as_bytes());
+        self.offsets.push(self.data.len() as u32);
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, row: usize) -> &str {
+        let start = self.offsets[row] as usize;
+        let end = self.offsets[row + 1] as usize;
+        // SAFETY: `data` is only ever appended to via `push`, whose argument is
+        // a `&str` (valid UTF-8), and offsets fall on those append boundaries,
+        // so every `[start, end)` slice is itself valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(&self.data[start..end]) }
+    }
+
+    pub fn gather(&self, indices: &[usize]) -> StrColumn {
+        let mut out = StrColumn::with_capacity(indices.len(), self.data.len());
+        for &i in indices {
+            out.push(self.get(i));
+        }
+        out
+    }
+
+    pub fn append(&mut self, other: &StrColumn) {
+        for i in 0..other.len() {
+            self.push(other.get(i));
+        }
+    }
+}
+
+impl<'a> FromIterator<&'a str> for StrColumn {
+    fn from_iter<I: IntoIterator<Item = &'a str>>(iter: I) -> Self {
+        let mut c = StrColumn::default();
+        c.offsets.push(0);
+        for s in iter {
+            c.push(s);
+        }
+        c
+    }
+}
+
+impl From<Vec<String>> for StrColumn {
+    fn from(v: Vec<String>) -> Self {
+        let bytes = v.iter().map(|s| s.len()).sum();
+        let mut c = StrColumn::with_capacity(v.len(), bytes);
+        for s in &v {
+            c.push(s);
+        }
+        c
+    }
+}
+
 /// A columnar buffer. One variant per execution lane (MVP subset).
 #[derive(Debug, Clone)]
 pub enum Column {
     Bool(Vec<bool>),
     I64(Vec<i64>),
     F64(Vec<f64>),
-    Str(Vec<String>),
+    Str(StrColumn),
 }
 
 impl Column {
@@ -97,7 +177,7 @@ impl Column {
             Column::Bool(v) => Value::Bool(v[row]),
             Column::I64(v) => Value::I64(v[row]),
             Column::F64(v) => Value::F64(v[row]),
-            Column::Str(v) => Value::Str(v[row].clone()),
+            Column::Str(v) => Value::Str(v.get(row).to_string()),
         }
     }
 
@@ -107,7 +187,7 @@ impl Column {
             Column::Bool(v) => Column::Bool(indices.iter().map(|&i| v[i]).collect()),
             Column::I64(v) => Column::I64(indices.iter().map(|&i| v[i]).collect()),
             Column::F64(v) => Column::F64(indices.iter().map(|&i| v[i]).collect()),
-            Column::Str(v) => Column::Str(indices.iter().map(|&i| v[i].clone()).collect()),
+            Column::Str(v) => Column::Str(v.gather(indices)),
         }
     }
 }
