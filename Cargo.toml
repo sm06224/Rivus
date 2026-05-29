@@ -17,11 +17,13 @@ repository = "https://github.com/sm06224/rivus"
 description = "Rivus: a flow-oriented, DAG-native, continue-first, observable stream runtime"
 
 [workspace.dependencies]
-rivus-core = { path = "crates/rivus-core" }
-rivus-ir = { path = "crates/rivus-ir" }
-rivus-parser = { path = "crates/rivus-parser" }
-rivus-optimizer = { path = "crates/rivus-optimizer" }
-rivus-runtime = { path = "crates/rivus-runtime" }
+# Internal crates carry an explicit version (not bare path deps) so the
+# dependency graph has no version-wildcards — see deny.toml [bans].
+rivus-core = { path = "crates/rivus-core", version = "0.1.0" }
+rivus-ir = { path = "crates/rivus-ir", version = "0.1.0" }
+rivus-parser = { path = "crates/rivus-parser", version = "0.1.0" }
+rivus-optimizer = { path = "crates/rivus-optimizer", version = "0.1.0" }
+rivus-runtime = { path = "crates/rivus-runtime", version = "0.1.0" }
 
 # Profile tuned for the MVP: fast iteration, but optimized release for
 # benchmark work (see docs/design/15-benchmark.md).
