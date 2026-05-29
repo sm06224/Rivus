@@ -1,0 +1,10 @@
+[package]
+name = "rivus-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rivus parser: source -> AST -> DAG IR"
+
+[dependencies]
+rivus-core.workspace = true
+rivus-ir.workspace = true

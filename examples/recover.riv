@@ -1,0 +1,12 @@
+# Continue-first + runtime mode escalation.
+# Point this at a CSV with malformed rows: parsing warns (it does not stop),
+# and the warning trips an `on error` hook that escalates the runtime mode.
+Import:
+    open examples/messy.csv
+    |? age >= 20
+    |> name age
+
+    on error severity >= warning:
+        transition degraded
+    ;
+;

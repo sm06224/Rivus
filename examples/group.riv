@@ -1,0 +1,6 @@
+# Group / partition by country (|#). The group is a materialization boundary:
+# counts are emitted once the input stream ends.
+Population:
+    open examples/users.csv
+    |# country
+;

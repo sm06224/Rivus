@@ -1,0 +1,17 @@
+# Multi-branch native: one source tees into two filtered flows, then merges.
+# Demonstrates the DAG (not a linear pipeline).
+Users:
+    open examples/users.csv
+
+    -> Adults:
+        |? age >= 20
+    ;
+
+    -> Minors:
+        |? age < 20
+    ;
+;
+
+Merged:
+    Adults + Minors
+;

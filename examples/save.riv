@@ -1,0 +1,7 @@
+# Sink to a file: keep JP adults, save name + age to a new CSV.
+Export:
+    open examples/users.csv
+    |? country == "JP"
+    |> name age
+    save examples/jp_users.csv
+;
