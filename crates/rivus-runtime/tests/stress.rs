@@ -143,6 +143,37 @@ fn string_filter_matches_oracle() {
 }
 
 #[test]
+fn binary_source_matches_oracle() {
+    // Fixed-width binary records (C struct dump): i32 id, i32 age, f64 score,
+    // u8 active. Decoding must produce the same filter result as an oracle that
+    // replays the generator's PRNG, across chunk sizes.
+    let rows = 50_000;
+    let seed = 7;
+    let bytes = gendata::bin_clean(rows, seed);
+    let f = TempCsv(gendata::write_temp_bytes("stress_bin", &bytes));
+    let p = f.0.display();
+
+    let mut rng = Rng::new(seed);
+    let mut ge = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(90);
+        let _score = rng.below(10_000);
+        let _active = rng.below(2);
+        if age >= 45 {
+            ge += 1;
+        }
+    }
+
+    for cs in [1, 1000, 8192] {
+        let src =
+            format!("F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n;");
+        let res = run_src(&src, cs);
+        assert_eq!(res.total_rows_out(), ge, "binary filter chunk_size={cs}");
+        assert!(res.errors.is_empty(), "clean binary should not error");
+    }
+}
+
+#[test]
 fn fanout_merge_conserves_rows() {
     let rows = 20_000;
     let data = gendata::clean(rows, 99);

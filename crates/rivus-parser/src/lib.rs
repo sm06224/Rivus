@@ -21,7 +21,9 @@ mod lexer;
 
 use lexer::{Lexer, Tok};
 use rivus_core::{Mode, RivusError, Severity, Value};
-use rivus_ir::{Access, CmpOp, EdgeKind, Expr, Hook, HookAction, HookEvent, NodeId, Op, PlanGraph};
+use rivus_ir::{
+    Access, BinType, CmpOp, EdgeKind, Expr, Hook, HookAction, HookEvent, NodeId, Op, PlanGraph,
+};
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
     let toks = Lexer::new(src).tokenize().map_err(RivusError::Parse)?;
@@ -235,6 +237,26 @@ impl Parser {
                 self.bump();
                 let name = self.word()?;
                 Ok(self.g.add_node(Op::StreamRef { name }))
+            }
+            // `readbin path (name:type ...)` — fixed-width binary records.
+            Tok::Word(w) if w == "readbin" => {
+                self.bump();
+                let path = self.word()?;
+                self.expect(&Tok::LParen)?;
+                let mut fields = Vec::new();
+                while !self.at(&Tok::RParen) && !self.at(&Tok::Eof) {
+                    let name = self.word()?;
+                    self.expect(&Tok::Colon)?;
+                    let ty = self.word()?;
+                    let bt = BinType::parse(&ty)
+                        .ok_or_else(|| self.err(format!("unknown binary type '{ty}'")))?;
+                    fields.push((name, bt));
+                }
+                self.expect(&Tok::RParen)?;
+                if fields.is_empty() {
+                    return Err(self.err("readbin requires at least one field"));
+                }
+                Ok(self.g.add_node(Op::OpenBinary { path, fields }))
             }
             // Reference to a named scope → merge (`+`) or join (`&`).
             Tok::Word(name) if self.g.labels.contains_key(&name) => {
@@ -490,6 +512,7 @@ fn is_keyword(w: &str) -> bool {
     matches!(
         w,
         "open"
+            | "readbin"
             | "stream"
             | "save"
             | "print"

@@ -233,6 +233,28 @@ fn bench_huge(c: &mut Criterion) {
     g.finish();
 }
 
+/// Binary (C-struct-dump) source: fixed-width records decode straight into
+/// columnar lanes with no text parsing, so this should beat CSV substantially.
+fn bench_binary(c: &mut Criterion) {
+    let bytes = gendata::bin_clean(ROWS, SEED);
+    let fx = Fixture {
+        path: gendata::write_temp_bytes("clean_bin", &bytes),
+    };
+    let p = fx.path.display();
+
+    let mut g = c.benchmark_group("binary");
+    g.sample_size(20);
+    g.throughput(Throughput::Elements(ROWS as u64));
+
+    g.bench_function("filter_only", |b| {
+        let src =
+            format!("F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n;");
+        b.iter(|| black_box(run_source(&src)));
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_large,
@@ -240,6 +262,7 @@ criterion_group!(
     bench_mixed,
     bench_fanout,
     bench_optimizer,
-    bench_huge
+    bench_huge,
+    bench_binary
 );
 criterion_main!(benches);

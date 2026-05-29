@@ -215,6 +215,24 @@ is locked by `tests/stress.rs::string_filter_matches_oracle`.
 with every step individually measured and semantics-preserving (correctness
 gated by `tests/stress.rs` + `tests/optimizer_equiv.rs`).
 
+### Binary source (C struct dump) — `readbin`
+
+Besides CSV, Rivus reads fixed-width binary records (a C struct dump):
+`readbin path (id:i32 age:i32 score:f64 active:u8)`. Fields are packed in
+declaration order, little-endian, and decode straight into columnar lanes —
+**no text parsing at all**.
+
+| scenario (200k rows) | time | throughput |
+|---|---:|---:|
+| `binary/filter_only` (`readbin … \|? age>=45`) | 10.7 ms | **~18.7 M rows/s** |
+| `large/filter_only` (CSV, 6 cols) | 52 ms | ~3.8 M rows/s |
+
+~5× the comparable CSV path. Correctness (incl. chunk-size independence) is
+locked by `tests/stress.rs::binary_source_matches_oracle`. Integer widths ride
+the `i64` lane, floats the `f64` lane, `bool` is one byte; `u64` above
+`i64::MAX` wraps (documented until a `u64` lane exists). Trailing partial
+records are reported on the error stream and ignored (continue-first).
+
 ### Scale validation (2,000,000 rows)
 
 Confirms the parallel parser + arena strings hold at millions of rows (no

@@ -7,11 +7,82 @@
 //! back into readable Rivus source (Master principle #5: IR reversibility).
 
 use crate::expr::Expr;
-use rivus_core::{Mode, Severity};
+use rivus_core::{DataType, Mode, Severity};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
 pub type NodeId = usize;
+
+/// A fixed-width field type for binary (C-struct-dump) records. Integer widths
+/// all ride the `i64` execution lane; floats ride `f64`; `bool` is one byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinType {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+    Bool,
+}
+
+impl BinType {
+    pub fn parse(s: &str) -> Option<BinType> {
+        Some(match s {
+            "i8" => BinType::I8,
+            "i16" => BinType::I16,
+            "i32" => BinType::I32,
+            "i64" => BinType::I64,
+            "u8" => BinType::U8,
+            "u16" => BinType::U16,
+            "u32" => BinType::U32,
+            "u64" => BinType::U64,
+            "f32" => BinType::F32,
+            "f64" => BinType::F64,
+            "bool" => BinType::Bool,
+            _ => return None,
+        })
+    }
+
+    /// Width in bytes (packed; no padding — the layout is explicit).
+    pub fn size(&self) -> usize {
+        match self {
+            BinType::I8 | BinType::U8 | BinType::Bool => 1,
+            BinType::I16 | BinType::U16 => 2,
+            BinType::I32 | BinType::U32 | BinType::F32 => 4,
+            BinType::I64 | BinType::U64 | BinType::F64 => 8,
+        }
+    }
+
+    /// Which columnar execution lane this decodes into.
+    pub fn lane(&self) -> DataType {
+        match self {
+            BinType::Bool => DataType::Bool,
+            BinType::F32 | BinType::F64 => DataType::F64,
+            _ => DataType::I64,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BinType::I8 => "i8",
+            BinType::I16 => "i16",
+            BinType::I32 => "i32",
+            BinType::I64 => "i64",
+            BinType::U8 => "u8",
+            BinType::U16 => "u16",
+            BinType::U32 => "u32",
+            BinType::U64 => "u64",
+            BinType::F32 => "f32",
+            BinType::F64 => "f64",
+            BinType::Bool => "bool",
+        }
+    }
+}
 
 /// A flow operator. One enum spanning sources, transforms, fan-out/in and
 /// sinks — because in Rivus they are all just nodes in the same graph.
@@ -23,6 +94,12 @@ pub enum Op {
     OpenCsv {
         path: String,
         projection: Option<Vec<String>>,
+    },
+    /// `readbin path (name:type ...)` — fixed-width binary records (a C struct
+    /// dump). Fields are packed in declaration order, little-endian.
+    OpenBinary {
+        path: String,
+        fields: Vec<(String, BinType)>,
     },
     /// `stream X` — replay of a named flow (and, internally, a reference edge).
     StreamRef { name: String },
@@ -56,6 +133,7 @@ impl Op {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Op::OpenCsv { .. } => "open",
+            Op::OpenBinary { .. } => "readbin",
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Project { .. } => "project",
@@ -76,6 +154,13 @@ impl Op {
                 Some(cols) => format!("open {path}  # read-only: {}", cols.join(",")),
                 None => format!("open {path}"),
             },
+            Op::OpenBinary { path, fields } => {
+                let cols: Vec<String> = fields
+                    .iter()
+                    .map(|(n, t)| format!("{n}:{}", t.as_str()))
+                    .collect();
+                format!("readbin {path} ({})", cols.join(" "))
+            }
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),

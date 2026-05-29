@@ -104,6 +104,38 @@ pub fn mixed_types(rows: usize, mix_ratio: f64, seed: u64) -> String {
     s
 }
 
+/// Rivus layout for [`bin_clean`]: packed little-endian `i32 id, i32 age,
+/// f64 score, u8 active` (record size = 17 bytes).
+pub const BIN_LAYOUT: &str = "id:i32 age:i32 score:f64 active:u8";
+
+/// `rows` fixed-width binary records matching [`BIN_LAYOUT`] (a C struct dump).
+/// The PRNG draws per row are `age = below(90)`, `score = below(10_000)`,
+/// `active = below(2)` — `id` is the row index and consumes no randomness.
+pub fn bin_clean(rows: usize, seed: u64) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut out = Vec::with_capacity(rows * 17);
+    for i in 0..rows {
+        out.extend_from_slice(&(i as i32).to_le_bytes());
+        let age = rng.below(90) as i32;
+        out.extend_from_slice(&age.to_le_bytes());
+        let score = (rng.below(10_000) as f64) / 100.0;
+        out.extend_from_slice(&score.to_le_bytes());
+        out.push(if rng.below(2) == 1 { 1u8 } else { 0u8 });
+    }
+    out
+}
+
+/// Like [`write_temp`] but for raw bytes (binary fixtures).
+pub fn write_temp_bytes(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!("rivus_{tag}_{}_{n}.bin", std::process::id()));
+    std::fs::write(&path, bytes).expect("write temp data");
+    path
+}
+
 /// Write `text` to a uniquely-named temp file and return its path. The caller
 /// owns cleanup; benches/tests delete it when done.
 pub fn write_temp(tag: &str, text: &str) -> std::path::PathBuf {

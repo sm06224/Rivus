@@ -37,9 +37,11 @@ directive  = ('monitor'|'watch'|'visualize'|'stop') ... ';' ;  (* MVP: no-op *)
 
 body       = head transform* ;
 head       = 'open' PATH
+           | 'readbin' PATH '(' (IDENT ':' BINTYPE)+ ')'   (* 固定長バイナリ *)
            | 'stream' IDENT
            | ref-expr
            | (* branch 子では空: 親 flow を継承 *) ;
+BINTYPE    = 'i8'|'i16'|'i32'|'i64'|'u8'|'u16'|'u32'|'u64'|'f32'|'f64'|'bool' ;
 ref-expr   = IDENT ( ('+' IDENT)+ | ('&' IDENT) )? ;   (* merge / join *)
 
 transform  = '|?' expr
