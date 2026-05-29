@@ -1,0 +1,13 @@
+[package]
+name = "rivus-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rivus runtime: single-thread chunk execution engine, telemetry, modes"
+
+[dependencies]
+rivus-core.workspace = true
+rivus-ir.workspace = true
+
+[dev-dependencies]
+rivus-parser.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "rivus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rivus command-line shell: run, explain, and visualize flows"
+
+[[bin]]
+name = "rivus"
+path = "src/main.rs"
+
+[dependencies]
+rivus-core.workspace = true
+rivus-ir.workspace = true
+rivus-parser.workspace = true
+rivus-runtime.workspace = true

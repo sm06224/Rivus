@@ -1,0 +1,133 @@
+# 10. Shell Syntax（Unified Flow Syntax）
+
+## 10.1 思想
+
+すべては Scope と Flow。`:` で scope 開始、`;` で scope 終了。プログラムは「逐次
+命令」ではなく「データ流の定義」。停止ではなく Continuity を優先する。
+
+## 10.2 演算子早見表
+
+| 記号 | 意味 | IR |
+|---|---|---|
+| `Label: ... ;` | scope（execution graph node）宣言 | label 付きノード |
+| `: ... ; Label` | 無名 scope + 結果への label 付与 | 同上 |
+| `\|?` | filter | `Op::Filter` |
+| `\|>` | map / projection | `Op::Project` |
+| `\|#` | group / partition by | `Op::GroupBy` |
+| `\| map { ... }` | map block（要素変換） | （MVP: 解析のみ） |
+| `->` | branch（tee, 多分岐） | fan-out edge |
+| `+` | merge（union） | `Op::Merge` |
+| `&` | synchronized join | `Op::Join` |
+| `Label!` | force materialize | （MVP: 構造的 no-op） |
+| `stream Label` | replay | `Op::StreamRef` |
+| `stop flow;` | 明示停止（例外的） | （MVP: directive） |
+| `$_` / `$_.x` / `$_..x` / `$_:N` | current object / field / deep / scope stack | `Expr::Field` |
+| `item("x")` | dynamic lookup（slow path） | `Expr::Field{Dynamic}` |
+
+## 10.3 文法（実装済み MVP サブセット）
+
+`rivus-parser`（lexer + recursive descent）が受理する範囲：
+
+```ebnf
+program    = item* ;
+item       = scope | anon-scope | directive ;
+scope      = IDENT ':' body ';' ;
+anon-scope = ':' body ';' IDENT? ;
+directive  = ('monitor'|'watch'|'visualize'|'stop') ... ';' ;  (* MVP: no-op *)
+
+body       = head transform* ;
+head       = 'open' PATH
+           | 'stream' IDENT
+           | ref-expr
+           | (* branch 子では空: 親 flow を継承 *) ;
+ref-expr   = IDENT ( ('+' IDENT)+ | ('&' IDENT) )? ;   (* merge / join *)
+
+transform  = '|?' expr
+           | '|>' field+
+           | '|#' field
+           | '|' 'map' block
+           | branch
+           | sink
+           | hook ;
+branch     = '->' IDENT ':' body ';' ;
+sink       = 'save' PATH | 'print' ;
+hook       = 'on' EVENT ('severity' '>=' SEV)? ':' action ';' ;
+action     = 'transition' MODE | 'log' STRING | ['route'|'reroute'] IDENT | IDENT ;
+
+expr       = or ;
+or         = and ('or' and)* ;
+and        = cmp ('and' cmp)* ;
+cmp        = primary (CMP primary)? ;
+primary    = INT | FLOAT | STRING | 'true' | 'false'
+           | '$_' field-tail | '$_:'N field-tail
+           | 'item' '(' STRING ')'
+           | IDENT ;                       (* bare field of current object *)
+field-tail = '.' IDENT | '..' IDENT ;
+CMP        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
+```
+
+字句規則：`#` は行コメント（ただし `|#` は演算子）。空白・改行は非有意。
+ファイルパスは `users.csv` `/tmp/x.csv` `data/out` が1トークンになるよう、
+word に `. / -` を許容（先頭は英字/`_`/`/`）。
+
+## 10.4 例（すべて `examples/` にあり、動く）
+
+```
+# adults.riv — 線形 flow
+Users:
+    open examples/users.csv
+    |? age >= 20
+    |> name age
+;
+```
+
+```
+# branch.riv — 多分岐 + 合流（DAG）
+Users:
+    open examples/users.csv
+    -> Adults: |? age >= 20 ;
+    -> Minors: |? age <  20 ;
+;
+Merged:
+    Adults + Minors
+;
+```
+
+```
+# recover.riv — continue-first + mode escalation
+Import:
+    open examples/messy.csv
+    |? age >= 20
+    on error severity >= warning:
+        transition degraded
+    ;
+;
+```
+
+## 10.5 scope stack（$_:N）の意味
+
+```
+Orders:
+    | map {
+        $_.items
+        |? $_:1.country == "JP"   # $_:0 = current(item), $_:1 = parent(order)
+    }
+;
+```
+
+`$_:0` 現在 / `$_:1` 親 scope / `$_:2` その上。MVP は parse して level を保持し、
+評価では flat schema 解決（nested chunk 実装後に親参照を有効化）。
+
+## 10.6 未実装（設計済み・パーサは将来拡張）
+
+`mode <name>: ...;` 定義、`on chunk_begin/recovery` の本体実行、`| map {}` 本体の
+評価、`item(..)`/`$_..` の slow path 実行、materialize/replay の実体。いずれも
+IR・実行モデル側の受け皿（`Op` / `Hook` / `Access`）は用意済み。
+
+### 段階表
+
+| | 構文 |
+|---|---|
+| MVP | scope / 無名 scope / `\|? \|> \|#` / `-> + &` / hook(on error) / sink |
+| 次 | `mode` 定義 / map block 評価 / 全 hook 実行 / scope stack 評価 |
+| 将来 | マクロ・ユーザ定義 operator 構文 / 型注釈構文 / `rivus live` Markdown |

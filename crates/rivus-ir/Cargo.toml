@@ -1,0 +1,9 @@
+[package]
+name = "rivus-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rivus DAG IR: flow graph, operators, expressions, reversible source"
+
+[dependencies]
+rivus-core.workspace = true

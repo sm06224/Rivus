@@ -1,0 +1,8 @@
+[package]
+name = "rivus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rivus core data model: Chunk, Schema, Value, Mode, Error stream"
+
+[dependencies]

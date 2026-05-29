@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rivus-core",
+    "crates/rivus-ir",
+    "crates/rivus-parser",
+    "crates/rivus-runtime",
+    "crates/rivus-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/sm06224/rivus"
+description = "Rivus: a flow-oriented, DAG-native, continue-first, observable stream runtime"
+
+[workspace.dependencies]
+rivus-core = { path = "crates/rivus-core" }
+rivus-ir = { path = "crates/rivus-ir" }
+rivus-parser = { path = "crates/rivus-parser" }
+rivus-runtime = { path = "crates/rivus-runtime" }
+
+# Profile tuned for the MVP: fast iteration, but optimized release for
+# benchmark work (see docs/design/15-benchmark.md).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

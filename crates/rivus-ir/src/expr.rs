@@ -1,0 +1,97 @@
+//! Scalar expressions used inside transforms (filter predicates, projections).
+//!
+//! Expressions encode the access strategies from the syntax draft:
+//! - `Col` / `$_.field`  → fast structural access
+//! - `DeepCol` / `$_..field` → recursive traversal (slow path)
+//! - `DynCol` / `item("field")` → dynamic resolution (slow path)
+//!
+//! Each carries an `access` tag so the optimizer / JIT can specialize the fast
+//! path and fall back only where required (Master principle #7).
+
+use rivus_core::Value;
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl CmpOp {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CmpOp::Eq => "==",
+            CmpOp::Ne => "!=",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// `$_.field` — direct structural lookup.
+    Fast,
+    /// `$_..field` — recursive traversal.
+    Deep,
+    /// `item("field")` — dynamic resolution.
+    Dynamic,
+}
+
+#[derive(Debug, Clone)]
+pub enum Expr {
+    /// Reference to a field of the current object, with an access strategy.
+    Field {
+        name: String,
+        access: Access,
+    },
+    Literal(Value),
+    Compare {
+        left: Box<Expr>,
+        op: CmpOp,
+        right: Box<Expr>,
+    },
+    /// Logical AND of two predicates.
+    And(Box<Expr>, Box<Expr>),
+    /// Logical OR of two predicates.
+    Or(Box<Expr>, Box<Expr>),
+}
+
+impl Expr {
+    pub fn field(name: impl Into<String>) -> Expr {
+        Expr::Field {
+            name: name.into(),
+            access: Access::Fast,
+        }
+    }
+
+    /// Source representation of the field accessor, for reversibility.
+    fn field_src(name: &str, access: Access) -> String {
+        match access {
+            Access::Fast => format!("$_.{name}"),
+            Access::Deep => format!("$_..{name}"),
+            Access::Dynamic => format!("item(\"{name}\")"),
+        }
+    }
+}
+
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expr::Field { name, access } => write!(f, "{}", Expr::field_src(name, *access)),
+            Expr::Literal(Value::Str(s)) => write!(f, "\"{s}\""),
+            Expr::Literal(v) => write!(f, "{v}"),
+            Expr::Compare { left, op, right } => {
+                write!(f, "{left} {} {right}", op.as_str())
+            }
+            Expr::And(a, b) => write!(f, "{a} and {b}"),
+            Expr::Or(a, b) => write!(f, "{a} or {b}"),
+        }
+    }
+}

@@ -1,0 +1,7 @@
+# The headline example: stream a CSV, keep adults, project two fields.
+# Run with:  rivus run examples/adults.riv
+Users:
+    open examples/users.csv
+    |? age >= 20
+    |> name age
+;
