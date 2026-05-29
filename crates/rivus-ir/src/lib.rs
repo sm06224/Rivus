@@ -20,6 +20,7 @@ mod tests {
         let mut g = PlanGraph::new();
         let a = g.add_node(Op::OpenCsv {
             path: "users.csv".into(),
+            projection: None,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {
@@ -39,6 +40,7 @@ mod tests {
         let mut g = PlanGraph::new();
         let a = g.add_node(Op::OpenCsv {
             path: "users.csv".into(),
+            projection: None,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {

@@ -11,7 +11,7 @@
 //!
 //! Rules are added incrementally (design doc 08). The first is `dedup_sources`.
 
-use rivus_ir::{Edge, EdgeKind, Node, NodeId, Op, PlanGraph};
+use rivus_ir::{Edge, EdgeKind, Expr, Node, NodeId, Op, PlanGraph};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -49,7 +49,94 @@ pub fn optimize(graph: PlanGraph) -> (PlanGraph, OptReport) {
     let mut report = OptReport::default();
     let graph = dedup_sources(graph, &mut report);
     let graph = fuse_linear(graph, &mut report);
+    let graph = project_pushdown(graph, &mut report);
     (graph, report)
+}
+
+/// **Projection pushdown.** When every consumer of a CSV source is a
+/// `FilterProject` that projects to a known column set (`fields = Some`), the
+/// source only needs to *build* the columns those consumers read: the union of
+/// each consumer's predicate columns and projected columns. Unused columns are
+/// then never parsed or allocated by the reader.
+///
+/// Safety: a `FilterProject{fields:Some(Y)}` emits only `Y`, so nothing
+/// downstream of it can reference a source column outside `preds ∪ Y`. If any
+/// consumer is something else (group/join/sink/merge, or a fused node with no
+/// projection), the source's output columns are live for unknown downstream
+/// use, so we conservatively skip pushdown for that source.
+fn project_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
+    let mut pushed = 0usize;
+    for sid in 0..graph.nodes.len() {
+        if !matches!(
+            graph.nodes[sid].op,
+            Op::OpenCsv {
+                projection: None,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let consumers = graph.outputs_of(sid);
+        if consumers.is_empty() {
+            continue;
+        }
+        let mut needed: Vec<String> = Vec::new();
+        let mut safe = true;
+        for c in &consumers {
+            match &graph.nodes[*c].op {
+                Op::FilterProject {
+                    preds,
+                    fields: Some(proj),
+                } => {
+                    for p in preds {
+                        collect_fields(p, &mut needed);
+                    }
+                    for f in proj {
+                        push_unique(&mut needed, f);
+                    }
+                }
+                _ => {
+                    safe = false;
+                    break;
+                }
+            }
+        }
+        if !safe || needed.is_empty() {
+            continue;
+        }
+        if let Op::OpenCsv { projection, .. } = &mut graph.nodes[sid].op {
+            *projection = Some(needed);
+            pushed += 1;
+        }
+    }
+    if pushed > 0 {
+        report.applied.push(format!(
+            "project_pushdown: restricted {pushed} source read(s) to live columns"
+        ));
+    }
+    graph
+}
+
+/// Collect referenced field names from a predicate expression.
+fn collect_fields(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Field { name, .. } => push_unique(out, name),
+        Expr::Literal(_) => {}
+        Expr::Compare { left, right, .. } => {
+            collect_fields(left, out);
+            collect_fields(right, out);
+        }
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            collect_fields(a, out);
+            collect_fields(b, out);
+        }
+    }
+}
+
+fn push_unique(out: &mut Vec<String>, name: &str) {
+    if !out.iter().any(|n| n == name) {
+        out.push(name.to_string());
+    }
 }
 
 /// **Operator fusion.** Collapse a linear chain of consecutive `Filter` nodes
@@ -213,7 +300,7 @@ fn dedup_sources(graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
     let mut canon: HashMap<&str, NodeId> = HashMap::new();
     let mut redirect: HashMap<NodeId, NodeId> = HashMap::new();
     for n in &graph.nodes {
-        if let Op::OpenCsv { path } = &n.op {
+        if let Op::OpenCsv { path, .. } = &n.op {
             if n.label.is_some() {
                 continue;
             }
@@ -378,6 +465,60 @@ B:\n open data.csv\n |# country\n;";
             }
             _ => panic!("expected fused node"),
         }
+    }
+
+    #[test]
+    fn pushes_projection_into_source() {
+        // open | filter(age) | project(name, age)  =>  source builds only {age, name}.
+        let src = "F:\n open d.csv\n |? age >= 20\n |> name age\n;";
+        let g = rivus_parser::parse(src).unwrap();
+        let (opt, report) = optimize(g);
+        let s = opt
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::OpenCsv { .. }))
+            .unwrap();
+        match &s.op {
+            Op::OpenCsv {
+                projection: Some(cols),
+                ..
+            } => {
+                // Predicate column `age` and projected `name`, `age`.
+                assert!(cols.contains(&"age".to_string()));
+                assert!(cols.contains(&"name".to_string()));
+            }
+            other => panic!("expected source projection, got {other:?}"),
+        }
+        assert!(report
+            .applied
+            .iter()
+            .any(|l| l.contains("project_pushdown")));
+    }
+
+    #[test]
+    fn no_pushdown_when_a_consumer_needs_all_columns() {
+        // The group consumer can reference any column, so the shared source must
+        // keep building everything.
+        let src = "\
+A:\n open d.csv\n |? age >= 20\n |> name\n;\n\
+B:\n open d.csv\n |# country\n;";
+        let g = rivus_parser::parse(src).unwrap();
+        let (opt, _) = optimize(g); // dedup merges the source; B blocks pushdown
+        let s = opt
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::OpenCsv { .. }))
+            .unwrap();
+        assert!(
+            matches!(
+                s.op,
+                Op::OpenCsv {
+                    projection: None,
+                    ..
+                }
+            ),
+            "pushdown must be skipped when a consumer needs all columns"
+        );
     }
 
     #[test]

@@ -226,7 +226,10 @@ impl Parser {
             Tok::Word(w) if w == "open" => {
                 self.bump();
                 let path = self.word()?;
-                Ok(self.g.add_node(Op::OpenCsv { path }))
+                Ok(self.g.add_node(Op::OpenCsv {
+                    path,
+                    projection: None,
+                }))
             }
             Tok::Word(w) if w == "stream" => {
                 self.bump();

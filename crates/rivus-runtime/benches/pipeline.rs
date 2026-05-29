@@ -183,6 +183,17 @@ fn bench_optimizer(c: &mut Criterion) {
     g.bench_function("filter_chain_fused", |b| {
         b.iter(|| black_box(run_source_opt(&chain)))
     });
+
+    // Projection pushdown: project to a single numeric column. Optimized, the
+    // reader builds ONLY `age` — the two string columns (name, country) and the
+    // rest are never parsed or allocated.
+    let proj = format!("F:\n open {p}\n |? age >= 30\n |> age\n;");
+    g.bench_function("project_pushdown_raw", |b| {
+        b.iter(|| black_box(run_source(&proj)))
+    });
+    g.bench_function("project_pushdown_opt", |b| {
+        b.iter(|| black_box(run_source_opt(&proj)))
+    });
     g.finish();
 }
 

@@ -17,8 +17,13 @@ pub type NodeId = usize;
 /// sinks — because in Rivus they are all just nodes in the same graph.
 #[derive(Debug, Clone)]
 pub enum Op {
-    /// `open path.csv`
-    OpenCsv { path: String },
+    /// `open path.csv`. `projection`, when set by the optimizer
+    /// (`project_pushdown`), restricts which columns the reader builds — unused
+    /// columns are never parsed or allocated.
+    OpenCsv {
+        path: String,
+        projection: Option<Vec<String>>,
+    },
     /// `stream X` — replay of a named flow (and, internally, a reference edge).
     StreamRef { name: String },
     /// `|? <pred>`
@@ -67,7 +72,10 @@ impl Op {
     /// Render this op as the pipeline fragment that produced it.
     fn to_src_line(&self) -> String {
         match self {
-            Op::OpenCsv { path } => format!("open {path}"),
+            Op::OpenCsv { path, projection } => match projection {
+                Some(cols) => format!("open {path}  # read-only: {}", cols.join(",")),
+                None => format!("open {path}"),
+            },
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),

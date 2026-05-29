@@ -24,26 +24,37 @@ pub struct CsvData {
     pub bad_rows: usize,
 }
 
-/// Parse CSV text into inferred columns. Never panics on malformed rows: rows
-/// with the wrong field count are counted in `bad_rows` and skipped
-/// (continue-first).
-pub fn parse(text: &str) -> Result<CsvData, String> {
+/// Parse CSV text into inferred columns, optionally restricting to a subset of
+/// columns by name (`allow`). Never panics on malformed rows: rows with the
+/// wrong field count are counted in `bad_rows` and skipped (continue-first).
+///
+/// Columns not in `allow` are still split past (so record boundaries and arity
+/// checks are unaffected) but are never inferred, parsed, or allocated — the
+/// projection-pushdown fast path. `allow = None` keeps every column.
+pub fn parse_projected(text: &str, allow: Option<&[String]>) -> Result<CsvData, String> {
     let mut lines = text.lines();
     let header = match lines.next() {
         Some(h) => h,
         None => return Err("empty CSV".to_string()),
     };
-    let names: Vec<String> = split_owned(header).into_iter().collect();
+    let names: Vec<String> = split_owned(header);
     let ncols = names.len();
     if ncols == 0 {
         return Err("CSV header has no columns".to_string());
     }
 
-    // Body starts after the header line.
+    // Indices of the columns we will actually build (in header order).
+    let keep: Vec<usize> = match allow {
+        None => (0..ncols).collect(),
+        Some(a) => (0..ncols)
+            .filter(|&i| a.iter().any(|n| n == &names[i]))
+            .collect(),
+    };
+
     let body = &text[header_end(text)..];
 
-    // --- Pass 1: infer column types and count valid / bad rows -------------
-    let mut flags: Vec<Flags> = (0..ncols).map(|_| Flags::new()).collect();
+    // --- Pass 1: infer types for kept columns; count valid / bad rows ------
+    let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
     let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
     let mut nrows = 0usize;
     let mut bad_rows = 0usize;
@@ -57,14 +68,14 @@ pub fn parse(text: &str) -> Result<CsvData, String> {
             bad_rows += 1;
             continue;
         }
-        for (i, cell) in scratch.iter().enumerate() {
-            flags[i].observe(cell.as_ref());
+        for (k, &ci) in keep.iter().enumerate() {
+            flags[k].observe(scratch[ci].as_ref());
         }
         nrows += 1;
     }
     let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
 
-    // --- Pass 2: build columns directly into pre-sized buffers -------------
+    // --- Pass 2: build only the kept columns into pre-sized buffers --------
     let mut builders: Vec<ColBuilder> = dtypes
         .iter()
         .map(|d| ColBuilder::with_capacity(*d, nrows))
@@ -78,16 +89,16 @@ pub fn parse(text: &str) -> Result<CsvData, String> {
         if scratch.len() != ncols {
             continue; // identical skip rule as pass 1
         }
-        for (i, cell) in scratch.iter().enumerate() {
-            builders[i].push(cell.as_ref());
+        for (k, &ci) in keep.iter().enumerate() {
+            builders[k].push(scratch[ci].as_ref());
         }
     }
 
-    let mut columns = Vec::with_capacity(ncols);
-    let mut fields = Vec::with_capacity(ncols);
-    for (i, name) in names.into_iter().enumerate() {
-        fields.push(Field::new(name, dtypes[i]));
-        columns.push(builders[i].finish());
+    let mut columns = Vec::with_capacity(keep.len());
+    let mut fields = Vec::with_capacity(keep.len());
+    for (k, &ci) in keep.iter().enumerate() {
+        fields.push(Field::new(names[ci].clone(), dtypes[k]));
+        columns.push(builders[k].finish());
     }
 
     Ok(CsvData {
@@ -251,7 +262,7 @@ mod tests {
 
     #[test]
     fn infers_and_parses_types() {
-        let data = parse("a,b,c,d\n1,1.5,true,x\n2,2.0,false,y\n").unwrap();
+        let data = parse_projected("a,b,c,d\n1,1.5,true,x\n2,2.0,false,y\n", None).unwrap();
         assert_eq!(data.schema.fields[0].dtype, DataType::I64);
         assert_eq!(data.schema.fields[1].dtype, DataType::F64);
         assert_eq!(data.schema.fields[2].dtype, DataType::Bool);
@@ -265,7 +276,7 @@ mod tests {
 
     #[test]
     fn skips_malformed_rows() {
-        let data = parse("a,b\n1,2\nonly_one_field\n3,4\n").unwrap();
+        let data = parse_projected("a,b\n1,2\nonly_one_field\n3,4\n", None).unwrap();
         assert_eq!(data.bad_rows, 1);
         match &data.columns[0] {
             Column::I64(v) => assert_eq!(v, &[1, 3]),
@@ -275,7 +286,7 @@ mod tests {
 
     #[test]
     fn handles_quoted_fields_with_commas() {
-        let data = parse("name,note\n\"a,b\",\"he said \"\"hi\"\"\"\n").unwrap();
+        let data = parse_projected("name,note\n\"a,b\",\"he said \"\"hi\"\"\"\n", None).unwrap();
         match &data.columns[0] {
             Column::Str(v) => assert_eq!(v[0], "a,b"),
             _ => panic!("expected str"),
@@ -288,7 +299,7 @@ mod tests {
 
     #[test]
     fn mixed_column_falls_back_to_str() {
-        let data = parse("v\n1\n2\nN/A\n").unwrap();
+        let data = parse_projected("v\n1\n2\nN/A\n", None).unwrap();
         assert_eq!(data.schema.fields[0].dtype, DataType::Str);
     }
 }

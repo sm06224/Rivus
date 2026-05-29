@@ -110,17 +110,38 @@ scan and a single-column gather → ~1.20×. Fusion is also a prerequisite for
 projection pushdown and the eventual SIMD kernels. Correctness is gated by
 `tests/optimizer_equiv.rs` (optimized == unoptimized, byte-for-byte).
 
+## Phase 0.4 — projection pushdown into the reader
+
+`project_pushdown` annotates a CSV source with the set of columns its consumers
+actually read (predicate columns ∪ projected columns), when every consumer is a
+`FilterProject{fields: Some}` (so nothing downstream can reference a pruned
+column). The reader then **never parses or allocates** the other columns.
+
+| scenario | raw | pushed-down | speedup |
+|---|---:|---:|---:|
+| `optimizer/project_pushdown` (`open \| filter age \| project age`) | 113 ms | **53 ms** | **2.14×** |
+
+This is the biggest single win after the CSV rewrite, because it attacks the
+now-dominant cost directly: the projected query needs only `age` (i64), so the
+two string columns (`name`, `country`) and the rest are never built — eliminating
+their per-cell allocation and parsing entirely (0.57 M → 200k/53ms ≈ **3.8 M
+rows/s** end-to-end). Safety + equivalence are gated by
+`tests/optimizer_equiv.rs::fusion_and_pushdown_preserve_results`.
+
+The optimizer pipeline now runs **dedup → fuse → pushdown**, each visible in
+`rivus explain`.
+
 ### Optimization backlog (driven by these numbers)
 
 1. ~~**CSV reader, single-pass, zero owned-`String`**~~ — ✅ done (Phase 0.1).
 2. ~~**Avoid double source reads**~~ — ✅ done (Phase 0.2, `dedup_sources`).
 3. ~~**Operator fusion** (filter chains → project)~~ — ✅ done (Phase 0.3).
-4. **Projection pushdown** into the CSV reader: don't *build* unused columns.
-   Since parsing dominates, skipping construction of dropped columns should beat
-   fusion's execution-only win — the next high-value target.
+4. ~~**Projection pushdown** into the CSV reader~~ — ✅ done (Phase 0.4).
 5. **Faster numeric parsing** (custom `i64`/`f64` from `&[u8]`); SIMD field
    scanning. Parse is the hot path now; asm-level tuning where a bench proves it.
-6. **Reduce gather copies** (esp. string columns) via Arrow `ArrayRef` sharing.
+6. **Filter pushdown** into the reader (skip building rows that won't survive).
+7. **Reduce gather copies** (esp. string columns) via Arrow `ArrayRef` sharing.
+8. **Parallel scheduler** (chunk split across workers) — design doc 05.
 3. **Vectorized / SIMD predicate kernels** for the `i64`/`f64` lanes (Phase 1→2,
    design doc 09); asm-level tuning where a bench proves the win.
 4. **Reduce fan-out clone cost** via Arrow `ArrayRef` refcount sharing (doc 03).

@@ -50,7 +50,9 @@ pub trait Operator {
 /// Build the operator for a node from its IR op.
 pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator> {
     match op {
-        Op::OpenCsv { path } => Box::new(SourceCsv::new(path.clone(), chunk_size)),
+        Op::OpenCsv { path, projection } => {
+            Box::new(SourceCsv::new(path.clone(), projection.clone(), chunk_size))
+        }
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Project { fields } => Box::new(Project {
@@ -80,6 +82,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
 
 struct SourceCsv {
     path: String,
+    projection: Option<Vec<String>>,
     chunk_size: usize,
     schema: Arc<Schema>,
     columns: Vec<Column>,
@@ -89,9 +92,10 @@ struct SourceCsv {
 }
 
 impl SourceCsv {
-    fn new(path: String, chunk_size: usize) -> Self {
+    fn new(path: String, projection: Option<Vec<String>>, chunk_size: usize) -> Self {
         SourceCsv {
             path,
+            projection,
             chunk_size: chunk_size.max(1),
             schema: Schema::empty(),
             columns: Vec::new(),
@@ -117,7 +121,7 @@ impl SourceCsv {
                 return;
             }
         };
-        match csv::parse(&text) {
+        match csv::parse_projected(&text, self.projection.as_deref()) {
             Ok(data) => {
                 if data.bad_rows > 0 {
                     ctx.raise(
