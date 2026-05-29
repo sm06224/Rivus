@@ -110,6 +110,39 @@ fn mixed_types_degrades_to_string_lane() {
 }
 
 #[test]
+fn string_filter_matches_oracle() {
+    // Filter on a string column (country == "JP") must match an independent
+    // count, exercising the borrowed-&str predicate fast path across chunk
+    // sizes. Also checks `!=` for the complementary count.
+    let rows = 40_000;
+    let seed = 123;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_strfilter", &data));
+    let p = f.0.display();
+
+    // Oracle: replay the generator's PRNG to count JP rows.
+    let mut rng = Rng::new(seed);
+    let countries = ["JP", "US", "DE", "FR", "BR"];
+    let mut jp = 0u64;
+    for _ in 0..rows {
+        let _age = rng.below(90);
+        let _score = rng.below(10_000);
+        let c = countries[rng.below(5) as usize];
+        let _active = rng.below(2);
+        if c == "JP" {
+            jp += 1;
+        }
+    }
+
+    for cs in [1, 1000, 8192] {
+        let eq = run_src(&format!("F:\n open {p}\n |? country == \"JP\"\n;"), cs);
+        assert_eq!(eq.total_rows_out(), jp, "== chunk_size={cs}");
+        let ne = run_src(&format!("F:\n open {p}\n |? country != \"JP\"\n;"), cs);
+        assert_eq!(ne.total_rows_out(), rows as u64 - jp, "!= chunk_size={cs}");
+    }
+}
+
+#[test]
 fn fanout_merge_conserves_rows() {
     let rows = 20_000;
     let data = gendata::clean(rows, 99);

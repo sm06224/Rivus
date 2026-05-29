@@ -180,6 +180,23 @@ appended) and locked by a multibyte round-trip test
 (`str_column_roundtrips_including_multibyte`). All stress + equivalence tests
 stay green.
 
+## Phase 0.7 — zero-copy `&str` predicate evaluation
+
+Predicate evaluation gained borrowed fast paths for the common `Field CMP
+Literal` shape: a string comparison reads the arena column as `&str` and a
+numeric comparison reads the lane directly, so neither allocates a `Value` (no
+`String` per row for string-keyed filters). Mixed/null operands fall back to the
+owned-`Value` interpreter, so results are identical.
+
+| scenario | before | after | change |
+|---|---:|---:|---|
+| `large/string_filter` (`country == "JP"`, 6 cols, no projection) | 58.9 ms | 56.2 ms | −5% |
+
+Modest because this case is parse-bound; the win is removing two `String`
+allocations per row, which scales with selectivity and string-heavy,
+filter-dominated pipelines. Correctness (incl. `!=` and chunk-size independence)
+is locked by `tests/stress.rs::string_filter_matches_oracle`.
+
 ### Optimization backlog (driven by these numbers)
 
 1. ~~CSV reader, single-pass, zero owned-`String`~~ — ✅ Phase 0.1.
@@ -188,10 +205,15 @@ stay green.
 4. ~~Projection pushdown into the CSV reader~~ — ✅ Phase 0.4.
 5. ~~Parallel CSV parsing + inference fast-path~~ — ✅ Phase 0.5.
 6. ~~Arena string columns (offsets + bytes)~~ — ✅ Phase 0.6.
-7. **Filter pushdown** into the reader (skip building rows that won't survive).
-8. **Parallel pipeline execution** (chunk-split operators across workers) — doc 05.
-9. **Zero-copy `&str` predicate eval** (compare against the arena without
-   materializing a `String` per row) for string-keyed filters/joins.
+7. ~~Zero-copy `&str` predicate eval~~ — ✅ Phase 0.7.
+8. **Filter pushdown** into the reader (skip building rows that won't survive).
+9. **Parallel pipeline execution** (chunk-split operators across workers) — doc 05.
+
+### Cumulative (200k rows, end-to-end read→parse→run)
+
+`open | filter | project age` : **0.57 → ~3.8 M rows/s** (baseline → Phase 0.7),
+with every step individually measured and semantics-preserving (correctness
+gated by `tests/stress.rs` + `tests/optimizer_equiv.rs`).
 
 Every optimization PR must attach its before/after row from this table and must
 keep `tests/stress.rs` green (correctness is the gate, speed is the reward).

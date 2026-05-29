@@ -58,6 +58,13 @@ fn bench_large(c: &mut Criterion) {
         b.iter(|| black_box(run_source(&src)));
     });
 
+    // String-keyed filter exercises the borrowed-&str predicate fast path
+    // (no String allocation per row). No projection, so parse cost is constant.
+    g.bench_function("string_filter", |b| {
+        let src = format!("F:\n open {p}\n |? country == \"JP\"\n;");
+        b.iter(|| black_box(run_source(&src)));
+    });
+
     g.bench_function("filter_project_group", |b| {
         let src = format!(
             "F:\n open {p}\n |? age >= 30\n |> name age country\n;\n\
