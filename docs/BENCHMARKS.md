@@ -76,11 +76,30 @@ confirming per-cell allocation was the dominant cost. Correctness held across
 all of `tests/stress.rs` and the new `csv` unit tests (chunk-size independence,
 malformed-row skipping, quoted fields, mixed-type fallback).
 
+## Phase 0.2 — optimizer: source de-duplication (CSE)
+
+First IR optimizer pass (`rivus-optimizer`, zero external deps). `dedup_sources`
+merges identical `open <path>` reads into one source that fans out to every
+consumer — a semantics-preserving DAG rewrite, surfaced via `rivus explain`.
+
+| scenario | raw | deduped | speedup |
+|---|---:|---:|---:|
+| `optimizer/two_reads` (same file in 2 scopes) | 0.86 M | **1.41 M rows/s** | **1.64×** |
+
+The win scales with the number of duplicate reads (N reads → 1). Correctness is
+gated by `tests/optimizer_equiv.rs`, which asserts the optimized graph produces
+byte-identical outputs to the unoptimized one. The CLI runs the optimizer by
+default (`--no-opt` to disable) and prints the applied rules.
+
 ### Optimization backlog (driven by these numbers)
 
 1. ~~**CSV reader, single-pass, zero owned-`String`**~~ — ✅ done (Phase 0.1).
-2. **Avoid double source reads** in multi-source programs (shared scan / cache).
-   `filter_project_group` reads the file twice; a shared source would help.
+2. ~~**Avoid double source reads**~~ — ✅ done (Phase 0.2, `dedup_sources`).
+3. **Operator fusion** (filter→project) to drop intermediate chunks (doc 08).
+4. **Projection pushdown** into the CSV reader: skip building unused columns.
+5. **Vectorized / SIMD predicate kernels** for `i64`/`f64` lanes (doc 09);
+   asm-level tuning where a bench proves the win.
+6. **Reduce gather copies** (esp. string columns) via Arrow `ArrayRef` sharing.
 3. **Vectorized / SIMD predicate kernels** for the `i64`/`f64` lanes (Phase 1→2,
    design doc 09); asm-level tuning where a bench proves the win.
 4. **Reduce fan-out clone cost** via Arrow `ArrayRef` refcount sharing (doc 03).

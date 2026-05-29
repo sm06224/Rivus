@@ -67,6 +67,7 @@ crates/
   rivus-core      Chunk / Column / Schema / Value / Mode / ErrorEvent
   rivus-ir        PlanGraph (DAG) / Op / Expr / to_source()  (reversible)
   rivus-parser    Unified Flow Syntax → DAG IR
+  rivus-optimizer semantics-preserving DAG transformations (IR-in / IR-out)
   rivus-runtime   single-thread chunk execution engine / operators / telemetry
   rivus-cli       `rivus run | explain | check`  (ASCII visualization)
 examples/         *.riv programs + users.csv

@@ -13,4 +13,5 @@ path = "src/main.rs"
 rivus-core.workspace = true
 rivus-ir.workspace = true
 rivus-parser.workspace = true
+rivus-optimizer.workspace = true
 rivus-runtime.workspace = true

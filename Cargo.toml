@@ -4,6 +4,7 @@ members = [
     "crates/rivus-core",
     "crates/rivus-ir",
     "crates/rivus-parser",
+    "crates/rivus-optimizer",
     "crates/rivus-runtime",
     "crates/rivus-cli",
 ]
@@ -19,6 +20,7 @@ description = "Rivus: a flow-oriented, DAG-native, continue-first, observable st
 rivus-core = { path = "crates/rivus-core" }
 rivus-ir = { path = "crates/rivus-ir" }
 rivus-parser = { path = "crates/rivus-parser" }
+rivus-optimizer = { path = "crates/rivus-optimizer" }
 rivus-runtime = { path = "crates/rivus-runtime" }
 
 # Profile tuned for the MVP: fast iteration, but optimized release for

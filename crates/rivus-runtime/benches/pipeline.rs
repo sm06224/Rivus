@@ -26,6 +26,13 @@ fn run_source(src: &str) -> rivus_runtime::RunResult {
     run(&graph, RunOptions { chunk_size: 8192 }).expect("run")
 }
 
+/// Parse + optimize + run.
+fn run_source_opt(src: &str) -> rivus_runtime::RunResult {
+    let graph = rivus_parser::parse(src).expect("parse");
+    let (graph, _) = rivus_optimizer::optimize(graph);
+    run(&graph, RunOptions { chunk_size: 8192 }).expect("run")
+}
+
 struct Fixture {
     path: PathBuf,
 }
@@ -134,11 +141,35 @@ fn bench_fanout(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_optimizer(c: &mut Criterion) {
+    let data = gendata::clean(ROWS, SEED);
+    let fx = Fixture {
+        path: gendata::write_temp("clean_opt", &data),
+    };
+    let p = fx.path.display();
+
+    // Two scopes read the same file; dedup_sources should merge the read.
+    let src = format!(
+        "A:\n open {p}\n |? age >= 30\n |> name age\n;\n\
+         B:\n open {p}\n |# country\n;"
+    );
+
+    let mut g = c.benchmark_group("optimizer");
+    g.sample_size(20);
+    g.throughput(Throughput::Elements(ROWS as u64));
+    g.bench_function("two_reads_raw", |b| b.iter(|| black_box(run_source(&src))));
+    g.bench_function("two_reads_dedup", |b| {
+        b.iter(|| black_box(run_source_opt(&src)))
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_large,
     bench_error_heavy,
     bench_mixed,
-    bench_fanout
+    bench_fanout,
+    bench_optimizer
 );
 criterion_main!(benches);

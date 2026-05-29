@@ -6,6 +6,7 @@
 
 use rivus_core::Chunk;
 use rivus_ir::PlanGraph;
+use rivus_optimizer::OptReport;
 use rivus_runtime::{Output, RunResult};
 
 const BAR_WIDTH: usize = 14;
@@ -173,6 +174,31 @@ fn render_table(chunks: &[Chunk], limit: usize) -> String {
     }
     if total > shown {
         s.push_str(&format!("  ... {} more row(s)\n", total - shown));
+    }
+    s
+}
+
+/// Just the applied-rules report (shown before a `run`).
+pub fn render_opt_report(report: &OptReport) -> String {
+    let mut s = String::from("\u{2592} optimizer\n");
+    for line in report.to_string().lines() {
+        s.push_str(&format!("  {line}\n"));
+    }
+    s
+}
+
+/// `explain` optimizer section: applied rules + the regenerated *optimized*
+/// source, demonstrating that optimization is a visible graph transformation.
+pub fn render_optimization(report: &OptReport, optimized: &PlanGraph) -> String {
+    let mut s = String::from("\u{2592} optimizer\n");
+    for line in report.to_string().lines() {
+        s.push_str(&format!("  {line}\n"));
+    }
+    if !report.is_empty() {
+        s.push_str("\u{2592} optimized source (after transformation)\n");
+        for line in optimized.to_source().lines() {
+            s.push_str(&format!("  {line}\n"));
+        }
     }
     s
 }

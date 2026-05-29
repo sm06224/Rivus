@@ -1,0 +1,15 @@
+[package]
+name = "rivus-optimizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rivus IR optimizer: semantics-preserving DAG transformations"
+
+# Supply-chain note: zero external dependencies. The optimizer operates purely
+# on rivus-ir's PlanGraph (IR-in / IR-out), keeping the trusted core small.
+[dependencies]
+rivus-core.workspace = true
+rivus-ir.workspace = true
+
+[dev-dependencies]
+rivus-parser.workspace = true
