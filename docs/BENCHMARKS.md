@@ -51,12 +51,36 @@ Machine: Intel Xeon @ 2.80␣GHz, 4␣vCPU. `cargo 1.94`, release profile
 - **Mixed-type fallback costs ~1.4×** (47␣ms → 66␣ms) when 50% of cells force
   the `Str` lane instead of `i64`. Graceful, not catastrophic.
 
+## Phase 0.1 — two-pass, allocation-light CSV reader
+
+Replaced the reader's `Vec<Vec<String>>` materialization (≈1.2 M owned-`String`
+allocations for 200k×6) with a two-pass parser: pass 1 splits into **borrowed
+`&str` slices** and infers types while scanning; pass 2 parses directly into
+**pre-sized typed column buffers**. Only genuine string columns allocate
+per-cell; unquoted records split with zero allocation.
+
+| scenario | Phase 0 | Phase 0.1 | speedup |
+|---|---:|---:|---:|
+| `large/filter_only` | 0.57 M | **1.54 M rows/s** | **2.7×** |
+| `large/filter_project_group` | 0.39 M | 0.82 M rows/s | 2.1× |
+| `error_heavy/bad=0%` | 0.67 M | 1.64 M rows/s | 2.5× |
+| `error_heavy/bad=25%` | 0.94 M | 2.06 M rows/s | 2.2× |
+| `error_heavy/bad=50%` | 1.40 M | 2.80 M rows/s | 2.0× |
+| `mixed_types/mix=0%` | 4.22 M | 5.49 M rows/s | 1.3× |
+| `mixed_types/mix=10%` | 3.22 M | 4.18 M rows/s | 1.3× |
+| `mixed_types/mix=50%` | 3.05 M | 3.87 M rows/s | 1.3× |
+| `fanout/branch3_merge` | 0.57 M | 1.20 M rows/s | 2.1× |
+
+The column-count gap is largely closed: 6-column workloads jumped ~2–2.7×,
+confirming per-cell allocation was the dominant cost. Correctness held across
+all of `tests/stress.rs` and the new `csv` unit tests (chunk-size independence,
+malformed-row skipping, quoted fields, mixed-type fallback).
+
 ### Optimization backlog (driven by these numbers)
 
-1. **CSV reader, single-pass, zero owned-`String`** — parse field slices, infer
-   while scanning once, build columns directly. Target: close the column-count
-   gap (expect large/* into multi-M rows/s). *(next stacked PR)*
+1. ~~**CSV reader, single-pass, zero owned-`String`**~~ — ✅ done (Phase 0.1).
 2. **Avoid double source reads** in multi-source programs (shared scan / cache).
+   `filter_project_group` reads the file twice; a shared source would help.
 3. **Vectorized / SIMD predicate kernels** for the `i64`/`f64` lanes (Phase 1→2,
    design doc 09); asm-level tuning where a bench proves the win.
 4. **Reduce fan-out clone cost** via Arrow `ArrayRef` refcount sharing (doc 03).
