@@ -53,52 +53,17 @@ pub fn parse_projected(text: &str, allow: Option<&[String]>) -> Result<CsvData, 
 
     let body = &text[header_end(text)..];
 
-    // --- Pass 1: infer types for kept columns; count valid / bad rows ------
-    let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
-    let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
-    let mut nrows = 0usize;
-    let mut bad_rows = 0usize;
-    for line in body.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        scratch.clear();
-        split_into(line, &mut scratch);
-        if scratch.len() != ncols {
-            bad_rows += 1;
-            continue;
-        }
-        for (k, &ci) in keep.iter().enumerate() {
-            flags[k].observe(scratch[ci].as_ref());
-        }
-        nrows += 1;
-    }
-    let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+    // Parse serially for small inputs; split across threads for large ones.
+    // Both paths produce byte-identical results (row order is preserved); the
+    // parallel path is exercised by the stress tests (20k–50k rows).
+    let (dtypes, columns, bad_rows) = match choose_threads(body.len()) {
+        1 => parse_serial(body, ncols, &keep),
+        n => parse_parallel(body, ncols, &keep, n),
+    };
 
-    // --- Pass 2: build only the kept columns into pre-sized buffers --------
-    let mut builders: Vec<ColBuilder> = dtypes
-        .iter()
-        .map(|d| ColBuilder::with_capacity(*d, nrows))
-        .collect();
-    for line in body.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        scratch.clear();
-        split_into(line, &mut scratch);
-        if scratch.len() != ncols {
-            continue; // identical skip rule as pass 1
-        }
-        for (k, &ci) in keep.iter().enumerate() {
-            builders[k].push(scratch[ci].as_ref());
-        }
-    }
-
-    let mut columns = Vec::with_capacity(keep.len());
     let mut fields = Vec::with_capacity(keep.len());
     for (k, &ci) in keep.iter().enumerate() {
         fields.push(Field::new(names[ci].clone(), dtypes[k]));
-        columns.push(builders[k].finish());
     }
 
     Ok(CsvData {
@@ -106,6 +71,184 @@ pub fn parse_projected(text: &str, allow: Option<&[String]>) -> Result<CsvData, 
         columns,
         bad_rows,
     })
+}
+
+/// How many threads to use for a body of `body_len` bytes. Sequential below a
+/// threshold (thread spawn isn't worth it); otherwise the machine parallelism,
+/// capped.
+fn choose_threads(body_len: usize) -> usize {
+    const MIN_PARALLEL_BYTES: usize = 512 * 1024;
+    if body_len < MIN_PARALLEL_BYTES {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+
+/// Result of inferring types over one slice.
+struct Inferred {
+    flags: Vec<Flags>,
+    nrows: usize,
+    bad: usize,
+}
+
+fn parse_serial(body: &str, ncols: usize, keep: &[usize]) -> (Vec<DataType>, Vec<Column>, usize) {
+    let inf = infer_slice(body, ncols, keep);
+    let dtypes: Vec<DataType> = inf.flags.iter().map(Flags::resolve).collect();
+    let columns = build_slice(body, ncols, keep, &dtypes, inf.nrows);
+    (dtypes, columns, inf.bad)
+}
+
+fn parse_parallel(
+    body: &str,
+    ncols: usize,
+    keep: &[usize],
+    nthreads: usize,
+) -> (Vec<DataType>, Vec<Column>, usize) {
+    let slices = split_lines(body, nthreads);
+    if slices.len() <= 1 {
+        return parse_serial(body, ncols, keep);
+    }
+
+    // Phase 1: infer types per slice, in parallel.
+    let infers: Vec<Inferred> = std::thread::scope(|s| {
+        let handles: Vec<_> = slices
+            .iter()
+            .map(|&sl| s.spawn(move || infer_slice(sl, ncols, keep)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Reduce per-slice flags to global column types.
+    let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+    let mut bad = 0usize;
+    for inf in &infers {
+        bad += inf.bad;
+        for (k, f) in inf.flags.iter().enumerate() {
+            flags[k].merge(f);
+        }
+    }
+    let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+
+    // Phase 2: build each slice's columns in parallel, then concatenate in order.
+    let parts: Vec<Vec<Column>> = std::thread::scope(|s| {
+        let dtypes = &dtypes;
+        let handles: Vec<_> = slices
+            .iter()
+            .zip(&infers)
+            .map(|(&sl, inf)| s.spawn(move || build_slice(sl, ncols, keep, dtypes, inf.nrows)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let columns = parts
+        .into_iter()
+        .reduce(|mut acc, part| {
+            for (a, b) in acc.iter_mut().zip(part) {
+                append_column(a, b);
+            }
+            acc
+        })
+        .unwrap_or_default();
+
+    (dtypes, columns, bad)
+}
+
+/// Infer column types (for kept columns) and count valid / bad rows in a slice.
+fn infer_slice(slice: &str, ncols: usize, keep: &[usize]) -> Inferred {
+    let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+    let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
+    let mut nrows = 0usize;
+    let mut bad = 0usize;
+    for line in slice.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        scratch.clear();
+        split_into(line, &mut scratch);
+        if scratch.len() != ncols {
+            bad += 1;
+            continue;
+        }
+        for (k, &ci) in keep.iter().enumerate() {
+            flags[k].observe(scratch[ci].as_ref());
+        }
+        nrows += 1;
+    }
+    Inferred { flags, nrows, bad }
+}
+
+/// Build the kept columns of a slice into pre-sized typed buffers.
+fn build_slice(
+    slice: &str,
+    ncols: usize,
+    keep: &[usize],
+    dtypes: &[DataType],
+    cap: usize,
+) -> Vec<Column> {
+    let mut builders: Vec<ColBuilder> = dtypes
+        .iter()
+        .map(|d| ColBuilder::with_capacity(*d, cap))
+        .collect();
+    let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
+    for line in slice.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        scratch.clear();
+        split_into(line, &mut scratch);
+        if scratch.len() != ncols {
+            continue; // identical skip rule as inference
+        }
+        for (k, &ci) in keep.iter().enumerate() {
+            builders[k].push(scratch[ci].as_ref());
+        }
+    }
+    builders.iter_mut().map(ColBuilder::finish).collect()
+}
+
+/// Split `body` into at most `n` non-overlapping, line-aligned slices that
+/// together cover it (each line lies wholly within exactly one slice).
+fn split_lines(body: &str, n: usize) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut idx = Vec::with_capacity(n + 1);
+    idx.push(0usize);
+    for i in 1..n {
+        let mut p = len * i / n;
+        while p < len && bytes[p] != b'\n' {
+            p += 1;
+        }
+        if p < len {
+            p += 1; // start at the byte after the newline
+        }
+        idx.push(p.min(len));
+    }
+    idx.push(len);
+
+    let mut out = Vec::with_capacity(n);
+    for w in idx.windows(2) {
+        if w[0] < w[1] {
+            out.push(&body[w[0]..w[1]]);
+        }
+    }
+    out
+}
+
+/// Append column `b` onto `a` (same dtype guaranteed by global inference).
+fn append_column(a: &mut Column, b: Column) {
+    match (a, b) {
+        (Column::Bool(x), Column::Bool(y)) => x.extend(y),
+        (Column::I64(x), Column::I64(y)) => x.extend(y),
+        (Column::F64(x), Column::F64(y)) => x.extend(y),
+        (Column::Str(x), Column::Str(y)) => x.extend(y),
+        _ => unreachable!("column dtype mismatch across slices"),
+    }
 }
 
 /// Byte offset just past the first line terminator (handles `\n` and `\r\n`).
@@ -141,7 +284,14 @@ impl Flags {
             return;
         }
         self.any = true;
-        if self.all_int && c.parse::<i64>().is_err() {
+        // Fast path: while the column is still all-integer, an integer cell is
+        // also a float, so skip the redundant f64 parse — but it is never a
+        // bool, so clear that lane.
+        if self.all_int {
+            if c.parse::<i64>().is_ok() {
+                self.all_bool = false;
+                return;
+            }
             self.all_int = false;
         }
         if self.all_float && c.parse::<f64>().is_err() {
@@ -150,6 +300,14 @@ impl Flags {
         if self.all_bool && !matches!(c, "true" | "false") {
             self.all_bool = false;
         }
+    }
+
+    /// Combine another slice's inference into this one (parallel reduce).
+    fn merge(&mut self, other: &Flags) {
+        self.any |= other.any;
+        self.all_int &= other.all_int;
+        self.all_float &= other.all_float;
+        self.all_bool &= other.all_bool;
     }
 
     fn resolve(&self) -> DataType {

@@ -131,20 +131,43 @@ rows/s** end-to-end). Safety + equivalence are gated by
 The optimizer pipeline now runs **dedup → fuse → pushdown**, each visible in
 `rivus explain`.
 
+## Phase 0.5 — parallel CSV parsing (std threads) + inference fast-path
+
+The reader splits a large file into line-aligned slices and parses them across
+`std::thread::scope` workers (no dependencies; sequential below 512 KB). Phase 1
+infers each slice's column types in parallel and reduces them; phase 2 builds
+each slice's columns in parallel and concatenates in order (row order preserved
+→ byte-identical output). Inference also gained a fast path: while a column is
+still all-integer, the redundant `f64` parse is skipped.
+
+Measured (4 vCPU), vs the Phase-0.4 serial reader:
+
+| scenario | serial | parallel | change |
+|---|---:|---:|---|
+| `mixed_types/mix=0%` (2 cols) | 36 ms | **19.9 ms** | **~1.8×** (10.0 M rows/s) |
+| `optimizer/project_pushdown_raw` | 113 ms | 92 ms | −19% |
+| `large/filter_only` (6 cols) | 130 ms | 111 ms | −15% (1.81 M rows/s) |
+| `error_heavy/bad=0%` | 122 ms | 105 ms | −14% |
+
+**Honest reading:** narrow data scales nearly linearly with cores; wide,
+string-heavy data only gains ~15% because the per-cell `String` allocations for
+the two text columns **contend on the global allocator** across threads. That is
+a precise pointer to the next target — arena / `ArrayRef` string storage — not
+more parser tuning. Correctness across the parallel path is held by
+`tests/stress.rs` (exact counts, chunk-size independence, error-heavy, fan-out)
+and `tests/optimizer_equiv.rs`, all run at row counts that trigger parallelism.
+
 ### Optimization backlog (driven by these numbers)
 
-1. ~~**CSV reader, single-pass, zero owned-`String`**~~ — ✅ done (Phase 0.1).
-2. ~~**Avoid double source reads**~~ — ✅ done (Phase 0.2, `dedup_sources`).
-3. ~~**Operator fusion** (filter chains → project)~~ — ✅ done (Phase 0.3).
-4. ~~**Projection pushdown** into the CSV reader~~ — ✅ done (Phase 0.4).
-5. **Faster numeric parsing** (custom `i64`/`f64` from `&[u8]`); SIMD field
-   scanning. Parse is the hot path now; asm-level tuning where a bench proves it.
-6. **Filter pushdown** into the reader (skip building rows that won't survive).
-7. **Reduce gather copies** (esp. string columns) via Arrow `ArrayRef` sharing.
-8. **Parallel scheduler** (chunk split across workers) — design doc 05.
-3. **Vectorized / SIMD predicate kernels** for the `i64`/`f64` lanes (Phase 1→2,
-   design doc 09); asm-level tuning where a bench proves the win.
-4. **Reduce fan-out clone cost** via Arrow `ArrayRef` refcount sharing (doc 03).
+1. ~~CSV reader, single-pass, zero owned-`String`~~ — ✅ Phase 0.1.
+2. ~~Avoid double source reads~~ — ✅ Phase 0.2 (`dedup_sources`).
+3. ~~Operator fusion (filter chains → project)~~ — ✅ Phase 0.3.
+4. ~~Projection pushdown into the CSV reader~~ — ✅ Phase 0.4.
+5. ~~Parallel CSV parsing + inference fast-path~~ — ✅ Phase 0.5.
+6. **String storage: arena / `ArrayRef`** to kill per-cell allocation and its
+   cross-thread allocator contention (the wide-data ceiling above).
+7. **Filter pushdown** into the reader (skip building rows that won't survive).
+8. **Parallel pipeline execution** (chunk-split operators across workers) — doc 05.
 
 Every optimization PR must attach its before/after row from this table and must
 keep `tests/stress.rs` green (correctness is the gate, speed is the reward).
