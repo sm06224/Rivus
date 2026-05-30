@@ -12,7 +12,7 @@ use crate::kernel;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
-use rivus_ir::{BinType, Endian, Expr, NodeId, Op};
+use rivus_ir::{AggFunc, BinType, Endian, Expr, NodeId, Op};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -79,7 +79,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
             preds: preds.clone(),
             fields: fields.clone(),
         }),
-        Op::GroupBy { key } => Box::new(GroupBy::new(key.clone())),
+        Op::GroupBy { key, aggs } => Box::new(GroupBy::new(key.clone(), aggs.clone())),
         Op::Merge => Box::new(Merge),
         Op::Branch => Box::new(Merge), // identity forwarder; fan-out is structural
         Op::Join {
@@ -620,17 +620,76 @@ impl Operator for FilterProject {
 
 // ------------------------------------------------------------------- group by
 
+/// Running accumulator for one aggregate within one group.
+#[derive(Clone)]
+struct AggAcc {
+    sum: f64,
+    min: f64,
+    max: f64,
+    n: i64,
+}
+
+impl AggAcc {
+    fn new() -> Self {
+        AggAcc {
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            n: 0,
+        }
+    }
+    fn add(&mut self, v: f64) {
+        self.sum += v;
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+        self.n += 1;
+    }
+    fn value(&self, f: AggFunc) -> f64 {
+        match f {
+            AggFunc::Sum => self.sum,
+            AggFunc::Avg => {
+                if self.n > 0 {
+                    self.sum / self.n as f64
+                } else {
+                    0.0
+                }
+            }
+            AggFunc::Min => {
+                if self.n > 0 {
+                    self.min
+                } else {
+                    0.0
+                }
+            }
+            AggFunc::Max => {
+                if self.n > 0 {
+                    self.max
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
+struct GroupState {
+    count: i64,
+    accs: Vec<AggAcc>,
+}
+
 struct GroupBy {
     key: String,
-    counts: BTreeMap<String, i64>,
+    aggs: Vec<(AggFunc, String)>,
+    groups: BTreeMap<String, GroupState>,
     emitted: bool,
 }
 
 impl GroupBy {
-    fn new(key: String) -> Self {
+    fn new(key: String, aggs: Vec<(AggFunc, String)>) -> Self {
         GroupBy {
             key,
-            counts: BTreeMap::new(),
+            aggs,
+            groups: BTreeMap::new(),
             emitted: false,
         }
     }
@@ -638,7 +697,7 @@ impl GroupBy {
 
 impl Operator for GroupBy {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let Some(col_idx) = chunk.schema.index_of(&self.key) else {
+        let Some(key_idx) = chunk.schema.index_of(&self.key) else {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Warn,
@@ -649,9 +708,28 @@ impl Operator for GroupBy {
             );
             return Vec::new();
         };
+        // Resolve aggregate column indices once per chunk.
+        let agg_idx: Vec<Option<usize>> = self
+            .aggs
+            .iter()
+            .map(|(_, c)| chunk.schema.index_of(c))
+            .collect();
+        let naggs = self.aggs.len();
+
         for row in 0..chunk.len {
-            let k = chunk.value(row, col_idx).to_string();
-            *self.counts.entry(k).or_insert(0) += 1;
+            let k = chunk.value(row, key_idx).to_string();
+            let state = self.groups.entry(k).or_insert_with(|| GroupState {
+                count: 0,
+                accs: vec![AggAcc::new(); naggs],
+            });
+            state.count += 1;
+            for (j, idx) in agg_idx.iter().enumerate() {
+                if let Some(ci) = idx {
+                    if let Some(v) = chunk.value(row, *ci).as_f64() {
+                        state.accs[j].add(v);
+                    }
+                }
+            }
         }
         Vec::new() // group is a materializing boundary; output on finish
     }
@@ -661,18 +739,31 @@ impl Operator for GroupBy {
             return Vec::new();
         }
         self.emitted = true;
-        let keys: StrColumn = self.counts.keys().map(String::as_str).collect();
-        let vals: Vec<i64> = self.counts.values().copied().collect();
-        let schema = Arc::new(Schema::new(vec![
+
+        let keys: StrColumn = self.groups.keys().map(String::as_str).collect();
+        let counts: Vec<i64> = self.groups.values().map(|s| s.count).collect();
+
+        let mut fields = vec![
             Field::new(self.key.clone(), DataType::Str),
             Field::new("count", DataType::I64),
-        ]));
+        ];
+        let mut columns: Vec<Column> = vec![Column::Str(keys), Column::I64(counts)];
+
+        for (j, (func, col)) in self.aggs.iter().enumerate() {
+            let vals: Vec<f64> = self
+                .groups
+                .values()
+                .map(|s| s.accs[j].value(*func))
+                .collect();
+            fields.push(Field::new(
+                format!("{}_{}", func.as_str(), col),
+                DataType::F64,
+            ));
+            columns.push(Column::F64(vals));
+        }
+
         let id = ctx.fresh_id();
-        vec![Chunk::new(
-            id,
-            schema,
-            vec![Column::Str(keys), Column::I64(vals)],
-        )]
+        vec![Chunk::new(id, Arc::new(Schema::new(fields)), columns)]
     }
 }
 

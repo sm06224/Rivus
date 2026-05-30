@@ -11,7 +11,8 @@
 //! body       := (source | ref-expr) (transform | branch | sink | hook)*
 //! source     := 'open' PATH | 'stream' IDENT
 //! ref-expr   := IDENT (('+' IDENT)+ | ('&' IDENT))?   // merge / join
-//! transform  := '|?' expr | '|>' field+ | '|#' field | '|' 'map' block
+//! transform  := '|?' expr | '|>' field+ | '|#' field (AGG ':' field)* | '|' 'map' block
+//!               AGG := 'sum' | 'avg' | 'min' | 'max'   (count is always emitted)
 //! branch     := '->' IDENT ':' body ';'
 //! sink       := 'save' PATH | 'print'
 //! hook       := 'on' EVENT ('severity' '>=' SEV)? ':' action ';'
@@ -22,8 +23,8 @@ mod lexer;
 use lexer::{Lexer, Tok};
 use rivus_core::{Mode, RivusError, Severity, Value};
 use rivus_ir::{
-    Access, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent, NodeId, Op,
-    PlanGraph,
+    Access, AggFunc, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent, NodeId,
+    Op, PlanGraph,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -170,7 +171,21 @@ impl Parser {
                 Tok::PipeGroup => {
                     self.bump();
                     let key = self.word()?;
-                    let n = self.g.add_node(Op::GroupBy { key });
+                    // Optional aggregates: `sum:col avg:col ...` (a func word
+                    // followed by `:`); anything else ends the group clause.
+                    let mut aggs = Vec::new();
+                    while let Tok::Word(w) = self.tok().clone() {
+                        match AggFunc::parse(&w) {
+                            Some(func) if self.toks[self.pos + 1].0 == Tok::Colon => {
+                                self.bump(); // func
+                                self.bump(); // ':'
+                                let col = self.word()?;
+                                aggs.push((func, col));
+                            }
+                            _ => break,
+                        }
+                    }
+                    let n = self.g.add_node(Op::GroupBy { key, aggs });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
