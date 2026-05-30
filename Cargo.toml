@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/sm06224/rivus"
@@ -19,11 +19,11 @@ description = "Rivus: a flow-oriented, DAG-native, continue-first, observable st
 [workspace.dependencies]
 # Internal crates carry an explicit version (not bare path deps) so the
 # dependency graph has no version-wildcards — see deny.toml [bans].
-rivus-core = { path = "crates/rivus-core", version = "0.1.0" }
-rivus-ir = { path = "crates/rivus-ir", version = "0.1.0" }
-rivus-parser = { path = "crates/rivus-parser", version = "0.1.0" }
-rivus-optimizer = { path = "crates/rivus-optimizer", version = "0.1.0" }
-rivus-runtime = { path = "crates/rivus-runtime", version = "0.1.0" }
+rivus-core = { path = "crates/rivus-core", version = "1.0.0" }
+rivus-ir = { path = "crates/rivus-ir", version = "1.0.0" }
+rivus-parser = { path = "crates/rivus-parser", version = "1.0.0" }
+rivus-optimizer = { path = "crates/rivus-optimizer", version = "1.0.0" }
+rivus-runtime = { path = "crates/rivus-runtime", version = "1.0.0" }
 
 # Profile tuned for the MVP: fast iteration, but optimized release for
 # benchmark work (see docs/design/15-benchmark.md).

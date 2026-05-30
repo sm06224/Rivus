@@ -215,10 +215,15 @@ staged as **MVP → optimization → JIT → distributed**.
 
 ## Status
 
-MVP (Phase 0) is implemented and runnable: the headline goal — *a working DAG
-flow and its visualization* — is met. See
-[`docs/design/16-mvp-scope.md`](docs/design/16-mvp-scope.md) for exactly what
-is implemented vs. designed-but-pending.
+**v1.0.0** — stable. Streaming engine (bounded memory, parallel) that **beats
+DuckDB** on everyday ETL (~1.45× faster at ~40× less memory — see
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)), with a full data-wrangling language:
+filter/`where` · project & computed columns · inline casts · group · sort ·
+distinct · describe · **inner hash join** · branch/merge · CSV (header-less,
+declared schema, quoted) / JSON(L) / binary · stdin↔stdout Unix-filter
+shorthand. See the [**Guide**](docs/GUIDE.md), the [`CHANGELOG`](CHANGELOG.md),
+and the [`ROADMAP`](docs/ROADMAP.md) for what's next (compression, Parquet,
+SIMD, imputation).
 
 ## License
 
