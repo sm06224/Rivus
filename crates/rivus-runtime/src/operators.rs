@@ -51,6 +51,37 @@ pub trait Operator {
     }
 }
 
+/// A source that yields pre-parsed chunks (used by the parallel executor: the
+/// file is parsed once, then partitions are fed to per-worker sub-DAGs).
+pub fn mem_source(chunks: Vec<Chunk>) -> Box<dyn Operator> {
+    Box::new(MemSource {
+        chunks: chunks.into(),
+    })
+}
+
+/// An identity operator that forwards its input, so the engine captures it as a
+/// leaf output (used to collect a file sink's rows for a single post-merge write
+/// during parallel execution).
+pub fn collector() -> Box<dyn Operator> {
+    Box::new(Merge)
+}
+
+struct MemSource {
+    chunks: std::collections::VecDeque<Chunk>,
+}
+
+impl Operator for MemSource {
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn pull(&mut self, _ctx: &mut OpCtx) -> Option<Chunk> {
+        self.chunks.pop_front()
+    }
+    fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        Vec::new()
+    }
+}
+
 /// Build the operator for a node from its IR op.
 pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator> {
     match op {
@@ -766,21 +797,7 @@ impl Operator for SinkCsv {
     }
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let mut out = String::new();
-        if let Some(first) = self.buf.first() {
-            out.push_str(&first.schema.field_names().join(","));
-            out.push('\n');
-            for chunk in &self.buf {
-                for row in 0..chunk.len {
-                    let cells: Vec<String> = (0..chunk.columns.len())
-                        .map(|c| csv_escape(&chunk.value(row, c)))
-                        .collect();
-                    out.push_str(&cells.join(","));
-                    out.push('\n');
-                }
-            }
-        }
-        if let Err(e) = std::fs::write(&self.path, out) {
+        if let Err(e) = write_csv_file(&self.path, &self.buf) {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,
@@ -792,6 +809,26 @@ impl Operator for SinkCsv {
         }
         Vec::new()
     }
+}
+
+/// Render `chunks` (sharing a schema) to a CSV file: a header line then rows.
+/// Shared by the serial `SinkCsv` and the parallel executor's single-write merge.
+pub fn write_csv_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
+    let mut out = String::new();
+    if let Some(first) = chunks.first() {
+        out.push_str(&first.schema.field_names().join(","));
+        out.push('\n');
+        for chunk in chunks {
+            for row in 0..chunk.len {
+                let cells: Vec<String> = (0..chunk.columns.len())
+                    .map(|c| csv_escape(&chunk.value(row, c)))
+                    .collect();
+                out.push_str(&cells.join(","));
+                out.push('\n');
+            }
+        }
+    }
+    std::fs::write(path, out)
 }
 
 fn csv_escape(v: &Value) -> String {
