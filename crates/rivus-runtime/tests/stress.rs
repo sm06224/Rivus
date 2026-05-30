@@ -137,6 +137,36 @@ fn sort_orders_rows_chunk_size_independent() {
 }
 
 #[test]
+fn distinct_dedups_chunk_size_independent() {
+    let rows = 20_000;
+    let seed = 11;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_distinct", &data));
+    let p = f.0.display();
+
+    // `country` is one of five fixed values; with 20k rows all five appear, so
+    // `distinct country` yields exactly 5 rows regardless of chunk size.
+    for cs in [1, 7, 1024, 8192, rows] {
+        let res = run_src(&format!("D:\n open {p}\n distinct country\n;"), cs);
+        assert_eq!(res.total_rows_out(), 5, "distinct country @cs={cs}");
+        assert!(res.errors.is_empty());
+    }
+
+    // Whole-row distinct: the surviving count must be identical across chunk
+    // sizes (first-occurrence dedup is order-deterministic, not chunk-bound).
+    let baseline = run_src(&format!("D:\n open {p}\n distinct\n;"), 4096).total_rows_out();
+    assert!(baseline > 0 && baseline <= rows as u64);
+    for cs in [1, 7, 8192, rows] {
+        let res = run_src(&format!("D:\n open {p}\n distinct\n;"), cs);
+        assert_eq!(
+            res.total_rows_out(),
+            baseline,
+            "whole-row distinct @cs={cs}"
+        );
+    }
+}
+
+#[test]
 fn error_heavy_skips_and_continues() {
     let rows = 40_000;
     let data = gendata::error_heavy(rows, 0.5, 7);

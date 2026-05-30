@@ -164,6 +164,11 @@ pub enum Op {
     /// stable, so equal keys keep source order and the result is chunk-size
     /// independent. Pipeline-breaker for the parallel executor.
     Sort { key: String, desc: bool },
+    /// `distinct [KEY ...]` — drop duplicate rows, keeping the first occurrence.
+    /// With no keys, the whole row is the dedup key; otherwise only the named
+    /// columns. Streaming (emits as it goes) but stateful (a global seen-set),
+    /// so it runs on the serial path. Output order = first-occurrence order.
+    Distinct { keys: Vec<String> },
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -203,6 +208,7 @@ impl Op {
             Op::Project { .. } => "project",
             Op::Take { .. } => "take",
             Op::Sort { .. } => "sort",
+            Op::Distinct { .. } => "distinct",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -250,6 +256,13 @@ impl Op {
                     format!("sort {key} desc")
                 } else {
                     format!("sort {key}")
+                }
+            }
+            Op::Distinct { keys } => {
+                if keys.is_empty() {
+                    "distinct".to_string()
+                } else {
+                    format!("distinct {}", keys.join(" "))
                 }
             }
             Op::FilterProject { preds, fields } => {

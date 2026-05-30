@@ -127,6 +127,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Take { n } => Box::new(Take { remaining: *n }),
         Op::Sort { key, desc } => Box::new(Sort::new(key.clone(), *desc)),
+        Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
         Op::Project { fields } => Box::new(Project {
             fields: fields.clone(),
         }),
@@ -689,6 +690,63 @@ impl Operator for Sort {
 
         let sorted: Vec<Column> = cols.iter().map(|c| c.gather(&idx)).collect();
         vec![Chunk::new(ctx.fresh_id(), schema, sorted)]
+    }
+}
+
+// ------------------------------------------------------------------ distinct
+
+/// `distinct [keys...]` — keep the first occurrence of each distinct key,
+/// dropping later duplicates. Streaming (emits surviving rows per chunk) but
+/// stateful: a global seen-set spans chunks, so it runs serially. Output order
+/// is first-occurrence order, independent of `chunk_size`.
+struct Distinct {
+    keys: Vec<String>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl Distinct {
+    fn new(keys: Vec<String>) -> Self {
+        Distinct {
+            keys,
+            seen: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl Operator for Distinct {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        // Columns that form the dedup key: the named ones, or every column.
+        let idxs: Vec<usize> = if self.keys.is_empty() {
+            (0..chunk.columns.len()).collect()
+        } else {
+            self.keys
+                .iter()
+                .filter_map(|k| chunk.schema.index_of(k))
+                .collect()
+        };
+
+        let mut keep = Vec::new();
+        let mut key = String::new();
+        for row in 0..chunk.len {
+            key.clear();
+            for (j, &ci) in idxs.iter().enumerate() {
+                if j > 0 {
+                    key.push('\u{1f}'); // unit separator: unlikely in data
+                }
+                key.push_str(&chunk.value(row, ci).to_string());
+            }
+            if self.seen.insert(key.clone()) {
+                keep.push(row);
+            }
+        }
+
+        if keep.is_empty() {
+            return Vec::new();
+        }
+        if keep.len() == chunk.len {
+            return vec![chunk];
+        }
+        vec![chunk.gather(&keep)]
     }
 }
 

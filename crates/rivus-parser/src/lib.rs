@@ -13,7 +13,7 @@
 //! ref-expr   := IDENT (('+' IDENT)+ | ('&' IDENT))?   // merge / join
 //! transform  := '|?' expr | '|>' field+ | '|#' field (AGG ':' field)*
 //!             | ('take'|'limit'|'head') INT | 'sort' IDENT ('asc'|'desc')?
-//!             | '|' 'map' block
+//!             | 'distinct' IDENT* | '|' 'map' block
 //!               AGG := 'sum' | 'avg' | 'min' | 'max'   (count is always emitted)
 //! branch     := '->' IDENT ':' body ';'
 //! sink       := 'save' PATH | 'print'
@@ -277,6 +277,22 @@ impl Parser {
                         false
                     };
                     let n = self.g.add_node(Op::Sort { key, desc });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `distinct [KEY ...]` — drop duplicate rows (whole-row, or by
+                // the named key columns). Bare words until the next transform.
+                Tok::Word(w) if w == "distinct" => {
+                    self.bump();
+                    let mut keys = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump();
+                        keys.push(name);
+                    }
+                    let n = self.g.add_node(Op::Distinct { keys });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -707,6 +723,7 @@ fn is_keyword(w: &str) -> bool {
             | "limit"
             | "head"
             | "sort"
+            | "distinct"
             | "on"
             | "map"
             | "mode"

@@ -40,6 +40,7 @@ Merged:
 | `\|?` filter · `\|>` map/project · `\|#` group | transforms |
 | `take N` (`limit`/`head`) | cap the stream at N rows |
 | `sort KEY [asc\|desc]` | stable order by one key (blocking) |
+| `distinct [KEY ...]` | drop duplicate rows (whole-row or by key) |
 | `->` branch (tee) · `+` merge · `&` join | DAG fan-out / fan-in |
 | `on error ... : transition degraded ;` | continue-first lifecycle hook |
 
