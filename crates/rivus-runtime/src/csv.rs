@@ -129,21 +129,20 @@ impl CsvChunker {
         chunk_size: usize,
         preview: bool,
         prefilter: &[(String, CmpOp, f64)],
+        header: bool,
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
-            return Self::open_preview(path, allow, chunk_size, prefilter);
+            return Self::open_preview(path, allow, chunk_size, prefilter, header);
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut r = BufReader::with_capacity(READ_BUF, f);
-        let mut header = String::new();
-        if r.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
-            return Err("empty CSV".to_string());
-        }
-        let names = split_owned(trim_eol(&header));
+        // `r` is left positioned at the first data row (after the header, or at
+        // byte 0 for a header-less file).
+        let (names, data_start) = read_header(&mut r, header)?;
         let ncols = names.len();
         if ncols == 0 {
-            return Err("CSV header has no columns".to_string());
+            return Err("CSV has no columns".to_string());
         }
         let keep: Vec<usize> = match allow {
             None => (0..ncols).collect(),
@@ -178,11 +177,12 @@ impl CsvChunker {
         let schema = Schema::new(fields);
         let pre = compile_prefilter(&names, &keep, &dtypes, prefilter);
 
-        // ---- pass 2 setup: reopen and skip the header line ----
+        // ---- pass 2 setup: reopen and seek to the first data row ----
         let f2 = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut reader = BufReader::with_capacity(READ_BUF, f2);
-        let mut skip = String::new();
-        reader.read_line(&mut skip).map_err(|e| e.to_string())?;
+        reader
+            .seek(SeekFrom::Start(data_start))
+            .map_err(|e| e.to_string())?;
 
         Ok((
             schema,
@@ -209,18 +209,14 @@ impl CsvChunker {
         allow: Option<&[String]>,
         chunk_size: usize,
         prefilter: &[(String, CmpOp, f64)],
+        header: bool,
     ) -> Result<(Schema, CsvChunker), String> {
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut reader = BufReader::with_capacity(READ_BUF, f);
-        let mut header = String::new();
-        let hlen = reader.read_line(&mut header).map_err(|e| e.to_string())?;
-        if hlen == 0 {
-            return Err("empty CSV".to_string());
-        }
-        let names = split_owned(trim_eol(&header));
+        let (names, data_start) = read_header(&mut reader, header)?;
         let ncols = names.len();
         if ncols == 0 {
-            return Err("CSV header has no columns".to_string());
+            return Err("CSV has no columns".to_string());
         }
         let keep: Vec<usize> = match allow {
             None => (0..ncols).collect(),
@@ -256,7 +252,7 @@ impl CsvChunker {
 
         // Rewind to the first data row and stream from there with this schema.
         reader
-            .seek(SeekFrom::Start(hlen as u64))
+            .seek(SeekFrom::Start(data_start))
             .map_err(|e| e.to_string())?;
 
         Ok((
@@ -404,6 +400,7 @@ pub fn plan_parallel(
     allow: Option<&[String]>,
     nthreads: usize,
     prefilter: &[(String, CmpOp, f64)],
+    header: bool,
 ) -> Result<CsvParallelPlan, String> {
     let file_len = std::fs::metadata(path)
         .map_err(|e| format!("cannot stat '{path}': {e}"))?
@@ -412,15 +409,10 @@ pub fn plan_parallel(
     // Header → column names, kept indices, and the first data byte offset.
     let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
     let mut r = BufReader::with_capacity(READ_BUF, f);
-    let mut header = String::new();
-    let hlen = r.read_line(&mut header).map_err(|e| e.to_string())?;
-    if hlen == 0 {
-        return Err("empty CSV".to_string());
-    }
-    let names = split_owned(trim_eol(&header));
+    let (names, data_start) = read_header(&mut r, header)?;
     let ncols = names.len();
     if ncols == 0 {
-        return Err("CSV header has no columns".to_string());
+        return Err("CSV has no columns".to_string());
     }
     let keep: Vec<usize> = match allow {
         None => (0..ncols).collect(),
@@ -429,7 +421,6 @@ pub fn plan_parallel(
             .collect(),
     };
 
-    let data_start = hlen as u64;
     let ranges = snap_ranges(&mut r, data_start, file_len, nthreads.max(1))?;
 
     // Infer types per range in parallel, then merge the flags.
@@ -536,6 +527,26 @@ fn infer_range(
         }
     }
     (flags, bad)
+}
+
+/// Read the column names and the byte offset of the first data row, leaving the
+/// reader positioned there. With `header`, the first line names the columns;
+/// without it, columns are named `c0, c1, …` from the first line's field count
+/// and that line is data (the reader rewinds to byte 0).
+fn read_header(r: &mut BufReader<File>, header: bool) -> Result<(Vec<String>, u64), String> {
+    let mut first = String::new();
+    let n = r.read_line(&mut first).map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("empty CSV".to_string());
+    }
+    if header {
+        Ok((split_owned(trim_eol(&first)), n as u64))
+    } else {
+        let ncols = split_owned(trim_eol(&first)).len();
+        let names = (0..ncols).map(|i| format!("c{i}")).collect();
+        r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        Ok((names, 0))
+    }
 }
 
 /// Strip a trailing `\n` or `\r\n` (mirrors `str::lines` semantics).

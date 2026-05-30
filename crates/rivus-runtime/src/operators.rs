@@ -182,12 +182,14 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             path,
             projection,
             prefilter,
+            header,
         } => Box::new(SourceCsv::new(
             path.clone(),
             projection.clone(),
             chunk_size,
             preview,
             prefilter.clone(),
+            *header,
         )),
         Op::OpenBinary {
             path,
@@ -260,6 +262,7 @@ struct SourceCsv {
     /// reader uses them to skip *building* rows that definitely fail (the
     /// downstream FilterProject remains authoritative).
     prefilter: Vec<(String, CmpOp, f64)>,
+    header: bool,
     schema: Arc<Schema>,
     /// Streaming reader for a real file; `None` for stdin / after a load error.
     stream: Option<csv::CsvChunker>,
@@ -276,6 +279,7 @@ impl SourceCsv {
         chunk_size: usize,
         preview: bool,
         prefilter: Vec<(String, CmpOp, f64)>,
+        header: bool,
     ) -> Self {
         SourceCsv {
             path,
@@ -284,6 +288,7 @@ impl SourceCsv {
             loaded: false,
             preview,
             prefilter,
+            header,
             schema: Schema::empty(),
             stream: None,
             columns: Vec::new(),
@@ -302,6 +307,7 @@ impl SourceCsv {
             loaded: true,
             preview: false,
             prefilter: Vec::new(),
+            header: true,
             schema,
             stream: Some(chunker),
             columns: Vec::new(),
@@ -321,6 +327,7 @@ impl SourceCsv {
                 self.chunk_size,
                 self.preview,
                 &self.prefilter,
+                self.header,
             ) {
                 Ok((schema, chunker)) => {
                     if chunker.bad_rows > 0 {

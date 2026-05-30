@@ -141,6 +141,9 @@ pub enum Op {
         path: String,
         projection: Option<Vec<String>>,
         prefilter: Vec<(String, CmpOp, f64)>,
+        /// Whether the first line is a header. `false` (`open f.csv noheader`)
+        /// treats every line as data and names columns `c0, c1, …`.
+        header: bool,
     },
     /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
     /// binary records (a C struct dump). `endian` selects byte order;
@@ -237,8 +240,12 @@ impl Op {
                 path,
                 projection,
                 prefilter,
+                header,
             } => {
                 let mut s = format!("open {path}");
+                if !header {
+                    s.push_str(" noheader");
+                }
                 if let Some(cols) = projection {
                     s.push_str(&format!("  # read-only: {}", cols.join(",")));
                 }

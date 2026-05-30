@@ -46,6 +46,32 @@ fn expected_clean_ge(rows: usize, seed: u64, threshold: u64) -> u64 {
 }
 
 #[test]
+fn headerless_csv_positional_columns_chunk_size_independent() {
+    // No header row: columns are named c0, c1, c2 and the FIRST line is data.
+    let rows = 20_000;
+    let mut rng = Rng::new(3);
+    let mut text = String::new();
+    let mut expect = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(90);
+        text.push_str(&format!("user,x,{age}\n"));
+        if age >= 45 {
+            expect += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_nh", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1, 7, 1024, 8192, rows] {
+        let res = run_src(
+            &format!("H:\n open {p} noheader\n |? c2 >= 45\n |> c0 c2\n;"),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), expect, "noheader filter @cs={cs}");
+        assert!(res.errors.is_empty());
+    }
+}
+
+#[test]
 fn large_clean_filter_is_exact() {
     let rows = 50_000;
     let seed = 42;

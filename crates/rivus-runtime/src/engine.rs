@@ -392,12 +392,13 @@ fn try_streaming_parallel(
     path: &str,
     threads: usize,
 ) -> Option<RunResult> {
-    let (projection, prefilter) = match &graph.nodes[src_id].op {
+    let (projection, prefilter, header) = match &graph.nodes[src_id].op {
         Op::OpenCsv {
             projection,
             prefilter,
+            header,
             ..
-        } => (projection.clone(), prefilter.clone()),
+        } => (projection.clone(), prefilter.clone(), *header),
         _ => return None, // only CSV has a streaming-parallel plan for now
     };
 
@@ -426,7 +427,7 @@ fn try_streaming_parallel(
         ranges,
         bad_rows,
         prefilter: pre,
-    } = crate::csv::plan_parallel(path, projection.as_deref(), threads, &prefilter).ok()?;
+    } = crate::csv::plan_parallel(path, projection.as_deref(), threads, &prefilter, header).ok()?;
     let nparts = ranges.len();
     if nparts < 2 {
         return None; // not worth threading; let the caller's serial path run

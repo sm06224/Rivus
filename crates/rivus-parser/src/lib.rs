@@ -333,10 +333,21 @@ impl Parser {
                 } else {
                     None
                 };
+                // Optional `noheader`: the file has no header row (CSV only).
+                let noheader = self.peek_is_word("noheader");
+                if noheader {
+                    self.bump();
+                }
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                 })?;
-                Ok(self.g.add_node(fmt.into_op(path)))
+                let mut op = fmt.into_op(path);
+                if noheader {
+                    if let Op::OpenCsv { header, .. } = &mut op {
+                        *header = false;
+                    }
+                }
+                Ok(self.g.add_node(op))
             }
             Tok::Word(w) if w == "readcsv" => {
                 self.bump();
@@ -345,6 +356,7 @@ impl Parser {
                     path,
                     projection: None,
                     prefilter: Vec::new(),
+                    header: true,
                 }))
             }
             Tok::Word(w) if w == "readjson" => {
@@ -758,6 +770,7 @@ impl Format {
                 path,
                 projection: None,
                 prefilter: Vec::new(),
+                header: true,
             },
             Format::Jsonl => Op::OpenJsonl { path },
         }
@@ -798,6 +811,7 @@ fn is_keyword(w: &str) -> bool {
             | "readcsv"
             | "readjson"
             | "as"
+            | "noheader"
             | "writecsv"
             | "writejson"
             | "stream"
