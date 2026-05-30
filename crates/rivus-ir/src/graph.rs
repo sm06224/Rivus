@@ -20,6 +20,36 @@ pub enum Endian {
     Big,
 }
 
+/// Aggregate functions for `|# key agg:col` (count is always emitted implicitly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggFunc {
+    pub fn parse(s: &str) -> Option<AggFunc> {
+        Some(match s {
+            "sum" => AggFunc::Sum,
+            "avg" => AggFunc::Avg,
+            "min" => AggFunc::Min,
+            "max" => AggFunc::Max,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+        }
+    }
+}
+
 /// A fixed-width field type for binary (C-struct-dump) records. Integer widths
 /// all ride the `i64` execution lane; floats ride `f64`; `bool` is one byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +155,12 @@ pub enum Op {
     Filter { pred: Expr },
     /// `|> field [field ...]`
     Project { fields: Vec<String> },
-    /// `|# key` — group / partition by key (MVP: group + count).
-    GroupBy { key: String },
+    /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
+    /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
+    GroupBy {
+        key: String,
+        aggs: Vec<(AggFunc, String)>,
+    },
     /// Fused linear chain of filters and an optional trailing projection,
     /// produced by the optimizer (`fuse_linear`). All `preds` must pass (AND);
     /// when `fields` is `Some`, only those columns are materialized — gathering
@@ -203,7 +237,13 @@ impl Op {
                 }
                 s.trim_end().to_string()
             }
-            Op::GroupBy { key } => format!("|# {key}"),
+            Op::GroupBy { key, aggs } => {
+                let mut s = format!("|# {key}");
+                for (f, c) in aggs {
+                    s.push_str(&format!(" {}:{c}", f.as_str()));
+                }
+                s
+            }
             Op::Branch => "-> branch".to_string(),
             Op::Merge => "+ merge".to_string(),
             Op::Join {

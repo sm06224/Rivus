@@ -278,3 +278,51 @@ fn fanout_merge_conserves_rows() {
     let a = run_src(&format!("F:\n open {p}\n |? age >= 60\n;"), 4096).total_rows_out() as usize;
     assert_eq!(merged_rows, rows + a, "fan-out/merge row conservation");
 }
+
+#[test]
+fn group_aggregates_are_exact() {
+    // `|# country sum:age max:age` (+ implicit count) must match an oracle that
+    // buckets the regenerated PRNG stream by country.
+    use std::collections::BTreeMap;
+    let rows = 20_000;
+    let seed = 314;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_groupagg", &data));
+    let p = f.0.display();
+
+    let countries = ["JP", "US", "DE", "FR", "BR"];
+    let mut rng = Rng::new(seed);
+    let mut oracle: BTreeMap<String, (i64, f64, f64)> = BTreeMap::new(); // (count,sum,max)
+    for _ in 0..rows {
+        let age = rng.below(90) as f64;
+        let _score = rng.below(10_000);
+        let c = countries[rng.below(5) as usize].to_string();
+        let _active = rng.below(2);
+        let e = oracle.entry(c).or_insert((0, 0.0, f64::NEG_INFINITY));
+        e.0 += 1;
+        e.1 += age;
+        e.2 = e.2.max(age);
+    }
+
+    let res = run_src(
+        &format!("G:\n open {p}\n |# country sum:age max:age\n;"),
+        4096,
+    );
+    let out = &res.outputs[0];
+    let chunk = &out.chunks[0];
+    assert_eq!(
+        chunk.schema.field_names(),
+        vec!["country", "count", "sum_age", "max_age"]
+    );
+    assert_eq!(chunk.len, oracle.len());
+    for row in 0..chunk.len {
+        let country = chunk.value(row, 0).to_string();
+        let count = chunk.value(row, 1).as_f64().unwrap() as i64;
+        let sum = chunk.value(row, 2).as_f64().unwrap();
+        let max = chunk.value(row, 3).as_f64().unwrap();
+        let (oc, os, om) = oracle[&country];
+        assert_eq!(count, oc, "count[{country}]");
+        assert_eq!(sum, os, "sum[{country}]");
+        assert_eq!(max, om, "max[{country}]");
+    }
+}

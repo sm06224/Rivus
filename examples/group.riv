@@ -1,6 +1,7 @@
-# Group / partition by country (|#). The group is a materialization boundary:
-# counts are emitted once the input stream ends.
+# Group / aggregate by country (|#). `count` is always emitted; add
+# sum/avg/min/max on a numeric column. The group is a materialization boundary
+# (results are emitted once the input stream ends).
 Population:
     open examples/users.csv
-    |# country
+    |# country sum:age avg:age max:age
 ;
