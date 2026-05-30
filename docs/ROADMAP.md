@@ -4,7 +4,9 @@ A living, prioritized backlog. Each item has a **status** — ✅ done · 🚧 i
 progress · 📋 planned — and a short design note so work can be picked up
 incrementally. Driven by the project philosophy: *Stream correctness >
 Zero-copy > Backpressure > Composability > Optimization visibility > Raw speed*,
-and zero third-party runtime dependencies.
+and a **zero-dependency default build** — heavy/standard formats (compression,
+Parquet, pickle) are allowed as **vetted, feature-gated, opt-in** adapters per
+[`SUPPLY-CHAIN.md`](SUPPLY-CHAIN.md), so the core stays dependency-free.
 
 The headline target is to **beat DuckDB for everyday data wrangling** — already
 true for streaming filter/project ETL (Rivus ~1.45× faster at ~40× less memory,
@@ -22,9 +24,10 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | JSON / JSON Lines / NDJSON, fixed-width binary | |
 | ✅ | **Header-less CSV** | `open f.csv noheader` → columns `c0,c1,…`; first line is data |
 | 📋 | **Typed / named columns at `open`** | `open f.csv (id:int, name:str, age:int)` — give a schema instead of inferring; also names a header-less file |
-| 📋 | **Compressed / archived inputs** | `.gz` (DEFLATE), `.zst`, `.zip`, tar. *Supply-chain decision:* implement std-only inflate, or vet one dependency (`flate2`/`zstd`) per `docs/SUPPLY-CHAIN.md`; or stream through a system `gzip -dc`. Optimize: decompress in the streaming reader, not up front. |
-| 📋 | TSV / custom delimiter (real) | `as tsv` currently aliases CSV; add a `delim` to `OpenCsv`/`SinkCsv` |
-| 📋 | YAML / TOML / INI / XML / HTML, Parquet/Arrow | breadth; Parquet/Arrow likely need a vetted dep |
+| 📋 | **Compressed inputs** (`.gz` first) | feature `gzip` via **`flate2`** (pure-Rust backend), serial single-pass (compressed streams can't seek → no byte-range parallel); then `.zst` (`ruzstd`), `.zip`/tar. Vetting log in `SUPPLY-CHAIN.md`. |
+| 📋 | TSV / custom delimiter (real) | `as tsv` currently aliases CSV; add a `delim` to `OpenCsv`/`SinkCsv` (std-only) |
+| 📋 | **Parquet / Arrow** | feature `parquet` via apache **`arrow`/`parquet`** (isolated behind the source/sink trait) |
+| 📋 | **Python pickle**, YAML/TOML/INI/XML/HTML | `pickle` via `serde-pickle`; text formats likely std-only or a small vetted dep |
 | 📋 | Transports: socket / HTTP / subscribe / scheduled-get | `docs/design/18` |
 
 ## B. Pipe / CLI ergonomics

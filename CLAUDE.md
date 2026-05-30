@@ -45,12 +45,17 @@ The maintainer squash-merges and wants near-zero merge effort. So:
 
 ## Supply-chain vigilance
 
-- The shipped runtime has **zero third-party dependencies** (core/ir/parser/
-  optimizer/runtime/cli are std-only). Keep it that way; isolate tooling under
-  `[dev-dependencies]`.
-- Before adding any crate, run the `docs/SUPPLY-CHAIN.md` checklist: is it
-  needed? who maintains it (trusted, active, widely used — beware typosquats and
-  brand-new crates)? dev-only? pin & vet *transitive* deps? permissive license?
+- The **default build has zero third-party dependencies** (core/ir/parser/
+  optimizer/runtime/cli are std-only with default features). Keep it that way;
+  isolate tooling under `[dev-dependencies]`.
+- **Heavy/standard formats (compression, Parquet, pickle) may use a vetted crate**,
+  but only **off-by-default, feature-gated, and behind the source/sink trait** so
+  the default build stays dep-free (maintainer-approved 2026-05; see selected
+  adapters in `docs/SUPPLY-CHAIN.md`). Prefer mature, major, stable, pure-Rust.
+- Before adding any crate, run the `docs/SUPPLY-CHAIN.md` checklist: needed?
+  mature/major/stable (not obsolete, not a typosquat)? trusted maintainer?
+  feature-gated? pin & vet *transitive* deps? permissive license? Verify with
+  `cargo deny check --all-features`.
 - Tools are installed from **official release binaries** and version-checked.
 - Run `gitleaks` routinely; never commit secrets.
 

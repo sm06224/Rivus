@@ -49,8 +49,9 @@ Merged:
 
 Rivus ships **pre-built binaries for macOS (Apple Silicon) and Windows 11+
 (x64)**. Every other platform — Linux, Intel Mac, ARM Windows — builds from
-source, which is a single command because the runtime has **zero third-party
-dependencies**.
+source, which is a single command because the default build has **zero
+third-party dependencies** (heavy formats like compression/Parquet are opt-in,
+vetted, feature-gated — see [`docs/SUPPLY-CHAIN.md`](docs/SUPPLY-CHAIN.md)).
 
 Each platform offers two flavors so you can trade compatibility for speed:
 
