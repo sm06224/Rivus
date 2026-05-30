@@ -125,6 +125,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         Op::OpenJsonl { path } => Box::new(SourceJsonl::new(path.clone(), chunk_size)),
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
+        Op::Take { n } => Box::new(Take { remaining: *n }),
         Op::Project { fields } => Box::new(Project {
             fields: fields.clone(),
         }),
@@ -569,6 +570,31 @@ impl Operator for Filter {
             return vec![chunk];
         }
         vec![chunk.gather(&keep)]
+    }
+}
+
+// ---------------------------------------------------------------------- take
+
+/// `take N` — forward at most `N` rows total, then drop everything else.
+/// Stateful: `remaining` is the global budget, so results are independent of
+/// `chunk_size` (a chunk straddling the limit is truncated to fit).
+struct Take {
+    remaining: usize,
+}
+
+impl Operator for Take {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.remaining == 0 {
+            return Vec::new();
+        }
+        if chunk.len <= self.remaining {
+            self.remaining -= chunk.len;
+            return vec![chunk];
+        }
+        // Chunk overruns the budget: keep just the first `remaining` rows.
+        let idx: Vec<usize> = (0..self.remaining).collect();
+        self.remaining = 0;
+        vec![chunk.gather(&idx)]
     }
 }
 

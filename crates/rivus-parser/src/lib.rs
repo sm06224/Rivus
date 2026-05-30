@@ -11,7 +11,8 @@
 //! body       := (source | ref-expr) (transform | branch | sink | hook)*
 //! source     := 'open' PATH | 'stream' IDENT
 //! ref-expr   := IDENT (('+' IDENT)+ | ('&' IDENT))?   // merge / join
-//! transform  := '|?' expr | '|>' field+ | '|#' field (AGG ':' field)* | '|' 'map' block
+//! transform  := '|?' expr | '|>' field+ | '|#' field (AGG ':' field)*
+//!             | ('take'|'limit'|'head') INT | '|' 'map' block
 //!               AGG := 'sum' | 'avg' | 'min' | 'max'   (count is always emitted)
 //! branch     := '->' IDENT ':' body ';'
 //! sink       := 'save' PATH | 'print'
@@ -243,6 +244,23 @@ impl Parser {
                     let n = self.g.add_node(Op::SinkJsonl { path });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
+                }
+                // `take N` / `limit N` / `head N` — cap the stream at N rows.
+                Tok::Word(w) if w == "take" || w == "limit" || w == "head" => {
+                    self.bump();
+                    let n = match self.tok().clone() {
+                        Tok::Int(v) if v >= 0 => {
+                            self.bump();
+                            v as usize
+                        }
+                        other => {
+                            return Err(self
+                                .err(format!("{w} expects a non-negative integer, got {other:?}")))
+                        }
+                    };
+                    let node = self.g.add_node(Op::Take { n });
+                    self.g.add_edge(current, node, EdgeKind::Stream);
+                    current = node;
                 }
                 Tok::Word(w) if w == "print" => {
                     self.bump();
@@ -667,6 +685,9 @@ fn is_keyword(w: &str) -> bool {
             | "stream"
             | "save"
             | "print"
+            | "take"
+            | "limit"
+            | "head"
             | "on"
             | "map"
             | "mode"

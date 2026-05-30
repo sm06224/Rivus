@@ -38,6 +38,7 @@ Merged:
 | operator | meaning |
 |---|---|
 | `\|?` filter · `\|>` map/project · `\|#` group | transforms |
+| `take N` (`limit`/`head`) | cap the stream at N rows |
 | `->` branch (tee) · `+` merge · `&` join | DAG fan-out / fan-in |
 | `on error ... : transition degraded ;` | continue-first lifecycle hook |
 

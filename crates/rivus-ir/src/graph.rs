@@ -155,6 +155,10 @@ pub enum Op {
     Filter { pred: Expr },
     /// `|> field [field ...]`
     Project { fields: Vec<String> },
+    /// `take N` / `limit N` / `head N` — pass through at most `N` rows of the
+    /// stream flowing through this node, then drop the rest. Stateful (a global
+    /// running count), so it is a pipeline-breaker for the parallel executor.
+    Take { n: usize },
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -192,6 +196,7 @@ impl Op {
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Project { .. } => "project",
+            Op::Take { .. } => "take",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -233,6 +238,7 @@ impl Op {
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
+            Op::Take { n } => format!("take {n}"),
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {

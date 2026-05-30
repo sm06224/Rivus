@@ -58,6 +58,35 @@ fn large_clean_filter_is_exact() {
 }
 
 #[test]
+fn take_caps_rows_chunk_size_independent() {
+    let rows = 50_000;
+    let seed = 42;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_take", &data));
+    let p = f.0.display();
+
+    let matched = expected_clean_ge(rows, seed, 45);
+    // Limit below and above the number of matches; result is min(N, matched),
+    // and must not depend on chunk granularity (a chunk may straddle the cut).
+    for n in [
+        0u64,
+        1,
+        123,
+        matched.saturating_sub(1),
+        matched,
+        matched + 1000,
+    ] {
+        let want = n.min(matched);
+        for cs in [1, 7, 1024, 8192, rows] {
+            let src = format!("F:\n open {p}\n |? age >= 45\n take {n}\n;");
+            let res = run_src(&src, cs);
+            assert_eq!(res.total_rows_out(), want, "take {n} @ chunk_size={cs}");
+            assert!(res.errors.is_empty(), "clean data should not error");
+        }
+    }
+}
+
+#[test]
 fn error_heavy_skips_and_continues() {
     let rows = 40_000;
     let data = gendata::error_heavy(rows, 0.5, 7);

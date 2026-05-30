@@ -14,6 +14,7 @@
 | `\|?` | filter | `Op::Filter` |
 | `\|>` | map / projection | `Op::Project` |
 | `\|#` | group / partition by | `Op::GroupBy` |
+| `take N` / `limit N` / `head N` | 先頭 N 行で打ち切り（chunk-size 非依存） | `Op::Take` |
 | `\| map { ... }` | map block（要素変換） | （MVP: 解析のみ） |
 | `->` | branch（tee, 多分岐） | fan-out edge |
 | `+` | merge（union） | `Op::Merge` |
@@ -62,6 +63,7 @@ ref-expr   = IDENT ( ('+' IDENT)+ | ('&' IDENT) )? ;   (* merge / join *)
 transform  = '|?' expr
            | '|>' field+
            | '|#' field
+           | ('take'|'limit'|'head') INT
            | '|' 'map' block
            | branch
            | sink
