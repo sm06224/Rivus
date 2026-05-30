@@ -590,7 +590,7 @@ fn resolve_format(path: &str, explicit: Option<&str>) -> Option<Format> {
         };
     }
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
+    if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") || lower.ends_with(".json") {
         Some(Format::Jsonl)
     } else {
         Some(Format::Csv) // default

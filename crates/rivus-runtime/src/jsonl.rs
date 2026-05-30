@@ -33,30 +33,35 @@ enum JVal {
 }
 
 pub fn parse(text: &str) -> Result<JsonlData, String> {
-    // First pass: column order from the first valid object.
     let mut names: Vec<String> = Vec::new();
     let mut started = false;
     let mut rows: Vec<Vec<(String, JVal)>> = Vec::new();
     let mut bad_rows = 0;
 
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match parse_object(line) {
-            Some(obj) => {
-                if !started {
-                    names = obj.iter().map(|(k, _)| k.clone()).collect();
-                    started = true;
-                }
-                rows.push(obj);
+    // A document beginning with `[` is a JSON array of objects (e.g. an API
+    // response); otherwise it is JSON Lines (one object per line).
+    if text.trim_start().starts_with('[') {
+        collect_array(text, &mut names, &mut started, &mut rows, &mut bad_rows);
+    } else {
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
             }
-            None => bad_rows += 1,
+            match parse_object(line) {
+                Some(obj) => {
+                    if !started {
+                        names = obj.iter().map(|(k, _)| k.clone()).collect();
+                        started = true;
+                    }
+                    rows.push(obj);
+                }
+                None => bad_rows += 1,
+            }
         }
     }
 
     if names.is_empty() {
-        return Err("JSONL has no valid object lines".to_string());
+        return Err("JSON has no valid objects".to_string());
     }
 
     // Gather per-column values (by key), then infer a lane and build.
@@ -79,6 +84,55 @@ pub fn parse(text: &str) -> Result<JsonlData, String> {
         columns,
         bad_rows,
     })
+}
+
+/// Collect objects from a top-level JSON array `[ {..}, {..}, ... ]` (which may
+/// span multiple lines). Non-object elements are counted as bad rows and
+/// skipped (continue-first).
+fn collect_array(
+    text: &str,
+    names: &mut Vec<String>,
+    started: &mut bool,
+    rows: &mut Vec<Vec<(String, JVal)>>,
+    bad_rows: &mut usize,
+) {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i] != b'[' {
+        i += 1;
+    }
+    i += 1; // past '['
+    loop {
+        skip_ws(b, &mut i);
+        match b.get(i) {
+            None | Some(b']') => break,
+            Some(b',') => i += 1,
+            Some(b'{') => {
+                let start = i;
+                // Capture the balanced object, then parse it.
+                if parse_nested(b, &mut i, b'{', b'}').is_some() {
+                    if let Some(obj) = parse_object(&text[start..i]) {
+                        if !*started {
+                            *names = obj.iter().map(|(k, _)| k.clone()).collect();
+                            *started = true;
+                        }
+                        rows.push(obj);
+                    } else {
+                        *bad_rows += 1;
+                    }
+                } else {
+                    break; // unterminated
+                }
+            }
+            Some(_) => {
+                // A non-object element: count it and skip past it.
+                *bad_rows += 1;
+                if parse_value(b, &mut i).is_none() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn infer(vals: &[JVal]) -> DataType {
@@ -372,6 +426,20 @@ mod tests {
         match &d.columns[0] {
             Column::I64(v) => assert_eq!(v, &[1, 2]),
             _ => panic!("expected i64"),
+        }
+    }
+
+    #[test]
+    fn parses_json_array_multiline() {
+        // A top-level array (possibly pretty-printed) of objects, like an API
+        // response, parses the same as JSON Lines.
+        let text = "[\n  {\"name\":\"aki\",\"age\":30},\n  {\"name\":\"ben\",\"age\":15},\n  42,\n  {\"name\":\"cho\",\"age\":40}\n]";
+        let d = parse(text).unwrap();
+        assert_eq!(d.schema.field_names(), vec!["name", "age"]);
+        assert_eq!(d.bad_rows, 1); // the bare `42` element
+        match &d.columns[1] {
+            Column::I64(v) => assert_eq!(v, &[30, 15, 40]),
+            _ => panic!("expected i64 age"),
         }
     }
 
