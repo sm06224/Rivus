@@ -233,6 +233,32 @@ the `i64` lane, floats the `f64` lane, `bool` is one byte; `u64` above
 `i64::MAX` wraps (documented until a `u64` lane exists). Trailing partial
 records are reported on the error stream and ignored (continue-first).
 
+### External comparison (anti-NIH grounding)
+
+Same logical task — read a 1,000,000-row CSV, filter `age >= 45`, project `name`,
+write the result — across Rivus and established tools (`bench/compare.sh`, best
+of 3; tools used only if present). This grounds Rivus's numbers against
+collective-wisdom engines rather than judging it in isolation.
+
+| tool | time | throughput | vs rivus (opt) |
+|---|---:|---:|---|
+| **rivus (optimized)** | 0.270 s | 3.71 M rows/s | — |
+| rivus (`--no-opt`) | 0.353 s | 2.84 M rows/s | |
+| awk (mawk) | 0.310 s | 3.22 M rows/s | rivus **1.15× faster** |
+| **duckdb 1.1.3** | 0.135 s | 7.39 M rows/s | duckdb **~2× faster** |
+| python (stdlib csv) | 1.232 s | 0.81 M rows/s | rivus **~4.6× faster** |
+
+**Honest standing:** optimized Rivus already beats `awk` and is ~4.6× faster
+than a hand-written Python loop — but a world-class vectorized, multi-threaded
+engine (DuckDB) is ~2× ahead. That 2× is the north star: it is explained almost
+entirely by (a) DuckDB executing the *whole* query multi-threaded while Rivus so
+far only parallelizes parsing, and (b) vectorized/SIMD predicate kernels. Both
+are on the backlog (items 8 + a SIMD kernel pass) — the comparison turns them
+from "nice to have" into a measured target. Projection pushdown is what gets
+Rivus from 0.353 → 0.270 s (it builds only `name`/`age`).
+
+Run it yourself: `bench/compare.sh [ROWS] [RUNS]`.
+
 ### Scale validation (2,000,000 rows)
 
 Confirms the parallel parser + arena strings hold at millions of rows (no
