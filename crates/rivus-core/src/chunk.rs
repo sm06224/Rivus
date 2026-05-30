@@ -181,6 +181,19 @@ impl Column {
         }
     }
 
+    /// Append another column of the same variant (used to concatenate buffered
+    /// chunks before a blocking sort). Mismatched variants are ignored — within
+    /// one stream every chunk shares the schema, so this never happens there.
+    pub fn append(&mut self, other: &Column) {
+        match (self, other) {
+            (Column::Bool(a), Column::Bool(b)) => a.extend_from_slice(b),
+            (Column::I64(a), Column::I64(b)) => a.extend_from_slice(b),
+            (Column::F64(a), Column::F64(b)) => a.extend_from_slice(b),
+            (Column::Str(a), Column::Str(b)) => a.append(b),
+            _ => {}
+        }
+    }
+
     /// Gather a new column from selected row indices (used by filter/join).
     pub fn gather(&self, indices: &[usize]) -> Column {
         match self {

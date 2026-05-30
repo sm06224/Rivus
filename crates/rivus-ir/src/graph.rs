@@ -159,6 +159,11 @@ pub enum Op {
     /// stream flowing through this node, then drop the rest. Stateful (a global
     /// running count), so it is a pipeline-breaker for the parallel executor.
     Take { n: usize },
+    /// `sort KEY [asc|desc]` — order the whole stream by one key column. A
+    /// blocking operator (buffers every row, emits on finish); the sort is
+    /// stable, so equal keys keep source order and the result is chunk-size
+    /// independent. Pipeline-breaker for the parallel executor.
+    Sort { key: String, desc: bool },
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -197,6 +202,7 @@ impl Op {
             Op::Filter { .. } => "filter",
             Op::Project { .. } => "project",
             Op::Take { .. } => "take",
+            Op::Sort { .. } => "sort",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -239,6 +245,13 @@ impl Op {
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
             Op::Take { n } => format!("take {n}"),
+            Op::Sort { key, desc } => {
+                if *desc {
+                    format!("sort {key} desc")
+                } else {
+                    format!("sort {key}")
+                }
+            }
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {

@@ -86,6 +86,56 @@ fn take_caps_rows_chunk_size_independent() {
     }
 }
 
+/// Collect an integer column across all chunks of the output labeled `label`.
+fn collect_i64(res: &rivus_runtime::RunResult, label: &str, col: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    let o = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some(label))
+        .expect("labeled output");
+    for c in &o.chunks {
+        if let Some(ci) = c.schema.index_of(col) {
+            for r in 0..c.len {
+                out.push(c.value(r, ci).as_f64().unwrap() as i64);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn sort_orders_rows_chunk_size_independent() {
+    let rows = 20_000;
+    let seed = 7;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_sort", &data));
+    let p = f.0.display();
+
+    // Oracle: regenerate the age multiset and sort it independently.
+    let mut rng = Rng::new(seed);
+    let mut want_asc = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let age = rng.below(90) as i64;
+        let _score = rng.below(10_000);
+        let _country = rng.below(5);
+        let _active = rng.below(2);
+        want_asc.push(age);
+    }
+    want_asc.sort_unstable();
+    let mut want_desc = want_asc.clone();
+    want_desc.reverse();
+
+    // The sorted output must equal the oracle exactly, for every chunk size.
+    for cs in [1, 7, 1024, 8192, rows] {
+        let asc = run_src(&format!("S:\n open {p}\n sort age\n;"), cs);
+        assert_eq!(collect_i64(&asc, "S", "age"), want_asc, "asc @cs={cs}");
+
+        let desc = run_src(&format!("S:\n open {p}\n sort age desc\n;"), cs);
+        assert_eq!(collect_i64(&desc, "S", "age"), want_desc, "desc @cs={cs}");
+    }
+}
+
 #[test]
 fn error_heavy_skips_and_continues() {
     let rows = 40_000;

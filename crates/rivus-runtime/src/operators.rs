@@ -126,6 +126,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Take { n } => Box::new(Take { remaining: *n }),
+        Op::Sort { key, desc } => Box::new(Sort::new(key.clone(), *desc)),
         Op::Project { fields } => Box::new(Project {
             fields: fields.clone(),
         }),
@@ -595,6 +596,99 @@ impl Operator for Take {
         let idx: Vec<usize> = (0..self.remaining).collect();
         self.remaining = 0;
         vec![chunk.gather(&idx)]
+    }
+}
+
+// ---------------------------------------------------------------------- sort
+
+/// `sort KEY [desc]` — a blocking sort. Buffers every chunk, then on finish
+/// concatenates them (in arrival = source order), stably sorts by the key
+/// column, and emits one ordered chunk. Stable + concatenate-then-sort makes
+/// the output independent of `chunk_size`; ties keep source order for both
+/// ascending and descending.
+struct Sort {
+    key: String,
+    desc: bool,
+    buf: Vec<Chunk>,
+    emitted: bool,
+}
+
+impl Sort {
+    fn new(key: String, desc: bool) -> Self {
+        Sort {
+            key,
+            desc,
+            buf: Vec::new(),
+            emitted: false,
+        }
+    }
+}
+
+/// Compare two rows of one column for ordering (NaN treated as equal).
+fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match col {
+        Column::Bool(v) => v[a].cmp(&v[b]),
+        Column::I64(v) => v[a].cmp(&v[b]),
+        Column::F64(v) => v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal),
+        Column::Str(v) => v.get(a).cmp(v.get(b)),
+    }
+}
+
+impl Operator for Sort {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !chunk.is_empty() {
+            self.buf.push(chunk);
+        }
+        Vec::new() // blocking boundary: output on finish
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.emitted || self.buf.is_empty() {
+            return Vec::new();
+        }
+        self.emitted = true;
+
+        // Concatenate buffered chunks into one set of columns (source order).
+        let mut iter = std::mem::take(&mut self.buf).into_iter();
+        let first = iter.next().unwrap();
+        let schema = first.schema.clone();
+        let mut cols = first.columns;
+        for c in iter {
+            for (i, col) in c.columns.iter().enumerate() {
+                cols[i].append(col);
+            }
+        }
+        let total = cols.first().map(|c| c.len()).unwrap_or(0);
+
+        let mut idx: Vec<usize> = (0..total).collect();
+        match schema.index_of(&self.key) {
+            Some(ki) => {
+                let key_col = &cols[ki];
+                let desc = self.desc;
+                idx.sort_by(|&a, &b| {
+                    let o = cmp_rows(key_col, a, b);
+                    if desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                });
+            }
+            None => {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!("sort: unknown key '{}' (emitting unsorted)", self.key),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+        }
+
+        let sorted: Vec<Column> = cols.iter().map(|c| c.gather(&idx)).collect();
+        vec![Chunk::new(ctx.fresh_id(), schema, sorted)]
     }
 }
 

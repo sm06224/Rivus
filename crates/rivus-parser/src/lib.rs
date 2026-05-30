@@ -12,7 +12,8 @@
 //! source     := 'open' PATH | 'stream' IDENT
 //! ref-expr   := IDENT (('+' IDENT)+ | ('&' IDENT))?   // merge / join
 //! transform  := '|?' expr | '|>' field+ | '|#' field (AGG ':' field)*
-//!             | ('take'|'limit'|'head') INT | '|' 'map' block
+//!             | ('take'|'limit'|'head') INT | 'sort' IDENT ('asc'|'desc')?
+//!             | '|' 'map' block
 //!               AGG := 'sum' | 'avg' | 'min' | 'max'   (count is always emitted)
 //! branch     := '->' IDENT ':' body ';'
 //! sink       := 'save' PATH | 'print'
@@ -261,6 +262,23 @@ impl Parser {
                     let node = self.g.add_node(Op::Take { n });
                     self.g.add_edge(current, node, EdgeKind::Stream);
                     current = node;
+                }
+                // `sort KEY [asc|desc]` — order the whole stream by one column.
+                Tok::Word(w) if w == "sort" => {
+                    self.bump();
+                    let key = self.word()?;
+                    let desc = if self.peek_is_word("desc") {
+                        self.bump();
+                        true
+                    } else if self.peek_is_word("asc") {
+                        self.bump();
+                        false
+                    } else {
+                        false
+                    };
+                    let n = self.g.add_node(Op::Sort { key, desc });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
                 }
                 Tok::Word(w) if w == "print" => {
                     self.bump();
@@ -688,6 +706,7 @@ fn is_keyword(w: &str) -> bool {
             | "take"
             | "limit"
             | "head"
+            | "sort"
             | "on"
             | "map"
             | "mode"

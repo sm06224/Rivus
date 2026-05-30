@@ -274,12 +274,14 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
                 }
                 source = Some(node.id);
             }
-            // Stateful or replay → not partitionable; run serially.
-            // `Take` keeps a global running count, so per-partition execution
-            // would each take N — wrong. Force the serial path.
-            Op::GroupBy { .. } | Op::Join { .. } | Op::StreamRef { .. } | Op::Take { .. } => {
-                return None
-            }
+            // Stateful or replay → not partitionable; run serially. `Take`
+            // keeps a global running count and `Sort` orders across all rows,
+            // so per-partition execution would be wrong. Force the serial path.
+            Op::GroupBy { .. }
+            | Op::Join { .. }
+            | Op::StreamRef { .. }
+            | Op::Take { .. }
+            | Op::Sort { .. } => return None,
             _ => {}
         }
     }
