@@ -194,8 +194,15 @@ crates/
   rivus-runtime   single-thread chunk execution engine / operators / telemetry
   rivus-cli       `rivus run | explain | check`  (ASCII visualization)
 examples/         *.riv programs + users.csv
-docs/design/      full 17-section design (architecture → distributed)
+docs/GUIDE.md     syntax & usage reference (start here)
+docs/design/      full design (architecture → distributed)
 ```
+
+## Guide
+
+[**`docs/GUIDE.md`**](docs/GUIDE.md) is the full syntax & usage reference: every
+source, transform and sink, the expression language, computed columns, a
+one-liner cookbook (`-c` / stdin / pipes), and the complete grammar.
 
 ## Design
 
