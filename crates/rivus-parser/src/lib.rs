@@ -201,7 +201,7 @@ impl Parser {
                 // sink mirrors the source format set (write what you can read).
                 Tok::Word(w) if w == "save" => {
                     self.bump();
-                    let path = self.word()?;
+                    let path = norm_path(self.word()?);
                     let explicit = if self.peek_is_word("as") {
                         self.bump();
                         Some(self.word()?)
@@ -257,7 +257,7 @@ impl Parser {
             // equivalent explicit aliases (lower cognitive load, fewer surprises).
             Tok::Word(w) if w == "open" => {
                 self.bump();
-                let path = self.word()?;
+                let path = norm_path(self.word()?);
                 let explicit = if self.peek_is_word("as") {
                     self.bump();
                     Some(self.word()?)
@@ -271,7 +271,7 @@ impl Parser {
             }
             Tok::Word(w) if w == "readcsv" => {
                 self.bump();
-                let path = self.word()?;
+                let path = norm_path(self.word()?);
                 Ok(self.g.add_node(Op::OpenCsv {
                     path,
                     projection: None,
@@ -279,7 +279,7 @@ impl Parser {
             }
             Tok::Word(w) if w == "readjson" => {
                 self.bump();
-                let path = self.word()?;
+                let path = norm_path(self.word()?);
                 Ok(self.g.add_node(Op::OpenJsonl { path }))
             }
             Tok::Word(w) if w == "stream" => {
@@ -585,6 +585,16 @@ impl Parser {
     }
 }
 
+/// Normalize a source/sink path: `stdin` / `stdout` / `-` all map to the `-`
+/// sentinel (read stdin / write stdout, direction inferred from source vs sink).
+fn norm_path(p: String) -> String {
+    if p == "stdin" || p == "stdout" || p == "-" {
+        "-".to_string()
+    } else {
+        p
+    }
+}
+
 /// A text source format selectable on `open` (binary goes via `readbin`).
 enum Format {
     Csv,
@@ -681,6 +691,30 @@ mod tests {
     fn nth_op(src: &str, n: usize) -> Op {
         let g = parse(src).unwrap();
         g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn stdio_paths_normalize() {
+        // `stdin`/`stdout` (and `-`) map to the "-" sentinel for source & sink.
+        let g = parse("F:\n open stdin\n save stdout\n;").unwrap();
+        match &g.nodes[0].op {
+            Op::OpenCsv { path, .. } => assert_eq!(path, "-"),
+            o => panic!("expected OpenCsv, got {o:?}"),
+        }
+        let sink = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::SinkCsv { path } => Some(path.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(sink, "-");
+        // stdin with an explicit format.
+        assert!(matches!(
+            &parse("F:\n open stdin as json\n;").unwrap().nodes[0].op,
+            Op::OpenJsonl { path } if path == "-"
+        ));
     }
 
     #[test]

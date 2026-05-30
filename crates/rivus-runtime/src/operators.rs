@@ -51,6 +51,28 @@ pub trait Operator {
     }
 }
 
+/// Read a text source: the `-` sentinel reads stdin, otherwise a file.
+fn read_input(path: &str) -> std::io::Result<String> {
+    if path == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path)
+    }
+}
+
+/// Write a text sink: the `-` sentinel writes stdout, otherwise a file.
+fn write_output(path: &str, data: &str) -> std::io::Result<()> {
+    if path == "-" {
+        use std::io::Write;
+        std::io::stdout().write_all(data.as_bytes())
+    } else {
+        std::fs::write(path, data)
+    }
+}
+
 /// Build the operator for a node from its IR op.
 pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator> {
     match op {
@@ -125,7 +147,7 @@ impl SourceCsv {
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -404,7 +426,7 @@ impl SourceJsonl {
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -781,7 +803,7 @@ impl Operator for SinkCsv {
                 }
             }
         }
-        if let Err(e) = std::fs::write(&self.path, out) {
+        if let Err(e) = write_output(&self.path, &out) {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,
@@ -845,7 +867,7 @@ impl Operator for SinkJsonl {
                 out.push_str("}\n");
             }
         }
-        if let Err(e) = std::fs::write(&self.path, out) {
+        if let Err(e) = write_output(&self.path, &out) {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,

@@ -49,6 +49,14 @@ BINTYPE    = 'i8'|'i16'|'i32'|'i64'|'u8'|'u16'|'u32'|'u64'|'f32'|'f64'|'bool' ;
 (*   - open f.csv / f.jsonl        … 拡張子で自動（最短手数の既定）          *)
 (*   - open f.dat as json          … 拡張子が無い/嘘の時は as で明示上書き    *)
 (*   - readcsv f / readjson f / readbin f (...) … 動詞エイリアスで一目瞭然    *)
+
+(* sink は source と対称（write what you can read）:                          *)
+(*   save PATH [as FMT] | writecsv PATH | writejson PATH                       *)
+
+(* stdin/stdout 連携（他シェルのパイプに挟める）:                              *)
+(*   open stdin [as FMT]   … 標準入力を読む（既定 csv）                       *)
+(*   save stdout [as FMT]  … 標準出力へ書く（`rivus run` の可視化は stderr）  *)
+(*   ( `stdin`/`stdout`/`-` はすべて同じ標準ストリームを指す )                 *)
 ref-expr   = IDENT ( ('+' IDENT)+ | ('&' IDENT) )? ;   (* merge / join *)
 
 transform  = '|?' expr
