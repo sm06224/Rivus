@@ -298,6 +298,13 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `describe` — replace the stream with a per-column summary.
+                Tok::Word(w) if w == "describe" => {
+                    self.bump();
+                    let n = self.g.add_node(Op::Describe);
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
                 Tok::Word(w) if w == "print" => {
                     self.bump();
                     let n = self.g.add_node(Op::SinkPrint);
@@ -822,6 +829,7 @@ fn is_keyword(w: &str) -> bool {
             | "head"
             | "sort"
             | "distinct"
+            | "describe"
             | "on"
             | "map"
             | "mode"

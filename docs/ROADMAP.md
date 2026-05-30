@@ -38,7 +38,7 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | stdout = clean data, stderr = visualization | pipe-friendly today |
 | 🚧 | **First-class stdin→process→stdout** | make `cat x.csv \| rivus '<transforms>'` ergonomic: a default source (stdin) and sink (stdout) so a bare transform chain works as a Unix filter |
 | 📋 | `-` sentinel for `open`/`save` | the bare dash isn't lexable yet (only `stdin`/`stdout`) |
-| 📋 | **`describe`** | `rivus describe <source>` / a `describe` verb: per-column type, count, nulls, min/max/mean — a streaming one-pass summary (pandas `.describe()` / SQL `DESCRIBE`) |
+| ✅ | **`describe`** | `rivus describe <source>` / a `describe` verb: per-column type, count, nulls, min/max/mean — a streaming one-pass summary (pandas `.describe()` / SQL `DESCRIBE`) |
 
 ## C. Language: a more readable, typed flow syntax
 
@@ -93,7 +93,7 @@ it in small, gated steps.
 ## Near-term order (how we eat the elephant)
 
 1. ~~Header-less CSV (A)~~ ✅ done — `open f.csv noheader`.
-2. **`describe`** (B) — high-value exploration, one streaming pass.
+2. ~~`describe` (B)~~ ✅ done — `open f.csv describe`.
 3. **Typed/named columns at `open`** (A/C) — declared schema; foundation for casts.
 4. **stdin→stdout filter ergonomics** (B).
 5. **Inline type casts + comma filter** (C) — readable, typed flow.

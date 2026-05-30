@@ -165,6 +165,19 @@ distinct user_id        # first row per user_id
 distinct country region # first row per (country, region)
 ```
 
+### `describe` — one-pass column summary
+
+Replace the stream with a per-column summary (like pandas `.describe()` / SQL
+`DESCRIBE`): `column`, `type`, `count`, and — for numeric columns — `min`,
+`max`, `mean`. Streaming, single pass.
+
+```
+open data.csv describe save stdout as csv
+# column,type,count,min,max,mean
+# id,i64,1000,1,1000,500.5
+# name,str,1000,,,
+```
+
 ### Composing them
 
 Transforms chain in any order:
@@ -390,6 +403,7 @@ transform  = '|?' expr                                        (filter)
            | ('take'|'limit'|'head') INT
            | 'sort' IDENT ('asc'|'desc')?
            | 'distinct' IDENT*
+           | 'describe'
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)

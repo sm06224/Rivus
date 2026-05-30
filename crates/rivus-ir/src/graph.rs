@@ -181,6 +181,10 @@ pub enum Op {
     /// columns. Streaming (emits as it goes) but stateful (a global seen-set),
     /// so it runs on the serial path. Output order = first-occurrence order.
     Distinct { keys: Vec<String> },
+    /// `describe` — replace the stream with a one-row-per-column summary
+    /// (column, type, count, min, max, mean). A streaming, single-pass
+    /// accumulator that emits on finish; stateful → serial path.
+    Describe,
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -222,6 +226,7 @@ impl Op {
             Op::Take { .. } => "take",
             Op::Sort { .. } => "sort",
             Op::Distinct { .. } => "distinct",
+            Op::Describe => "describe",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -309,6 +314,7 @@ impl Op {
                     format!("distinct {}", keys.join(" "))
                 }
             }
+            Op::Describe => "describe".to_string(),
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {

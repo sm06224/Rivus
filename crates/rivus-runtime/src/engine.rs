@@ -94,6 +94,7 @@ fn must_drain(graph: &PlanGraph) -> bool {
                 | Op::GroupBy { .. }
                 | Op::Sort { .. }
                 | Op::Distinct { .. }
+                | Op::Describe
                 | Op::Join { .. }
                 | Op::StreamRef { .. }
         )
@@ -620,7 +621,8 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             | Op::StreamRef { .. }
             | Op::Take { .. }
             | Op::Sort { .. }
-            | Op::Distinct { .. } => return None,
+            | Op::Distinct { .. }
+            | Op::Describe => return None,
             _ => {}
         }
     }

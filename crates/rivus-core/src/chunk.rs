@@ -64,11 +64,22 @@ impl ChunkMeta {
 /// offsets. A cell is a `&str` slice — there is **no allocation per cell**,
 /// which both speeds the reader and removes the cross-thread allocator
 /// contention measured in `docs/BENCHMARKS.md` (Phase 0.5).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StrColumn {
     /// `offsets.len() == rows + 1`, `offsets[0] == 0`, monotonically increasing.
     offsets: Vec<u32>,
     data: Vec<u8>,
+}
+
+impl Default for StrColumn {
+    /// A valid **empty** column: `offsets == [0]` (not an empty vec), so the
+    /// `offsets.len() == rows + 1` invariant holds and `push` works correctly.
+    fn default() -> Self {
+        StrColumn {
+            offsets: vec![0],
+            data: Vec::new(),
+        }
+    }
 }
 
 impl StrColumn {
@@ -120,8 +131,7 @@ impl StrColumn {
 
 impl<'a> FromIterator<&'a str> for StrColumn {
     fn from_iter<I: IntoIterator<Item = &'a str>>(iter: I) -> Self {
-        let mut c = StrColumn::default();
-        c.offsets.push(0);
+        let mut c = StrColumn::default(); // already seeded with offsets == [0]
         for s in iter {
             c.push(s);
         }
@@ -269,5 +279,23 @@ impl Chunk {
             columns,
             len: self.len,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StrColumn;
+
+    #[test]
+    fn default_strcolumn_is_a_valid_empty_column() {
+        // `default()` must seed offsets == [0] so the first push is addressable
+        // (regression: an empty offsets vec lost/shifted the first cell).
+        let mut c = StrColumn::default();
+        assert_eq!(c.len(), 0);
+        c.push("first");
+        c.push("second");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.get(0), "first");
+        assert_eq!(c.get(1), "second");
     }
 }

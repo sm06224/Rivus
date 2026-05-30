@@ -72,6 +72,56 @@ fn headerless_csv_positional_columns_chunk_size_independent() {
 }
 
 #[test]
+fn describe_matches_oracle() {
+    // One numeric column `v`; `describe` must report count/min/max/mean that
+    // match an independent computation, for every chunk size.
+    let rows = 10_000;
+    let mut rng = Rng::new(1);
+    let mut text = String::from("v\n");
+    let (mut sum, mut mn, mut mx) = (0i64, i64::MAX, i64::MIN);
+    for _ in 0..rows {
+        let x = rng.below(1000) as i64;
+        text.push_str(&format!("{x}\n"));
+        sum += x;
+        mn = mn.min(x);
+        mx = mx.max(x);
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_desc", text.as_bytes()));
+    let p = f.0.display();
+    let mean = sum as f64 / rows as f64;
+
+    for cs in [1, 7, 1024, rows] {
+        let res = run_src(&format!("D:\n open {p}\n describe\n;"), cs);
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .expect("describe output");
+        let c = &o.chunks[0];
+        let cell = |col: &str| {
+            let ci = c.schema.index_of(col).unwrap();
+            c.value(0, ci).to_string()
+        };
+        assert_eq!(cell("column"), "v", "@cs={cs}");
+        assert_eq!(cell("count"), rows.to_string(), "count @cs={cs}");
+        assert_eq!(
+            cell("min").parse::<f64>().unwrap(),
+            mn as f64,
+            "min @cs={cs}"
+        );
+        assert_eq!(
+            cell("max").parse::<f64>().unwrap(),
+            mx as f64,
+            "max @cs={cs}"
+        );
+        assert!(
+            (cell("mean").parse::<f64>().unwrap() - mean).abs() < 1e-6,
+            "mean @cs={cs}"
+        );
+    }
+}
+
+#[test]
 fn large_clean_filter_is_exact() {
     let rows = 50_000;
     let seed = 42;

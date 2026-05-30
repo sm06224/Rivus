@@ -209,6 +209,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Take { n } => Box::new(Take { remaining: *n }),
         Op::Sort { key, desc } => Box::new(Sort::new(key.clone(), *desc)),
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
+        Op::Describe => Box::new(Describe::default()),
         Op::ProjectExpr { items } => Box::new(ProjectExpr {
             items: items.clone(),
         }),
@@ -924,6 +925,119 @@ impl Operator for Distinct {
             return vec![chunk];
         }
         vec![chunk.gather(&keep)]
+    }
+}
+
+// ------------------------------------------------------------------ describe
+
+/// `describe` — a one-pass streaming summary: per input column, its type, row
+/// count, and (for numeric columns) min / max / mean. Accumulates across chunks
+/// and emits a single summary chunk on finish (one row per column). Stateful →
+/// serial path. The summary is rendered as string cells for clean display.
+#[derive(Default)]
+struct Describe {
+    names: Vec<String>,
+    types: Vec<DataType>,
+    count: u64,
+    // Per-column numeric accumulators (used only for I64/F64 columns).
+    n: Vec<u64>,
+    sum: Vec<f64>,
+    min: Vec<f64>,
+    max: Vec<f64>,
+    inited: bool,
+    emitted: bool,
+}
+
+impl Describe {
+    fn init(&mut self, chunk: &Chunk) {
+        self.names = chunk
+            .schema
+            .field_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        self.types = chunk.columns.iter().map(|c| c.dtype()).collect();
+        let k = self.names.len();
+        self.n = vec![0; k];
+        self.sum = vec![0.0; k];
+        self.min = vec![f64::INFINITY; k];
+        self.max = vec![f64::NEG_INFINITY; k];
+        self.inited = true;
+    }
+}
+
+impl Operator for Describe {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !self.inited {
+            self.init(&chunk);
+        }
+        self.count += chunk.len as u64;
+        for (ci, col) in chunk.columns.iter().enumerate() {
+            let vals: &mut dyn Iterator<Item = f64> = match col {
+                Column::I64(v) => &mut v.iter().map(|&x| x as f64),
+                Column::F64(v) => &mut v.iter().copied(),
+                _ => continue, // non-numeric: only type + count are reported
+            };
+            for x in vals {
+                self.n[ci] += 1;
+                self.sum[ci] += x;
+                self.min[ci] = self.min[ci].min(x);
+                self.max[ci] = self.max[ci].max(x);
+            }
+        }
+        Vec::new() // summary emitted on finish
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.emitted || !self.inited {
+            return Vec::new();
+        }
+        self.emitted = true;
+
+        let fmt = |x: f64| {
+            if x.fract() == 0.0 && x.abs() < 1e15 {
+                format!("{x:.0}")
+            } else {
+                format!("{x}")
+            }
+        };
+        let mut column = StrColumn::default();
+        let mut typ = StrColumn::default();
+        let mut count = Vec::new();
+        let mut min = StrColumn::default();
+        let mut max = StrColumn::default();
+        let mut mean = StrColumn::default();
+        for (i, name) in self.names.iter().enumerate() {
+            column.push(name);
+            typ.push(&self.types[i].to_string());
+            count.push(self.count as i64);
+            if self.n[i] > 0 {
+                min.push(&fmt(self.min[i]));
+                max.push(&fmt(self.max[i]));
+                mean.push(&fmt(self.sum[i] / self.n[i] as f64));
+            } else {
+                min.push("");
+                max.push("");
+                mean.push("");
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("column", DataType::Str),
+            Field::new("type", DataType::Str),
+            Field::new("count", DataType::I64),
+            Field::new("min", DataType::Str),
+            Field::new("max", DataType::Str),
+            Field::new("mean", DataType::Str),
+        ]));
+        let columns = vec![
+            Column::Str(column),
+            Column::Str(typ),
+            Column::I64(count),
+            Column::Str(min),
+            Column::Str(max),
+            Column::Str(mean),
+        ];
+        vec![Chunk::new(ctx.fresh_id(), schema, columns)]
     }
 }
 
