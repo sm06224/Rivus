@@ -1144,6 +1144,64 @@ impl Operator for Fill {
     }
 }
 
+/// `rename OLD NEW [OLD NEW ...]` — rename columns in place. Position, type and
+/// values are untouched; only the field name changes. Unknown `OLD` names raise
+/// a one-line warning and are skipped. Stateless and streaming.
+struct Rename {
+    pairs: Vec<(String, String)>,
+}
+
+impl Operator for Rename {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let mut fields = chunk.schema.fields.clone();
+        for (from, to) in &self.pairs {
+            match chunk.schema.index_of(from) {
+                Some(i) => fields[i] = Field::new(to.clone(), fields[i].dtype),
+                None => ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!("rename: unknown column '{from}'"),
+                    )
+                    .at_node(ctx.label.clone())
+                    .at_chunk(chunk.meta.id),
+                ),
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let mut out = Chunk::new(chunk.meta.id, schema, chunk.columns.clone());
+        out.meta = chunk.meta.clone();
+        vec![out]
+    }
+}
+
+/// `drop COL [COL ...]` — remove the named columns, keeping the rest in order.
+/// Unknown names are ignored (dropping a non-existent column is a no-op).
+/// Stateless and streaming.
+struct Drop {
+    cols: Vec<String>,
+}
+
+impl Operator for Drop {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        let keep: Vec<usize> = (0..chunk.schema.fields.len())
+            .filter(|&i| !self.cols.iter().any(|c| c == &chunk.schema.fields[i].name))
+            .collect();
+        if keep.len() == chunk.schema.fields.len() {
+            return vec![chunk]; // nothing matched → unchanged
+        }
+        let fields: Vec<Field> = keep
+            .iter()
+            .map(|&i| chunk.schema.fields[i].clone())
+            .collect();
+        let columns: Vec<Column> = keep.iter().map(|&i| chunk.columns[i].clone()).collect();
+        let schema = Arc::new(Schema::new(fields));
+        let mut out = Chunk::new(chunk.meta.id, schema, columns);
+        out.meta = chunk.meta.clone();
+        vec![out]
+    }
+}
+
 // -------------------------------------------------------- computed projection
 
 /// `|> field (expr) as alias …` — projection that can compute new columns.
