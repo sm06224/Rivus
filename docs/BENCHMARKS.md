@@ -335,8 +335,15 @@ resident memory is independent of input size. Measured peak RSS (`os.wait4`
 
 | pipeline | input | peak RSS | time | throughput |
 |---|---:|---:|---:|---:|
-| `open \|? age>=50 \|> name age save out.csv` | 1.1 GB | **10.1 MiB** | 15.9 s | ~3.0 M rows/s |
+| `open \|? age>=50 \|> name age save out.csv` | 1.1 GB | **10.1 MiB** | 14.4 s | ~3.3 M rows/s |
 | `open \|? age>=50 \|> (age*2) as a save out.jsonl` | 1.1 GB | **10.1 MiB** | 15.7 s | ~3.1 M rows/s |
+| `open big.csv` (bare, no sink → **preview**) | 1.1 GB | **10.0 MiB** | **0.00 s** | instant |
+| `open \|? age>=50` (no sink → **preview**) | 1.1 GB | **10.4 MiB** | **0.00 s** | instant |
+
+A sink-less `rivus run` is a **preview**: the CSV source sample-infers its
+schema from the first chunk and the engine stops after the row cap (default
+1000), so eyeballing a 15 GB file is instant and flat-memory. Adding
+`save out.csv` switches to full global-inference streaming over every row.
 
 Before streaming, `open` alone read the whole file into a `String` and parsed
 every column up front (~2–3 GB resident for this input, with a long stall and no

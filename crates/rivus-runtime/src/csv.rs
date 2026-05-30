@@ -25,7 +25,7 @@
 use rivus_core::{Column, DataType, Field, Schema, StrColumn};
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
 /// Streaming CSV reader: bounded memory regardless of file size.
 ///
@@ -50,11 +50,21 @@ pub struct CsvChunker {
 impl CsvChunker {
     /// Open `path` for streaming, returning the inferred schema and the reader
     /// positioned just after the header (ready for `next_columns`).
+    ///
+    /// `preview` trades correctness for latency: instead of streaming the whole
+    /// file to infer a global schema, it samples only the first `chunk_size`
+    /// rows and seeks back — so a sink-less `open big.csv` preview starts
+    /// instantly. Full runs (with a sink) use the global two-pass inference so
+    /// types stay chunk-size independent.
     pub fn open(
         path: &str,
         allow: Option<&[String]>,
         chunk_size: usize,
+        preview: bool,
     ) -> Result<(Schema, CsvChunker), String> {
+        if preview {
+            return Self::open_preview(path, allow, chunk_size);
+        }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut r = BufReader::new(f);
@@ -109,6 +119,81 @@ impl CsvChunker {
         let mut reader = BufReader::new(f2);
         let mut skip = String::new();
         reader.read_line(&mut skip).map_err(|e| e.to_string())?;
+
+        Ok((
+            schema,
+            CsvChunker {
+                reader,
+                ncols,
+                keep,
+                dtypes,
+                chunk_size: chunk_size.max(1),
+                line: String::new(),
+                bad_rows: bad,
+                eof: false,
+            },
+        ))
+    }
+
+    /// Latency-first open: sample the first `chunk_size` rows to infer the
+    /// schema, then seek back to the first data row and stream from there.
+    fn open_preview(
+        path: &str,
+        allow: Option<&[String]>,
+        chunk_size: usize,
+    ) -> Result<(Schema, CsvChunker), String> {
+        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut reader = BufReader::new(f);
+        let mut header = String::new();
+        let hlen = reader.read_line(&mut header).map_err(|e| e.to_string())?;
+        if hlen == 0 {
+            return Err("empty CSV".to_string());
+        }
+        let names = split_owned(trim_eol(&header));
+        let ncols = names.len();
+        if ncols == 0 {
+            return Err("CSV header has no columns".to_string());
+        }
+        let keep: Vec<usize> = match allow {
+            None => (0..ncols).collect(),
+            Some(a) => (0..ncols)
+                .filter(|&i| a.iter().any(|n| n == &names[i]))
+                .collect(),
+        };
+
+        let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+        let mut bad = 0usize;
+        let mut line = String::new();
+        for _ in 0..chunk_size {
+            line.clear();
+            if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            let l = trim_eol(&line);
+            if l.trim().is_empty() {
+                continue;
+            }
+            let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
+            split_into(l, &mut scratch);
+            if scratch.len() != ncols {
+                bad += 1;
+                continue;
+            }
+            for (k, &ci) in keep.iter().enumerate() {
+                flags[k].observe(scratch[ci].as_ref());
+            }
+        }
+        let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        let mut fields = Vec::with_capacity(keep.len());
+        for (k, &ci) in keep.iter().enumerate() {
+            fields.push(Field::new(names[ci].clone(), dtypes[k]));
+        }
+        let schema = Schema::new(fields);
+
+        // Rewind to the first data row and stream from there with this schema.
+        reader
+            .seek(SeekFrom::Start(hlen as u64))
+            .map_err(|e| e.to_string())?;
 
         Ok((
             schema,

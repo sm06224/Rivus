@@ -144,11 +144,15 @@ fn main() -> ExitCode {
             }
             // Live progress only when stderr is a terminal (keep logs/pipes clean).
             let progress = std::io::stderr().is_terminal();
+            // Sink-less flows are previews: cap captured rows so `rivus run
+            // 'open big.csv'` shows the head instantly in bounded memory. A
+            // `save` sink overrides this and writes every row.
             match run(
                 &graph,
                 RunOptions {
                     chunk_size,
                     progress,
+                    max_capture: Some(1000),
                 },
             ) {
                 Ok(res) => {

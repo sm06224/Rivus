@@ -24,6 +24,12 @@ pub struct RunOptions {
     pub chunk_size: usize,
     /// Show a live progress line on stderr during a (serial) run.
     pub progress: bool,
+    /// Cap how many rows each un-sinked leaf captures for display. `None` keeps
+    /// everything (library default). When set, a flow that has no sink and no
+    /// blocking operator stops reading once the cap is met — so a bare
+    /// `open big.csv` previews instantly in bounded memory instead of
+    /// materializing the whole file. A file sink (`save`) always drains in full.
+    pub max_capture: Option<usize>,
 }
 
 impl Default for RunOptions {
@@ -31,6 +37,7 @@ impl Default for RunOptions {
         RunOptions {
             chunk_size: 4096,
             progress: false,
+            max_capture: None,
         }
     }
 }
@@ -68,8 +75,29 @@ pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError>
     if let Some(res) = try_parallel(graph, &opts) {
         return Ok(res);
     }
-    let ops = build_ops(graph, &opts, None);
-    Ok(drive(graph, ops, 0, opts.progress))
+    // Sink-less, non-blocking flows with a capture cap are previews: let the
+    // CSV source sample-infer its schema so it starts instantly.
+    let preview = opts.max_capture.is_some() && !must_drain(graph);
+    let ops = build_ops(graph, &opts, None, preview);
+    Ok(drive(graph, ops, 0, opts.progress, opts.max_capture))
+}
+
+/// A flow that must read all input to be correct: a file sink (writes every
+/// row) or a blocking/replay operator (needs the whole stream). Used to decide
+/// whether a row cap may also stop the source early / sample-infer.
+fn must_drain(graph: &PlanGraph) -> bool {
+    graph.nodes.iter().any(|nd| {
+        matches!(
+            nd.op,
+            Op::SinkCsv { .. }
+                | Op::SinkJsonl { .. }
+                | Op::GroupBy { .. }
+                | Op::Sort { .. }
+                | Op::Distinct { .. }
+                | Op::Join { .. }
+                | Op::StreamRef { .. }
+        )
+    })
 }
 
 /// Build one operator per node. In parallel mode, `mem` replaces the single
@@ -79,6 +107,7 @@ fn build_ops(
     graph: &PlanGraph,
     opts: &RunOptions,
     mem: Option<(NodeId, Vec<Chunk>)>,
+    preview: bool,
 ) -> Vec<Box<dyn Operator>> {
     let (mem_id, mut mem_chunks) = match mem {
         Some((id, c)) => (Some(id), Some(c)),
@@ -95,7 +124,12 @@ fn build_ops(
             {
                 operators::collector()
             } else {
-                operators::build(&node.op, &graph.inputs_of(node.id), opts.chunk_size)
+                operators::build(
+                    &node.op,
+                    &graph.inputs_of(node.id),
+                    opts.chunk_size,
+                    preview,
+                )
             }
         })
         .collect()
@@ -108,9 +142,13 @@ fn drive(
     mut ops: Vec<Box<dyn Operator>>,
     chunk_id_base: u64,
     progress: bool,
+    max_capture: Option<usize>,
 ) -> RunResult {
     let n = graph.nodes.len();
     let topo = graph.topo_order().expect("acyclic (checked by caller)");
+
+    // Only a sink-less, non-blocking flow may stop the source early on a cap.
+    let must_drain = must_drain(graph);
 
     let mut in_q: Vec<VecDeque<(NodeId, Chunk)>> = (0..n).map(|_| VecDeque::new()).collect();
     let mut done = vec![false; n];
@@ -134,6 +172,8 @@ fn drive(
 
     let mut prog = Progress::new(progress);
     let mut rows_seen: u64 = 0;
+    let mut total_captured: usize = 0;
+    let mut truncated = false;
 
     let mut active = true;
     while active && !fatal {
@@ -148,19 +188,29 @@ fn drive(
             let mut produced: Vec<Chunk> = Vec::new();
             let mut finished_now = false;
 
+            // Preview satisfied: a sink-less, non-blocking flow has captured
+            // enough rows — stop reading the source instead of streaming the
+            // rest of (potentially) a 15 GB file just to show a preview.
+            let preview_satisfied =
+                matches!(max_capture, Some(cap) if !must_drain && total_captured >= cap);
+
             if ops[nid].is_source() {
-                let mut ctx = OpCtx {
-                    label,
-                    errors: &mut errors,
-                    next_chunk_id: &mut next_chunk_id,
-                };
-                match ops[nid].pull(&mut ctx) {
-                    Some(chunk) => {
-                        rows_seen += chunk.len as u64;
-                        produced.push(chunk);
-                        prog.tick(rows_seen);
+                if preview_satisfied {
+                    finished_now = true;
+                } else {
+                    let mut ctx = OpCtx {
+                        label,
+                        errors: &mut errors,
+                        next_chunk_id: &mut next_chunk_id,
+                    };
+                    match ops[nid].pull(&mut ctx) {
+                        Some(chunk) => {
+                            rows_seen += chunk.len as u64;
+                            produced.push(chunk);
+                            prog.tick(rows_seen);
+                        }
+                        None => finished_now = true,
                     }
-                    None => finished_now = true,
                 }
             } else if let Some((from, chunk)) = in_q[nid].pop_front() {
                 telemetry[nid].chunks_in += 1;
@@ -208,6 +258,9 @@ fn drive(
                     &mut telemetry,
                     &mut in_q,
                     &mut results,
+                    max_capture,
+                    &mut total_captured,
+                    &mut truncated,
                 );
             }
             active = true;
@@ -223,6 +276,18 @@ fn drive(
     }
 
     prog.finish(rows_seen);
+
+    if truncated {
+        if let Some(cap) = max_capture {
+            errors.push(ErrorEvent::new(
+                Severity::Info,
+                ErrorScope::Graph,
+                format!(
+                    "output preview limited to {cap} row(s) — add a sink (e.g. `save out.csv`) to materialize all"
+                ),
+            ));
+        }
+    }
 
     let mut outputs: Vec<Output> = results
         .into_iter()
@@ -405,7 +470,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
     }
 
     // Parse the source once.
-    let mut src_op = operators::build(&graph.nodes[src_id].op, &[], opts.chunk_size);
+    let mut src_op = operators::build(&graph.nodes[src_id].op, &[], opts.chunk_size, false);
     let mut src_errors: Vec<ErrorEvent> = Vec::new();
     let mut next_id: u64 = 0;
     let mut all: Vec<Chunk> = Vec::new();
@@ -423,8 +488,8 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
 
     // Too few chunks to be worth threads: run once over the already-parsed data.
     if all.len() < threads * 2 {
-        let ops = build_ops(graph, opts, Some((src_id, all)));
-        let mut res = drive(graph, ops, 0, false);
+        let ops = build_ops(graph, opts, Some((src_id, all)), false);
+        let mut res = drive(graph, ops, 0, false, None);
         // Write any collected sink (build_ops made it a collector).
         flush_parallel_sinks(graph, &mut res);
         res.errors.splice(0..0, src_errors);
@@ -442,8 +507,8 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             .enumerate()
             .map(|(i, chunks)| {
                 scope.spawn(move || {
-                    let ops = build_ops(graph, opts, Some((src_id, chunks)));
-                    drive(graph, ops, (i as u64) << 40, false)
+                    let ops = build_ops(graph, opts, Some((src_id, chunks)), false);
+                    drive(graph, ops, (i as u64) << 40, false, None)
                 })
             })
             .collect();
@@ -566,6 +631,7 @@ fn merge_results(
 
 /// Push a node's produced chunks to its successors (fan-out) or capture them as
 /// a leaf output. Stamps the current runtime mode on every chunk.
+#[allow(clippy::too_many_arguments)]
 fn distribute(
     graph: &PlanGraph,
     nid: NodeId,
@@ -574,6 +640,9 @@ fn distribute(
     telemetry: &mut [NodeTelemetry],
     in_q: &mut [VecDeque<(NodeId, Chunk)>],
     results: &mut HashMap<NodeId, Vec<Chunk>>,
+    max_capture: Option<usize>,
+    total_captured: &mut usize,
+    truncated: &mut bool,
 ) {
     let succ = graph.outputs_of(nid);
     for mut chunk in chunks {
@@ -581,6 +650,27 @@ fn distribute(
         telemetry[nid].chunks_out += 1;
         telemetry[nid].rows_out += chunk.len as u64;
         if succ.is_empty() {
+            // Leaf capture for display. With a cap, keep at most `cap` rows per
+            // leaf (bounded memory); telemetry still counts the true total above.
+            if let Some(cap) = max_capture {
+                let have: usize = results
+                    .get(&nid)
+                    .map(|v| v.iter().map(|c| c.len).sum())
+                    .unwrap_or(0);
+                if have >= cap {
+                    *truncated = true;
+                    continue;
+                }
+                let room = cap - have;
+                if chunk.len > room {
+                    *truncated = true;
+                    let idx: Vec<usize> = (0..room).collect();
+                    *total_captured += room;
+                    results.entry(nid).or_default().push(chunk.gather(&idx));
+                    continue;
+                }
+            }
+            *total_captured += chunk.len;
             results.entry(nid).or_default().push(chunk);
         } else {
             for (k, &s) in succ.iter().enumerate() {

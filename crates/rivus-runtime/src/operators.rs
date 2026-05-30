@@ -150,12 +150,16 @@ impl Operator for MemSource {
     }
 }
 
-/// Build the operator for a node from its IR op.
-pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator> {
+/// Build the operator for a node from its IR op. `preview` lets a CSV source
+/// sample-infer its schema (instant start) for sink-less preview runs.
+pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Box<dyn Operator> {
     match op {
-        Op::OpenCsv { path, projection } => {
-            Box::new(SourceCsv::new(path.clone(), projection.clone(), chunk_size))
-        }
+        Op::OpenCsv { path, projection } => Box::new(SourceCsv::new(
+            path.clone(),
+            projection.clone(),
+            chunk_size,
+            preview,
+        )),
         Op::OpenBinary {
             path,
             fields,
@@ -211,6 +215,7 @@ struct SourceCsv {
     projection: Option<Vec<String>>,
     chunk_size: usize,
     loaded: bool,
+    preview: bool,
     schema: Arc<Schema>,
     /// Streaming reader for a real file; `None` for stdin / after a load error.
     stream: Option<csv::CsvChunker>,
@@ -221,12 +226,18 @@ struct SourceCsv {
 }
 
 impl SourceCsv {
-    fn new(path: String, projection: Option<Vec<String>>, chunk_size: usize) -> Self {
+    fn new(
+        path: String,
+        projection: Option<Vec<String>>,
+        chunk_size: usize,
+        preview: bool,
+    ) -> Self {
         SourceCsv {
             path,
             projection,
             chunk_size: chunk_size.max(1),
             loaded: false,
+            preview,
             schema: Schema::empty(),
             stream: None,
             columns: Vec::new(),
@@ -240,7 +251,12 @@ impl SourceCsv {
         if self.path == "-" {
             self.load_stdin(ctx);
         } else {
-            match csv::CsvChunker::open(&self.path, self.projection.as_deref(), self.chunk_size) {
+            match csv::CsvChunker::open(
+                &self.path,
+                self.projection.as_deref(),
+                self.chunk_size,
+                self.preview,
+            ) {
                 Ok((schema, chunker)) => {
                     if chunker.bad_rows > 0 {
                         ctx.raise(
