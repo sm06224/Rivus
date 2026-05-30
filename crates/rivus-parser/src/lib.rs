@@ -1033,6 +1033,8 @@ fn is_keyword(w: &str) -> bool {
             | "describe"
             | "dropna"
             | "fill"
+            | "drop"
+            | "rename"
             | "where"
             | "on"
             | "map"
