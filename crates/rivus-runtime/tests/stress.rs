@@ -250,6 +250,81 @@ fn jsonl_source_matches_oracle() {
 }
 
 #[test]
+fn json_array_source_matches_oracle() {
+    // A large top-level JSON array of objects (multi-line) must filter to the
+    // same count as an oracle replaying the generator's PRNG.
+    let rows = 30_000;
+    let seed = 88;
+    let lines = gendata::jsonl_clean(rows, seed);
+    let array = format!("[\n{}\n]", lines.trim_end().replace('\n', ",\n"));
+    let raw = gendata::write_temp("stress_jsonarr", &array);
+    let mut jpath = raw.clone();
+    jpath.set_extension("json");
+    std::fs::rename(&raw, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+
+    let mut rng = Rng::new(seed);
+    let mut ge = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(90);
+        let _score = rng.below(10_000);
+        let _country = rng.below(5);
+        let _active = rng.below(2);
+        if age >= 50 {
+            ge += 1;
+        }
+    }
+
+    for cs in [1, 1000, 8192] {
+        let res = run_src(
+            &format!("F:\n open {}\n |? age >= 50\n;", jpath.display()),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), ge, "json array chunk_size={cs}");
+        assert!(res.errors.is_empty(), "clean json array should not error");
+    }
+}
+
+#[test]
+fn csv_to_jsonl_roundtrip_preserves_data() {
+    // open CSV -> save JSONL -> open JSONL: the same filter must yield the same
+    // count, proving the source/sink format pair round-trips (numbers, strings,
+    // bools all survive).
+    let rows = 5_000;
+    let seed = 3;
+    let csv = TempCsv(gendata::write_temp("rt_csv", &gendata::clean(rows, seed)));
+    let mut jpath = csv.0.clone();
+    jpath.set_extension("jsonl");
+    let _jguard = TempCsv(jpath.clone());
+
+    // Convert CSV -> JSONL (explicit `as jsonl`).
+    run_src(
+        &format!(
+            "C:\n open {}\n save {} as jsonl\n;",
+            csv.0.display(),
+            jpath.display()
+        ),
+        4096,
+    );
+
+    let want = run_src(
+        &format!("C:\n open {}\n |? age >= 45\n;", csv.0.display()),
+        4096,
+    )
+    .total_rows_out();
+    let got = run_src(
+        &format!("J:\n open {}\n |? age >= 45\n;", jpath.display()),
+        4096,
+    )
+    .total_rows_out();
+    assert!(want > 0 && want < rows as u64);
+    assert_eq!(
+        want, got,
+        "CSV->JSONL->read must preserve the filtered count"
+    );
+}
+
+#[test]
 fn fanout_merge_conserves_rows() {
     let rows = 20_000;
     let data = gendata::clean(rows, 99);
@@ -277,4 +352,52 @@ fn fanout_merge_conserves_rows() {
     // Here we assert the total equals |B|+|C|+|A| = rows + |A|.
     let a = run_src(&format!("F:\n open {p}\n |? age >= 60\n;"), 4096).total_rows_out() as usize;
     assert_eq!(merged_rows, rows + a, "fan-out/merge row conservation");
+}
+
+#[test]
+fn group_aggregates_are_exact() {
+    // `|# country sum:age max:age` (+ implicit count) must match an oracle that
+    // buckets the regenerated PRNG stream by country.
+    use std::collections::BTreeMap;
+    let rows = 20_000;
+    let seed = 314;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_groupagg", &data));
+    let p = f.0.display();
+
+    let countries = ["JP", "US", "DE", "FR", "BR"];
+    let mut rng = Rng::new(seed);
+    let mut oracle: BTreeMap<String, (i64, f64, f64)> = BTreeMap::new(); // (count,sum,max)
+    for _ in 0..rows {
+        let age = rng.below(90) as f64;
+        let _score = rng.below(10_000);
+        let c = countries[rng.below(5) as usize].to_string();
+        let _active = rng.below(2);
+        let e = oracle.entry(c).or_insert((0, 0.0, f64::NEG_INFINITY));
+        e.0 += 1;
+        e.1 += age;
+        e.2 = e.2.max(age);
+    }
+
+    let res = run_src(
+        &format!("G:\n open {p}\n |# country sum:age max:age\n;"),
+        4096,
+    );
+    let out = &res.outputs[0];
+    let chunk = &out.chunks[0];
+    assert_eq!(
+        chunk.schema.field_names(),
+        vec!["country", "count", "sum_age", "max_age"]
+    );
+    assert_eq!(chunk.len, oracle.len());
+    for row in 0..chunk.len {
+        let country = chunk.value(row, 0).to_string();
+        let count = chunk.value(row, 1).as_f64().unwrap() as i64;
+        let sum = chunk.value(row, 2).as_f64().unwrap();
+        let max = chunk.value(row, 3).as_f64().unwrap();
+        let (oc, os, om) = oracle[&country];
+        assert_eq!(count, oc, "count[{country}]");
+        assert_eq!(sum, os, "sum[{country}]");
+        assert_eq!(max, om, "max[{country}]");
+    }
 }

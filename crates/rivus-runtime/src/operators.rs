@@ -12,7 +12,7 @@ use crate::kernel;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
-use rivus_ir::{BinType, Endian, Expr, NodeId, Op};
+use rivus_ir::{AggFunc, BinType, Endian, Expr, NodeId, Op};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -51,6 +51,59 @@ pub trait Operator {
     }
 }
 
+/// Read a text source: the `-` sentinel reads stdin, otherwise a file.
+fn read_input(path: &str) -> std::io::Result<String> {
+    if path == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path)
+    }
+}
+
+/// Write a text sink: the `-` sentinel writes stdout, otherwise a file.
+fn write_output(path: &str, data: &str) -> std::io::Result<()> {
+    if path == "-" {
+        use std::io::Write;
+        std::io::stdout().write_all(data.as_bytes())
+    } else {
+        std::fs::write(path, data)
+    }
+}
+
+/// A source that yields pre-parsed chunks (used by the parallel executor: the
+/// file is parsed once, then partitions are fed to per-worker sub-DAGs).
+pub fn mem_source(chunks: Vec<Chunk>) -> Box<dyn Operator> {
+    Box::new(MemSource {
+        chunks: chunks.into(),
+    })
+}
+
+/// An identity operator that forwards its input, so the engine captures it as a
+/// leaf output (used to collect a file sink's rows for a single post-merge write
+/// during parallel execution).
+pub fn collector() -> Box<dyn Operator> {
+    Box::new(Merge)
+}
+
+struct MemSource {
+    chunks: std::collections::VecDeque<Chunk>,
+}
+
+impl Operator for MemSource {
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn pull(&mut self, _ctx: &mut OpCtx) -> Option<Chunk> {
+        self.chunks.pop_front()
+    }
+    fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        Vec::new()
+    }
+}
+
 /// Build the operator for a node from its IR op.
 pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator> {
     match op {
@@ -79,7 +132,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
             preds: preds.clone(),
             fields: fields.clone(),
         }),
-        Op::GroupBy { key } => Box::new(GroupBy::new(key.clone())),
+        Op::GroupBy { key, aggs } => Box::new(GroupBy::new(key.clone(), aggs.clone())),
         Op::Merge => Box::new(Merge),
         Op::Branch => Box::new(Merge), // identity forwarder; fan-out is structural
         Op::Join {
@@ -92,6 +145,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         )),
         Op::SinkPrint => Box::new(SinkPrint),
         Op::SinkCsv { path } => Box::new(SinkCsv::new(path.clone())),
+        Op::SinkJsonl { path } => Box::new(SinkJsonl::new(path.clone())),
     }
 }
 
@@ -124,7 +178,7 @@ impl SourceCsv {
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -403,7 +457,7 @@ impl SourceJsonl {
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -620,17 +674,76 @@ impl Operator for FilterProject {
 
 // ------------------------------------------------------------------- group by
 
+/// Running accumulator for one aggregate within one group.
+#[derive(Clone)]
+struct AggAcc {
+    sum: f64,
+    min: f64,
+    max: f64,
+    n: i64,
+}
+
+impl AggAcc {
+    fn new() -> Self {
+        AggAcc {
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            n: 0,
+        }
+    }
+    fn add(&mut self, v: f64) {
+        self.sum += v;
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+        self.n += 1;
+    }
+    fn value(&self, f: AggFunc) -> f64 {
+        match f {
+            AggFunc::Sum => self.sum,
+            AggFunc::Avg => {
+                if self.n > 0 {
+                    self.sum / self.n as f64
+                } else {
+                    0.0
+                }
+            }
+            AggFunc::Min => {
+                if self.n > 0 {
+                    self.min
+                } else {
+                    0.0
+                }
+            }
+            AggFunc::Max => {
+                if self.n > 0 {
+                    self.max
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
+struct GroupState {
+    count: i64,
+    accs: Vec<AggAcc>,
+}
+
 struct GroupBy {
     key: String,
-    counts: BTreeMap<String, i64>,
+    aggs: Vec<(AggFunc, String)>,
+    groups: BTreeMap<String, GroupState>,
     emitted: bool,
 }
 
 impl GroupBy {
-    fn new(key: String) -> Self {
+    fn new(key: String, aggs: Vec<(AggFunc, String)>) -> Self {
         GroupBy {
             key,
-            counts: BTreeMap::new(),
+            aggs,
+            groups: BTreeMap::new(),
             emitted: false,
         }
     }
@@ -638,7 +751,7 @@ impl GroupBy {
 
 impl Operator for GroupBy {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let Some(col_idx) = chunk.schema.index_of(&self.key) else {
+        let Some(key_idx) = chunk.schema.index_of(&self.key) else {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Warn,
@@ -649,9 +762,28 @@ impl Operator for GroupBy {
             );
             return Vec::new();
         };
+        // Resolve aggregate column indices once per chunk.
+        let agg_idx: Vec<Option<usize>> = self
+            .aggs
+            .iter()
+            .map(|(_, c)| chunk.schema.index_of(c))
+            .collect();
+        let naggs = self.aggs.len();
+
         for row in 0..chunk.len {
-            let k = chunk.value(row, col_idx).to_string();
-            *self.counts.entry(k).or_insert(0) += 1;
+            let k = chunk.value(row, key_idx).to_string();
+            let state = self.groups.entry(k).or_insert_with(|| GroupState {
+                count: 0,
+                accs: vec![AggAcc::new(); naggs],
+            });
+            state.count += 1;
+            for (j, idx) in agg_idx.iter().enumerate() {
+                if let Some(ci) = idx {
+                    if let Some(v) = chunk.value(row, *ci).as_f64() {
+                        state.accs[j].add(v);
+                    }
+                }
+            }
         }
         Vec::new() // group is a materializing boundary; output on finish
     }
@@ -661,18 +793,31 @@ impl Operator for GroupBy {
             return Vec::new();
         }
         self.emitted = true;
-        let keys: StrColumn = self.counts.keys().map(String::as_str).collect();
-        let vals: Vec<i64> = self.counts.values().copied().collect();
-        let schema = Arc::new(Schema::new(vec![
+
+        let keys: StrColumn = self.groups.keys().map(String::as_str).collect();
+        let counts: Vec<i64> = self.groups.values().map(|s| s.count).collect();
+
+        let mut fields = vec![
             Field::new(self.key.clone(), DataType::Str),
             Field::new("count", DataType::I64),
-        ]));
+        ];
+        let mut columns: Vec<Column> = vec![Column::Str(keys), Column::I64(counts)];
+
+        for (j, (func, col)) in self.aggs.iter().enumerate() {
+            let vals: Vec<f64> = self
+                .groups
+                .values()
+                .map(|s| s.accs[j].value(*func))
+                .collect();
+            fields.push(Field::new(
+                format!("{}_{}", func.as_str(), col),
+                DataType::F64,
+            ));
+            columns.push(Column::F64(vals));
+        }
+
         let id = ctx.fresh_id();
-        vec![Chunk::new(
-            id,
-            schema,
-            vec![Column::Str(keys), Column::I64(vals)],
-        )]
+        vec![Chunk::new(id, Arc::new(Schema::new(fields)), columns)]
     }
 }
 
@@ -766,21 +911,7 @@ impl Operator for SinkCsv {
     }
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let mut out = String::new();
-        if let Some(first) = self.buf.first() {
-            out.push_str(&first.schema.field_names().join(","));
-            out.push('\n');
-            for chunk in &self.buf {
-                for row in 0..chunk.len {
-                    let cells: Vec<String> = (0..chunk.columns.len())
-                        .map(|c| csv_escape(&chunk.value(row, c)))
-                        .collect();
-                    out.push_str(&cells.join(","));
-                    out.push('\n');
-                }
-            }
-        }
-        if let Err(e) = std::fs::write(&self.path, out) {
+        if let Err(e) = write_csv_file(&self.path, &self.buf) {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,
@@ -794,6 +925,26 @@ impl Operator for SinkCsv {
     }
 }
 
+/// Render `chunks` (sharing a schema) to a CSV file: a header line then rows.
+/// Shared by the serial `SinkCsv` and the parallel executor's single-write merge.
+pub fn write_csv_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
+    let mut out = String::new();
+    if let Some(first) = chunks.first() {
+        out.push_str(&first.schema.field_names().join(","));
+        out.push('\n');
+        for chunk in chunks {
+            for row in 0..chunk.len {
+                let cells: Vec<String> = (0..chunk.columns.len())
+                    .map(|c| csv_escape(&chunk.value(row, c)))
+                    .collect();
+                out.push_str(&cells.join(","));
+                out.push('\n');
+            }
+        }
+    }
+    write_output(path, &out)
+}
+
 fn csv_escape(v: &Value) -> String {
     let s = v.to_string();
     if s.contains(',') || s.contains('"') || s.contains('\n') {
@@ -801,4 +952,95 @@ fn csv_escape(v: &Value) -> String {
     } else {
         s
     }
+}
+
+// ----------------------------------------------------------------- sink: jsonl
+
+/// Writes JSON Lines (one object per row), mirroring the JSONL source so a flow
+/// can read and write the same format. Buffered, written on finish.
+struct SinkJsonl {
+    path: String,
+    buf: Vec<Chunk>,
+}
+
+impl SinkJsonl {
+    fn new(path: String) -> Self {
+        SinkJsonl {
+            path,
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl Operator for SinkJsonl {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        self.buf.push(chunk);
+        Vec::new() // consume: written on finish
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if let Err(e) = write_jsonl_file(&self.path, &self.buf) {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Critical,
+                    ErrorScope::Graph,
+                    format!("cannot write '{}': {e}", self.path),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        Vec::new()
+    }
+}
+
+/// Render `chunks` as JSON Lines (one object per row). Shared by the serial
+/// `SinkJsonl` and the parallel executor's single-write merge.
+pub fn write_jsonl_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
+    let mut out = String::new();
+    for chunk in chunks {
+        let names = chunk.schema.field_names();
+        for row in 0..chunk.len {
+            out.push('{');
+            for (c, name) in names.iter().enumerate() {
+                if c > 0 {
+                    out.push(',');
+                }
+                json_string(&mut out, name);
+                out.push(':');
+                json_value(&mut out, &chunk.value(row, c));
+            }
+            out.push_str("}\n");
+        }
+    }
+    write_output(path, &out)
+}
+
+/// Encode a JSON value from a Rivus scalar.
+fn json_value(out: &mut String, v: &Value) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::I64(n) => out.push_str(&n.to_string()),
+        // JSON has no NaN/Infinity → emit null (continue-first).
+        Value::F64(f) if f.is_finite() => out.push_str(&f.to_string()),
+        Value::F64(_) => out.push_str("null"),
+        Value::Str(s) => json_string(out, s),
+    }
+}
+
+/// Append a JSON-escaped string (with quotes) to `out`.
+fn json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }

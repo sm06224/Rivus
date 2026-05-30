@@ -13,9 +13,9 @@
 
 use crate::operators::{self, OpCtx, Operator};
 use crate::telemetry::NodeTelemetry;
-use rivus_core::{Chunk, ErrorEvent, Mode, RivusError};
-use rivus_ir::{HookAction, HookEvent, NodeId, PlanGraph};
-use std::collections::{HashMap, VecDeque};
+use rivus_core::{Chunk, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
+use rivus_ir::{HookAction, HookEvent, NodeId, Op, PlanGraph};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -56,16 +56,52 @@ impl RunResult {
 }
 
 pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError> {
-    let n = graph.nodes.len();
-    let topo = graph
-        .topo_order()
-        .ok_or_else(|| RivusError::Build("flow graph contains a cycle".into()))?;
+    if graph.topo_order().is_none() {
+        return Err(RivusError::Build("flow graph contains a cycle".into()));
+    }
+    // Data-parallel fast path for stateless, single-source flows; else serial.
+    if let Some(res) = try_parallel(graph, &opts) {
+        return Ok(res);
+    }
+    let ops = build_ops(graph, &opts, None);
+    Ok(drive(graph, ops, 0))
+}
 
-    let mut ops: Vec<Box<dyn Operator>> = graph
+/// Build one operator per node. In parallel mode, `mem` replaces the single
+/// source with a pre-parsed [`operators::mem_source`] and any file sink with a
+/// collector (rows gathered and written once after the merge).
+fn build_ops(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    mem: Option<(NodeId, Vec<Chunk>)>,
+) -> Vec<Box<dyn Operator>> {
+    let (mem_id, mut mem_chunks) = match mem {
+        Some((id, c)) => (Some(id), Some(c)),
+        None => (None, None),
+    };
+    graph
         .nodes
         .iter()
-        .map(|node| operators::build(&node.op, &graph.inputs_of(node.id), opts.chunk_size))
-        .collect();
+        .map(|node| {
+            if Some(node.id) == mem_id {
+                operators::mem_source(mem_chunks.take().unwrap_or_default())
+            } else if mem_id.is_some()
+                && matches!(node.op, Op::SinkCsv { .. } | Op::SinkJsonl { .. })
+            {
+                operators::collector()
+            } else {
+                operators::build(&node.op, &graph.inputs_of(node.id), opts.chunk_size)
+            }
+        })
+        .collect()
+}
+
+/// Drive the DAG to completion with a pre-built operator set (the chunk-granular
+/// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
+fn drive(graph: &PlanGraph, mut ops: Vec<Box<dyn Operator>>, chunk_id_base: u64) -> RunResult {
+    let n = graph.nodes.len();
+    let topo = graph.topo_order().expect("acyclic (checked by caller)");
+
     let mut in_q: Vec<VecDeque<(NodeId, Chunk)>> = (0..n).map(|_| VecDeque::new()).collect();
     let mut done = vec![false; n];
     let mut upstream_remaining: Vec<usize> = (0..n).map(|i| graph.inputs_of(i).len()).collect();
@@ -83,7 +119,7 @@ pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError>
         })
         .collect();
     let mut mode = Mode::Normal;
-    let mut next_chunk_id: u64 = 0;
+    let mut next_chunk_id: u64 = chunk_id_base;
     let mut fatal = false;
 
     let mut active = true;
@@ -179,12 +215,230 @@ pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError>
         .collect();
     outputs.sort_by_key(|o| o.node_id);
 
-    Ok(RunResult {
+    RunResult {
         telemetry,
         errors,
         final_mode: mode,
         outputs,
-    })
+    }
+}
+
+/// Rank for escalating runtime modes when merging parallel partitions.
+fn mode_rank(m: Mode) -> u8 {
+    match m {
+        Mode::Normal => 0,
+        Mode::Degraded => 1,
+        Mode::Recovery => 2,
+        Mode::Isolation => 3,
+        Mode::Emergency => 4,
+        Mode::Halted => 5,
+    }
+}
+
+/// Split chunks into `n` contiguous groups (order-preserving on concatenation).
+fn partition(all: Vec<Chunk>, n: usize) -> Vec<Vec<Chunk>> {
+    let total = all.len();
+    let base = total / n;
+    let rem = total % n;
+    let mut it = all.into_iter();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let take = base + if i < rem { 1 } else { 0 };
+        let group: Vec<Chunk> = it.by_ref().take(take).collect();
+        if !group.is_empty() {
+            out.push(group);
+        }
+    }
+    out
+}
+
+/// Attempt data-parallel execution. Eligible flows have exactly one file source
+/// and no stateful operators (group/join/stream). The source is parsed once
+/// (its parse is already internally parallel), then contiguous chunk partitions
+/// are run through identical stateless sub-DAGs on worker threads and merged in
+/// source order. Returns `None` (→ serial) when ineligible or too small.
+fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        return None;
+    }
+
+    let mut source: Option<NodeId> = None;
+    for node in &graph.nodes {
+        match &node.op {
+            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. } => {
+                if source.is_some() {
+                    return None; // multiple sources → serial
+                }
+                source = Some(node.id);
+            }
+            // Stateful or replay → not partitionable; run serially.
+            Op::GroupBy { .. } | Op::Join { .. } | Op::StreamRef { .. } => return None,
+            _ => {}
+        }
+    }
+    let src_id = source?;
+
+    // Parse the source once.
+    let mut src_op = operators::build(&graph.nodes[src_id].op, &[], opts.chunk_size);
+    let mut src_errors: Vec<ErrorEvent> = Vec::new();
+    let mut next_id: u64 = 0;
+    let mut all: Vec<Chunk> = Vec::new();
+    {
+        let mut ctx = OpCtx {
+            label: label_of(graph, src_id),
+            errors: &mut src_errors,
+            next_chunk_id: &mut next_id,
+        };
+        while let Some(c) = src_op.pull(&mut ctx) {
+            all.push(c);
+        }
+    }
+    let src_fatal = src_errors.iter().any(ErrorEvent::is_fatal);
+
+    // Too few chunks to be worth threads: run once over the already-parsed data.
+    if all.len() < threads * 2 {
+        let ops = build_ops(graph, opts, Some((src_id, all)));
+        let mut res = drive(graph, ops, 0);
+        // Write any collected sink (build_ops made it a collector).
+        flush_parallel_sinks(graph, &mut res);
+        res.errors.splice(0..0, src_errors);
+        if src_fatal {
+            res.final_mode = Mode::Halted;
+        }
+        return Some(res);
+    }
+
+    // Run partitions on worker threads.
+    let parts = partition(all, threads);
+    let results: Vec<RunResult> = std::thread::scope(|scope| {
+        let handles: Vec<_> = parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, chunks)| {
+                scope.spawn(move || {
+                    let ops = build_ops(graph, opts, Some((src_id, chunks)));
+                    drive(graph, ops, (i as u64) << 40)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    Some(merge_results(graph, results, src_errors, src_fatal))
+}
+
+/// In the single-partition path, file sinks were built as collectors; write
+/// their gathered rows once and drop them from `outputs` (a sink consumes).
+fn flush_parallel_sinks(graph: &PlanGraph, res: &mut RunResult) {
+    let mut kept = Vec::new();
+    for out in std::mem::take(&mut res.outputs) {
+        if let Some((path, result)) = write_sink(&graph.nodes[out.node_id].op, &out.chunks) {
+            if let Err(e) = result {
+                res.errors.push(
+                    ErrorEvent::new(
+                        Severity::Critical,
+                        ErrorScope::Graph,
+                        format!("cannot write '{path}': {e}"),
+                    )
+                    .at_node(label_of(graph, out.node_id)),
+                );
+            }
+        } else {
+            kept.push(out);
+        }
+    }
+    res.outputs = kept;
+}
+
+/// If `op` is a file sink, write `chunks` to it once and return (path, result).
+fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Result<()>)> {
+    match op {
+        Op::SinkCsv { path } => Some((path, operators::write_csv_file(path, chunks))),
+        Op::SinkJsonl { path } => Some((path, operators::write_jsonl_file(path, chunks))),
+        _ => None,
+    }
+}
+
+/// Merge per-partition results in source order: concatenate outputs, sum
+/// telemetry, union the error stream, escalate the mode, and write each file
+/// sink exactly once.
+fn merge_results(
+    graph: &PlanGraph,
+    results: Vec<RunResult>,
+    src_errors: Vec<ErrorEvent>,
+    src_fatal: bool,
+) -> RunResult {
+    let mut telemetry: Vec<NodeTelemetry> = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            NodeTelemetry::new(
+                node.id,
+                label_of(graph, node.id),
+                node.op.kind_str().to_string(),
+            )
+        })
+        .collect();
+    let mut errors: Vec<ErrorEvent> = src_errors;
+    let mut mode = Mode::Normal;
+    let mut by_node: BTreeMap<NodeId, Vec<Chunk>> = BTreeMap::new();
+
+    for res in results {
+        if mode_rank(res.final_mode) > mode_rank(mode) {
+            mode = res.final_mode;
+        }
+        errors.extend(res.errors);
+        for (i, t) in res.telemetry.into_iter().enumerate() {
+            telemetry[i].chunks_in += t.chunks_in;
+            telemetry[i].chunks_out += t.chunks_out;
+            telemetry[i].rows_in += t.rows_in;
+            telemetry[i].rows_out += t.rows_out;
+            telemetry[i].errors += t.errors;
+            telemetry[i].busy += t.busy;
+            telemetry[i].finished |= t.finished;
+            if t.mode != Mode::Normal {
+                telemetry[i].mode = t.mode;
+            }
+        }
+        for o in res.outputs {
+            by_node.entry(o.node_id).or_default().extend(o.chunks);
+        }
+    }
+    if src_fatal {
+        mode = Mode::Halted;
+    }
+
+    let mut outputs = Vec::new();
+    for (node_id, chunks) in by_node {
+        if let Some((path, result)) = write_sink(&graph.nodes[node_id].op, &chunks) {
+            if let Err(e) = result {
+                errors.push(
+                    ErrorEvent::new(
+                        Severity::Critical,
+                        ErrorScope::Graph,
+                        format!("cannot write '{path}': {e}"),
+                    )
+                    .at_node(label_of(graph, node_id)),
+                );
+            }
+        } else {
+            outputs.push(Output {
+                node_id,
+                label: graph.nodes[node_id].label.clone(),
+                chunks,
+            });
+        }
+    }
+
+    RunResult {
+        telemetry,
+        errors,
+        final_mode: mode,
+        outputs,
+    }
 }
 
 /// Push a node's produced chunks to its successors (fan-out) or capture them as

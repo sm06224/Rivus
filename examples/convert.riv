@@ -1,0 +1,8 @@
+# Source/sink format symmetry: read CSV, write JSONL (write what you can read).
+#   rivus run examples/convert.riv  &&  cat examples/jp.jsonl
+Export:
+    open examples/users.csv
+    |? country == "JP"
+    |> name age
+    save examples/jp.jsonl
+;

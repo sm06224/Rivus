@@ -1,0 +1,12 @@
+Rivus
+Copyright 2026 sm06224
+
+This product is licensed under the Apache License, Version 2.0 (see the LICENSE
+file). The shipped runtime has no third-party dependencies; build- and test-only
+tooling (e.g. criterion) is isolated under [dev-dependencies] and is not
+distributed with the runtime.
+
+Acknowledgment: portions of this project were developed with the assistance of
+AI tooling (Anthropic's Claude). Such assistance is noted here for transparency;
+copyright in the work is held by the human author named above. AI systems are
+not, and cannot be, copyright holders.

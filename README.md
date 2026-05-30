@@ -91,4 +91,11 @@ is implemented vs. designed-but-pending.
 
 ## License
 
-Apache-2.0 (see [LICENSE](LICENSE)).
+Licensed under the **Apache License 2.0** (see [LICENSE](LICENSE) and
+[NOTICE](NOTICE)).
+
+Use it freely — commercial use, modification, and redistribution are all
+permitted, and the license includes an explicit patent grant. It is provided
+**as-is, without warranty or liability** (LICENSE §7–8). Copyright is held by
+the human author (sm06224); AI tooling assisted development and is credited in
+NOTICE for transparency, not as a copyright holder.

@@ -96,19 +96,22 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "run" => {
-            println!("\u{2550}\u{2550} Rivus \u{2550}\u{2550}  flow: {path}\n");
+            // Human-facing visualization goes to STDERR so that a `save stdout`
+            // sink leaves STDOUT as clean data for shell pipes (`… | rivus run
+            // flow.riv | …`). Interactive terminals still show stderr.
+            eprintln!("\u{2550}\u{2550} Rivus \u{2550}\u{2550}  flow: {path}\n");
             let (graph, report) = if optimize {
                 rivus_optimizer::optimize(parsed)
             } else {
                 (parsed, rivus_optimizer::OptReport::default())
             };
             if !report.is_empty() {
-                print!("{}", viz::render_opt_report(&report));
-                println!();
+                eprint!("{}", viz::render_opt_report(&report));
+                eprintln!();
             }
             match run(&graph, RunOptions { chunk_size }) {
                 Ok(res) => {
-                    print!("{}", viz::render_run(&graph, &res));
+                    eprint!("{}", viz::render_run(&graph, &res));
                     // A fatal error on the stream means the graph halted.
                     if res.final_mode == rivus_core::Mode::Halted {
                         return ExitCode::FAILURE;
