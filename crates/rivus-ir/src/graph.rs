@@ -6,7 +6,7 @@
 //! that the optimizer rewrites and that [`PlanGraph::to_source`] regenerates
 //! back into readable Rivus source (Master principle #5: IR reversibility).
 
-use crate::expr::{Access, Expr};
+use crate::expr::{Access, CmpOp, Expr};
 use rivus_core::{DataType, Mode, Severity};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -133,10 +133,14 @@ impl BinType {
 pub enum Op {
     /// `open path.csv`. `projection`, when set by the optimizer
     /// (`project_pushdown`), restricts which columns the reader builds — unused
-    /// columns are never parsed or allocated.
+    /// columns are never parsed or allocated. `prefilter`, set by
+    /// `filter_pushdown`, lets the reader skip *building* rows whose numeric
+    /// `(column, op, rhs)` conjunction is definitely false — a conservative
+    /// pre-pass; the downstream `FilterProject` remains authoritative.
     OpenCsv {
         path: String,
         projection: Option<Vec<String>>,
+        prefilter: Vec<(String, CmpOp, f64)>,
     },
     /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
     /// binary records (a C struct dump). `endian` selects byte order;
@@ -229,10 +233,24 @@ impl Op {
     /// Render this op as the pipeline fragment that produced it.
     fn to_src_line(&self) -> String {
         match self {
-            Op::OpenCsv { path, projection } => match projection {
-                Some(cols) => format!("open {path}  # read-only: {}", cols.join(",")),
-                None => format!("open {path}"),
-            },
+            Op::OpenCsv {
+                path,
+                projection,
+                prefilter,
+            } => {
+                let mut s = format!("open {path}");
+                if let Some(cols) = projection {
+                    s.push_str(&format!("  # read-only: {}", cols.join(",")));
+                }
+                if !prefilter.is_empty() {
+                    let preds: Vec<String> = prefilter
+                        .iter()
+                        .map(|(c, op, v)| format!("{c}{}{v}", op.as_str()))
+                        .collect();
+                    s.push_str(&format!("  # pre-filter: {}", preds.join(" and ")));
+                }
+                s
+            }
             Op::OpenBinary {
                 path,
                 fields,

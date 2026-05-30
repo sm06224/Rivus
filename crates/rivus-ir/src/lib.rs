@@ -24,6 +24,7 @@ mod tests {
         let a = g.add_node(Op::OpenCsv {
             path: "users.csv".into(),
             projection: None,
+            prefilter: Vec::new(),
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {
@@ -44,6 +45,7 @@ mod tests {
         let a = g.add_node(Op::OpenCsv {
             path: "users.csv".into(),
             projection: None,
+            prefilter: Vec::new(),
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {

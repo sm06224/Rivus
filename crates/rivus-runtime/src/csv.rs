@@ -23,6 +23,7 @@
 //! back to an owned, escape-aware split.
 
 use rivus_core::{Column, DataType, Field, Schema, StrColumn};
+use rivus_ir::CmpOp;
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -30,6 +31,62 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 /// Read buffer for the streaming reader. Larger than the 8 KiB default to cut
 /// syscalls on big sequential scans (inference and build each stream the file).
 const READ_BUF: usize = 256 * 1024;
+
+/// A pushed-down numeric predicate compiled to a raw column index for the
+/// reader: `(raw_col, op, rhs)`. Used to skip *building* rows that are
+/// definitely out — conservatively (a parse failure never drops a row).
+type PreCmp = (usize, CmpOp, f64);
+
+/// Resolve optimizer prefilter `(name, op, rhs)` to compiled `(raw_idx, …)`,
+/// keeping only predicates on a kept **numeric** column (so reader-side f64
+/// comparison matches the engine's column evaluation).
+fn compile_prefilter(
+    names: &[String],
+    keep: &[usize],
+    dtypes: &[DataType],
+    pf: &[(String, CmpOp, f64)],
+) -> Vec<PreCmp> {
+    let mut out = Vec::new();
+    for (name, op, rhs) in pf {
+        if let Some(raw) = names.iter().position(|n| n == name) {
+            if let Some(k) = keep.iter().position(|&c| c == raw) {
+                if matches!(dtypes[k], DataType::I64 | DataType::F64) {
+                    out.push((raw, *op, *rhs));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does a numeric value satisfy `value op rhs`?
+#[inline]
+fn cmp_num(value: f64, op: CmpOp, rhs: f64) -> bool {
+    match op {
+        CmpOp::Eq => value == rhs,
+        CmpOp::Ne => value != rhs,
+        CmpOp::Lt => value < rhs,
+        CmpOp::Le => value <= rhs,
+        CmpOp::Gt => value > rhs,
+        CmpOp::Ge => value >= rhs,
+    }
+}
+
+/// Conservative reader-side prefilter: skip a row only when a cell parses and
+/// the comparison is **definitely false**. A parse failure keeps the row (the
+/// authoritative FilterProject downstream decides).
+#[inline]
+fn row_passes_prefilter(pf: &[PreCmp], line: &str, offsets: &[(usize, usize)]) -> bool {
+    for &(idx, op, rhs) in pf {
+        let (s, e) = offsets[idx];
+        if let Ok(v) = line[s..e].trim().parse::<f64>() {
+            if !cmp_num(v, op, rhs) {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 /// Streaming CSV reader: bounded memory regardless of file size.
 ///
@@ -53,6 +110,8 @@ pub struct CsvChunker {
     /// the file in a parallel worker). `limit == None` streams to EOF.
     pos: u64,
     limit: Option<u64>,
+    /// Compiled pushed-down numeric predicates (skip building failing rows).
+    prefilter: Vec<PreCmp>,
 }
 
 impl CsvChunker {
@@ -69,9 +128,10 @@ impl CsvChunker {
         allow: Option<&[String]>,
         chunk_size: usize,
         preview: bool,
+        prefilter: &[(String, CmpOp, f64)],
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
-            return Self::open_preview(path, allow, chunk_size);
+            return Self::open_preview(path, allow, chunk_size, prefilter);
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -116,6 +176,7 @@ impl CsvChunker {
             fields.push(Field::new(names[ci].clone(), dtypes[k]));
         }
         let schema = Schema::new(fields);
+        let pre = compile_prefilter(&names, &keep, &dtypes, prefilter);
 
         // ---- pass 2 setup: reopen and skip the header line ----
         let f2 = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -134,6 +195,7 @@ impl CsvChunker {
                 line: String::new(),
                 bad_rows: bad,
                 eof: false,
+                prefilter: pre,
                 pos: 0,
                 limit: None,
             },
@@ -146,6 +208,7 @@ impl CsvChunker {
         path: &str,
         allow: Option<&[String]>,
         chunk_size: usize,
+        prefilter: &[(String, CmpOp, f64)],
     ) -> Result<(Schema, CsvChunker), String> {
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut reader = BufReader::with_capacity(READ_BUF, f);
@@ -189,6 +252,7 @@ impl CsvChunker {
             fields.push(Field::new(names[ci].clone(), dtypes[k]));
         }
         let schema = Schema::new(fields);
+        let pre = compile_prefilter(&names, &keep, &dtypes, prefilter);
 
         // Rewind to the first data row and stream from there with this schema.
         reader
@@ -206,6 +270,7 @@ impl CsvChunker {
                 line: String::new(),
                 bad_rows: bad,
                 eof: false,
+                prefilter: pre,
                 pos: 0,
                 limit: None,
             },
@@ -215,6 +280,7 @@ impl CsvChunker {
     /// Stream one byte range `[start, end)` of the file with an already-inferred
     /// global schema (used by the parallel streaming executor). `start`/`end`
     /// must be newline-aligned offsets into the data region (see `plan_parallel`).
+    #[allow(clippy::too_many_arguments)]
     pub fn for_range(
         path: &str,
         dtypes: Vec<DataType>,
@@ -223,6 +289,7 @@ impl CsvChunker {
         start: u64,
         end: u64,
         chunk_size: usize,
+        prefilter: Vec<PreCmp>,
     ) -> Result<CsvChunker, String> {
         let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
@@ -235,6 +302,7 @@ impl CsvChunker {
             line: String::new(),
             bad_rows: 0,
             eof: false,
+            prefilter,
             pos: start,
             limit: Some(end),
         })
@@ -284,11 +352,19 @@ impl CsvChunker {
                 if offsets.len() != self.ncols {
                     continue;
                 }
+                // Pushed-down prefilter: skip building rows that are definitely
+                // out (conservative; the downstream FilterProject is final).
+                if !self.prefilter.is_empty() && !row_passes_prefilter(&self.prefilter, l, &offsets)
+                {
+                    continue;
+                }
                 for (k, &ci) in self.keep.iter().enumerate() {
                     let (s, e) = offsets[ci];
                     builders[k].push(&l[s..e]);
                 }
             } else {
+                // Quoted records take the owned slow path and skip the prefilter
+                // (rare; FilterProject still filters them downstream).
                 let fields = split_record(l);
                 if fields.len() != self.ncols {
                     continue;
@@ -316,6 +392,8 @@ pub struct CsvParallelPlan {
     pub ncols: usize,
     pub ranges: Vec<(u64, u64)>,
     pub bad_rows: usize,
+    /// Compiled pushed-down prefilter (raw col index, op, rhs) for each worker.
+    pub prefilter: Vec<PreCmp>,
 }
 
 /// Build a [`CsvParallelPlan`]: read the header, snap `nthreads` byte ranges to
@@ -325,6 +403,7 @@ pub fn plan_parallel(
     path: &str,
     allow: Option<&[String]>,
     nthreads: usize,
+    prefilter: &[(String, CmpOp, f64)],
 ) -> Result<CsvParallelPlan, String> {
     let file_len = std::fs::metadata(path)
         .map_err(|e| format!("cannot stat '{path}': {e}"))?
@@ -379,6 +458,7 @@ pub fn plan_parallel(
     for (k, &ci) in keep.iter().enumerate() {
         fields.push(Field::new(names[ci].clone(), dtypes[k]));
     }
+    let pre = compile_prefilter(&names, &keep, &dtypes, prefilter);
 
     Ok(CsvParallelPlan {
         schema: Schema::new(fields),
@@ -387,6 +467,7 @@ pub fn plan_parallel(
         ncols,
         ranges,
         bad_rows: bad,
+        prefilter: pre,
     })
 }
 

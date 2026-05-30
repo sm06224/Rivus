@@ -12,7 +12,7 @@ use crate::kernel;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
-use rivus_ir::{AggFunc, BinType, Endian, Expr, NodeId, Op};
+use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, NodeId, Op};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -148,8 +148,9 @@ pub fn csv_range_source(
     start: u64,
     end: u64,
     chunk_size: usize,
+    prefilter: Vec<(usize, CmpOp, f64)>,
 ) -> Box<dyn Operator> {
-    match csv::CsvChunker::for_range(path, dtypes, keep, ncols, start, end, chunk_size) {
+    match csv::CsvChunker::for_range(path, dtypes, keep, ncols, start, end, chunk_size, prefilter) {
         Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
@@ -177,11 +178,16 @@ impl Operator for MemSource {
 /// sample-infer its schema (instant start) for sink-less preview runs.
 pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Box<dyn Operator> {
     match op {
-        Op::OpenCsv { path, projection } => Box::new(SourceCsv::new(
+        Op::OpenCsv {
+            path,
+            projection,
+            prefilter,
+        } => Box::new(SourceCsv::new(
             path.clone(),
             projection.clone(),
             chunk_size,
             preview,
+            prefilter.clone(),
         )),
         Op::OpenBinary {
             path,
@@ -250,6 +256,10 @@ struct SourceCsv {
     chunk_size: usize,
     loaded: bool,
     preview: bool,
+    /// Numeric `(column, op, rhs)` predicates pushed down by the optimizer; the
+    /// reader uses them to skip *building* rows that definitely fail (the
+    /// downstream FilterProject remains authoritative).
+    prefilter: Vec<(String, CmpOp, f64)>,
     schema: Arc<Schema>,
     /// Streaming reader for a real file; `None` for stdin / after a load error.
     stream: Option<csv::CsvChunker>,
@@ -265,6 +275,7 @@ impl SourceCsv {
         projection: Option<Vec<String>>,
         chunk_size: usize,
         preview: bool,
+        prefilter: Vec<(String, CmpOp, f64)>,
     ) -> Self {
         SourceCsv {
             path,
@@ -272,6 +283,7 @@ impl SourceCsv {
             chunk_size: chunk_size.max(1),
             loaded: false,
             preview,
+            prefilter,
             schema: Schema::empty(),
             stream: None,
             columns: Vec::new(),
@@ -289,6 +301,7 @@ impl SourceCsv {
             chunk_size: 0,
             loaded: true,
             preview: false,
+            prefilter: Vec::new(),
             schema,
             stream: Some(chunker),
             columns: Vec::new(),
@@ -307,6 +320,7 @@ impl SourceCsv {
                 self.projection.as_deref(),
                 self.chunk_size,
                 self.preview,
+                &self.prefilter,
             ) {
                 Ok((schema, chunker)) => {
                     if chunker.bad_rows > 0 {

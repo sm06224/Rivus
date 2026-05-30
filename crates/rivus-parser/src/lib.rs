@@ -344,6 +344,7 @@ impl Parser {
                 Ok(self.g.add_node(Op::OpenCsv {
                     path,
                     projection: None,
+                    prefilter: Vec::new(),
                 }))
             }
             Tok::Word(w) if w == "readjson" => {
@@ -756,6 +757,7 @@ impl Format {
             Format::Csv => Op::OpenCsv {
                 path,
                 projection: None,
+                prefilter: Vec::new(),
             },
             Format::Jsonl => Op::OpenJsonl { path },
         }
