@@ -250,6 +250,42 @@ fn jsonl_source_matches_oracle() {
 }
 
 #[test]
+fn json_array_source_matches_oracle() {
+    // A large top-level JSON array of objects (multi-line) must filter to the
+    // same count as an oracle replaying the generator's PRNG.
+    let rows = 30_000;
+    let seed = 88;
+    let lines = gendata::jsonl_clean(rows, seed);
+    let array = format!("[\n{}\n]", lines.trim_end().replace('\n', ",\n"));
+    let raw = gendata::write_temp("stress_jsonarr", &array);
+    let mut jpath = raw.clone();
+    jpath.set_extension("json");
+    std::fs::rename(&raw, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+
+    let mut rng = Rng::new(seed);
+    let mut ge = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(90);
+        let _score = rng.below(10_000);
+        let _country = rng.below(5);
+        let _active = rng.below(2);
+        if age >= 50 {
+            ge += 1;
+        }
+    }
+
+    for cs in [1, 1000, 8192] {
+        let res = run_src(
+            &format!("F:\n open {}\n |? age >= 50\n;", jpath.display()),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), ge, "json array chunk_size={cs}");
+        assert!(res.errors.is_empty(), "clean json array should not error");
+    }
+}
+
+#[test]
 fn fanout_merge_conserves_rows() {
     let rows = 20_000;
     let data = gendata::clean(rows, 99);
