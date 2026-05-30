@@ -197,10 +197,35 @@ impl Parser {
                     // no-op in the MVP (the boundary is implicit at a sink).
                     self.bump();
                 }
+                // `save PATH [as FMT]` — extension default, `as` overrides; the
+                // sink mirrors the source format set (write what you can read).
                 Tok::Word(w) if w == "save" => {
                     self.bump();
                     let path = self.word()?;
+                    let explicit = if self.peek_is_word("as") {
+                        self.bump();
+                        Some(self.word()?)
+                    } else {
+                        None
+                    };
+                    let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
+                        self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
+                    })?;
+                    let n = self.g.add_node(fmt.into_sink_op(path));
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                Tok::Word(w) if w == "writecsv" => {
+                    self.bump();
+                    let path = self.word()?;
                     let n = self.g.add_node(Op::SinkCsv { path });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                Tok::Word(w) if w == "writejson" => {
+                    self.bump();
+                    let path = self.word()?;
+                    let n = self.g.add_node(Op::SinkJsonl { path });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -576,6 +601,13 @@ impl Format {
             Format::Jsonl => Op::OpenJsonl { path },
         }
     }
+
+    fn into_sink_op(self, path: String) -> Op {
+        match self {
+            Format::Csv => Op::SinkCsv { path },
+            Format::Jsonl => Op::SinkJsonl { path },
+        }
+    }
 }
 
 /// Resolve the format for `open`: an explicit `as FMT` wins; otherwise fall back
@@ -605,6 +637,8 @@ fn is_keyword(w: &str) -> bool {
             | "readcsv"
             | "readjson"
             | "as"
+            | "writecsv"
+            | "writejson"
             | "stream"
             | "save"
             | "print"
@@ -642,6 +676,36 @@ mod tests {
     fn first_op(src: &str) -> Op {
         let g = parse(src).unwrap();
         g.nodes[0].op.clone()
+    }
+
+    fn nth_op(src: &str, n: usize) -> Op {
+        let g = parse(src).unwrap();
+        g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn sink_format_selection() {
+        // The sink mirrors the source format set: extension default + `as` + aliases.
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.csv\n;", 1),
+            Op::SinkCsv { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.jsonl\n;", 1),
+            Op::SinkJsonl { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.dat as json\n;", 1),
+            Op::SinkJsonl { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n writejson o.x\n;", 1),
+            Op::SinkJsonl { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n writecsv o.x\n;", 1),
+            Op::SinkCsv { .. }
+        ));
     }
 
     #[test]

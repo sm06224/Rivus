@@ -250,6 +250,45 @@ fn jsonl_source_matches_oracle() {
 }
 
 #[test]
+fn csv_to_jsonl_roundtrip_preserves_data() {
+    // open CSV -> save JSONL -> open JSONL: the same filter must yield the same
+    // count, proving the source/sink format pair round-trips (numbers, strings,
+    // bools all survive).
+    let rows = 5_000;
+    let seed = 3;
+    let csv = TempCsv(gendata::write_temp("rt_csv", &gendata::clean(rows, seed)));
+    let mut jpath = csv.0.clone();
+    jpath.set_extension("jsonl");
+    let _jguard = TempCsv(jpath.clone());
+
+    // Convert CSV -> JSONL (explicit `as jsonl`).
+    run_src(
+        &format!(
+            "C:\n open {}\n save {} as jsonl\n;",
+            csv.0.display(),
+            jpath.display()
+        ),
+        4096,
+    );
+
+    let want = run_src(
+        &format!("C:\n open {}\n |? age >= 45\n;", csv.0.display()),
+        4096,
+    )
+    .total_rows_out();
+    let got = run_src(
+        &format!("J:\n open {}\n |? age >= 45\n;", jpath.display()),
+        4096,
+    )
+    .total_rows_out();
+    assert!(want > 0 && want < rows as u64);
+    assert_eq!(
+        want, got,
+        "CSV->JSONL->read must preserve the filtered count"
+    );
+}
+
+#[test]
 fn fanout_merge_conserves_rows() {
     let rows = 20_000;
     let data = gendata::clean(rows, 99);
