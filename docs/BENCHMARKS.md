@@ -220,6 +220,30 @@ unchanged: the kernel targets *execution*-bound filtering, not I/O. Closing the
 remaining DuckDB gap on I/O-bound tasks needs parallel *pipeline* execution
 (item 9), which the external comparison already flagged.
 
+## Phase 0.9 — parallel pipeline execution
+
+The whole stateless pipeline now runs multi-threaded, not just parsing. When a
+flow has a single file source and no stateful op (group/join), the engine parses
+the source once, splits the chunks into contiguous partitions, runs identical
+stateless sub-DAGs on worker threads, and merges in source order (file sinks are
+written exactly once after the merge). Group/join/multi-source flows stay
+serial. Correctness is held by the existing stress + equivalence suites, which
+exercise the parallel path at small chunk sizes (`chunk_size=1` → thousands of
+chunks) and still match their oracles exactly.
+
+Measured (4 vCPU):
+
+| scenario | serial | parallel | change |
+|---|---:|---:|---|
+| `bench/compare.sh` 1M e2e (filter→project→write) | 0.277 s | **0.178 s** | **1.55×** (5.6 M rows/s) |
+| `large/filter_only` (200k, 6 cols) | ~50 ms | 39.8 ms | −23% |
+| `huge/filter_only_2M` (2M rows) | ~650 ms | **357 ms** | **−45% (~1.8×)** |
+
+The win **grows with data size** (more chunks to spread): ~1.3× at 200k, ~1.8×
+at 2M. Against the external baseline, optimized Rivus went 3.7 → **5.6 M rows/s**
+on the compare task — still behind DuckDB but materially closer, with the
+remaining gap now in parsing/IO parallelism rather than execution.
+
 ### Optimization backlog (driven by these numbers)
 
 1. ~~CSV reader, single-pass, zero owned-`String`~~ — ✅ Phase 0.1.
@@ -230,9 +254,10 @@ remaining DuckDB gap on I/O-bound tasks needs parallel *pipeline* execution
 6. ~~Arena string columns (offsets + bytes)~~ — ✅ Phase 0.6.
 7. ~~Zero-copy `&str` predicate eval~~ — ✅ Phase 0.7.
 8. ~~Vectorized numeric predicate kernel~~ — ✅ Phase 0.8.
-9. **Parallel pipeline execution** (chunk-split operators across workers) — the
-   measured path to DuckDB-class throughput on I/O-bound queries (doc 05).
+9. ~~Parallel pipeline execution~~ — ✅ Phase 0.9.
 10. **Filter pushdown** into the reader (skip building rows that won't survive).
+11. **Parallel sink writing** + memory-mapped source reads (close the rest of
+    the DuckDB gap, which is now in parse/IO rather than execution).
 
 ### Cumulative (200k rows, end-to-end read→parse→run)
 

@@ -10,12 +10,20 @@ binding unless the user overrides it.
   decisions in PR descriptions, not as blocking questions.
 - **Keep momentum.** Land work as a chain of small, reviewable PRs.
 
-## Workflow: stacked PRs, locally guaranteed
+## Workflow: ONE integration branch, squash-merge (minimize maintainer effort)
 
-- **Stacked PRs (PR on PR).** Each new branch is based on the previous feature
-  branch, not `main`. State the base in the PR body.
-- **Do not wait on GitHub CI.** Guarantee green *locally* before pushing. The
-  local gate is the source of truth; GitHub CI is a backstop.
+The maintainer squash-merges and wants near-zero merge effort. So:
+
+- **Single long-lived branch `dev`, linear history.** Commit features
+  sequentially on `dev` (never parallel feature branches → never internal merge
+  conflicts). `git push` is free (not rate-limited); push often.
+- **Exactly ONE open PR** (`dev` → `main`), kept updated by pushes. Do not open
+  a second PR. After the maintainer squash-merges it, `git fetch origin main`
+  then `git reset --hard origin/main` on `dev` and keep committing.
+- **GitHub API is the scarce resource** (secondary rate limit on PR/comment
+  creation). So: never poll CI via API — rely on the `<github-webhook-activity>`
+  events; don't open/close PRs in bursts; don't repeatedly edit PR bodies.
+- **Do not wait on GitHub CI.** Guarantee green *locally* before every push.
 - **Local gate (must pass before every push):**
   ```sh
   cargo fmt --all -- --check
@@ -24,7 +32,6 @@ binding unless the user overrides it.
   gitleaks detect --no-git --source .
   cargo deny check bans sources licenses    # advisories needs network → CI
   ```
-- Always create the PR (ready for review) after pushing.
 
 ## Benchmarking discipline
 
