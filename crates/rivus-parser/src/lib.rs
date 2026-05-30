@@ -21,7 +21,10 @@ mod lexer;
 
 use lexer::{Lexer, Tok};
 use rivus_core::{Mode, RivusError, Severity, Value};
-use rivus_ir::{Access, CmpOp, EdgeKind, Expr, Hook, HookAction, HookEvent, NodeId, Op, PlanGraph};
+use rivus_ir::{
+    Access, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent, NodeId, Op,
+    PlanGraph,
+};
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
     let toks = Lexer::new(src).tokenize().map_err(RivusError::Parse)?;
@@ -223,15 +226,89 @@ impl Parser {
     /// upstream node.
     fn parse_body_head(&mut self, input: Option<NodeId>) -> Result<NodeId, RivusError> {
         match self.tok().clone() {
+            // `open PATH [as FMT]` — extension is only the default; an explicit
+            // `as csv|tsv|json|jsonl|ndjson` overrides it (and works when the
+            // path has no/odd extension). `readcsv`/`readjson`/`readbin` are
+            // equivalent explicit aliases (lower cognitive load, fewer surprises).
             Tok::Word(w) if w == "open" => {
                 self.bump();
                 let path = self.word()?;
-                Ok(self.g.add_node(Op::OpenCsv { path }))
+                let explicit = if self.peek_is_word("as") {
+                    self.bump();
+                    Some(self.word()?)
+                } else {
+                    None
+                };
+                let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
+                    self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
+                })?;
+                Ok(self.g.add_node(fmt.into_op(path)))
+            }
+            Tok::Word(w) if w == "readcsv" => {
+                self.bump();
+                let path = self.word()?;
+                Ok(self.g.add_node(Op::OpenCsv {
+                    path,
+                    projection: None,
+                }))
+            }
+            Tok::Word(w) if w == "readjson" => {
+                self.bump();
+                let path = self.word()?;
+                Ok(self.g.add_node(Op::OpenJsonl { path }))
             }
             Tok::Word(w) if w == "stream" => {
                 self.bump();
                 let name = self.word()?;
                 Ok(self.g.add_node(Op::StreamRef { name }))
+            }
+            // `readbin path [le|be] [packed|aligned] (name:type ...)`.
+            Tok::Word(w) if w == "readbin" => {
+                self.bump();
+                let path = self.word()?;
+                let mut endian = Endian::Little;
+                let mut c_align = false;
+                loop {
+                    match self.tok() {
+                        Tok::Word(m) if m == "le" => {
+                            endian = Endian::Little;
+                            self.bump();
+                        }
+                        Tok::Word(m) if m == "be" => {
+                            endian = Endian::Big;
+                            self.bump();
+                        }
+                        Tok::Word(m) if m == "packed" => {
+                            c_align = false;
+                            self.bump();
+                        }
+                        Tok::Word(m) if m == "aligned" => {
+                            c_align = true;
+                            self.bump();
+                        }
+                        _ => break,
+                    }
+                }
+                self.expect(&Tok::LParen)?;
+                let mut fields = Vec::new();
+                while !self.at(&Tok::RParen) && !self.at(&Tok::Eof) {
+                    let name = self.word()?;
+                    self.expect(&Tok::Colon)?;
+                    let ty = self.word()?;
+                    let bt = BinType::parse(&ty)
+                        .ok_or_else(|| self.err(format!("unknown binary type '{ty}'")))?;
+                    fields.push((name, bt));
+                }
+                self.expect(&Tok::RParen)?;
+                if fields.is_empty() {
+                    return Err(self.err("readbin requires at least one field"));
+                }
+                Ok(self.g.add_node(Op::OpenBinary {
+                    path,
+                    fields,
+                    endian,
+                    c_align,
+                }))
             }
             // Reference to a named scope → merge (`+`) or join (`&`).
             Tok::Word(name) if self.g.labels.contains_key(&name) => {
@@ -483,10 +560,51 @@ impl Parser {
     }
 }
 
+/// A text source format selectable on `open` (binary goes via `readbin`).
+enum Format {
+    Csv,
+    Jsonl,
+}
+
+impl Format {
+    fn into_op(self, path: String) -> Op {
+        match self {
+            Format::Csv => Op::OpenCsv {
+                path,
+                projection: None,
+            },
+            Format::Jsonl => Op::OpenJsonl { path },
+        }
+    }
+}
+
+/// Resolve the format for `open`: an explicit `as FMT` wins; otherwise fall back
+/// to the file extension; otherwise default to CSV. Returns `None` only for an
+/// unrecognized explicit format name.
+fn resolve_format(path: &str, explicit: Option<&str>) -> Option<Format> {
+    if let Some(f) = explicit {
+        return match f.to_ascii_lowercase().as_str() {
+            "csv" | "tsv" => Some(Format::Csv),
+            "json" | "jsonl" | "ndjson" => Some(Format::Jsonl),
+            _ => None,
+        };
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
+        Some(Format::Jsonl)
+    } else {
+        Some(Format::Csv) // default
+    }
+}
+
 fn is_keyword(w: &str) -> bool {
     matches!(
         w,
         "open"
+            | "readbin"
+            | "readcsv"
+            | "readjson"
+            | "as"
             | "stream"
             | "save"
             | "print"
@@ -519,6 +637,48 @@ fn parse_mode(s: &str) -> Option<Mode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rivus_ir::Op;
+
+    fn first_op(src: &str) -> Op {
+        let g = parse(src).unwrap();
+        g.nodes[0].op.clone()
+    }
+
+    #[test]
+    fn format_selection_extension_alias_and_override() {
+        // Default: extension picks the format.
+        assert!(matches!(first_op("F:\n open d.csv\n;"), Op::OpenCsv { .. }));
+        assert!(matches!(
+            first_op("F:\n open d.jsonl\n;"),
+            Op::OpenJsonl { .. }
+        ));
+        assert!(matches!(
+            first_op("F:\n open d.ndjson\n;"),
+            Op::OpenJsonl { .. }
+        ));
+        // Odd/absent extension defaults to CSV...
+        assert!(matches!(first_op("F:\n open d.dat\n;"), Op::OpenCsv { .. }));
+        // ...but `as FMT` overrides the extension entirely.
+        assert!(matches!(
+            first_op("F:\n open d.dat as json\n;"),
+            Op::OpenJsonl { .. }
+        ));
+        assert!(matches!(
+            first_op("F:\n open d.jsonl as csv\n;"),
+            Op::OpenCsv { .. }
+        ));
+        // Explicit aliases ignore the extension.
+        assert!(matches!(
+            first_op("F:\n readjson d.weird\n;"),
+            Op::OpenJsonl { .. }
+        ));
+        assert!(matches!(
+            first_op("F:\n readcsv d.weird\n;"),
+            Op::OpenCsv { .. }
+        ));
+        // Unknown explicit format is an error.
+        assert!(parse("F:\n open d.x as toml\n;").is_err());
+    }
 
     #[test]
     fn parses_linear_scope() {

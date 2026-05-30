@@ -7,6 +7,7 @@
 //!
 //! Flags:
 //!   --chunk-size <N>          rows per chunk emitted by sources (default 4096)
+//!   --no-opt                  disable the IR optimizer (run/explain)
 
 mod viz;
 
@@ -28,9 +29,11 @@ fn main() -> ExitCode {
 
     let mut path: Option<String> = None;
     let mut chunk_size = RunOptions::default().chunk_size;
+    let mut optimize = true;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
+            "--no-opt" => optimize = false,
             "--chunk-size" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
@@ -67,7 +70,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let graph = match rivus_parser::parse(&source) {
+    let parsed = match rivus_parser::parse(&source) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("parse error in '{path}': {e}");
@@ -79,17 +82,30 @@ fn main() -> ExitCode {
         "check" => {
             println!(
                 "ok: {} node(s), {} edge(s)",
-                graph.nodes.len(),
-                graph.edges.len()
+                parsed.nodes.len(),
+                parsed.edges.len()
             );
             ExitCode::SUCCESS
         }
         "explain" => {
-            print!("{}", viz::render_explain(&graph));
+            print!("{}", viz::render_explain(&parsed));
+            if optimize {
+                let (opt, report) = rivus_optimizer::optimize(parsed.clone());
+                print!("{}", viz::render_optimization(&report, &opt));
+            }
             ExitCode::SUCCESS
         }
         "run" => {
             println!("\u{2550}\u{2550} Rivus \u{2550}\u{2550}  flow: {path}\n");
+            let (graph, report) = if optimize {
+                rivus_optimizer::optimize(parsed)
+            } else {
+                (parsed, rivus_optimizer::OptReport::default())
+            };
+            if !report.is_empty() {
+                print!("{}", viz::render_opt_report(&report));
+                println!();
+            }
             match run(&graph, RunOptions { chunk_size }) {
                 Ok(res) => {
                     print!("{}", viz::render_run(&graph, &res));
@@ -117,8 +133,8 @@ fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
-         \x20 rivus run     <file.riv> [--chunk-size N]   run and visualize a flow\n\
-         \x20 rivus explain <file.riv>                    show DAG IR + regenerated source\n\
-         \x20 rivus check   <file.riv>                    parse only\n"
+         \x20 rivus run     <file.riv> [--chunk-size N] [--no-opt]   run and visualize a flow\n\
+         \x20 rivus explain <file.riv> [--no-opt]                    show DAG IR + optimizer report\n\
+         \x20 rivus check   <file.riv>                               parse only\n"
     );
 }

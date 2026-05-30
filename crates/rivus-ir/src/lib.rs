@@ -8,7 +8,9 @@ pub mod expr;
 pub mod graph;
 
 pub use expr::{Access, CmpOp, Expr};
-pub use graph::{Edge, EdgeKind, Hook, HookAction, HookEvent, Node, NodeId, Op, PlanGraph};
+pub use graph::{
+    BinType, Edge, EdgeKind, Endian, Hook, HookAction, HookEvent, Node, NodeId, Op, PlanGraph,
+};
 
 #[cfg(test)]
 mod tests {
@@ -20,6 +22,7 @@ mod tests {
         let mut g = PlanGraph::new();
         let a = g.add_node(Op::OpenCsv {
             path: "users.csv".into(),
+            projection: None,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {
@@ -39,6 +42,7 @@ mod tests {
         let mut g = PlanGraph::new();
         let a = g.add_node(Op::OpenCsv {
             path: "users.csv".into(),
+            projection: None,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {

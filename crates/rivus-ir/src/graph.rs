@@ -7,18 +7,118 @@
 //! back into readable Rivus source (Master principle #5: IR reversibility).
 
 use crate::expr::Expr;
-use rivus_core::{Mode, Severity};
+use rivus_core::{DataType, Mode, Severity};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
 pub type NodeId = usize;
 
+/// Byte order for binary records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endian {
+    Little,
+    Big,
+}
+
+/// A fixed-width field type for binary (C-struct-dump) records. Integer widths
+/// all ride the `i64` execution lane; floats ride `f64`; `bool` is one byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinType {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+    Bool,
+}
+
+impl BinType {
+    pub fn parse(s: &str) -> Option<BinType> {
+        Some(match s {
+            "i8" => BinType::I8,
+            "i16" => BinType::I16,
+            "i32" => BinType::I32,
+            "i64" => BinType::I64,
+            "u8" => BinType::U8,
+            "u16" => BinType::U16,
+            "u32" => BinType::U32,
+            "u64" => BinType::U64,
+            "f32" => BinType::F32,
+            "f64" => BinType::F64,
+            "bool" => BinType::Bool,
+            _ => return None,
+        })
+    }
+
+    /// Width in bytes (packed; no padding — the layout is explicit).
+    pub fn size(&self) -> usize {
+        match self {
+            BinType::I8 | BinType::U8 | BinType::Bool => 1,
+            BinType::I16 | BinType::U16 => 2,
+            BinType::I32 | BinType::U32 | BinType::F32 => 4,
+            BinType::I64 | BinType::U64 | BinType::F64 => 8,
+        }
+    }
+
+    /// Natural alignment in bytes (for C `repr(C)` layout). For these
+    /// primitives alignment equals size.
+    pub fn align(&self) -> usize {
+        self.size()
+    }
+
+    /// Which columnar execution lane this decodes into.
+    pub fn lane(&self) -> DataType {
+        match self {
+            BinType::Bool => DataType::Bool,
+            BinType::F32 | BinType::F64 => DataType::F64,
+            _ => DataType::I64,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BinType::I8 => "i8",
+            BinType::I16 => "i16",
+            BinType::I32 => "i32",
+            BinType::I64 => "i64",
+            BinType::U8 => "u8",
+            BinType::U16 => "u16",
+            BinType::U32 => "u32",
+            BinType::U64 => "u64",
+            BinType::F32 => "f32",
+            BinType::F64 => "f64",
+            BinType::Bool => "bool",
+        }
+    }
+}
+
 /// A flow operator. One enum spanning sources, transforms, fan-out/in and
 /// sinks — because in Rivus they are all just nodes in the same graph.
 #[derive(Debug, Clone)]
 pub enum Op {
-    /// `open path.csv`
-    OpenCsv { path: String },
+    /// `open path.csv`. `projection`, when set by the optimizer
+    /// (`project_pushdown`), restricts which columns the reader builds — unused
+    /// columns are never parsed or allocated.
+    OpenCsv {
+        path: String,
+        projection: Option<Vec<String>>,
+    },
+    /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
+    /// binary records (a C struct dump). `endian` selects byte order;
+    /// `c_align` true uses C `repr(C)` natural-alignment padding, false packs.
+    OpenBinary {
+        path: String,
+        fields: Vec<(String, BinType)>,
+        endian: Endian,
+        c_align: bool,
+    },
+    /// `open path.jsonl` — JSON Lines (one flat JSON object per line).
+    OpenJsonl { path: String },
     /// `stream X` — replay of a named flow (and, internally, a reference edge).
     StreamRef { name: String },
     /// `|? <pred>`
@@ -27,6 +127,14 @@ pub enum Op {
     Project { fields: Vec<String> },
     /// `|# key` — group / partition by key (MVP: group + count).
     GroupBy { key: String },
+    /// Fused linear chain of filters and an optional trailing projection,
+    /// produced by the optimizer (`fuse_linear`). All `preds` must pass (AND);
+    /// when `fields` is `Some`, only those columns are materialized — gathering
+    /// the projected columns once instead of filter-then-project's two passes.
+    FilterProject {
+        preds: Vec<Expr>,
+        fields: Option<Vec<String>>,
+    },
     /// `->` fan-out (tee): forwards each chunk to every outgoing edge.
     Branch,
     /// `+` merge: union of all incoming streams.
@@ -43,9 +151,12 @@ impl Op {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Op::OpenCsv { .. } => "open",
+            Op::OpenBinary { .. } => "readbin",
+            Op::OpenJsonl { .. } => "open",
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Project { .. } => "project",
+            Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
             Op::Merge => "merge",
@@ -58,10 +169,40 @@ impl Op {
     /// Render this op as the pipeline fragment that produced it.
     fn to_src_line(&self) -> String {
         match self {
-            Op::OpenCsv { path } => format!("open {path}"),
+            Op::OpenCsv { path, projection } => match projection {
+                Some(cols) => format!("open {path}  # read-only: {}", cols.join(",")),
+                None => format!("open {path}"),
+            },
+            Op::OpenBinary {
+                path,
+                fields,
+                endian,
+                c_align,
+            } => {
+                let cols: Vec<String> = fields
+                    .iter()
+                    .map(|(n, t)| format!("{n}:{}", t.as_str()))
+                    .collect();
+                let mut mods = String::new();
+                if *endian == Endian::Big {
+                    mods.push_str("be ");
+                }
+                if *c_align {
+                    mods.push_str("aligned ");
+                }
+                format!("readbin {path} {mods}({})", cols.join(" "))
+            }
+            Op::OpenJsonl { path } => format!("open {path}"),
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
+            Op::FilterProject { preds, fields } => {
+                let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
+                if let Some(f) = fields {
+                    s.push_str(&format!("|> {}", f.join(" ")));
+                }
+                s.trim_end().to_string()
+            }
             Op::GroupBy { key } => format!("|# {key}"),
             Op::Branch => "-> branch".to_string(),
             Op::Merge => "+ merge".to_string(),

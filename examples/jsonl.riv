@@ -1,0 +1,7 @@
+# JSON Lines source: `.jsonl` is selected automatically by `open`.
+#   rivus run examples/jsonl.riv
+Adults:
+    open examples/users.jsonl
+    |? age >= 20
+    |> name age
+;

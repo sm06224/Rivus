@@ -36,10 +36,19 @@ anon-scope = ':' body ';' IDENT? ;
 directive  = ('monitor'|'watch'|'visualize'|'stop') ... ';' ;  (* MVP: no-op *)
 
 body       = head transform* ;
-head       = 'open' PATH
+head       = 'open' PATH ('as' FMT)?                       (* 既定は拡張子, asで上書き *)
+           | 'readcsv' PATH | 'readjson' PATH              (* 明示エイリアス *)
+           | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
            | 'stream' IDENT
            | ref-expr
            | (* branch 子では空: 親 flow を継承 *) ;
+FMT        = 'csv'|'tsv'|'json'|'jsonl'|'ndjson' ;
+BINTYPE    = 'i8'|'i16'|'i32'|'i64'|'u8'|'u16'|'u32'|'u64'|'f32'|'f64'|'bool' ;
+
+(* フォーマット判別は拡張子に依存しすぎない:                                   *)
+(*   - open f.csv / f.jsonl        … 拡張子で自動（最短手数の既定）          *)
+(*   - open f.dat as json          … 拡張子が無い/嘘の時は as で明示上書き    *)
+(*   - readcsv f / readjson f / readbin f (...) … 動詞エイリアスで一目瞭然    *)
 ref-expr   = IDENT ( ('+' IDENT)+ | ('&' IDENT) )? ;   (* merge / join *)
 
 transform  = '|?' expr

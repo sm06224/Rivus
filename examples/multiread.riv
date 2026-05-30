@@ -1,0 +1,14 @@
+# Two scopes read the SAME file. The optimizer's dedup_sources pass merges the
+# duplicate read into one source that fans out to both flows.
+#   rivus explain examples/multiread.riv      # see the transformation
+#   rivus run     examples/multiread.riv      # optimizer report + results
+Adults:
+    open examples/users.csv
+    |? age >= 20
+    |> name age
+;
+
+Population:
+    open examples/users.csv
+    |# country
+;
