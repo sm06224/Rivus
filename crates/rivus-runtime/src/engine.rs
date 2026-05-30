@@ -16,17 +16,22 @@ use crate::telemetry::NodeTelemetry;
 use rivus_core::{Chunk, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
 use rivus_ir::{HookAction, HookEvent, NodeId, Op, PlanGraph};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     /// Maximum rows per chunk emitted by sources.
     pub chunk_size: usize,
+    /// Show a live progress line on stderr during a (serial) run.
+    pub progress: bool,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        RunOptions { chunk_size: 4096 }
+        RunOptions {
+            chunk_size: 4096,
+            progress: false,
+        }
     }
 }
 
@@ -64,7 +69,7 @@ pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError>
         return Ok(res);
     }
     let ops = build_ops(graph, &opts, None);
-    Ok(drive(graph, ops, 0))
+    Ok(drive(graph, ops, 0, opts.progress))
 }
 
 /// Build one operator per node. In parallel mode, `mem` replaces the single
@@ -98,7 +103,12 @@ fn build_ops(
 
 /// Drive the DAG to completion with a pre-built operator set (the chunk-granular
 /// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
-fn drive(graph: &PlanGraph, mut ops: Vec<Box<dyn Operator>>, chunk_id_base: u64) -> RunResult {
+fn drive(
+    graph: &PlanGraph,
+    mut ops: Vec<Box<dyn Operator>>,
+    chunk_id_base: u64,
+    progress: bool,
+) -> RunResult {
     let n = graph.nodes.len();
     let topo = graph.topo_order().expect("acyclic (checked by caller)");
 
@@ -122,6 +132,9 @@ fn drive(graph: &PlanGraph, mut ops: Vec<Box<dyn Operator>>, chunk_id_base: u64)
     let mut next_chunk_id: u64 = chunk_id_base;
     let mut fatal = false;
 
+    let mut prog = Progress::new(progress);
+    let mut rows_seen: u64 = 0;
+
     let mut active = true;
     while active && !fatal {
         active = false;
@@ -142,7 +155,11 @@ fn drive(graph: &PlanGraph, mut ops: Vec<Box<dyn Operator>>, chunk_id_base: u64)
                     next_chunk_id: &mut next_chunk_id,
                 };
                 match ops[nid].pull(&mut ctx) {
-                    Some(chunk) => produced.push(chunk),
+                    Some(chunk) => {
+                        rows_seen += chunk.len as u64;
+                        produced.push(chunk);
+                        prog.tick(rows_seen);
+                    }
                     None => finished_now = true,
                 }
             } else if let Some((from, chunk)) = in_q[nid].pop_front() {
@@ -205,6 +222,8 @@ fn drive(graph: &PlanGraph, mut ops: Vec<Box<dyn Operator>>, chunk_id_base: u64)
         }
     }
 
+    prog.finish(rows_seen);
+
     let mut outputs: Vec<Output> = results
         .into_iter()
         .map(|(node_id, chunks)| Output {
@@ -220,6 +239,88 @@ fn drive(graph: &PlanGraph, mut ops: Vec<Box<dyn Operator>>, chunk_id_base: u64)
         errors,
         final_mode: mode,
         outputs,
+    }
+}
+
+/// A throttled live-progress line on stderr (≈5 Hz). No-op unless enabled, and
+/// only used on the serial path (parallel workers stay silent). Writes to
+/// stderr so a `save stdout` sink keeps stdout clean.
+struct Progress {
+    on: bool,
+    start: Instant,
+    last: Instant,
+    drew: bool,
+}
+
+impl Progress {
+    fn new(on: bool) -> Self {
+        let now = Instant::now();
+        Progress {
+            on,
+            start: now,
+            last: now,
+            drew: false,
+        }
+    }
+
+    fn tick(&mut self, rows: u64) {
+        if !self.on || self.last.elapsed() < Duration::from_millis(200) {
+            return;
+        }
+        self.last = Instant::now();
+        self.drew = true;
+        let secs = self.start.elapsed().as_secs_f64();
+        let rate = if secs > 0.0 { rows as f64 / secs } else { 0.0 };
+        use std::io::Write;
+        eprint!(
+            "\r\x1b[2K  \u{2026} {} rows  {secs:.1}s  {} rows/s",
+            group_thousands(rows),
+            group_thousands(rate as u64)
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    fn finish(&mut self, rows: u64) {
+        if !self.on {
+            return;
+        }
+        use std::io::Write;
+        let secs = self.start.elapsed().as_secs_f64();
+        let rate = if secs > 0.0 { rows as f64 / secs } else { 0.0 };
+        // Only emit the summary when we actually streamed enough to draw.
+        if self.drew {
+            eprintln!(
+                "\r\x1b[2K  \u{2713} {} rows in {secs:.1}s  ({} rows/s)",
+                group_thousands(rows),
+                group_thousands(rate as u64)
+            );
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
+/// Format an integer with thousands separators (e.g. 12_345_678 → "12,345,678").
+fn group_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let first = bytes.len() % 3;
+    for (i, &b) in bytes.iter().enumerate() {
+        if i >= first && i > 0 && (i - first).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+/// The file path of a single-file source op (for the parallel size gate).
+fn source_path(op: &Op) -> Option<&str> {
+    match op {
+        Op::OpenCsv { path, .. } | Op::OpenJsonl { path } | Op::OpenBinary { path, .. } => {
+            Some(path)
+        }
+        _ => None,
     }
 }
 
@@ -289,6 +390,20 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
     }
     let src_id = source?;
 
+    // The parallel path materializes the whole input to partition it across
+    // threads. For large files that defeats streaming, so cap it by file size
+    // and let big inputs flow through the bounded-memory serial reader instead.
+    const PARALLEL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+    if let Some(path) = source_path(&graph.nodes[src_id].op) {
+        if path != "-" {
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.len() > PARALLEL_MAX_BYTES {
+                    return None;
+                }
+            }
+        }
+    }
+
     // Parse the source once.
     let mut src_op = operators::build(&graph.nodes[src_id].op, &[], opts.chunk_size);
     let mut src_errors: Vec<ErrorEvent> = Vec::new();
@@ -309,7 +424,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
     // Too few chunks to be worth threads: run once over the already-parsed data.
     if all.len() < threads * 2 {
         let ops = build_ops(graph, opts, Some((src_id, all)));
-        let mut res = drive(graph, ops, 0);
+        let mut res = drive(graph, ops, 0, false);
         // Write any collected sink (build_ops made it a collector).
         flush_parallel_sinks(graph, &mut res);
         res.errors.splice(0..0, src_errors);
@@ -328,7 +443,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             .map(|(i, chunks)| {
                 scope.spawn(move || {
                     let ops = build_ops(graph, opts, Some((src_id, chunks)));
-                    drive(graph, ops, (i as u64) << 40)
+                    drive(graph, ops, (i as u64) << 40, false)
                 })
             })
             .collect();
@@ -503,4 +618,20 @@ fn label_of(graph: &PlanGraph, id: NodeId) -> String {
         .label
         .clone()
         .unwrap_or_else(|| format!("{}#{id}", graph.nodes[id].op.kind_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group_thousands;
+
+    #[test]
+    fn thousands_separator() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(42), "42");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(12_345), "12,345");
+        assert_eq!(group_thousands(123_456), "123,456");
+        assert_eq!(group_thousands(48_000_000), "48,000,000");
+    }
 }

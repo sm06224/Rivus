@@ -158,6 +158,21 @@ sink leaves **stdout** as clean data you can pipe onward
 (`rivus run -c '…' | jq .`). The same `-c` / `-` input works for `explain` and
 `check` too.
 
+### Large files stream (bounded memory)
+
+CSV sources and sinks are **streaming**: a file is read in chunks and written as
+results flow, so memory stays flat regardless of size. A **1.1 GB** CSV through
+`open |? … |> … save out.csv` runs in **~10 MiB** of resident memory (it does
+*not* load the file). On an interactive terminal a live progress line shows on
+stderr:
+
+```
+  … 47,534,080 rows  15.3s  3,114,112 rows/s
+  ✓ 48,000,000 rows in 15.4s  (3,123,164 rows/s)
+```
+
+(stdin is the exception — it can't be re-read, so a piped-in CSV is buffered.)
+
 `rivus run` prints the live execution graph, the error stream, and captured outputs:
 
 ```

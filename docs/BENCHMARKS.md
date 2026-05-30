@@ -326,3 +326,23 @@ rows) and parallel pipeline execution.
 
 Every optimization PR must attach its before/after row from this table and must
 keep `tests/stress.rs` green (correctness is the gate, speed is the reward).
+
+### Streaming ingestion — bounded memory at any file size
+
+The CSV source and sinks stream (read in chunks, write as results flow), so
+resident memory is independent of input size. Measured peak RSS (`os.wait4`
+`ru_maxrss`) on a 1.1 GB / 48 M-row CSV, release build, single thread:
+
+| pipeline | input | peak RSS | time | throughput |
+|---|---:|---:|---:|---:|
+| `open \|? age>=50 \|> name age save out.csv` | 1.1 GB | **10.1 MiB** | 15.9 s | ~3.0 M rows/s |
+| `open \|? age>=50 \|> (age*2) as a save out.jsonl` | 1.1 GB | **10.1 MiB** | 15.7 s | ~3.1 M rows/s |
+
+Before streaming, `open` alone read the whole file into a `String` and parsed
+every column up front (~2–3 GB resident for this input, with a long stall and no
+output). Now memory is flat at chunk scale and rows flow immediately; an
+interactive run shows a live `… N rows  T s  R rows/s` line on stderr.
+
+Files above 256 MiB use the bounded-memory serial reader rather than the
+parallel parser (which has to materialize the whole input to partition it);
+re-parallelizing the *streaming* reader is on the backlog.

@@ -38,7 +38,14 @@ mod tests {
         let csv = write_temp("users", "name,age\naki,30\nben,15\ncho,40\n");
         let src = format!("Users:\n    open {csv}\n    |? age >= 20\n    |> name\n;");
         let graph = rivus_parser::parse(&src).unwrap();
-        let res = run(&graph, RunOptions { chunk_size: 2 }).unwrap();
+        let res = run(
+            &graph,
+            RunOptions {
+                chunk_size: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let out = &res.outputs[0];
         let names: Vec<Value> = out
@@ -72,7 +79,14 @@ Merged:
 ;"
         );
         let graph = rivus_parser::parse(&src).unwrap();
-        let res = run(&graph, RunOptions { chunk_size: 4 }).unwrap();
+        let res = run(
+            &graph,
+            RunOptions {
+                chunk_size: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let merged = res
             .outputs
             .iter()

@@ -18,7 +18,14 @@ impl Drop for TempCsv {
 
 fn run_src(src: &str, chunk_size: usize) -> rivus_runtime::RunResult {
     let graph = rivus_parser::parse(src).expect("parse");
-    run(&graph, RunOptions { chunk_size }).expect("run")
+    run(
+        &graph,
+        RunOptions {
+            chunk_size,
+            ..Default::default()
+        },
+    )
+    .expect("run")
 }
 
 /// Independent oracle: count clean rows with age >= threshold by regenerating

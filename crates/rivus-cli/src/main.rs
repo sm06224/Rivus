@@ -17,7 +17,7 @@
 mod viz;
 
 use rivus_runtime::{run, RunOptions};
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -142,7 +142,15 @@ fn main() -> ExitCode {
                 eprint!("{}", viz::render_opt_report(&report));
                 eprintln!();
             }
-            match run(&graph, RunOptions { chunk_size }) {
+            // Live progress only when stderr is a terminal (keep logs/pipes clean).
+            let progress = std::io::stderr().is_terminal();
+            match run(
+                &graph,
+                RunOptions {
+                    chunk_size,
+                    progress,
+                },
+            ) {
                 Ok(res) => {
                     eprint!("{}", viz::render_run(&graph, &res));
                     // A fatal error on the stream means the graph halted.

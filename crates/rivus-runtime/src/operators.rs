@@ -14,7 +14,53 @@ use rivus_core::{
 };
 use rivus_ir::{AggFunc, BinType, Endian, Expr, NodeId, Op};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
+
+/// An incremental sink writer: opens the file (or stdout for `-`) on the first
+/// chunk and appends as chunks arrive, so a sink never buffers the whole output
+/// in memory. Shared by the streaming CSV and JSONL sinks.
+struct StreamWriter {
+    path: String,
+    inner: Option<BufWriter<Box<dyn Write>>>,
+    wrote_header: bool,
+    failed: bool,
+}
+
+impl StreamWriter {
+    fn new(path: String) -> Self {
+        StreamWriter {
+            path,
+            inner: None,
+            wrote_header: false,
+            failed: false,
+        }
+    }
+
+    fn writer(&mut self) -> std::io::Result<&mut BufWriter<Box<dyn Write>>> {
+        if self.inner.is_none() {
+            let w: Box<dyn Write> = if self.path == "-" {
+                Box::new(std::io::stdout())
+            } else {
+                Box::new(File::create(&self.path)?)
+            };
+            self.inner = Some(BufWriter::new(w));
+        }
+        Ok(self.inner.as_mut().unwrap())
+    }
+
+    /// Flush on completion; if no chunk ever arrived, still create an empty file
+    /// (matching the old whole-buffer sinks) — but never touch stdout.
+    fn finish(&mut self) -> std::io::Result<()> {
+        if let Some(w) = self.inner.as_mut() {
+            w.flush()?;
+        } else if self.path != "-" {
+            File::create(&self.path)?;
+        }
+        Ok(())
+    }
+}
 
 /// Per-call execution context handed to operators.
 pub struct OpCtx<'a> {
@@ -157,15 +203,21 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
 
 // ---------------------------------------------------------------- source (csv)
 
+/// CSV source. A real file streams (bounded memory, [`csv::CsvChunker`]); the
+/// `-` stdin sentinel can't be re-read for two-pass inference, so it falls back
+/// to the buffered whole-input parse (stdin is rarely the 15 GB case).
 struct SourceCsv {
     path: String,
     projection: Option<Vec<String>>,
     chunk_size: usize,
+    loaded: bool,
     schema: Arc<Schema>,
+    /// Streaming reader for a real file; `None` for stdin / after a load error.
+    stream: Option<csv::CsvChunker>,
+    /// Buffered fallback (stdin): pre-parsed columns sliced by `pull`.
     columns: Vec<Column>,
     cursor: usize,
     total: usize,
-    loaded: bool,
 }
 
 impl SourceCsv {
@@ -174,16 +226,44 @@ impl SourceCsv {
             path,
             projection,
             chunk_size: chunk_size.max(1),
+            loaded: false,
             schema: Schema::empty(),
+            stream: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
-            loaded: false,
         }
     }
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
+        if self.path == "-" {
+            self.load_stdin(ctx);
+        } else {
+            match csv::CsvChunker::open(&self.path, self.projection.as_deref(), self.chunk_size) {
+                Ok((schema, chunker)) => {
+                    if chunker.bad_rows > 0 {
+                        ctx.raise(
+                            ErrorEvent::new(
+                                Severity::Recoverable,
+                                ErrorScope::Item,
+                                format!("{} malformed row(s) skipped", chunker.bad_rows),
+                            )
+                            .at_node(ctx.label.clone()),
+                        );
+                    }
+                    self.schema = Arc::new(schema);
+                    self.stream = Some(chunker);
+                }
+                Err(e) => ctx.raise(
+                    ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
+                        .at_node(ctx.label.clone()),
+                ),
+            }
+        }
+    }
+
+    fn load_stdin(&mut self, ctx: &mut OpCtx) {
         let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
@@ -230,6 +310,12 @@ impl Operator for SourceCsv {
         if !self.loaded {
             self.load(ctx);
         }
+        if let Some(chunker) = self.stream.as_mut() {
+            let cols = chunker.next_columns()?;
+            let id = ctx.fresh_id();
+            return Some(Chunk::new(id, self.schema.clone(), cols));
+        }
+        // Buffered (stdin) path.
         if self.cursor >= self.total {
             return None;
         }
@@ -1110,36 +1196,75 @@ impl Operator for SinkPrint {
 
 // ------------------------------------------------------------------ sink: csv
 
+/// Streaming CSV sink: writes the header on the first chunk and appends rows as
+/// chunks arrive (bounded memory), so `open big.csv |? … save out.csv` never
+/// buffers the whole output.
 struct SinkCsv {
-    path: String,
-    buf: Vec<Chunk>,
+    w: StreamWriter,
 }
 
 impl SinkCsv {
     fn new(path: String) -> Self {
         SinkCsv {
-            path,
-            buf: Vec::new(),
+            w: StreamWriter::new(path),
         }
+    }
+
+    fn write_chunk(&mut self, chunk: &Chunk) -> std::io::Result<()> {
+        let need_header = !self.w.wrote_header;
+        {
+            let w = self.w.writer()?;
+            if need_header {
+                writeln!(w, "{}", chunk.schema.field_names().join(","))?;
+            }
+            let mut line = String::new();
+            for row in 0..chunk.len {
+                line.clear();
+                for c in 0..chunk.columns.len() {
+                    if c > 0 {
+                        line.push(',');
+                    }
+                    line.push_str(&csv_escape(&chunk.value(row, c)));
+                }
+                writeln!(w, "{line}")?;
+            }
+        }
+        self.w.wrote_header = true;
+        Ok(())
     }
 }
 
 impl Operator for SinkCsv {
-    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
-        self.buf.push(chunk);
-        Vec::new() // consume: written to disk on finish
-    }
-
-    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        if let Err(e) = write_csv_file(&self.path, &self.buf) {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.w.failed {
+            return Vec::new();
+        }
+        if let Err(e) = self.write_chunk(&chunk) {
+            self.w.failed = true;
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,
                     ErrorScope::Graph,
-                    format!("cannot write '{}': {e}", self.path),
+                    format!("cannot write '{}': {e}", self.w.path),
                 )
                 .at_node(ctx.label.clone()),
             );
+        }
+        Vec::new()
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !self.w.failed {
+            if let Err(e) = self.w.finish() {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Critical,
+                        ErrorScope::Graph,
+                        format!("cannot write '{}': {e}", self.w.path),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
         }
         Vec::new()
     }
@@ -1178,36 +1303,71 @@ fn csv_escape(v: &Value) -> String {
 
 /// Writes JSON Lines (one object per row), mirroring the JSONL source so a flow
 /// can read and write the same format. Buffered, written on finish.
+/// Streaming JSONL sink: appends one JSON object per row as chunks arrive.
 struct SinkJsonl {
-    path: String,
-    buf: Vec<Chunk>,
+    w: StreamWriter,
 }
 
 impl SinkJsonl {
     fn new(path: String) -> Self {
         SinkJsonl {
-            path,
-            buf: Vec::new(),
+            w: StreamWriter::new(path),
         }
+    }
+
+    fn write_chunk(&mut self, chunk: &Chunk) -> std::io::Result<()> {
+        let w = self.w.writer()?;
+        let names = chunk.schema.field_names();
+        let mut out = String::new();
+        for row in 0..chunk.len {
+            out.clear();
+            out.push('{');
+            for (c, name) in names.iter().enumerate() {
+                if c > 0 {
+                    out.push(',');
+                }
+                json_string(&mut out, name);
+                out.push(':');
+                json_value(&mut out, &chunk.value(row, c));
+            }
+            out.push('}');
+            writeln!(w, "{out}")?;
+        }
+        Ok(())
     }
 }
 
 impl Operator for SinkJsonl {
-    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
-        self.buf.push(chunk);
-        Vec::new() // consume: written on finish
-    }
-
-    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        if let Err(e) = write_jsonl_file(&self.path, &self.buf) {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.w.failed {
+            return Vec::new();
+        }
+        if let Err(e) = self.write_chunk(&chunk) {
+            self.w.failed = true;
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,
                     ErrorScope::Graph,
-                    format!("cannot write '{}': {e}", self.path),
+                    format!("cannot write '{}': {e}", self.w.path),
                 )
                 .at_node(ctx.label.clone()),
             );
+        }
+        Vec::new()
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !self.w.failed {
+            if let Err(e) = self.w.finish() {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Critical,
+                        ErrorScope::Graph,
+                        format!("cannot write '{}': {e}", self.w.path),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
         }
         Vec::new()
     }

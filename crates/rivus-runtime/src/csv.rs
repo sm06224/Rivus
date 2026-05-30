@@ -1,9 +1,17 @@
-//! Minimal CSV reader with per-column type inference.
+//! CSV reader with per-column type inference, in two forms:
 //!
-//! MVP-grade: the whole file is read and materialized, then handed out in
-//! chunks. The design doc (03-stream-chunk-model.md) describes the streaming,
-//! Arrow-backed reader that replaces this behind the same `Operator` boundary.
-//! Quoting is handled just enough for simple fields.
+//! - [`CsvChunker`] — the **streaming** reader for a real file. Bounded memory
+//!   regardless of file size: pass 1 streams the file to infer a global schema
+//!   (only type flags kept), pass 2 streams it again yielding one chunk of rows
+//!   per call. A 1 GB file flows through in ~10 MiB of resident memory.
+//! - [`parse_projected`] — the whole-input parser, used for stdin (which can't
+//!   be re-read for two-pass inference) and in tests. Reads everything, then
+//!   hands out columns.
+//!
+//! Both share the same inference (`Flags`), split (`split_into`) and column
+//! builders, so they produce identical results; the streaming and whole-file
+//! paths are kept byte-for-byte equivalent by the stress tests. Quoting is
+//! handled just enough for simple fields.
 //!
 //! Performance: this is a **two-pass, allocation-light** parser. Pass 1 splits
 //! each record into borrowed `&str` field slices (no owned `String` per cell)
@@ -16,6 +24,160 @@
 
 use rivus_core::{Column, DataType, Field, Schema, StrColumn};
 use std::borrow::Cow;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+
+/// Streaming CSV reader: bounded memory regardless of file size.
+///
+/// Pass 1 streams the whole file once to infer a **global** schema (only
+/// per-column type flags are kept — O(1) memory), so the inferred types — and
+/// therefore the result — are independent of `chunk_size`, exactly like the
+/// whole-file parser. Pass 2 (`next_columns`) re-streams the file and yields one
+/// `chunk_size`-row batch of typed columns per call, so a 15 GB file flows
+/// through in chunk-sized pieces instead of being slurped into RAM.
+pub struct CsvChunker {
+    reader: BufReader<File>,
+    ncols: usize,
+    keep: Vec<usize>,
+    dtypes: Vec<DataType>,
+    chunk_size: usize,
+    line: String,
+    /// Rows skipped in pass 1 for wrong arity (reported once by the source).
+    pub bad_rows: usize,
+    eof: bool,
+}
+
+impl CsvChunker {
+    /// Open `path` for streaming, returning the inferred schema and the reader
+    /// positioned just after the header (ready for `next_columns`).
+    pub fn open(
+        path: &str,
+        allow: Option<&[String]>,
+        chunk_size: usize,
+    ) -> Result<(Schema, CsvChunker), String> {
+        // ---- pass 1: infer a global schema by streaming the whole file ----
+        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut r = BufReader::new(f);
+        let mut header = String::new();
+        if r.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+            return Err("empty CSV".to_string());
+        }
+        let names = split_owned(trim_eol(&header));
+        let ncols = names.len();
+        if ncols == 0 {
+            return Err("CSV header has no columns".to_string());
+        }
+        let keep: Vec<usize> = match allow {
+            None => (0..ncols).collect(),
+            Some(a) => (0..ncols)
+                .filter(|&i| a.iter().any(|n| n == &names[i]))
+                .collect(),
+        };
+
+        let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+        let mut bad = 0usize;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            let l = trim_eol(&line);
+            if l.trim().is_empty() {
+                continue;
+            }
+            let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
+            split_into(l, &mut scratch);
+            if scratch.len() != ncols {
+                bad += 1;
+                continue;
+            }
+            for (k, &ci) in keep.iter().enumerate() {
+                flags[k].observe(scratch[ci].as_ref());
+            }
+        }
+        let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+
+        let mut fields = Vec::with_capacity(keep.len());
+        for (k, &ci) in keep.iter().enumerate() {
+            fields.push(Field::new(names[ci].clone(), dtypes[k]));
+        }
+        let schema = Schema::new(fields);
+
+        // ---- pass 2 setup: reopen and skip the header line ----
+        let f2 = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut reader = BufReader::new(f2);
+        let mut skip = String::new();
+        reader.read_line(&mut skip).map_err(|e| e.to_string())?;
+
+        Ok((
+            schema,
+            CsvChunker {
+                reader,
+                ncols,
+                keep,
+                dtypes,
+                chunk_size: chunk_size.max(1),
+                line: String::new(),
+                bad_rows: bad,
+                eof: false,
+            },
+        ))
+    }
+
+    /// Yield the next batch of up to `chunk_size` rows as typed columns, or
+    /// `None` at end of file. Malformed rows (wrong arity) are skipped — already
+    /// counted in `bad_rows` during pass 1.
+    pub fn next_columns(&mut self) -> Option<Vec<Column>> {
+        if self.eof {
+            return None;
+        }
+        let mut builders: Vec<ColBuilder> = self
+            .dtypes
+            .iter()
+            .map(|d| ColBuilder::with_capacity(*d, self.chunk_size))
+            .collect();
+        let mut got = 0usize;
+        while got < self.chunk_size {
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.eof = true;
+                    break;
+                }
+            }
+            let l = trim_eol(&self.line);
+            if l.trim().is_empty() {
+                continue;
+            }
+            let mut scratch: Vec<Cow<str>> = Vec::with_capacity(self.ncols);
+            split_into(l, &mut scratch);
+            if scratch.len() != self.ncols {
+                continue;
+            }
+            for (k, &ci) in self.keep.iter().enumerate() {
+                builders[k].push(scratch[ci].as_ref());
+            }
+            got += 1;
+        }
+        if got == 0 {
+            return None;
+        }
+        Some(builders.iter_mut().map(ColBuilder::finish).collect())
+    }
+}
+
+/// Strip a trailing `\n` or `\r\n` (mirrors `str::lines` semantics).
+fn trim_eol(s: &str) -> &str {
+    s.strip_suffix('\n')
+        .map(|s| s.strip_suffix('\r').unwrap_or(s))
+        .unwrap_or(s)
+}
 
 pub struct CsvData {
     pub schema: Schema,
