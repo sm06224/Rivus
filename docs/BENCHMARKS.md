@@ -336,7 +336,7 @@ resident memory is independent of input size. Measured peak RSS (`os.wait4`
 | pipeline | input | peak RSS | time | throughput |
 |---|---:|---:|---:|---:|
 | `open \|? age>=50 \|> name age save out.csv` (serial) | 1.1 GB | **10.1 MiB** | 14.4 s | ~3.3 M rows/s |
-| same, **streaming-parallel** (4 cores) | 1.1 GB | **10.2 MiB** | **5.3 s** | **~9.0 M rows/s** |
+| same, **streaming-parallel** (4 cores) | 1.1 GB | **10.2 MiB** | **4.5 s** | **~10.7 M rows/s** |
 | `open big.csv` (bare, no sink → **preview**) | 1.1 GB | **10.0 MiB** | **0.00 s** | instant |
 | `open \|? age>=50` (no sink → **preview**) | 1.1 GB | **10.4 MiB** | **0.00 s** | instant |
 

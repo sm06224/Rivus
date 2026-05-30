@@ -91,6 +91,7 @@ impl CsvChunker {
         let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
         let mut bad = 0usize;
         let mut line = String::new();
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
         loop {
             line.clear();
             if r.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
@@ -100,14 +101,8 @@ impl CsvChunker {
             if l.trim().is_empty() {
                 continue;
             }
-            let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
-            split_into(l, &mut scratch);
-            if scratch.len() != ncols {
+            if !observe_line(l, ncols, &keep, &mut flags, &mut offsets) {
                 bad += 1;
-                continue;
-            }
-            for (k, &ci) in keep.iter().enumerate() {
-                flags[k].observe(scratch[ci].as_ref());
             }
         }
         let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
@@ -170,6 +165,7 @@ impl CsvChunker {
         let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
         let mut bad = 0usize;
         let mut line = String::new();
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
         for _ in 0..chunk_size {
             line.clear();
             if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
@@ -179,14 +175,8 @@ impl CsvChunker {
             if l.trim().is_empty() {
                 continue;
             }
-            let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
-            split_into(l, &mut scratch);
-            if scratch.len() != ncols {
+            if !observe_line(l, ncols, &keep, &mut flags, &mut offsets) {
                 bad += 1;
-                continue;
-            }
-            for (k, &ci) in keep.iter().enumerate() {
-                flags[k].observe(scratch[ci].as_ref());
             }
         }
         let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
@@ -258,6 +248,9 @@ impl CsvChunker {
             .iter()
             .map(|d| ColBuilder::with_capacity(*d, self.chunk_size))
             .collect();
+        // Reused field byte-ranges (no per-row allocation on the unquoted fast
+        // path); quoted records fall back to an owned split.
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(self.ncols);
         let mut got = 0usize;
         while got < self.chunk_size {
             // Stop at the worker's byte range end (lines never straddle a
@@ -283,13 +276,22 @@ impl CsvChunker {
             if l.trim().is_empty() {
                 continue;
             }
-            let mut scratch: Vec<Cow<str>> = Vec::with_capacity(self.ncols);
-            split_into(l, &mut scratch);
-            if scratch.len() != self.ncols {
-                continue;
-            }
-            for (k, &ci) in self.keep.iter().enumerate() {
-                builders[k].push(scratch[ci].as_ref());
+            if split_offsets(l, &mut offsets) {
+                if offsets.len() != self.ncols {
+                    continue;
+                }
+                for (k, &ci) in self.keep.iter().enumerate() {
+                    let (s, e) = offsets[ci];
+                    builders[k].push(&l[s..e]);
+                }
+            } else {
+                let fields = split_record(l);
+                if fields.len() != self.ncols {
+                    continue;
+                }
+                for (k, &ci) in self.keep.iter().enumerate() {
+                    builders[k].push(&fields[ci]);
+                }
             }
             got += 1;
         }
@@ -432,6 +434,7 @@ fn infer_range(
     }
     let mut pos = start;
     let mut line = String::new();
+    let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
     while pos < end {
         line.clear();
         match r.read_line(&mut line) {
@@ -443,14 +446,8 @@ fn infer_range(
         if l.trim().is_empty() {
             continue;
         }
-        let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
-        split_into(l, &mut scratch);
-        if scratch.len() != ncols {
+        if !observe_line(l, ncols, keep, &mut flags, &mut offsets) {
             bad += 1;
-            continue;
-        }
-        for (k, &ci) in keep.iter().enumerate() {
-            flags[k].observe(scratch[ci].as_ref());
         }
     }
     (flags, bad)
@@ -808,6 +805,56 @@ impl ColBuilder {
             ColBuilder::Str(v) => Column::Str(std::mem::take(v)),
         }
     }
+}
+
+/// Split an unquoted record into field byte-ranges `(start, end)` into `out`
+/// (cleared first), allocating nothing — `out` is reused across rows. Returns
+/// `false` when the line contains a `"` (the caller takes the owned slow path).
+fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>) -> bool {
+    out.clear();
+    let bytes = line.as_bytes();
+    if bytes.contains(&b'"') {
+        return false;
+    }
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b',' {
+            out.push((start, i));
+            start = i + 1;
+        }
+    }
+    out.push((start, bytes.len()));
+    true
+}
+
+/// Observe one record into per-column type `flags` (kept columns only), using
+/// the allocation-free offset split on the fast path. `offsets` is reused.
+/// Returns `false` for a malformed (wrong-arity) record.
+fn observe_line(
+    line: &str,
+    ncols: usize,
+    keep: &[usize],
+    flags: &mut [Flags],
+    offsets: &mut Vec<(usize, usize)>,
+) -> bool {
+    if split_offsets(line, offsets) {
+        if offsets.len() != ncols {
+            return false;
+        }
+        for (k, &ci) in keep.iter().enumerate() {
+            let (s, e) = offsets[ci];
+            flags[k].observe(&line[s..e]);
+        }
+    } else {
+        let fields = split_record(line);
+        if fields.len() != ncols {
+            return false;
+        }
+        for (k, &ci) in keep.iter().enumerate() {
+            flags[k].observe(&fields[ci]);
+        }
+    }
+    true
 }
 
 /// Split a record into fields. Fast path: records without `"` split into
