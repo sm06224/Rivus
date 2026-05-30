@@ -336,7 +336,7 @@ resident memory is independent of input size. Measured peak RSS (`os.wait4`
 | pipeline | input | peak RSS | time | throughput |
 |---|---:|---:|---:|---:|
 | `open \|? age>=50 \|> name age save out.csv` (serial) | 1.1 GB | **10.1 MiB** | 14.4 s | ~3.3 M rows/s |
-| same, **streaming-parallel** (4 cores) | 1.1 GB | **10.2 MiB** | **4.5 s** | **~10.7 M rows/s** |
+| same, **streaming-parallel** (4 cores) | 1.1 GB | **10.2 MiB** | **4.1 s** | **~11.7 M rows/s** |
 | `open big.csv` (bare, no sink → **preview**) | 1.1 GB | **10.0 MiB** | **0.00 s** | instant |
 | `open \|? age>=50` (no sink → **preview**) | 1.1 GB | **10.4 MiB** | **0.00 s** | instant |
 
@@ -370,14 +370,14 @@ build, 4 vCPU, peak RSS via `os.wait4`:
 
 | tool | command | time | peak RSS |
 |---|---|---:|---:|
-| **Rivus** | `open … \|? age>=50 \|> name age save out.csv` | **4.5 s** | **10.2 MiB** |
+| **Rivus** | `open … \|? age>=50 \|> name age save out.csv` | **4.1 s** | **10.2 MiB** |
 | DuckDB | `COPY (SELECT name,age … WHERE age>=50) TO …` | 4.4 s | 406.8 MiB |
 | gawk | `awk -F, 'NR>1&&$3>=50{print $2","$3}'` | 11.5 s | — |
 | Python | stdlib `csv` reader/writer | 30.9 s | 10.1 MiB |
 
-All four produce the same 22.4 M output rows. **Rivus matches DuckDB's wall
+All four produce the same 22.4 M output rows. **Rivus edges out DuckDB on wall
 time while using ~40× less memory** (10 MiB vs 407 MiB — DuckDB parallelizes
-the whole query but buffers; Rivus streams), and is **2.5× faster than awk**
+the whole query but buffers; Rivus streams), and is **2.8× faster than awk**
 and **~7× faster than Python**. This is the headline target met: for everyday
 streaming ETL, Rivus is a credible replacement for reaching to DuckDB/Python —
 same speed, a fraction of the footprint. Reproduce with `bench/compare.sh`.

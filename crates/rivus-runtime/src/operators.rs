@@ -45,7 +45,7 @@ impl StreamWriter {
             } else {
                 Box::new(File::create(&self.path)?)
             };
-            self.inner = Some(BufWriter::new(w));
+            self.inner = Some(BufWriter::with_capacity(256 * 1024, w));
         }
         Ok(self.inner.as_mut().unwrap())
     }

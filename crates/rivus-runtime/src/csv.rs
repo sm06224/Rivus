@@ -27,6 +27,10 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
+/// Read buffer for the streaming reader. Larger than the 8 KiB default to cut
+/// syscalls on big sequential scans (inference and build each stream the file).
+const READ_BUF: usize = 256 * 1024;
+
 /// Streaming CSV reader: bounded memory regardless of file size.
 ///
 /// Pass 1 streams the whole file once to infer a **global** schema (only
@@ -71,7 +75,7 @@ impl CsvChunker {
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut r = BufReader::new(f);
+        let mut r = BufReader::with_capacity(READ_BUF, f);
         let mut header = String::new();
         if r.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
             return Err("empty CSV".to_string());
@@ -115,7 +119,7 @@ impl CsvChunker {
 
         // ---- pass 2 setup: reopen and skip the header line ----
         let f2 = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut reader = BufReader::new(f2);
+        let mut reader = BufReader::with_capacity(READ_BUF, f2);
         let mut skip = String::new();
         reader.read_line(&mut skip).map_err(|e| e.to_string())?;
 
@@ -144,7 +148,7 @@ impl CsvChunker {
         chunk_size: usize,
     ) -> Result<(Schema, CsvChunker), String> {
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut reader = BufReader::new(f);
+        let mut reader = BufReader::with_capacity(READ_BUF, f);
         let mut header = String::new();
         let hlen = reader.read_line(&mut header).map_err(|e| e.to_string())?;
         if hlen == 0 {
@@ -223,7 +227,7 @@ impl CsvChunker {
         let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
         Ok(CsvChunker {
-            reader: BufReader::new(f),
+            reader: BufReader::with_capacity(READ_BUF, f),
             ncols,
             keep,
             dtypes,
@@ -328,7 +332,7 @@ pub fn plan_parallel(
 
     // Header → column names, kept indices, and the first data byte offset.
     let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-    let mut r = BufReader::new(f);
+    let mut r = BufReader::with_capacity(READ_BUF, f);
     let mut header = String::new();
     let hlen = r.read_line(&mut header).map_err(|e| e.to_string())?;
     if hlen == 0 {
@@ -428,7 +432,7 @@ fn infer_range(
         Ok(f) => f,
         Err(_) => return (flags, bad),
     };
-    let mut r = BufReader::new(f);
+    let mut r = BufReader::with_capacity(READ_BUF, f);
     if r.seek(SeekFrom::Start(start)).is_err() {
         return (flags, bad);
     }
