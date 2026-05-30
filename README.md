@@ -41,6 +41,62 @@ Merged:
 | `->` branch (tee) · `+` merge · `&` join | DAG fan-out / fan-in |
 | `on error ... : transition degraded ;` | continue-first lifecycle hook |
 
+## Installation
+
+Rivus ships **pre-built binaries for macOS and Windows (x64)**. On any other
+platform — Linux, Apple Silicon, ARM — you build from source, which is a
+single command because the runtime has **zero third-party dependencies**.
+
+### Option A — download a pre-built binary (macOS / Windows, x64)
+
+1. Open the [**Releases**](https://github.com/sm06224/rivus/releases) page and
+   download the asset for your OS:
+   - macOS (Intel/x64): `rivus-<version>-x86_64-apple-darwin.tar.gz`
+   - Windows (x64): `rivus-<version>-x86_64-pc-windows-msvc.zip`
+2. Verify the checksum (optional but recommended — each asset ships a
+   matching `.sha256`):
+   - macOS: `shasum -a 256 -c rivus-<version>-x86_64-apple-darwin.tar.gz.sha256`
+   - Windows (PowerShell): `Get-FileHash .\rivus-<version>-x86_64-pc-windows-msvc.zip -Algorithm SHA256`
+3. Extract and put `rivus` on your `PATH`:
+
+   **macOS** (Terminal):
+   ```sh
+   tar -xzf rivus-<version>-x86_64-apple-darwin.tar.gz
+   cd rivus-<version>-x86_64-apple-darwin
+   # macOS quarantines downloads; clear it so Gatekeeper lets it run:
+   xattr -d com.apple.quarantine ./rivus 2>/dev/null || true
+   sudo mv ./rivus /usr/local/bin/        # or any dir on your PATH
+   rivus --help
+   ```
+
+   **Windows** (PowerShell):
+   ```powershell
+   Expand-Archive .\rivus-<version>-x86_64-pc-windows-msvc.zip -DestinationPath .\rivus
+   # Add the folder to PATH for this session (use the GUI for a permanent one):
+   $env:Path = "$PWD\rivus;$env:Path"
+   rivus --help
+   ```
+
+### Option B — build from source (any platform)
+
+You need a Rust toolchain (`rustup` from <https://rustup.rs>). Then:
+
+```sh
+git clone https://github.com/sm06224/rivus
+cd rivus
+cargo build --release                  # binary at target/release/rivus
+./target/release/rivus run examples/branch.riv
+```
+
+Or install it straight onto your `PATH` with Cargo:
+
+```sh
+cargo install --path crates/rivus-cli  # provides the `rivus` command
+```
+
+> Building macOS/Windows x64 packages yourself? `dist/build.sh` produces the
+> same archive layout as the official releases — see [`dist/`](dist/README.md).
+
 ## Quick start
 
 ```sh
@@ -49,6 +105,9 @@ cargo run -p rivus-cli -- run     examples/branch.riv
 cargo run -p rivus-cli -- run     examples/recover.riv   # escalates to mode: degraded
 cargo run -p rivus-cli -- explain examples/branch.riv    # DAG IR + regenerated source
 ```
+
+> Already installed via Option A/B? Drop the `cargo run -p rivus-cli --` and
+> just call `rivus run examples/branch.riv`.
 
 `rivus run` prints the live execution graph, the error stream, and captured outputs:
 
