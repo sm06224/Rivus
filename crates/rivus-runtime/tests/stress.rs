@@ -799,3 +799,94 @@ fn group_aggregates_are_exact() {
         assert_eq!(max, om, "max[{country}]");
     }
 }
+
+#[test]
+fn tsv_read_filter_project_chunk_size_independent() {
+    // A `.tsv` source must split on tabs, infer per-column types (so the numeric
+    // filter works), and stay chunk-size independent — exactly like CSV.
+    let rows = 20_000;
+    let mut rng = Rng::new(7);
+    let mut text = String::from("name\tage\tcity\n");
+    let mut expect = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(90);
+        text.push_str(&format!("user\t{age}\tNYC\n"));
+        if age >= 40 {
+            expect += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_tsv", text.as_bytes()));
+    let p = f.0.display();
+    // The path has no `.tsv` extension, so force the delimiter with `as tsv`.
+    for cs in [1, 7, 1024, 8192, rows] {
+        let res = run_src(
+            &format!("T:\n open {p} as tsv\n |? age >= 40\n |> name age\n;"),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), expect, "tsv filter @cs={cs}");
+        assert!(res.errors.is_empty(), "tsv errors @cs={cs}: {:?}", res.errors);
+    }
+}
+
+#[test]
+fn group_extended_aggregates_are_correct_and_chunk_independent() {
+    // std / count_distinct / first / last (plus avg) must be correct and
+    // independent of chunk size. Two small groups with known statistics.
+    let text = "team,player,score\nA,x,10\nA,y,20\nA,x,30\nB,z,5\nB,z,5\nB,w,15\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_grpext", text.as_bytes()));
+    let p = f.0.display();
+    let src = format!(
+        "G:\n open {p}\n |# team std:score count_distinct:player first:player last:player avg:score\n;"
+    );
+
+    // Verify the values once (at a normal chunk size), then assert that smaller
+    // chunk sizes produce a byte-identical result row-for-row.
+    let base = run_src(&src, 4096);
+    let bchunk = &base.outputs[0].chunks[0];
+    assert_eq!(
+        bchunk.schema.field_names(),
+        vec![
+            "team",
+            "count",
+            "std_score",
+            "count_distinct_player",
+            "first_player",
+            "last_player",
+            "avg_score",
+        ]
+    );
+    assert_eq!(bchunk.len, 2);
+    let cell = |row: usize, col: usize| bchunk.value(row, col).to_string();
+    let num = |row: usize, col: usize| bchunk.value(row, col).as_f64().unwrap();
+    // Group A: scores 10,20,30 → std 10, avg 20; players x,y,x → distinct 2, first x, last x.
+    assert_eq!(cell(0, 0), "A");
+    assert_eq!(num(0, 1), 3.0);
+    assert!((num(0, 2) - 10.0).abs() < 1e-9);
+    assert_eq!(num(0, 3), 2.0);
+    assert_eq!(cell(0, 4), "x");
+    assert_eq!(cell(0, 5), "x");
+    assert!((num(0, 6) - 20.0).abs() < 1e-9);
+    // Group B: scores 5,5,15 → sample std 5.7735…, avg 25/3; players z,z,w → distinct 2, first z, last w.
+    assert_eq!(cell(1, 0), "B");
+    assert!((num(1, 2) - 5.773_502_691_896_257).abs() < 1e-9);
+    assert_eq!(num(1, 3), 2.0);
+    assert_eq!(cell(1, 4), "z");
+    assert_eq!(cell(1, 5), "w");
+    assert!((num(1, 6) - 25.0 / 3.0).abs() < 1e-9);
+
+    // Chunk-size independence: every cell matches the base across chunk sizes.
+    for cs in [1usize, 2, 5, 64] {
+        let r = run_src(&src, cs);
+        let c = &r.outputs[0].chunks[0];
+        assert_eq!(c.len, bchunk.len, "row count @cs={cs}");
+        for row in 0..c.len {
+            for col in 0..bchunk.schema.fields.len() {
+                assert_eq!(
+                    c.value(row, col).to_string(),
+                    bchunk.value(row, col).to_string(),
+                    "cell[{row}][{col}] @cs={cs}"
+                );
+            }
+        }
+    }
+}

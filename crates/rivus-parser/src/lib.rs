@@ -1230,4 +1230,99 @@ Import:
         let n = g.labels["Import"];
         assert!(!g.nodes[n].hooks.is_empty());
     }
+
+    #[test]
+    fn tsv_extension_sets_tab_delim() {
+        // `.tsv`/`.tab` open as tab-delimited without an explicit `as tsv`.
+        assert!(matches!(
+            first_op("F:\n open d.tsv\n;"),
+            Op::OpenCsv { delim: b'\t', .. }
+        ));
+        assert!(matches!(
+            first_op("F:\n open d.tab\n;"),
+            Op::OpenCsv { delim: b'\t', .. }
+        ));
+        // A plain `.csv` stays comma.
+        assert!(matches!(
+            first_op("F:\n open d.csv\n;"),
+            Op::OpenCsv { delim: b',', .. }
+        ));
+    }
+
+    #[test]
+    fn as_tsv_overrides_extension() {
+        // `as tsv` forces a tab on any path; `as csv` forces a comma back.
+        assert!(matches!(
+            first_op("F:\n open d.txt as tsv\n;"),
+            Op::OpenCsv { delim: b'\t', .. }
+        ));
+        assert!(matches!(
+            first_op("F:\n open d.tsv as csv\n;"),
+            Op::OpenCsv { delim: b',', .. }
+        ));
+    }
+
+    #[test]
+    fn tsv_sink_delim_from_extension_and_override() {
+        // Sinks pick up the delimiter the same way sources do.
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.tsv\n;", 1),
+            Op::SinkCsv { delim: b'\t', .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.csv as tsv\n;", 1),
+            Op::SinkCsv { delim: b'\t', .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.csv\n;", 1),
+            Op::SinkCsv { delim: b',', .. }
+        ));
+    }
+
+    #[test]
+    fn tsv_round_trips_cleanly() {
+        // A `.tsv` source/sink needs no modifier (extension implies tab), so the
+        // regenerated source is clean and re-parses identically.
+        let g = parse("F:\n open a.tsv\n |> name age\n save out.tsv\n;").unwrap();
+        let src = g.to_source();
+        assert!(src.contains("open a.tsv"), "got: {src}");
+        assert!(src.contains("save out.tsv"), "got: {src}");
+        assert!(!src.contains("as tsv"), "redundant modifier in: {src}");
+        assert_eq!(src, parse(&src).unwrap().to_source());
+    }
+
+    #[test]
+    fn explicit_tsv_modifier_round_trips() {
+        // When the delimiter disagrees with the extension, `as tsv`/`as csv` is
+        // emitted so the round-trip stays faithful.
+        let g = parse("F:\n open a.txt as tsv\n save out.dat as tsv\n;").unwrap();
+        let src = g.to_source();
+        assert!(src.contains("open a.txt as tsv"), "got: {src}");
+        assert!(src.contains("save out.dat as tsv"), "got: {src}");
+        assert_eq!(src, parse(&src).unwrap().to_source());
+    }
+
+    #[test]
+    fn group_parses_extended_aggregates() {
+        // std / count_distinct / nunique / first / last all parse into GroupBy.
+        use rivus_ir::AggFunc;
+        let op = nth_op(
+            "G:\n open a.csv\n |# team std:score count_distinct:p nunique:p first:p last:p\n;",
+            1,
+        );
+        let Op::GroupBy { aggs, .. } = op else {
+            panic!("expected GroupBy, got {op:?}");
+        };
+        let funcs: Vec<AggFunc> = aggs.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            funcs,
+            vec![
+                AggFunc::Std,
+                AggFunc::CountDistinct,
+                AggFunc::CountDistinct, // nunique is an alias
+                AggFunc::First,
+                AggFunc::Last,
+            ]
+        );
+    }
 }
