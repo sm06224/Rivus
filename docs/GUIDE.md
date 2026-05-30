@@ -321,6 +321,19 @@ rivus run -c 'G: open sales.csv |# region sum:amount avg:amount save stdout as c
 rivus run -c 'U: open log.csv distinct user_id |# day save stdout as csv ;'
 ```
 
+**Unix-filter shorthand.** A *transform-only* program (one that starts with a
+pipe `|…` or a transform verb) is automatically wrapped to read CSV from stdin
+and write CSV to stdout — so Rivus drops in like `awk`/`jq`, no scope needed:
+
+```sh
+cat data.csv | rivus '|? age >= 20 |> name age'   # filter + project
+cat data.csv | rivus 'sort age desc'              # sort
+cat data.csv | rivus 'describe'                    # summary
+cat data.csv | rivus '|# country sum:amount'       # group + aggregate
+```
+
+(For non-CSV stdin or other sinks, write the full `open stdin as … / save …` form.)
+
 **Pipe into other tools** (stdout stays clean):
 
 ```sh

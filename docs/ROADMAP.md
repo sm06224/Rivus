@@ -36,7 +36,7 @@ formats until reaching for DuckDB/pandas is unnecessary.
 |---|---|---|
 | ✅ | Inline `-c`, stdin heredoc, `open stdin` / `save stdout` | |
 | ✅ | stdout = clean data, stderr = visualization | pipe-friendly today |
-| 🚧 | **First-class stdin→process→stdout** | make `cat x.csv \| rivus '<transforms>'` ergonomic: a default source (stdin) and sink (stdout) so a bare transform chain works as a Unix filter |
+| ✅ | **First-class stdin→process→stdout** | make `cat x.csv \| rivus '<transforms>'` ergonomic: a default source (stdin) and sink (stdout) so a bare transform chain works as a Unix filter |
 | 📋 | `-` sentinel for `open`/`save` | the bare dash isn't lexable yet (only `stdin`/`stdout`) |
 | ✅ | **`describe`** | `rivus describe <source>` / a `describe` verb: per-column type, count, nulls, min/max/mean — a streaming one-pass summary (pandas `.describe()` / SQL `DESCRIBE`) |
 
@@ -95,7 +95,7 @@ it in small, gated steps.
 1. ~~Header-less CSV (A)~~ ✅ done — `open f.csv noheader`.
 2. ~~`describe` (B)~~ ✅ done — `open f.csv describe`.
 3. ~~Typed/named columns at `open`~~ ✅ done — `open f.csv (id:int name:str)`.
-4. **stdin→stdout filter ergonomics** (B).
+4. ~~stdin→stdout filter ergonomics~~ ✅ done — `cat x | rivus '|? …'`.
 5. **Inline type casts + comma filter** (C) — readable, typed flow.
 6. **Joins** (D), then **imputation** (D).
 7. **SIMD CSV scan** (E) — the next big speed lever vs DuckDB.
