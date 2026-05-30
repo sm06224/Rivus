@@ -63,7 +63,7 @@ it in small, gated steps.
 | ✅ | filter · project · group(sum/avg/min/max/count) · sort · distinct · take | |
 | ✅ | **Joins (inner hash join)** | hash join: buffer the build side, probe the stream. `A & B on k`. Inner first, then left/right/outer. Memory: build side bounded by its cardinality (document it as a pipeline-breaker like sort). |
 | 🚧 | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅ and `fill col VALUE` ✅ done; `fill col mean\|median\|ffill\|bfill` still planned. |
-| 📋 | More aggregates | `count_distinct`, `std`, `p50/p90`, first/last |
+| ✅ | More aggregates | `std` (sample), `count_distinct`/`nunique`, `first`, `last` done; `p50/p90` still planned |
 | 📋 | `rename`, `drop`, `reorder` columns | sugar over project |
 
 ## E. Performance — keep beating DuckDB

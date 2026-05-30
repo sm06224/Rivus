@@ -27,6 +27,14 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// Sample standard deviation (ddof=1; `0` for fewer than two values).
+    Std,
+    /// Number of distinct non-empty values (`nunique` is an accepted alias).
+    CountDistinct,
+    /// First non-empty value seen in the group (source order).
+    First,
+    /// Last non-empty value seen in the group (source order).
+    Last,
 }
 
 impl AggFunc {
@@ -36,6 +44,10 @@ impl AggFunc {
             "avg" => AggFunc::Avg,
             "min" => AggFunc::Min,
             "max" => AggFunc::Max,
+            "std" => AggFunc::Std,
+            "count_distinct" | "nunique" => AggFunc::CountDistinct,
+            "first" => AggFunc::First,
+            "last" => AggFunc::Last,
             _ => return None,
         })
     }
@@ -46,6 +58,10 @@ impl AggFunc {
             AggFunc::Avg => "avg",
             AggFunc::Min => "min",
             AggFunc::Max => "max",
+            AggFunc::Std => "std",
+            AggFunc::CountDistinct => "count_distinct",
+            AggFunc::First => "first",
+            AggFunc::Last => "last",
         }
     }
 }

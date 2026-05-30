@@ -1281,32 +1281,76 @@ impl Operator for FilterProject {
 
 // ------------------------------------------------------------------- group by
 
-/// Running accumulator for one aggregate within one group.
+/// Running accumulator for one aggregate within one group. Carries the
+/// aggregate's `func` so it only maintains the state that function needs
+/// (numeric moments, a distinct set, or first/last cells).
 #[derive(Clone)]
 struct AggAcc {
+    func: AggFunc,
     sum: f64,
+    sum_sq: f64,
     min: f64,
     max: f64,
     n: i64,
+    first: Option<String>,
+    last: Option<String>,
+    distinct: std::collections::HashSet<String>,
 }
 
 impl AggAcc {
-    fn new() -> Self {
+    fn new(func: AggFunc) -> Self {
         AggAcc {
+            func,
             sum: 0.0,
+            sum_sq: 0.0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             n: 0,
+            first: None,
+            last: None,
+            distinct: std::collections::HashSet::new(),
         }
     }
-    fn add(&mut self, v: f64) {
-        self.sum += v;
-        self.min = self.min.min(v);
-        self.max = self.max.max(v);
-        self.n += 1;
+
+    /// Observe one cell value for this aggregate. Numeric aggregates ignore
+    /// non-numeric cells; first/last/count_distinct ignore empty cells.
+    fn observe(&mut self, v: &Value) {
+        match self.func {
+            AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max | AggFunc::Std => {
+                if let Some(x) = v.as_f64() {
+                    self.sum += x;
+                    self.sum_sq += x * x;
+                    self.min = self.min.min(x);
+                    self.max = self.max.max(x);
+                    self.n += 1;
+                }
+            }
+            AggFunc::CountDistinct => {
+                let s = v.to_string();
+                if !s.is_empty() {
+                    self.distinct.insert(s);
+                }
+            }
+            AggFunc::First => {
+                if self.first.is_none() {
+                    let s = v.to_string();
+                    if !s.is_empty() {
+                        self.first = Some(s);
+                    }
+                }
+            }
+            AggFunc::Last => {
+                let s = v.to_string();
+                if !s.is_empty() {
+                    self.last = Some(s);
+                }
+            }
+        }
     }
-    fn value(&self, f: AggFunc) -> f64 {
-        match f {
+
+    /// Numeric aggregate value (sum/avg/min/max/std). `0.0` for an empty group.
+    fn num_value(&self) -> f64 {
+        match self.func {
             AggFunc::Sum => self.sum,
             AggFunc::Avg => {
                 if self.n > 0 {
@@ -1329,7 +1373,28 @@ impl AggAcc {
                     0.0
                 }
             }
+            AggFunc::Std => {
+                if self.n > 1 {
+                    // Sample standard deviation (ddof=1): √((Σx² − Σx·mean)/(n−1)).
+                    let mean = self.sum / self.n as f64;
+                    let var = (self.sum_sq - self.sum * mean) / (self.n as f64 - 1.0);
+                    var.max(0.0).sqrt()
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
         }
+    }
+
+    fn distinct_count(&self) -> i64 {
+        self.distinct.len() as i64
+    }
+    fn first_str(&self) -> &str {
+        self.first.as_deref().unwrap_or("")
+    }
+    fn last_str(&self) -> &str {
+        self.last.as_deref().unwrap_or("")
     }
 }
 
@@ -1375,20 +1440,21 @@ impl Operator for GroupBy {
             .iter()
             .map(|(_, c)| chunk.schema.index_of(c))
             .collect();
-        let naggs = self.aggs.len();
+        // The aggregate funcs, copied out so the group-insert closure doesn't
+        // borrow `self.aggs` while `self.groups` is mutably borrowed.
+        let funcs: Vec<AggFunc> = self.aggs.iter().map(|(f, _)| *f).collect();
 
         for row in 0..chunk.len {
             let k = chunk.value(row, key_idx).to_string();
             let state = self.groups.entry(k).or_insert_with(|| GroupState {
                 count: 0,
-                accs: vec![AggAcc::new(); naggs],
+                accs: funcs.iter().map(|f| AggAcc::new(*f)).collect(),
             });
             state.count += 1;
             for (j, idx) in agg_idx.iter().enumerate() {
                 if let Some(ci) = idx {
-                    if let Some(v) = chunk.value(row, *ci).as_f64() {
-                        state.accs[j].add(v);
-                    }
+                    let v = chunk.value(row, *ci);
+                    state.accs[j].observe(&v);
                 }
             }
         }
@@ -1411,16 +1477,41 @@ impl Operator for GroupBy {
         let mut columns: Vec<Column> = vec![Column::Str(keys), Column::I64(counts)];
 
         for (j, (func, col)) in self.aggs.iter().enumerate() {
-            let vals: Vec<f64> = self
-                .groups
-                .values()
-                .map(|s| s.accs[j].value(*func))
-                .collect();
-            fields.push(Field::new(
-                format!("{}_{}", func.as_str(), col),
-                DataType::F64,
-            ));
-            columns.push(Column::F64(vals));
+            let name = format!("{}_{}", func.as_str(), col);
+            let (dtype, column) = match func {
+                AggFunc::CountDistinct => (
+                    DataType::I64,
+                    Column::I64(
+                        self.groups
+                            .values()
+                            .map(|s| s.accs[j].distinct_count())
+                            .collect(),
+                    ),
+                ),
+                AggFunc::First | AggFunc::Last => {
+                    let mut sc = StrColumn::default();
+                    for s in self.groups.values() {
+                        let cell = if matches!(func, AggFunc::First) {
+                            s.accs[j].first_str()
+                        } else {
+                            s.accs[j].last_str()
+                        };
+                        sc.push(cell);
+                    }
+                    (DataType::Str, Column::Str(sc))
+                }
+                _ => (
+                    DataType::F64,
+                    Column::F64(
+                        self.groups
+                            .values()
+                            .map(|s| s.accs[j].num_value())
+                            .collect(),
+                    ),
+                ),
+            };
+            fields.push(Field::new(name, dtype));
+            columns.push(column);
         }
 
         let id = ctx.fresh_id();

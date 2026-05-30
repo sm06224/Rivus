@@ -454,7 +454,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
            | '|>' proj+                                       (project / compute)
-           | '|#' IDENT (('sum'|'avg'|'min'|'max') ':' IDENT)*  (group)
+           | '|#' IDENT ((AGG) ':' IDENT)*                     (group)
            | ('take'|'limit'|'head') INT
            | 'sort' IDENT ('asc'|'desc')?
            | 'distinct' IDENT*
@@ -469,6 +469,8 @@ cmp        = add (CMP add)? ; add = mul (('+'|'-') mul)* ; mul = primary (('*'|'
 primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
            | IDENT | '$_' field-tail | '$_:'N field-tail | 'item' '(' STRING ')' ;
 FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
+AGG        = 'sum' | 'avg' | 'min' | 'max' | 'std'
+           | 'count_distinct' | 'nunique' | 'first' | 'last' ;
 CMP        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
 ```
 

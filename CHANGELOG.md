@@ -7,6 +7,12 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **More group aggregates (std-only).** `|#` gains `std` (sample standard
+  deviation, ddof=1), `count_distinct` (alias `nunique`, emitted as an integer),
+  and `first` / `last` (first/last non-empty value in source order, emitted as
+  text) alongside the existing `sum`/`avg`/`min`/`max`. Each aggregate's
+  accumulator tracks only the state its function needs; results stay chunk-size
+  independent (oracle-tested).
 - **TSV / custom delimiter (std-only).** `OpenCsv`/`SinkCsv` now carry a
   `delim: u8`. `.tsv` and `.tab` files are read and written tab-delimited
   automatically; `as tsv` / `as csv` overrides the extension either way. The
