@@ -149,8 +149,11 @@ pub fn csv_range_source(
     end: u64,
     chunk_size: usize,
     prefilter: Vec<(usize, CmpOp, f64)>,
+    delim: u8,
 ) -> Box<dyn Operator> {
-    match csv::CsvChunker::for_range(path, dtypes, keep, ncols, start, end, chunk_size, prefilter) {
+    match csv::CsvChunker::for_range(
+        path, dtypes, keep, ncols, start, end, chunk_size, prefilter, delim,
+    ) {
         Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
@@ -184,6 +187,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             prefilter,
             header,
             declared,
+            delim,
         } => Box::new(SourceCsv::new(
             path.clone(),
             projection.clone(),
@@ -192,6 +196,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             prefilter.clone(),
             *header,
             declared.clone(),
+            *delim,
         )),
         Op::OpenBinary {
             path,
@@ -239,15 +244,15 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             inputs.first().copied().unwrap_or(usize::MAX),
         )),
         Op::SinkPrint => Box::new(SinkPrint),
-        Op::SinkCsv { path } => Box::new(SinkCsv::new(path.clone())),
+        Op::SinkCsv { path, delim } => Box::new(SinkCsv::new(path.clone(), *delim)),
         Op::SinkJsonl { path } => Box::new(SinkJsonl::new(path.clone())),
     }
 }
 
 /// A streaming CSV sink to `path` (used by the parallel executor to write a
 /// worker's byte-range partition to a part file).
-pub fn csv_sink(path: String) -> Box<dyn Operator> {
-    Box::new(SinkCsv::new(path))
+pub fn csv_sink(path: String, delim: u8) -> Box<dyn Operator> {
+    Box::new(SinkCsv::new(path, delim))
 }
 
 /// A streaming JSONL sink to `path` (parallel worker part file).
@@ -272,6 +277,8 @@ struct SourceCsv {
     prefilter: Vec<(String, CmpOp, f64)>,
     header: bool,
     declared: Option<Vec<(String, Option<DataType>)>>,
+    /// Field delimiter byte (`b','` CSV, `b'\t'` TSV).
+    delim: u8,
     schema: Arc<Schema>,
     /// Streaming reader for a real file; `None` for stdin / after a load error.
     stream: Option<csv::CsvChunker>,
@@ -291,6 +298,7 @@ impl SourceCsv {
         prefilter: Vec<(String, CmpOp, f64)>,
         header: bool,
         declared: Option<Vec<(String, Option<DataType>)>>,
+        delim: u8,
     ) -> Self {
         SourceCsv {
             path,
@@ -301,6 +309,7 @@ impl SourceCsv {
             prefilter,
             header,
             declared,
+            delim,
             schema: Schema::empty(),
             stream: None,
             columns: Vec::new(),
@@ -321,6 +330,7 @@ impl SourceCsv {
             prefilter: Vec::new(),
             header: true,
             declared: None,
+            delim: b',',
             schema,
             stream: Some(chunker),
             columns: Vec::new(),
@@ -342,6 +352,7 @@ impl SourceCsv {
                 &self.prefilter,
                 self.header,
                 self.declared.as_deref(),
+                self.delim,
             ) {
                 Ok((schema, chunker)) => {
                     if chunker.bad_rows > 0 {
@@ -380,7 +391,7 @@ impl SourceCsv {
                 return;
             }
         };
-        match csv::parse_projected(&text, self.projection.as_deref()) {
+        match csv::parse_projected(&text, self.projection.as_deref(), self.delim) {
             Ok(data) => {
                 if data.bad_rows > 0 {
                     ctx.raise(
@@ -1574,30 +1585,34 @@ impl Operator for SinkPrint {
 /// buffers the whole output.
 struct SinkCsv {
     w: StreamWriter,
+    delim: u8,
 }
 
 impl SinkCsv {
-    fn new(path: String) -> Self {
+    fn new(path: String, delim: u8) -> Self {
         SinkCsv {
             w: StreamWriter::new(path),
+            delim,
         }
     }
 
     fn write_chunk(&mut self, chunk: &Chunk) -> std::io::Result<()> {
         let need_header = !self.w.wrote_header;
+        let sep = self.delim as char;
+        let delim = self.delim;
         {
             let w = self.w.writer()?;
             if need_header {
-                writeln!(w, "{}", chunk.schema.field_names().join(","))?;
+                writeln!(w, "{}", chunk.schema.field_names().join(&sep.to_string()))?;
             }
             let mut line = String::new();
             for row in 0..chunk.len {
                 line.clear();
                 for c in 0..chunk.columns.len() {
                     if c > 0 {
-                        line.push(',');
+                        line.push(sep);
                     }
-                    line.push_str(&csv_escape(&chunk.value(row, c)));
+                    line.push_str(&csv_escape(&chunk.value(row, c), delim));
                 }
                 writeln!(w, "{line}")?;
             }
@@ -1645,17 +1660,18 @@ impl Operator for SinkCsv {
 
 /// Render `chunks` (sharing a schema) to a CSV file: a header line then rows.
 /// Shared by the serial `SinkCsv` and the parallel executor's single-write merge.
-pub fn write_csv_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
+pub fn write_csv_file(path: &str, chunks: &[Chunk], delim: u8) -> std::io::Result<()> {
+    let sep = (delim as char).to_string();
     let mut out = String::new();
     if let Some(first) = chunks.first() {
-        out.push_str(&first.schema.field_names().join(","));
+        out.push_str(&first.schema.field_names().join(&sep));
         out.push('\n');
         for chunk in chunks {
             for row in 0..chunk.len {
                 let cells: Vec<String> = (0..chunk.columns.len())
-                    .map(|c| csv_escape(&chunk.value(row, c)))
+                    .map(|c| csv_escape(&chunk.value(row, c), delim))
                     .collect();
-                out.push_str(&cells.join(","));
+                out.push_str(&cells.join(&sep));
                 out.push('\n');
             }
         }
@@ -1663,9 +1679,9 @@ pub fn write_csv_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
     write_output(path, &out)
 }
 
-fn csv_escape(v: &Value) -> String {
+fn csv_escape(v: &Value, delim: u8) -> String {
     let s = v.to_string();
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
+    if s.bytes().any(|b| b == delim) || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s

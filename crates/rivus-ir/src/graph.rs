@@ -149,6 +149,10 @@ pub enum Op {
         /// columns positionally (overriding the header / `c0…`) and, where a
         /// type is given, fixes that column's lane instead of inferring it.
         declared: Option<Vec<(String, Option<DataType>)>>,
+        /// Field delimiter byte. `b','` for CSV (the default); `b'\t'` for a
+        /// `.tsv`/`.tab` file or `open f.x as tsv`. Std-only — the reader just
+        /// splits on a different byte.
+        delim: u8,
     },
     /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
     /// binary records (a C struct dump). `endian` selects byte order;
@@ -218,10 +222,52 @@ pub enum Op {
     Join { left_key: String, right_key: String },
     /// `print` / default leaf sink.
     SinkPrint,
-    /// `save path.csv`
-    SinkCsv { path: String },
+    /// `save path.csv` — `delim` selects the field separator (`b','` for CSV,
+    /// `b'\t'` for a `.tsv`/`.tab` path or `save out.x as tsv`).
+    SinkCsv { path: String, delim: u8 },
     /// `save path.jsonl` — write JSON Lines (one object per row).
     SinkJsonl { path: String },
+}
+
+/// The default CSV field delimiter.
+pub const COMMA: u8 = b',';
+
+/// Pick the field delimiter for a path by extension: `.tsv`/`.tab` use a tab,
+/// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
+/// feature — `open f.tsv` and `save out.tsv` just work.
+pub fn delim_for_path(path: &str) -> u8 {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".tsv") || lower.ends_with(".tab") {
+        b'\t'
+    } else {
+        COMMA
+    }
+}
+
+/// Render the `as …` modifier needed so `path` re-parses with `delim`, for
+/// `to_source` reversibility. Returns `None` when the path extension already
+/// implies `delim` (e.g. `.tsv` → tab, `.csv` → comma) so the rendered source
+/// stays clean; otherwise the explicit `as tsv` / `as csv` (or `delim "…"`).
+pub fn delim_modifier_for(path: &str, delim: u8) -> Option<String> {
+    if delim == delim_for_path(path) {
+        return None;
+    }
+    Some(match delim {
+        COMMA => "as csv".to_string(),
+        b'\t' => "as tsv".to_string(),
+        other => format!("delim \"{}\"", escape_delim(other)),
+    })
+}
+
+/// Render a delimiter byte for display inside a quoted `delim "…"` modifier.
+fn escape_delim(b: u8) -> String {
+    match b {
+        b'\t' => "\\t".to_string(),
+        b'\n' => "\\n".to_string(),
+        b'\r' => "\\r".to_string(),
+        0x20..=0x7e => (b as char).to_string(),
+        other => format!("\\x{other:02x}"),
+    }
 }
 
 impl Op {
@@ -260,10 +306,15 @@ impl Op {
                 prefilter,
                 header,
                 declared,
+                delim,
             } => {
                 let mut s = format!("open {path}");
                 if !header {
                     s.push_str(" noheader");
+                }
+                if let Some(m) = delim_modifier_for(path, *delim) {
+                    s.push(' ');
+                    s.push_str(&m);
                 }
                 if let Some(cols) = declared {
                     let parts: Vec<String> = cols
@@ -368,7 +419,10 @@ impl Op {
                 right_key,
             } => format!("& on {left_key} = {right_key}"),
             Op::SinkPrint => "print".to_string(),
-            Op::SinkCsv { path } => format!("save {path}"),
+            Op::SinkCsv { path, delim } => match delim_modifier_for(path, *delim) {
+                Some(m) => format!("save {path} {m}"),
+                None => format!("save {path}"),
+            },
             Op::SinkJsonl { path } => format!("save {path}  # as jsonl"),
         }
     }

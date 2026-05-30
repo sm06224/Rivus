@@ -25,7 +25,7 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | **Header-less CSV** | `open f.csv noheader` → columns `c0,c1,…`; first line is data |
 | ✅ | **Typed / named columns at `open`** | `open f.csv (id:int, name:str, age:int)` — give a schema instead of inferring; also names a header-less file |
 | 📋 | **Compressed inputs** (`.gz` first) | feature `gzip` via **`flate2`** (pure-Rust backend), serial single-pass (compressed streams can't seek → no byte-range parallel); then `.zst` (`ruzstd`), `.zip`/tar. Vetting log in `SUPPLY-CHAIN.md`. |
-| 📋 | TSV / custom delimiter (real) | `as tsv` currently aliases CSV; add a `delim` to `OpenCsv`/`SinkCsv` (std-only) |
+| ✅ | **TSV / custom delimiter** (real) | `delim: u8` threaded through `OpenCsv`/`SinkCsv` (std-only). `.tsv`/`.tab` paths split on a tab automatically; `as tsv`/`as csv` overrides the extension. Reader, parallel reader, and sinks all honor it; `to_source` stays faithful. |
 | 📋 | **Parquet / Arrow** | feature `parquet` via apache **`arrow`/`parquet`** (isolated behind the source/sink trait) |
 | 📋 | **Python pickle**, YAML/TOML/INI/XML/HTML | `pickle` via `serde-pickle`; text formats likely std-only or a small vetted dep |
 | 📋 | Transports: socket / HTTP / subscribe / scheduled-get | `docs/design/18` |

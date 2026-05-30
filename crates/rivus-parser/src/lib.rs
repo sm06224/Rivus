@@ -235,17 +235,21 @@ impl Parser {
                     } else {
                         None
                     };
+                    let delim = resolve_delim(&path, explicit.as_deref());
                     let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                         self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                     })?;
-                    let n = self.g.add_node(fmt.into_sink_op(path));
+                    let n = self.g.add_node(fmt.into_sink_op(path, delim));
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
                 Tok::Word(w) if w == "writecsv" => {
                     self.bump();
                     let path = self.word()?;
-                    let n = self.g.add_node(Op::SinkCsv { path });
+                    let n = self.g.add_node(Op::SinkCsv {
+                        delim: rivus_ir::delim_for_path(&path),
+                        path,
+                    });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -415,10 +419,11 @@ impl Parser {
                 } else {
                     None
                 };
+                let delim = resolve_delim(&path, explicit.as_deref());
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                 })?;
-                let mut op = fmt.into_op(path);
+                let mut op = fmt.into_op(path, delim);
                 if let Op::OpenCsv {
                     header, declared, ..
                 } = &mut op
@@ -434,6 +439,7 @@ impl Parser {
                 self.bump();
                 let path = norm_path(self.word()?);
                 Ok(self.g.add_node(Op::OpenCsv {
+                    delim: rivus_ir::delim_for_path(&path),
                     path,
                     projection: None,
                     prefilter: Vec::new(),
@@ -916,7 +922,7 @@ enum Format {
 }
 
 impl Format {
-    fn into_op(self, path: String) -> Op {
+    fn into_op(self, path: String, delim: u8) -> Op {
         match self {
             Format::Csv => Op::OpenCsv {
                 path,
@@ -924,16 +930,28 @@ impl Format {
                 prefilter: Vec::new(),
                 header: true,
                 declared: None,
+                delim,
             },
             Format::Jsonl => Op::OpenJsonl { path },
         }
     }
 
-    fn into_sink_op(self, path: String) -> Op {
+    fn into_sink_op(self, path: String, delim: u8) -> Op {
         match self {
-            Format::Csv => Op::SinkCsv { path },
+            Format::Csv => Op::SinkCsv { path, delim },
             Format::Jsonl => Op::SinkJsonl { path },
         }
+    }
+}
+
+/// Resolve the field delimiter for `open`/`save`: an explicit `as csv|tsv` wins
+/// (`tsv` → tab, `csv` → comma); otherwise it follows the path extension
+/// (`.tsv`/`.tab` → tab, else comma). JSON formats ignore this.
+fn resolve_delim(path: &str, explicit: Option<&str>) -> u8 {
+    match explicit.map(|f| f.to_ascii_lowercase()).as_deref() {
+        Some("tsv") => b'\t',
+        Some("csv") => rivus_ir::COMMA,
+        _ => rivus_ir::delim_for_path(path),
     }
 }
 
@@ -1091,7 +1109,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::SinkCsv { path } => Some(path.clone()),
+                Op::SinkCsv { path, .. } => Some(path.clone()),
                 _ => None,
             })
             .unwrap();

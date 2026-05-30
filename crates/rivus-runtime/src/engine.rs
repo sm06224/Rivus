@@ -393,18 +393,20 @@ fn try_streaming_parallel(
     path: &str,
     threads: usize,
 ) -> Option<RunResult> {
-    let (projection, prefilter, header, declared) = match &graph.nodes[src_id].op {
+    let (projection, prefilter, header, declared, delim) = match &graph.nodes[src_id].op {
         Op::OpenCsv {
             projection,
             prefilter,
             header,
             declared,
+            delim,
             ..
         } => (
             projection.clone(),
             prefilter.clone(),
             *header,
             declared.clone(),
+            *delim,
         ),
         _ => return None, // only CSV has a streaming-parallel plan for now
     };
@@ -414,15 +416,15 @@ fn try_streaming_parallel(
     // order. Map every file sink to its final path; bail to serial if any sink
     // writes stdout (can't split an ordered stream across workers) or if there
     // is no file sink (nothing to write in parallel without buffering).
-    let mut sinks: Vec<(NodeId, String, bool)> = Vec::new();
+    let mut sinks: Vec<(NodeId, String, bool, u8)> = Vec::new();
     for nd in &graph.nodes {
         match &nd.op {
-            Op::SinkCsv { path } => sinks.push((nd.id, path.clone(), false)),
-            Op::SinkJsonl { path } => sinks.push((nd.id, path.clone(), true)),
+            Op::SinkCsv { path, delim } => sinks.push((nd.id, path.clone(), false, *delim)),
+            Op::SinkJsonl { path } => sinks.push((nd.id, path.clone(), true, b',')),
             _ => {}
         }
     }
-    if sinks.is_empty() || sinks.iter().any(|(_, p, _)| p == "-") {
+    if sinks.is_empty() || sinks.iter().any(|(_, p, _, _)| p == "-") {
         return None;
     }
 
@@ -441,6 +443,7 @@ fn try_streaming_parallel(
         &prefilter,
         header,
         declared.as_deref(),
+        delim,
     )
     .ok()?;
     let nparts = ranges.len();
@@ -472,6 +475,7 @@ fn try_streaming_parallel(
                         b,
                         opts.chunk_size,
                         pre.clone(),
+                        delim,
                     ));
                     let ops: Vec<Box<dyn Operator>> = graph
                         .nodes
@@ -479,14 +483,14 @@ fn try_streaming_parallel(
                         .map(|node| {
                             if node.id == src_id {
                                 src.take().expect("one source")
-                            } else if let Some((_, fp, jsonl)) =
-                                sinks.iter().find(|(id, _, _)| *id == node.id)
+                            } else if let Some((_, fp, jsonl, sdelim)) =
+                                sinks.iter().find(|(id, _, _, _)| *id == node.id)
                             {
                                 let pp = part_path(fp, i);
                                 if *jsonl {
                                     operators::jsonl_sink(pp)
                                 } else {
-                                    operators::csv_sink(pp)
+                                    operators::csv_sink(pp, *sdelim)
                                 }
                             } else {
                                 operators::build(
@@ -519,7 +523,7 @@ fn try_streaming_parallel(
     let mut res = merge_results(graph, results, src_errors, false);
 
     // Concatenate each sink's part files in source order into its final path.
-    for (_, final_path, jsonl) in &sinks {
+    for (_, final_path, jsonl, _) in &sinks {
         let parts: Vec<String> = (0..nparts).map(|i| part_path(final_path, i)).collect();
         if let Err(e) = concat_parts(final_path, &parts, *jsonl) {
             res.errors.push(ErrorEvent::new(
@@ -743,7 +747,9 @@ fn flush_parallel_sinks(graph: &PlanGraph, res: &mut RunResult) {
 /// If `op` is a file sink, write `chunks` to it once and return (path, result).
 fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Result<()>)> {
     match op {
-        Op::SinkCsv { path } => Some((path, operators::write_csv_file(path, chunks))),
+        Op::SinkCsv { path, delim } => {
+            Some((path, operators::write_csv_file(path, chunks, *delim)))
+        }
         Op::SinkJsonl { path } => Some((path, operators::write_jsonl_file(path, chunks))),
         _ => None,
     }

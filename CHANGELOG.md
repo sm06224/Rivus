@@ -4,6 +4,17 @@ All notable changes to Rivus. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [SemVer](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- **TSV / custom delimiter (std-only).** `OpenCsv`/`SinkCsv` now carry a
+  `delim: u8`. `.tsv` and `.tab` files are read and written tab-delimited
+  automatically; `as tsv` / `as csv` overrides the extension either way. The
+  delimiter flows through the streaming reader, the byte-range parallel reader,
+  and both serial and parallel sinks. `to_source` only emits an `as …` modifier
+  when the delimiter disagrees with the path extension, so round-trips stay
+  clean and faithful. No new dependencies.
+
 ## [1.0.0] — 2026-05-30
 
 First stable release. Rivus is a flow-oriented, DAG-native, continue-first,
