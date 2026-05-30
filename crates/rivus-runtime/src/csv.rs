@@ -45,6 +45,10 @@ pub struct CsvChunker {
     /// Rows skipped in pass 1 for wrong arity (reported once by the source).
     pub bad_rows: usize,
     eof: bool,
+    /// Current byte offset and an optional end (for streaming one byte range of
+    /// the file in a parallel worker). `limit == None` streams to EOF.
+    pos: u64,
+    limit: Option<u64>,
 }
 
 impl CsvChunker {
@@ -131,6 +135,8 @@ impl CsvChunker {
                 line: String::new(),
                 bad_rows: bad,
                 eof: false,
+                pos: 0,
+                limit: None,
             },
         ))
     }
@@ -206,8 +212,38 @@ impl CsvChunker {
                 line: String::new(),
                 bad_rows: bad,
                 eof: false,
+                pos: 0,
+                limit: None,
             },
         ))
+    }
+
+    /// Stream one byte range `[start, end)` of the file with an already-inferred
+    /// global schema (used by the parallel streaming executor). `start`/`end`
+    /// must be newline-aligned offsets into the data region (see `plan_parallel`).
+    pub fn for_range(
+        path: &str,
+        dtypes: Vec<DataType>,
+        keep: Vec<usize>,
+        ncols: usize,
+        start: u64,
+        end: u64,
+        chunk_size: usize,
+    ) -> Result<CsvChunker, String> {
+        let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        Ok(CsvChunker {
+            reader: BufReader::new(f),
+            ncols,
+            keep,
+            dtypes,
+            chunk_size: chunk_size.max(1),
+            line: String::new(),
+            bad_rows: 0,
+            eof: false,
+            pos: start,
+            limit: Some(end),
+        })
     }
 
     /// Yield the next batch of up to `chunk_size` rows as typed columns, or
@@ -224,18 +260,25 @@ impl CsvChunker {
             .collect();
         let mut got = 0usize;
         while got < self.chunk_size {
+            // Stop at the worker's byte range end (lines never straddle a
+            // newline-aligned boundary, so the last line ends exactly at it).
+            if matches!(self.limit, Some(end) if self.pos >= end) {
+                self.eof = true;
+                break;
+            }
             self.line.clear();
-            match self.reader.read_line(&mut self.line) {
+            let n = match self.reader.read_line(&mut self.line) {
                 Ok(0) => {
                     self.eof = true;
                     break;
                 }
-                Ok(_) => {}
+                Ok(n) => n,
                 Err(_) => {
                     self.eof = true;
                     break;
                 }
-            }
+            };
+            self.pos += n as u64;
             let l = trim_eol(&self.line);
             if l.trim().is_empty() {
                 continue;
@@ -255,6 +298,162 @@ impl CsvChunker {
         }
         Some(builders.iter_mut().map(ColBuilder::finish).collect())
     }
+}
+
+/// A plan for streaming-parallel CSV reading: a global schema plus the
+/// newline-aligned byte ranges each worker streams (covering the data region
+/// exactly once). Inference itself runs in parallel over the same ranges.
+pub struct CsvParallelPlan {
+    pub schema: Schema,
+    pub dtypes: Vec<DataType>,
+    pub keep: Vec<usize>,
+    pub ncols: usize,
+    pub ranges: Vec<(u64, u64)>,
+    pub bad_rows: usize,
+}
+
+/// Build a [`CsvParallelPlan`]: read the header, snap `nthreads` byte ranges to
+/// newline boundaries, then infer the global column types by streaming those
+/// ranges in parallel and merging the per-range type flags. O(1) memory.
+pub fn plan_parallel(
+    path: &str,
+    allow: Option<&[String]>,
+    nthreads: usize,
+) -> Result<CsvParallelPlan, String> {
+    let file_len = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat '{path}': {e}"))?
+        .len();
+
+    // Header → column names, kept indices, and the first data byte offset.
+    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let mut r = BufReader::new(f);
+    let mut header = String::new();
+    let hlen = r.read_line(&mut header).map_err(|e| e.to_string())?;
+    if hlen == 0 {
+        return Err("empty CSV".to_string());
+    }
+    let names = split_owned(trim_eol(&header));
+    let ncols = names.len();
+    if ncols == 0 {
+        return Err("CSV header has no columns".to_string());
+    }
+    let keep: Vec<usize> = match allow {
+        None => (0..ncols).collect(),
+        Some(a) => (0..ncols)
+            .filter(|&i| a.iter().any(|n| n == &names[i]))
+            .collect(),
+    };
+
+    let data_start = hlen as u64;
+    let ranges = snap_ranges(&mut r, data_start, file_len, nthreads.max(1))?;
+
+    // Infer types per range in parallel, then merge the flags.
+    let kept = keep.clone();
+    let infers: Vec<(Vec<Flags>, usize)> = std::thread::scope(|s| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(a, b)| {
+                let kref = &kept;
+                s.spawn(move || infer_range(path, kref, ncols, a, b))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+    let mut bad = 0usize;
+    for (fs, b) in &infers {
+        bad += *b;
+        for (k, f) in fs.iter().enumerate() {
+            flags[k].merge(f);
+        }
+    }
+    let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+    let mut fields = Vec::with_capacity(keep.len());
+    for (k, &ci) in keep.iter().enumerate() {
+        fields.push(Field::new(names[ci].clone(), dtypes[k]));
+    }
+
+    Ok(CsvParallelPlan {
+        schema: Schema::new(fields),
+        dtypes,
+        keep,
+        ncols,
+        ranges,
+        bad_rows: bad,
+    })
+}
+
+/// Snap `n` evenly-spaced offsets in `[data_start, file_len)` to the byte just
+/// after the next newline, yielding contiguous line-aligned ranges.
+fn snap_ranges(
+    r: &mut BufReader<File>,
+    data_start: u64,
+    file_len: u64,
+    n: usize,
+) -> Result<Vec<(u64, u64)>, String> {
+    let mut bounds = vec![data_start];
+    let span = file_len.saturating_sub(data_start);
+    let mut scratch = String::new();
+    for i in 1..n {
+        let target = data_start + span * (i as u64) / (n as u64);
+        if target <= *bounds.last().unwrap() {
+            continue;
+        }
+        r.seek(SeekFrom::Start(target)).map_err(|e| e.to_string())?;
+        scratch.clear();
+        let consumed = r.read_line(&mut scratch).map_err(|e| e.to_string())?;
+        let next = (target + consumed as u64).min(file_len);
+        if next > *bounds.last().unwrap() && next < file_len {
+            bounds.push(next);
+        }
+    }
+    bounds.push(file_len);
+    Ok(bounds.windows(2).map(|w| (w[0], w[1])).collect())
+}
+
+/// Infer column type flags over one byte range (streaming, O(1) memory).
+fn infer_range(
+    path: &str,
+    keep: &[usize],
+    ncols: usize,
+    start: u64,
+    end: u64,
+) -> (Vec<Flags>, usize) {
+    let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+    let mut bad = 0usize;
+    let f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (flags, bad),
+    };
+    let mut r = BufReader::new(f);
+    if r.seek(SeekFrom::Start(start)).is_err() {
+        return (flags, bad);
+    }
+    let mut pos = start;
+    let mut line = String::new();
+    while pos < end {
+        line.clear();
+        match r.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(n) => pos += n as u64,
+            Err(_) => break,
+        }
+        let l = trim_eol(&line);
+        if l.trim().is_empty() {
+            continue;
+        }
+        let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
+        split_into(l, &mut scratch);
+        if scratch.len() != ncols {
+            bad += 1;
+            continue;
+        }
+        for (k, &ci) in keep.iter().enumerate() {
+            flags[k].observe(scratch[ci].as_ref());
+        }
+    }
+    (flags, bad)
 }
 
 /// Strip a trailing `\n` or `\r\n` (mirrors `str::lines` semantics).

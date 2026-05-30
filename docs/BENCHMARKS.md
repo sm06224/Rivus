@@ -335,8 +335,8 @@ resident memory is independent of input size. Measured peak RSS (`os.wait4`
 
 | pipeline | input | peak RSS | time | throughput |
 |---|---:|---:|---:|---:|
-| `open \|? age>=50 \|> name age save out.csv` | 1.1 GB | **10.1 MiB** | 14.4 s | ~3.3 M rows/s |
-| `open \|? age>=50 \|> (age*2) as a save out.jsonl` | 1.1 GB | **10.1 MiB** | 15.7 s | ~3.1 M rows/s |
+| `open \|? age>=50 \|> name age save out.csv` (serial) | 1.1 GB | **10.1 MiB** | 14.4 s | ~3.3 M rows/s |
+| same, **streaming-parallel** (4 cores) | 1.1 GB | **10.2 MiB** | **5.3 s** | **~9.0 M rows/s** |
 | `open big.csv` (bare, no sink → **preview**) | 1.1 GB | **10.0 MiB** | **0.00 s** | instant |
 | `open \|? age>=50` (no sink → **preview**) | 1.1 GB | **10.4 MiB** | **0.00 s** | instant |
 
@@ -344,6 +344,15 @@ A sink-less `rivus run` is a **preview**: the CSV source sample-infers its
 schema from the first chunk and the engine stops after the row cap (default
 1000), so eyeballing a 15 GB file is instant and flat-memory. Adding
 `save out.csv` switches to full global-inference streaming over every row.
+
+**Streaming-parallel** (files > 256 MiB with a file sink): the schema is
+inferred once over newline-aligned byte ranges *in parallel*, then each worker
+streams its range through an identical stateless sub-DAG and writes a **part
+file**; the parts are concatenated in source order (CSV headers de-duplicated).
+**2.7× on 4 cores while staying at ~10 MiB** — bounded memory is preserved
+because nothing is buffered (an earlier `collector`-based attempt hit 690 MiB;
+that regression is why workers stream to part files instead). A byte-identical
+oracle test (`engine::tests::streaming_parallel_matches_serial`) gates it.
 
 Before streaming, `open` alone read the whole file into a `String` and parsed
 every column up front (~2–3 GB resident for this input, with a long stall and no

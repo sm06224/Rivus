@@ -100,26 +100,27 @@ fn must_drain(graph: &PlanGraph) -> bool {
     })
 }
 
-/// Build one operator per node. In parallel mode, `mem` replaces the single
-/// source with a pre-parsed [`operators::mem_source`] and any file sink with a
-/// collector (rows gathered and written once after the merge).
+/// Build one operator per node. In parallel mode, `src_override` replaces the
+/// single source (with a partition's `mem_source` or a byte-range streaming
+/// source) and any file sink becomes a collector (rows gathered and written
+/// once after the merge).
 fn build_ops(
     graph: &PlanGraph,
     opts: &RunOptions,
-    mem: Option<(NodeId, Vec<Chunk>)>,
+    src_override: Option<(NodeId, Box<dyn Operator>)>,
     preview: bool,
 ) -> Vec<Box<dyn Operator>> {
-    let (mem_id, mut mem_chunks) = match mem {
-        Some((id, c)) => (Some(id), Some(c)),
+    let (ov_id, mut ov_op) = match src_override {
+        Some((id, op)) => (Some(id), Some(op)),
         None => (None, None),
     };
     graph
         .nodes
         .iter()
         .map(|node| {
-            if Some(node.id) == mem_id {
-                operators::mem_source(mem_chunks.take().unwrap_or_default())
-            } else if mem_id.is_some()
+            if Some(node.id) == ov_id {
+                ov_op.take().expect("source override used once")
+            } else if ov_id.is_some()
                 && matches!(node.op, Op::SinkCsv { .. } | Op::SinkJsonl { .. })
             {
                 operators::collector()
@@ -379,6 +380,168 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
+/// Stream a large CSV in parallel: infer the global schema once (in parallel),
+/// then have each worker stream one newline-aligned **byte range** through an
+/// identical stateless sub-DAG and merge in source order — all in bounded
+/// memory (no whole-file materialization). Returns `None` for non-CSV sources
+/// (binary/jsonl large files fall back to the serial streaming reader).
+fn try_streaming_parallel(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    src_id: NodeId,
+    path: &str,
+    threads: usize,
+) -> Option<RunResult> {
+    let projection = match &graph.nodes[src_id].op {
+        Op::OpenCsv { projection, .. } => projection.clone(),
+        _ => return None, // only CSV has a streaming-parallel plan for now
+    };
+
+    // Each worker streams its byte range to a per-worker *part file* (bounded
+    // memory — no output buffering), then the parts are concatenated in source
+    // order. Map every file sink to its final path; bail to serial if any sink
+    // writes stdout (can't split an ordered stream across workers) or if there
+    // is no file sink (nothing to write in parallel without buffering).
+    let mut sinks: Vec<(NodeId, String, bool)> = Vec::new();
+    for nd in &graph.nodes {
+        match &nd.op {
+            Op::SinkCsv { path } => sinks.push((nd.id, path.clone(), false)),
+            Op::SinkJsonl { path } => sinks.push((nd.id, path.clone(), true)),
+            _ => {}
+        }
+    }
+    if sinks.is_empty() || sinks.iter().any(|(_, p, _)| p == "-") {
+        return None;
+    }
+
+    let crate::csv::CsvParallelPlan {
+        schema,
+        dtypes,
+        keep,
+        ncols,
+        ranges,
+        bad_rows,
+    } = crate::csv::plan_parallel(path, projection.as_deref(), threads).ok()?;
+    let nparts = ranges.len();
+    if nparts < 2 {
+        return None; // not worth threading; let the caller's serial path run
+    }
+    let schema = std::sync::Arc::new(schema);
+
+    let part_path = |final_path: &str, i: usize| format!("{final_path}.rivpart{i}");
+
+    let results: Vec<RunResult> = std::thread::scope(|scope| {
+        let sinks = &sinks;
+        let schema = &schema;
+        let dtypes = &dtypes;
+        let keep = &keep;
+        let handles: Vec<_> = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, b))| {
+                scope.spawn(move || {
+                    let mut src = Some(operators::csv_range_source(
+                        path,
+                        dtypes.clone(),
+                        keep.clone(),
+                        ncols,
+                        schema.clone(),
+                        a,
+                        b,
+                        opts.chunk_size,
+                    ));
+                    let ops: Vec<Box<dyn Operator>> = graph
+                        .nodes
+                        .iter()
+                        .map(|node| {
+                            if node.id == src_id {
+                                src.take().expect("one source")
+                            } else if let Some((_, fp, jsonl)) =
+                                sinks.iter().find(|(id, _, _)| *id == node.id)
+                            {
+                                let pp = part_path(fp, i);
+                                if *jsonl {
+                                    operators::jsonl_sink(pp)
+                                } else {
+                                    operators::csv_sink(pp)
+                                }
+                            } else {
+                                operators::build(
+                                    &node.op,
+                                    &graph.inputs_of(node.id),
+                                    opts.chunk_size,
+                                    false,
+                                )
+                            }
+                        })
+                        .collect();
+                    drive(graph, ops, (i as u64) << 40, false, None)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut src_errors = Vec::new();
+    if bad_rows > 0 {
+        src_errors.push(
+            ErrorEvent::new(
+                Severity::Recoverable,
+                ErrorScope::Item,
+                format!("{bad_rows} malformed row(s) skipped"),
+            )
+            .at_node(label_of(graph, src_id)),
+        );
+    }
+    let mut res = merge_results(graph, results, src_errors, false);
+
+    // Concatenate each sink's part files in source order into its final path.
+    for (_, final_path, jsonl) in &sinks {
+        let parts: Vec<String> = (0..nparts).map(|i| part_path(final_path, i)).collect();
+        if let Err(e) = concat_parts(final_path, &parts, *jsonl) {
+            res.errors.push(ErrorEvent::new(
+                Severity::Critical,
+                ErrorScope::Graph,
+                format!("cannot assemble '{final_path}': {e}"),
+            ));
+        }
+    }
+    Some(res)
+}
+
+/// Concatenate worker part files into `final_path` in order. For CSV, keep the
+/// header of the first non-empty part and drop the rest; JSONL has no header.
+/// Streams part-by-part (bounded memory) and removes the parts when done.
+fn concat_parts(final_path: &str, parts: &[String], jsonl: bool) -> std::io::Result<()> {
+    use std::io::{BufRead, Write};
+    let mut out = std::io::BufWriter::new(std::fs::File::create(final_path)?);
+    let mut header_done = jsonl;
+    for part in parts {
+        let f = match std::fs::File::open(part) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut r = std::io::BufReader::new(f);
+        if !jsonl {
+            let mut first = Vec::new();
+            if r.read_until(b'\n', &mut first)? == 0 {
+                continue; // empty part (worker produced no rows)
+            }
+            if !header_done {
+                out.write_all(&first)?;
+                header_done = true;
+            }
+            // else: drop this part's duplicate header
+        }
+        std::io::copy(&mut r, &mut out)?;
+    }
+    out.flush()?;
+    for p in parts {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
+}
+
 /// The file path of a single-file source op (for the parallel size gate).
 fn source_path(op: &Op) -> Option<&str> {
     match op {
@@ -455,15 +618,21 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
     }
     let src_id = source?;
 
-    // The parallel path materializes the whole input to partition it across
-    // threads. For large files that defeats streaming, so cap it by file size
-    // and let big inputs flow through the bounded-memory serial reader instead.
+    // A sink-less preview (CLI `rivus run open big.csv`) wants the instant,
+    // bounded-memory serial path — never materialize for it.
+    if opts.max_capture.is_some() && !must_drain(graph) {
+        return None;
+    }
+
+    // The chunk-partition path materializes the whole input to split it. For a
+    // large file, stream it in parallel instead (byte ranges, no buffering);
+    // non-CSV large sources fall back to the serial streaming reader.
     const PARALLEL_MAX_BYTES: u64 = 256 * 1024 * 1024;
     if let Some(path) = source_path(&graph.nodes[src_id].op) {
         if path != "-" {
             if let Ok(meta) = std::fs::metadata(path) {
                 if meta.len() > PARALLEL_MAX_BYTES {
-                    return None;
+                    return try_streaming_parallel(graph, opts, src_id, path, threads);
                 }
             }
         }
@@ -488,7 +657,12 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
 
     // Too few chunks to be worth threads: run once over the already-parsed data.
     if all.len() < threads * 2 {
-        let ops = build_ops(graph, opts, Some((src_id, all)), false);
+        let ops = build_ops(
+            graph,
+            opts,
+            Some((src_id, operators::mem_source(all))),
+            false,
+        );
         let mut res = drive(graph, ops, 0, false, None);
         // Write any collected sink (build_ops made it a collector).
         flush_parallel_sinks(graph, &mut res);
@@ -507,7 +681,8 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             .enumerate()
             .map(|(i, chunks)| {
                 scope.spawn(move || {
-                    let ops = build_ops(graph, opts, Some((src_id, chunks)), false);
+                    let src = operators::mem_source(chunks);
+                    let ops = build_ops(graph, opts, Some((src_id, src)), false);
                     drive(graph, ops, (i as u64) << 40, false, None)
                 })
             })
@@ -712,7 +887,8 @@ fn label_of(graph: &PlanGraph, id: NodeId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::group_thousands;
+    use super::*;
+    use crate::gendata;
 
     #[test]
     fn thousands_separator() {
@@ -723,5 +899,53 @@ mod tests {
         assert_eq!(group_thousands(12_345), "12,345");
         assert_eq!(group_thousands(123_456), "123,456");
         assert_eq!(group_thousands(48_000_000), "48,000,000");
+    }
+
+    /// Streaming-parallel (byte-range workers writing ordered part files) must
+    /// produce a **byte-identical** output file to the serial streaming reader.
+    /// Forced on a small file (4 ranges) so it runs in CI, and the assertion
+    /// also guards the header-dedup + source-order concatenation.
+    #[test]
+    fn streaming_parallel_matches_serial() {
+        let rows = 30_000;
+        let data = gendata::clean(rows, 7);
+        let path = gendata::write_temp("stream_par", &data);
+        let psafe = path.to_string_lossy().to_string();
+        let out_serial = format!("{psafe}.serial.out");
+        let out_par = format!("{psafe}.par.out");
+        let opts = RunOptions::default();
+
+        // Serial reference (bypass try_parallel): the real sink writes the file.
+        let gs = rivus_parser::parse(&format!(
+            "S:\n open {psafe}\n |? age >= 45\n |> name age\n save {out_serial}\n;"
+        ))
+        .unwrap();
+        let ops = build_ops(&gs, &opts, None, false);
+        let _ = drive(&gs, ops, 0, false, None);
+
+        // Forced streaming-parallel over 4 byte ranges → ordered part-file concat.
+        let gp = rivus_parser::parse(&format!(
+            "S:\n open {psafe}\n |? age >= 45\n |> name age\n save {out_par}\n;"
+        ))
+        .unwrap();
+        let src_id = gp
+            .nodes
+            .iter()
+            .position(|nd| matches!(nd.op, Op::OpenCsv { .. }))
+            .unwrap();
+        try_streaming_parallel(&gp, &opts, src_id, &psafe, 4)
+            .expect("streaming-parallel should engage");
+
+        let a = std::fs::read_to_string(&out_serial).unwrap();
+        let b = std::fs::read_to_string(&out_par).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&out_serial);
+        let _ = std::fs::remove_file(&out_par);
+
+        assert!(a.lines().count() > 1, "expected real output");
+        assert_eq!(
+            a, b,
+            "streaming-parallel output must equal serial, byte-for-byte"
+        );
     }
 }

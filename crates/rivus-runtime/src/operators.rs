@@ -134,6 +134,29 @@ pub fn collector() -> Box<dyn Operator> {
     Box::new(Merge)
 }
 
+/// A streaming CSV source over one byte range `[start, end)` of a file, used by
+/// the parallel streaming executor. The global schema/types are pre-inferred
+/// (see [`csv::plan_parallel`]); on open error it yields nothing (continue-first
+/// — the worker simply contributes no rows).
+#[allow(clippy::too_many_arguments)]
+pub fn csv_range_source(
+    path: &str,
+    dtypes: Vec<rivus_core::DataType>,
+    keep: Vec<usize>,
+    ncols: usize,
+    schema: Arc<Schema>,
+    start: u64,
+    end: u64,
+    chunk_size: usize,
+) -> Box<dyn Operator> {
+    match csv::CsvChunker::for_range(path, dtypes, keep, ncols, start, end, chunk_size) {
+        Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch)),
+        Err(_) => Box::new(MemSource {
+            chunks: std::collections::VecDeque::new(),
+        }),
+    }
+}
+
 struct MemSource {
     chunks: std::collections::VecDeque<Chunk>,
 }
@@ -205,6 +228,17 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
     }
 }
 
+/// A streaming CSV sink to `path` (used by the parallel executor to write a
+/// worker's byte-range partition to a part file).
+pub fn csv_sink(path: String) -> Box<dyn Operator> {
+    Box::new(SinkCsv::new(path))
+}
+
+/// A streaming JSONL sink to `path` (parallel worker part file).
+pub fn jsonl_sink(path: String) -> Box<dyn Operator> {
+    Box::new(SinkJsonl::new(path))
+}
+
 // ---------------------------------------------------------------- source (csv)
 
 /// CSV source. A real file streams (bounded memory, [`csv::CsvChunker`]); the
@@ -240,6 +274,23 @@ impl SourceCsv {
             preview,
             schema: Schema::empty(),
             stream: None,
+            columns: Vec::new(),
+            cursor: 0,
+            total: 0,
+        }
+    }
+
+    /// A source wrapping an already-built streaming reader (a parallel worker's
+    /// byte range), with a schema inferred globally beforehand.
+    fn from_stream(schema: Arc<Schema>, chunker: csv::CsvChunker) -> Self {
+        SourceCsv {
+            path: String::new(),
+            projection: None,
+            chunk_size: 0,
+            loaded: true,
+            preview: false,
+            schema,
+            stream: Some(chunker),
             columns: Vec::new(),
             cursor: 0,
             total: 0,
