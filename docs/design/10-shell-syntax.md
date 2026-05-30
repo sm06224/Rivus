@@ -12,7 +12,8 @@
 | `Label: ... ;` | scope（execution graph node）宣言 | label 付きノード |
 | `: ... ; Label` | 無名 scope + 結果への label 付与 | 同上 |
 | `\|?` | filter | `Op::Filter` |
-| `\|>` | map / projection | `Op::Project` |
+| `\|>` | map / projection（裸の列） | `Op::Project` |
+| `\|> (expr) as name` | 計算列（`+ - * / %`・別名） | `Op::ProjectExpr` |
 | `\|#` | group / partition by | `Op::GroupBy` |
 | `take N` / `limit N` / `head N` | 先頭 N 行で打ち切り（chunk-size 非依存） | `Op::Take` |
 | `sort KEY [asc\|desc]` | キー列で安定ソート（blocking・chunk-size 非依存） | `Op::Sort` |
@@ -63,7 +64,7 @@ BINTYPE    = 'i8'|'i16'|'i32'|'i64'|'u8'|'u16'|'u32'|'u64'|'f32'|'f64'|'bool' ;
 ref-expr   = IDENT ( ('+' IDENT)+ | ('&' IDENT) )? ;   (* merge / join *)
 
 transform  = '|?' expr
-           | '|>' field+
+           | '|>' proj+
            | '|#' field
            | ('take'|'limit'|'head') INT
            | 'sort' IDENT ('asc'|'desc')?
@@ -77,11 +78,16 @@ sink       = 'save' PATH | 'print' ;
 hook       = 'on' EVENT ('severity' '>=' SEV)? ':' action ';' ;
 action     = 'transition' MODE | 'log' STRING | ['route'|'reroute'] IDENT | IDENT ;
 
+proj       = IDENT ('as' IDENT)?           (* bare field / rename *)
+           | '(' expr ')' 'as' IDENT ;     (* computed column *)
 expr       = or ;
 or         = and ('or' and)* ;
 and        = cmp ('and' cmp)* ;
-cmp        = primary (CMP primary)? ;
+cmp        = add (CMP add)? ;
+add        = mul (('+'|'-') mul)* ;         (* arithmetic: 括弧内のみ字句化 *)
+mul        = primary (('*'|'/'|'%') primary)* ;
 primary    = INT | FLOAT | STRING | 'true' | 'false'
+           | '(' expr ')'                  (* grouping + expression mode *)
            | '$_' field-tail | '$_:'N field-tail
            | 'item' '(' STRING ')'
            | IDENT ;                       (* bare field of current object *)

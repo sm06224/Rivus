@@ -6,7 +6,7 @@
 //! that the optimizer rewrites and that [`PlanGraph::to_source`] regenerates
 //! back into readable Rivus source (Master principle #5: IR reversibility).
 
-use crate::expr::Expr;
+use crate::expr::{Access, Expr};
 use rivus_core::{DataType, Mode, Severity};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -153,8 +153,13 @@ pub enum Op {
     StreamRef { name: String },
     /// `|? <pred>`
     Filter { pred: Expr },
-    /// `|> field [field ...]`
+    /// `|> field [field ...]` — pure column selection.
     Project { fields: Vec<String> },
+    /// `|> field (expr) as alias ...` — projection with computed columns. Each
+    /// item is `(expr, output_name)`; a bare field is `(Field, name)`. Emitted
+    /// only when at least one item is computed (pure selection stays `Project`),
+    /// so existing fusion/pushdown are unaffected. Stateless (row-wise).
+    ProjectExpr { items: Vec<(Expr, String)> },
     /// `take N` / `limit N` / `head N` — pass through at most `N` rows of the
     /// stream flowing through this node, then drop the rest. Stateful (a global
     /// running count), so it is a pipeline-breaker for the parallel executor.
@@ -206,6 +211,7 @@ impl Op {
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Project { .. } => "project",
+            Op::ProjectExpr { .. } => "project",
             Op::Take { .. } => "take",
             Op::Sort { .. } => "sort",
             Op::Distinct { .. } => "distinct",
@@ -250,6 +256,19 @@ impl Op {
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
+            Op::ProjectExpr { items } => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|(e, alias)| match e {
+                        Expr::Field {
+                            name,
+                            access: Access::Fast,
+                        } if name == alias => name.clone(),
+                        _ => format!("{e} as {alias}"),
+                    })
+                    .collect();
+                format!("|> {}", parts.join(" "))
+            }
             Op::Take { n } => format!("take {n}"),
             Op::Sort { key, desc } => {
                 if *desc {

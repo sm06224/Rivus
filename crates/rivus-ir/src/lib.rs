@@ -7,7 +7,7 @@
 pub mod expr;
 pub mod graph;
 
-pub use expr::{Access, CmpOp, Expr};
+pub use expr::{Access, ArithOp, CmpOp, Expr};
 pub use graph::{
     AggFunc, BinType, Edge, EdgeKind, Endian, Hook, HookAction, HookEvent, Node, NodeId, Op,
     PlanGraph,

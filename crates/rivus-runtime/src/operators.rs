@@ -128,6 +128,9 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         Op::Take { n } => Box::new(Take { remaining: *n }),
         Op::Sort { key, desc } => Box::new(Sort::new(key.clone(), *desc)),
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
+        Op::ProjectExpr { items } => Box::new(ProjectExpr {
+            items: items.clone(),
+        }),
         Op::Project { fields } => Box::new(Project {
             fields: fields.clone(),
         }),
@@ -747,6 +750,45 @@ impl Operator for Distinct {
             return vec![chunk];
         }
         vec![chunk.gather(&keep)]
+    }
+}
+
+// -------------------------------------------------------- computed projection
+
+/// `|> field (expr) as alias …` — projection that can compute new columns.
+/// Each item is evaluated columnar-style over the chunk (see `eval::eval_column`)
+/// and emitted under its output name. Stateless and row-count preserving.
+struct ProjectExpr {
+    items: Vec<(Expr, String)>,
+}
+
+impl Operator for ProjectExpr {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let mut fields = Vec::with_capacity(self.items.len());
+        let mut cols = Vec::with_capacity(self.items.len());
+        for (expr, alias) in &self.items {
+            // Observe a bare reference to a missing column (continue-first).
+            if let Expr::Field { name, .. } = expr {
+                if chunk.column(name).is_none() {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Warn,
+                            ErrorScope::Chunk,
+                            format!("project: unknown field '{name}'"),
+                        )
+                        .at_node(ctx.label.clone())
+                        .at_chunk(chunk.meta.id),
+                    );
+                }
+            }
+            let col = eval::eval_column(expr, &chunk);
+            fields.push(Field::new(alias.clone(), col.dtype()));
+            cols.push(col);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let mut out = Chunk::new(chunk.meta.id, schema, cols);
+        out.meta = chunk.meta.clone(); // preserve mode / telemetry
+        vec![out]
     }
 }
 

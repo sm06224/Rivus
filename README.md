@@ -38,6 +38,7 @@ Merged:
 | operator | meaning |
 |---|---|
 | `\|?` filter · `\|>` map/project · `\|#` group | transforms |
+| `\|> name (age * 12) as months` | computed columns (`+ - * / %`, `as` alias) |
 | `take N` (`limit`/`head`) | cap the stream at N rows |
 | `sort KEY [asc\|desc]` | stable order by one key (blocking) |
 | `distinct [KEY ...]` | drop duplicate rows (whole-row or by key) |

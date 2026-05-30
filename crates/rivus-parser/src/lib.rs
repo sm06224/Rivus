@@ -11,9 +11,11 @@
 //! body       := (source | ref-expr) (transform | branch | sink | hook)*
 //! source     := 'open' PATH | 'stream' IDENT
 //! ref-expr   := IDENT (('+' IDENT)+ | ('&' IDENT))?   // merge / join
-//! transform  := '|?' expr | '|>' field+ | '|#' field (AGG ':' field)*
+//! transform  := '|?' expr | '|>' proj+ | '|#' field (AGG ':' field)*
 //!             | ('take'|'limit'|'head') INT | 'sort' IDENT ('asc'|'desc')?
 //!             | 'distinct' IDENT* | '|' 'map' block
+//!   proj     := IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT  // computed cols
+//!   expr     := … cmp over add(+,-) over mul(*,/,%) over primary; '(' expr ')'
 //!               AGG := 'sum' | 'avg' | 'min' | 'max'   (count is always emitted)
 //! branch     := '->' IDENT ':' body ';'
 //! sink       := 'save' PATH | 'print'
@@ -25,8 +27,8 @@ mod lexer;
 use lexer::{Lexer, Tok};
 use rivus_core::{Mode, RivusError, Severity, Value};
 use rivus_ir::{
-    Access, AggFunc, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent, NodeId,
-    Op, PlanGraph,
+    Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent,
+    NodeId, Op, PlanGraph,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -165,8 +167,8 @@ impl Parser {
                 }
                 Tok::PipeMap => {
                     self.bump();
-                    let fields = self.parse_field_list()?;
-                    let n = self.g.add_node(Op::Project { fields });
+                    let op = self.parse_projection()?;
+                    let n = self.g.add_node(op);
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -446,19 +448,50 @@ impl Parser {
         }
     }
 
-    fn parse_field_list(&mut self) -> Result<Vec<String>, RivusError> {
-        let mut fields = Vec::new();
-        while let Tok::Word(w) = self.tok() {
-            if is_keyword(w) {
-                break;
+    /// Parse a `|>` projection list. Items are bare fields (`name`), renames
+    /// (`name as alias`), or computed columns (`(expr) as alias`). When every
+    /// item is a bare field this lowers to the pure-selection `Op::Project`
+    /// (so existing fusion/pushdown are untouched); otherwise to `ProjectExpr`.
+    fn parse_projection(&mut self) -> Result<Op, RivusError> {
+        let mut items: Vec<(Expr, String)> = Vec::new();
+        let mut all_bare = true;
+        loop {
+            match self.tok().clone() {
+                // `(expr) as alias` — computed column.
+                Tok::LParen => {
+                    let e = self.parse_primary()?; // consumes the parenthesized expr
+                    if !self.peek_is_word("as") {
+                        return Err(self.err("computed projection `(expr)` requires `as <name>`"));
+                    }
+                    self.bump(); // `as`
+                    let alias = self.word()?;
+                    items.push((e, alias));
+                    all_bare = false;
+                }
+                // `name` or `name as alias`.
+                Tok::Word(w) if !is_keyword(&w) => {
+                    self.bump();
+                    if self.peek_is_word("as") {
+                        self.bump();
+                        let alias = self.word()?;
+                        items.push((Expr::field(&w), alias));
+                        all_bare = false;
+                    } else {
+                        items.push((Expr::field(&w), w));
+                    }
+                }
+                _ => break,
             }
-            fields.push(w.clone());
-            self.bump();
         }
-        if fields.is_empty() {
-            return Err(self.err("`|>` requires at least one field name"));
+        if items.is_empty() {
+            return Err(self.err("`|>` requires at least one field or computed column"));
         }
-        Ok(fields)
+        if all_bare {
+            let fields = items.into_iter().map(|(_, alias)| alias).collect();
+            Ok(Op::Project { fields })
+        } else {
+            Ok(Op::ProjectExpr { items })
+        }
     }
 
     fn skip_block(&mut self) -> Result<(), RivusError> {
@@ -564,10 +597,10 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, RivusError> {
-        let left = self.parse_primary()?;
+        let left = self.parse_add()?;
         if let Tok::Cmp(op) = self.tok().clone() {
             self.bump();
-            let right = self.parse_primary()?;
+            let right = self.parse_add()?;
             Ok(Expr::Compare {
                 left: Box::new(left),
                 op,
@@ -578,8 +611,57 @@ impl Parser {
         }
     }
 
+    /// Additive level: `+` / `-` (left-associative, lower precedence than `*`).
+    fn parse_add(&mut self) -> Result<Expr, RivusError> {
+        let mut e = self.parse_mul()?;
+        loop {
+            let op = match self.tok() {
+                Tok::Plus => ArithOp::Add,
+                Tok::Minus => ArithOp::Sub,
+                _ => break,
+            };
+            self.bump();
+            let right = self.parse_mul()?;
+            e = Expr::Arith {
+                left: Box::new(e),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(e)
+    }
+
+    /// Multiplicative level: `*` / `/` / `%` (binds tighter than `+`/`-`).
+    fn parse_mul(&mut self) -> Result<Expr, RivusError> {
+        let mut e = self.parse_primary()?;
+        loop {
+            let op = match self.tok() {
+                Tok::Star => ArithOp::Mul,
+                Tok::Slash => ArithOp::Div,
+                Tok::Percent => ArithOp::Mod,
+                _ => break,
+            };
+            self.bump();
+            let right = self.parse_primary()?;
+            e = Expr::Arith {
+                left: Box::new(e),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(e)
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, RivusError> {
         match self.tok().clone() {
+            // Parenthesized sub-expression (and the entry to expression mode for
+            // arithmetic, which the lexer only tokenizes inside parens).
+            Tok::LParen => {
+                self.bump();
+                let e = self.parse_expr()?;
+                self.expect(&Tok::RParen)?;
+                Ok(e)
+            }
             Tok::Int(n) => {
                 self.bump();
                 Ok(Expr::Literal(Value::I64(n)))
@@ -763,6 +845,39 @@ mod tests {
     fn nth_op(src: &str, n: usize) -> Op {
         let g = parse(src).unwrap();
         g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn projection_pure_vs_computed_lowering() {
+        // All bare fields → pure Op::Project (keeps fusion/pushdown intact).
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n |> name age\n;", 1),
+            Op::Project { .. }
+        ));
+        // Any computed item → Op::ProjectExpr.
+        match nth_op("F:\n open a.csv\n |> name (age * 12) as months\n;", 1) {
+            Op::ProjectExpr { items } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[1].1, "months");
+                assert!(matches!(items[1].0, Expr::Arith { .. }));
+            }
+            other => panic!("expected ProjectExpr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn computed_projection_round_trips() {
+        // Reversibility: source → IR → source must re-parse to the same source.
+        let src = "F:\n open a.csv\n |> name (age + 2 * 10) as v\n;";
+        let g1 = parse(src).unwrap();
+        let s1 = g1.to_source();
+        let g2 = parse(&s1).unwrap();
+        assert_eq!(s1, g2.to_source(), "computed projection not reversible");
+        // Precedence preserved as (age + (2 * 10)), aliased to v.
+        assert!(
+            s1.contains("($_.age + (2 * 10)) as v"),
+            "unexpected reversed source: {s1}"
+        );
     }
 
     #[test]

@@ -167,6 +167,28 @@ fn distinct_dedups_chunk_size_independent() {
 }
 
 #[test]
+fn computed_columns_are_exact_chunk_size_independent() {
+    let rows = 20_000;
+    let seed = 5;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_calc", &data));
+    let p = f.0.display();
+
+    // `(age * 2 + 1)` must equal the arithmetic on the source `age`, exactly and
+    // for every chunk size. Carry `age` through so we can check element-wise.
+    for cs in [1, 7, 1024, 8192, rows] {
+        let res = run_src(&format!("C:\n open {p}\n |> age (age * 2 + 1) as v\n;"), cs);
+        let age = collect_i64(&res, "C", "age");
+        let v = collect_i64(&res, "C", "v");
+        assert_eq!(age.len(), rows, "row count @cs={cs}");
+        assert_eq!(v.len(), rows, "computed row count @cs={cs}");
+        for (a, got) in age.iter().zip(&v) {
+            assert_eq!(*got, a * 2 + 1, "computed value @cs={cs}");
+        }
+    }
+}
+
+#[test]
 fn error_heavy_skips_and_continues() {
     let rows = 40_000;
     let data = gendata::error_heavy(rows, 0.5, 7);

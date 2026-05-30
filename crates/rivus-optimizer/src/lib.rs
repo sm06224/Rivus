@@ -130,6 +130,10 @@ fn collect_fields(e: &Expr, out: &mut Vec<String>) {
             collect_fields(a, out);
             collect_fields(b, out);
         }
+        Expr::Arith { left, right, .. } => {
+            collect_fields(left, out);
+            collect_fields(right, out);
+        }
     }
 }
 
