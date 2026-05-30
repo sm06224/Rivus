@@ -257,6 +257,14 @@ Used in `|?` predicates and `(…)` computed columns.
 | deep / dynamic field | `$_..age` (recursive), `item("age")` (dynamic) |
 | parent scope field | `$_:1.country` (`$_:0` = current, `$_:1` = parent …) |
 
+**Functions** — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
+`substr(s, start, len)`, `contains(s, sub)` → bool:
+
+```
+|? contains(email, "@gmail")
+|> (upper(name)) as NAME (len(name)) as nlen (substr(zip, 0, 3)) as area
+```
+
 **Comparison** — `==  !=  <  <=  >  >=`
 **Logic** — `and`, `or`
 **Arithmetic** (inside parentheses) — `+  -  *  /  %`, with `* / %` binding

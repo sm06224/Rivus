@@ -27,8 +27,8 @@ mod lexer;
 use lexer::{Lexer, Tok};
 use rivus_core::{DataType, Mode, RivusError, Severity, Value};
 use rivus_ir::{
-    Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent,
-    NodeId, Op, PlanGraph,
+    Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, Func, Hook, HookAction,
+    HookEvent, NodeId, Op, PlanGraph,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -837,6 +837,24 @@ impl Parser {
                     name,
                     access: Access::Dynamic,
                 })
+            }
+            // Scalar function call `func(args…)` — e.g. `upper(name)`,
+            // `substr(name, 0, 3)`, `contains(city, "NY")`.
+            Tok::Word(ref w)
+                if Func::parse(w).is_some() && self.toks[self.pos + 1].0 == Tok::LParen =>
+            {
+                let func = Func::parse(w).unwrap();
+                self.bump(); // func name
+                self.expect(&Tok::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&Tok::RParen) {
+                    args.push(self.parse_expr()?);
+                    while self.eat(&Tok::Comma) {
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                Ok(Expr::Func { func, args })
             }
             // Bare field of the current object: `age`.
             Tok::Word(name) => {

@@ -175,6 +175,43 @@ fn inner_hash_join_matches_oracle() {
 }
 
 #[test]
+fn string_functions_chunk_size_independent() {
+    // contains(city, "y") filter + upper(name) projection must match an oracle.
+    let rows = 6_000usize;
+    let mut text = String::from("name,city\n");
+    let cities = ["york", "la", "yyz", "sfo"];
+    let mut kept = 0u64;
+    for i in 0..rows {
+        let city = cities[i % cities.len()];
+        text.push_str(&format!("u{i},{city}\n"));
+        if city.contains('y') {
+            kept += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_strfn", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1, 7, 1024, rows] {
+        let res = run_src(
+            &format!("S:\n open {p}\n |? contains(city, \"y\")\n |> (upper(name)) as up\n;"),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), kept, "contains filter @cs={cs}");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("S"))
+            .unwrap();
+        for c in &o.chunks {
+            let ci = c.schema.index_of("up").unwrap();
+            for r in 0..c.len {
+                let v = c.value(r, ci).to_string();
+                assert_eq!(v, v.to_uppercase(), "upper() not applied");
+            }
+        }
+    }
+}
+
+#[test]
 fn dropna_and_fill_chunk_size_independent() {
     // city is blank on every 3rd row. dropna city drops those; fill city
     // replaces them. Both must be exact and chunk-size independent.

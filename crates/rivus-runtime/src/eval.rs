@@ -13,8 +13,38 @@
 //! results are identical.
 
 use rivus_core::{Chunk, Column, DataType, StrColumn, Value};
-use rivus_ir::{Access, ArithOp, CmpOp, Expr};
+use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func};
 use std::cmp::Ordering;
+
+/// Apply a scalar function to argument values for one row.
+fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
+    let arg = |i: usize| {
+        args.get(i)
+            .map(|e| eval(e, chunk, row))
+            .unwrap_or(Value::Null)
+    };
+    match func {
+        Func::Upper => Value::Str(arg(0).to_string().to_uppercase()),
+        Func::Lower => Value::Str(arg(0).to_string().to_lowercase()),
+        Func::Trim => Value::Str(arg(0).to_string().trim().to_string()),
+        Func::Len => Value::I64(arg(0).to_string().chars().count() as i64),
+        Func::Contains => {
+            let hay = arg(0).to_string();
+            let needle = arg(1).to_string();
+            Value::Bool(hay.contains(&needle))
+        }
+        Func::Substr => {
+            let s = arg(0).to_string();
+            let start = arg(1).as_f64().unwrap_or(0.0) as usize;
+            let take = args
+                .get(2)
+                .map(|e| eval(e, chunk, row).as_f64().unwrap_or(0.0) as usize)
+                .unwrap_or(usize::MAX);
+            let out: String = s.chars().skip(start).take(take).collect();
+            Value::Str(out)
+        }
+    }
+}
 
 /// Coerce a value to an integer (truncating floats; parsing strings; bool→0/1).
 fn to_i64(v: Value) -> i64 {
@@ -96,6 +126,28 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
         Expr::Literal(v) => const_column(v, chunk.len),
         Expr::Cast { expr, ty } => cast_column(eval_column(expr, chunk), *ty),
         Expr::Arith { left, op, right } => eval_arith(left, *op, right, chunk),
+        Expr::Func { func, args } => {
+            let n = chunk.len;
+            match func {
+                Func::Len => Column::I64(
+                    (0..n)
+                        .map(|r| to_i64(call_func(*func, args, chunk, r)))
+                        .collect(),
+                ),
+                Func::Contains => Column::Bool(
+                    (0..n)
+                        .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
+                        .collect(),
+                ),
+                _ => {
+                    let mut s = StrColumn::with_capacity(n, n * 8);
+                    for r in 0..n {
+                        s.push(&call_func(*func, args, chunk, r).to_string());
+                    }
+                    Column::Str(s)
+                }
+            }
+        }
         // Compare / And / Or are predicates → a boolean column.
         _ => {
             let v: Vec<bool> = (0..chunk.len)
@@ -209,6 +261,7 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
         }
         Expr::Arith { left, op, right } => arith_value(left, *op, right, chunk, row),
         Expr::Cast { expr, ty } => cast_value(eval(expr, chunk, row), *ty),
+        Expr::Func { func, args } => call_func(*func, args, chunk, row),
     }
 }
 

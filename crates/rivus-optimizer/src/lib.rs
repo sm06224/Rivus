@@ -219,6 +219,11 @@ fn collect_fields(e: &Expr, out: &mut Vec<String>) {
             collect_fields(b, out);
         }
         Expr::Cast { expr, .. } => collect_fields(expr, out),
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_fields(a, out);
+            }
+        }
         Expr::Arith { left, right, .. } => {
             collect_fields(left, out);
             collect_fields(right, out);
