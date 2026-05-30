@@ -1,9 +1,18 @@
 name: Release
 
-# Build pre-built x64 binaries for macOS and Windows and attach them to a
-# GitHub Release. Other platforms (Linux, ARM, …) build from source — see
-# the README "Installation" section. Triggered by pushing a `v*` tag, or
-# manually via the Actions tab (workflow_dispatch) for a dry-run/manual cut.
+# Build release binaries and attach them to a GitHub Release. Two flavors per
+# platform are published side by side:
+#
+#   * "portable"  — a multi-architecture baseline build that runs on the widest
+#                   range of CPUs of that family (e.g. any x64, Intel included).
+#   * "tuned"     — a microarchitecture-specialized build (-C target-cpu=…) that
+#                   is faster but only runs on that CPU generation or newer.
+#
+# Platforms (everything else builds from source — see README → Installation):
+#   * macOS  : Apple Silicon (M1 and later) only — no legacy Intel Mac.
+#   * Windows: 11+ x64 — portable (Intel & older AMD) + AMD Zen 4 / Zen 3 tuned.
+#
+# Triggered by pushing a `v*` tag, or manually via the Actions tab.
 
 on:
   push:
@@ -22,16 +31,35 @@ env:
 
 jobs:
   dist:
-    name: dist · ${{ matrix.target }}
+    name: dist · ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13                  # Intel host → native x86_64 build
-            target: x86_64-apple-darwin
+          # ---- macOS: Apple Silicon (M1+) only ----------------------------
+          - os: macos-14                  # Apple Silicon runner → native arm64
+            target: aarch64-apple-darwin
+            label: macos-arm64            # portable across all Apple Silicon
+            rustflags: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: macos-arm64-appleM-tuned
+            rustflags: "-C target-cpu=apple-m1"   # tuned, runs on all M1+
+
+          # ---- Windows 11+ x64 --------------------------------------------
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            label: windows-x64-portable   # baseline x64: Intel & older AMD too
+            rustflags: "-C target-cpu=x86-64"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64-amd-zen4   # tuned: AMD Zen 4 (Ryzen 7000+)
+            rustflags: "-C target-cpu=znver4"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64-amd-zen3   # tuned: AMD Zen 3 (Ryzen 5000+)
+            rustflags: "-C target-cpu=znver3"
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +69,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked -p rivus-cli --target ${{ matrix.target }}
 
       - name: Resolve tag
@@ -59,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
-          name="rivus-${tag}-${{ matrix.target }}"
+          name="rivus-${tag}-${{ matrix.label }}"
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/rivus" "dist/${name}/"
           cp README.md LICENSE NOTICE "dist/${name}/"
@@ -73,20 +103,20 @@ jobs:
         shell: pwsh
         run: |
           $tag  = "${{ steps.tag.outputs.tag }}"
-          $name = "rivus-$tag-${{ matrix.target }}"
+          $name = "rivus-$tag-${{ matrix.label }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/rivus.exe" "dist/$name/"
           Copy-Item README.md,LICENSE,NOTICE "dist/$name/"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
-          "ASSET=dist/$name.zip"           | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+          "ASSET=dist/$name.zip"            | Out-File -Append -Encoding ascii $env:GITHUB_ENV
           "ASSET_SHA=dist/$name.zip.sha256" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rivus-${{ matrix.target }}
+          name: rivus-${{ matrix.label }}
           path: |
             ${{ env.ASSET }}
             ${{ env.ASSET_SHA }}
@@ -99,11 +129,11 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
-          # Idempotent + race-tolerant: the two matrix jobs may reach here at
-          # the same time, so creating an existing release must not fail.
+          # Idempotent + race-tolerant: matrix jobs may reach here together, so
+          # creating an already-existing release must not fail the job.
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" \
               --title "Rivus $tag" \
-              --notes "Pre-built x64 binaries for macOS and Windows. Other platforms: build from source (see README → Installation)." \
+              --notes "Pre-built binaries. macOS: Apple Silicon (M1+). Windows 11+ x64: portable (Intel & AMD) + AMD Zen 4 / Zen 3 tuned. Each platform ships a portable (multi-arch) and a CPU-tuned build. Other platforms: build from source (see README → Installation)." \
             || true
           gh release upload "$tag" "$ASSET" "$ASSET_SHA" --clobber
