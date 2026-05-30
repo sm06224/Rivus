@@ -824,7 +824,11 @@ fn tsv_read_filter_project_chunk_size_independent() {
             cs,
         );
         assert_eq!(res.total_rows_out(), expect, "tsv filter @cs={cs}");
-        assert!(res.errors.is_empty(), "tsv errors @cs={cs}: {:?}", res.errors);
+        assert!(
+            res.errors.is_empty(),
+            "tsv errors @cs={cs}: {:?}",
+            res.errors
+        );
     }
 }
 
