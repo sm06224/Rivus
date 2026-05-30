@@ -56,6 +56,8 @@ hidden serialization / opaque optimizer / runtime magic without observability。
 | 15 | [benchmark](15-benchmark.md) | ベンチ戦略と回帰検知 |
 | 16 | [mvp-scope](16-mvp-scope.md) | MVP の確定スコープと現状実装 |
 | 17 | [distributed](17-distributed.md) | 将来の分散アーキテクチャ |
+| 18 | [io-formats-and-transports](18-io-formats-and-transports.md) | 入出力フォーマット・トランスポートの拡張計画 |
+| 19 | [interactive-and-shell](19-interactive-and-shell.md) | 対話ビューア（Out-GridView 相当）・実行アナリティクス GUI・シェル統合 |
 
 ## 段階設計（MVP → 最適化 → JIT/分散）
 
