@@ -459,6 +459,8 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'sort' IDENT ('asc'|'desc')?
            | 'distinct' IDENT*
            | 'describe'
+           | 'dropna' IDENT* | 'fill' IDENT VALUE
+           | 'rename' (IDENT IDENT)+ | 'drop' IDENT+
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)

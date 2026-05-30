@@ -349,6 +349,43 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `drop COL [COL ...]` — remove the named columns.
+                Tok::Word(w) if w == "drop" => {
+                    self.bump();
+                    let mut cols = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump();
+                        cols.push(name);
+                    }
+                    if cols.is_empty() {
+                        return Err(self.err("drop expects at least one column name"));
+                    }
+                    let n = self.g.add_node(Op::Drop { cols });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `rename OLD NEW [OLD NEW ...]` — rename columns in place.
+                Tok::Word(w) if w == "rename" => {
+                    self.bump();
+                    let mut pairs = Vec::new();
+                    while let Tok::Word(from) = self.tok().clone() {
+                        if is_keyword(&from) {
+                            break;
+                        }
+                        self.bump();
+                        let to = self.word()?;
+                        pairs.push((from, to));
+                    }
+                    if pairs.is_empty() {
+                        return Err(self.err("rename expects `OLD NEW` column pairs"));
+                    }
+                    let n = self.g.add_node(Op::Rename { pairs });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
                 Tok::Word(w) if w == "print" => {
                     self.bump();
                     let n = self.g.add_node(Op::SinkPrint);
@@ -1324,5 +1361,38 @@ Import:
                 AggFunc::Last,
             ]
         );
+    }
+
+    #[test]
+    fn rename_and_drop_parse_and_round_trip() {
+        // `rename OLD NEW ...` lowers to Op::Rename with ordered pairs.
+        match nth_op("F:\n open a.csv\n rename age years city loc\n;", 1) {
+            Op::Rename { pairs } => assert_eq!(
+                pairs,
+                vec![
+                    ("age".to_string(), "years".to_string()),
+                    ("city".to_string(), "loc".to_string()),
+                ]
+            ),
+            o => panic!("expected Rename, got {o:?}"),
+        }
+        // `drop COL ...` lowers to Op::Drop.
+        match nth_op("F:\n open a.csv\n drop city zip\n;", 1) {
+            Op::Drop { cols } => assert_eq!(cols, vec!["city".to_string(), "zip".to_string()]),
+            o => panic!("expected Drop, got {o:?}"),
+        }
+        // Reversible: source -> IR -> source re-parses identically.
+        let g = parse("F:\n open a.csv\n rename age years\n drop city\n;").unwrap();
+        let s = g.to_source();
+        assert!(s.contains("rename age years"), "got: {s}");
+        assert!(s.contains("drop city"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+    }
+
+    #[test]
+    fn rename_and_drop_reject_empty() {
+        // Both verbs require at least one operand.
+        assert!(parse("F:\n open a.csv\n rename\n;").is_err());
+        assert!(parse("F:\n open a.csv\n drop\n;").is_err());
     }
 }

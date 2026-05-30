@@ -216,6 +216,15 @@ pub enum Op {
     /// `fill col VALUE` — replace missing (empty) cells of `col` with `VALUE`
     /// (the column becomes text). Streaming, stateless.
     Fill { col: String, value: String },
+    /// `rename OLD NEW [OLD NEW ...]` — rename columns in place, preserving
+    /// position, type and values. Unknown `OLD` names are skipped with a warning.
+    /// Streaming, stateless.
+    Rename { pairs: Vec<(String, String)> },
+    /// `drop COL [COL ...]` — remove the named columns, keeping the rest in
+    /// order. Unknown names are ignored. Streaming, stateless. (Sugar over
+    /// projection, but resolved against the live schema since `drop` names the
+    /// columns to remove rather than the ones to keep.)
+    Drop { cols: Vec<String> },
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -414,6 +423,11 @@ impl Op {
                 }
             }
             Op::Fill { col, value } => format!("fill {col} \"{value}\""),
+            Op::Rename { pairs } => {
+                let parts: Vec<String> = pairs.iter().map(|(f, t)| format!("{f} {t}")).collect();
+                format!("rename {}", parts.join(" "))
+            }
+            Op::Drop { cols } => format!("drop {}", cols.join(" ")),
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {

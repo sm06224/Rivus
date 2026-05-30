@@ -7,6 +7,11 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Column `rename` / `drop` (std-only).** `rename OLD NEW [OLD NEW ...]`
+  renames columns in place (position, type and values untouched); `drop COL
+  [COL ...]` removes columns, keeping the rest in order. Both are stateless,
+  streaming, work on the parallel path, and round-trip through `to_source`.
+  Unknown columns warn (rename) or are ignored (drop). No new dependencies.
 - **More group aggregates (std-only).** `|#` gains `std` (sample standard
   deviation, ddof=1), `count_distinct` (alias `nunique`, emitted as an integer),
   and `first` / `last` (first/last non-empty value in source order, emitted as

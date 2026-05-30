@@ -894,3 +894,47 @@ fn group_extended_aggregates_are_correct_and_chunk_independent() {
         }
     }
 }
+
+#[test]
+fn rename_and_drop_are_chunk_size_independent() {
+    // `rename` changes only column names; `drop` removes columns. Both are
+    // stateless, so the result must not depend on chunk size. Verify the output
+    // schema and that the kept values survive across chunk sizes.
+    let rows = 20_000;
+    let mut rng = Rng::new(11);
+    let mut text = String::from("name,age,city\n");
+    let mut ages: Vec<u64> = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let age = rng.below(90);
+        ages.push(age);
+        text.push_str(&format!("user,{age},NYC\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_rendrop", text.as_bytes()));
+    let p = f.0.display();
+    // rename age -> years, then drop city: output columns must be [name, years].
+    let src = format!("R:\n open {p}\n rename age years\n drop city\n;");
+    for cs in [1usize, 7, 1024, 8192, rows] {
+        let res = run_src(&src, cs);
+        assert!(res.errors.is_empty(), "errors @cs={cs}: {:?}", res.errors);
+        let out = &res.outputs[0];
+        let total: usize = out.chunks.iter().map(|c| c.len).sum();
+        assert_eq!(total, rows, "row count @cs={cs}");
+        let first = &out.chunks[0];
+        assert_eq!(
+            first.schema.field_names(),
+            vec!["name", "years"],
+            "schema @cs={cs}"
+        );
+    }
+    // Spot-check values: the `years` column equals the original ages, in order.
+    let res = run_src(&src, 4096);
+    let out = &res.outputs[0];
+    let mut got = Vec::with_capacity(rows);
+    for c in &out.chunks {
+        let yi = c.schema.index_of("years").unwrap();
+        for r in 0..c.len {
+            got.push(c.value(r, yi).as_f64().unwrap() as u64);
+        }
+    }
+    assert_eq!(got, ages, "renamed column values preserved in order");
+}

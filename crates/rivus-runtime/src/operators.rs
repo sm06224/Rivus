@@ -222,6 +222,10 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             col: col.clone(),
             value: value.clone(),
         }),
+        Op::Rename { pairs } => Box::new(Rename {
+            pairs: pairs.clone(),
+        }),
+        Op::Drop { cols } => Box::new(Drop { cols: cols.clone() }),
         Op::ProjectExpr { items } => Box::new(ProjectExpr {
             items: items.clone(),
         }),
