@@ -197,6 +197,29 @@ allocations per row, which scales with selectivity and string-heavy,
 filter-dominated pipelines. Correctness (incl. `!=` and chunk-size independence)
 is locked by `tests/stress.rs::string_filter_matches_oracle`.
 
+## Phase 0.8 — vectorized numeric predicate kernel
+
+The interpreter (`eval.rs`) walked the `Expr` tree *and resolved each field by
+name on every row* (`O(rows × fields)` lookups). For a conjunction of
+`field <cmp> number`, `kernel.rs` now **compiles once** — resolving each field
+to a column index + numeric rhs — then evaluates with per-column typed loops.
+Non-numeric / OR / string predicates fall back to the interpreter (identical
+results, gated by stress + equivalence tests).
+
+Clean before/after (kernel off via env vs on), `optimizer/filter_chain_raw`
+(4 numeric filters + project, 200k rows):
+
+| | time | throughput |
+|---|---:|---:|
+| interpreter (kernel off) | 71.6 ms | 2.79 M rows/s |
+| **vectorized kernel (on)** | **47.5 ms** | **4.21 M rows/s** | 
+
+**~1.5× on multi-predicate filters** — the per-row name lookup ×N preds was the
+killer. Single-predicate, parse/write-bound tasks (e.g. `bench/compare.sh`) are
+unchanged: the kernel targets *execution*-bound filtering, not I/O. Closing the
+remaining DuckDB gap on I/O-bound tasks needs parallel *pipeline* execution
+(item 9), which the external comparison already flagged.
+
 ### Optimization backlog (driven by these numbers)
 
 1. ~~CSV reader, single-pass, zero owned-`String`~~ — ✅ Phase 0.1.
@@ -206,8 +229,10 @@ is locked by `tests/stress.rs::string_filter_matches_oracle`.
 5. ~~Parallel CSV parsing + inference fast-path~~ — ✅ Phase 0.5.
 6. ~~Arena string columns (offsets + bytes)~~ — ✅ Phase 0.6.
 7. ~~Zero-copy `&str` predicate eval~~ — ✅ Phase 0.7.
-8. **Filter pushdown** into the reader (skip building rows that won't survive).
-9. **Parallel pipeline execution** (chunk-split operators across workers) — doc 05.
+8. ~~Vectorized numeric predicate kernel~~ — ✅ Phase 0.8.
+9. **Parallel pipeline execution** (chunk-split operators across workers) — the
+   measured path to DuckDB-class throughput on I/O-bound queries (doc 05).
+10. **Filter pushdown** into the reader (skip building rows that won't survive).
 
 ### Cumulative (200k rows, end-to-end read→parse→run)
 

@@ -8,6 +8,7 @@
 use crate::csv;
 use crate::eval;
 use crate::jsonl;
+use crate::kernel;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
@@ -500,12 +501,13 @@ struct Filter {
 
 impl Operator for Filter {
     fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
-        let mut keep = Vec::new();
-        for row in 0..chunk.len {
-            if eval::eval_predicate(&self.pred, &chunk, row) {
-                keep.push(row);
-            }
-        }
+        // Vectorized numeric path when possible; else the row-wise interpreter.
+        let keep = match kernel::compile(&[&self.pred], &chunk) {
+            Some(plan) => kernel::run(&plan, &chunk),
+            None => (0..chunk.len)
+                .filter(|&row| eval::eval_predicate(&self.pred, &chunk, row))
+                .collect(),
+        };
         if keep.is_empty() {
             return Vec::new();
         }
@@ -556,16 +558,19 @@ struct FilterProject {
 
 impl Operator for FilterProject {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let mut keep = Vec::new();
-        for row in 0..chunk.len {
-            if self
-                .preds
-                .iter()
-                .all(|p| eval::eval_predicate(p, &chunk, row))
-            {
-                keep.push(row);
-            }
-        }
+        // Vectorized numeric path when the whole conjunction compiles; else the
+        // row-wise interpreter (must produce identical results).
+        let pred_refs: Vec<&Expr> = self.preds.iter().collect();
+        let keep = match kernel::compile(&pred_refs, &chunk) {
+            Some(plan) => kernel::run(&plan, &chunk),
+            None => (0..chunk.len)
+                .filter(|&row| {
+                    self.preds
+                        .iter()
+                        .all(|p| eval::eval_predicate(p, &chunk, row))
+                })
+                .collect(),
+        };
         if keep.is_empty() {
             return Vec::new();
         }

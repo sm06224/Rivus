@@ -9,6 +9,7 @@ mod csv;
 mod engine;
 mod eval;
 mod jsonl;
+mod kernel;
 mod operators;
 mod telemetry;
 
