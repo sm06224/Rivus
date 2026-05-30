@@ -25,7 +25,7 @@
 mod lexer;
 
 use lexer::{Lexer, Tok};
-use rivus_core::{Mode, RivusError, Severity, Value};
+use rivus_core::{DataType, Mode, RivusError, Severity, Value};
 use rivus_ir::{
     Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent,
     NodeId, Op, PlanGraph,
@@ -324,6 +324,30 @@ impl Parser {
 
     /// Parse the first element of a body: a source, a stream replay, a
     /// merge/join over named scopes, or (for branch children) the inherited
+    /// Parse a declared column schema `( name[:type] name[:type] … )` for
+    /// `open`. Space-separated (like `readbin`); a type fixes that column's
+    /// lane, otherwise it is inferred. Types: `int`/`i64`, `float`/`f64`,
+    /// `str`/`string`, `bool`.
+    fn parse_decl_schema(&mut self) -> Result<Vec<(String, Option<DataType>)>, RivusError> {
+        self.expect(&Tok::LParen)?;
+        let mut cols = Vec::new();
+        while !self.at(&Tok::RParen) && !self.at(&Tok::Eof) {
+            let name = self.word()?;
+            let ty = if self.eat(&Tok::Colon) {
+                let t = self.word()?;
+                Some(decl_type(&t).ok_or_else(|| self.err(format!("unknown column type '{t}'")))?)
+            } else {
+                None
+            };
+            cols.push((name, ty));
+        }
+        self.expect(&Tok::RParen)?;
+        if cols.is_empty() {
+            return Err(self.err("declared schema `( … )` needs at least one column"));
+        }
+        Ok(cols)
+    }
+
     /// upstream node.
     fn parse_body_head(&mut self, input: Option<NodeId>) -> Result<NodeId, RivusError> {
         match self.tok().clone() {
@@ -345,14 +369,24 @@ impl Parser {
                 if noheader {
                     self.bump();
                 }
+                // Optional declared schema `(col[:type] ...)` (CSV only).
+                let decl = if self.at(&Tok::LParen) {
+                    Some(self.parse_decl_schema()?)
+                } else {
+                    None
+                };
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                 })?;
                 let mut op = fmt.into_op(path);
-                if noheader {
-                    if let Op::OpenCsv { header, .. } = &mut op {
+                if let Op::OpenCsv {
+                    header, declared, ..
+                } = &mut op
+                {
+                    if noheader {
                         *header = false;
                     }
+                    *declared = decl;
                 }
                 Ok(self.g.add_node(op))
             }
@@ -364,6 +398,7 @@ impl Parser {
                     projection: None,
                     prefilter: Vec::new(),
                     header: true,
+                    declared: None,
                 }))
             }
             Tok::Word(w) if w == "readjson" => {
@@ -756,6 +791,17 @@ impl Parser {
 
 /// Normalize a source/sink path: `stdin` / `stdout` / `-` all map to the `-`
 /// sentinel (read stdin / write stdout, direction inferred from source vs sink).
+/// Map a declared column type name to a `DataType` lane.
+fn decl_type(s: &str) -> Option<DataType> {
+    Some(match s.to_ascii_lowercase().as_str() {
+        "int" | "i64" | "integer" => DataType::I64,
+        "float" | "f64" | "double" => DataType::F64,
+        "str" | "string" | "text" => DataType::Str,
+        "bool" | "boolean" => DataType::Bool,
+        _ => return None,
+    })
+}
+
 fn norm_path(p: String) -> String {
     if p == "stdin" || p == "stdout" || p == "-" {
         "-".to_string()
@@ -778,6 +824,7 @@ impl Format {
                 projection: None,
                 prefilter: Vec::new(),
                 header: true,
+                declared: None,
             },
             Format::Jsonl => Op::OpenJsonl { path },
         }

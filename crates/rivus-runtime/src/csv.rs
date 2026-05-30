@@ -123,6 +123,7 @@ impl CsvChunker {
     /// rows and seeks back — so a sink-less `open big.csv` preview starts
     /// instantly. Full runs (with a sink) use the global two-pass inference so
     /// types stay chunk-size independent.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         path: &str,
         allow: Option<&[String]>,
@@ -130,16 +131,17 @@ impl CsvChunker {
         preview: bool,
         prefilter: &[(String, CmpOp, f64)],
         header: bool,
+        declared: Option<&[(String, Option<DataType>)]>,
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
-            return Self::open_preview(path, allow, chunk_size, prefilter, header);
+            return Self::open_preview(path, allow, chunk_size, prefilter, header, declared);
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut r = BufReader::with_capacity(READ_BUF, f);
         // `r` is left positioned at the first data row (after the header, or at
         // byte 0 for a header-less file).
-        let (names, data_start) = read_header(&mut r, header)?;
+        let (names, data_start) = read_header(&mut r, header, declared)?;
         let ncols = names.len();
         if ncols == 0 {
             return Err("CSV has no columns".to_string());
@@ -168,7 +170,8 @@ impl CsvChunker {
                 bad += 1;
             }
         }
-        let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        apply_declared_types(&mut dtypes, &keep, declared);
 
         let mut fields = Vec::with_capacity(keep.len());
         for (k, &ci) in keep.iter().enumerate() {
@@ -204,16 +207,18 @@ impl CsvChunker {
 
     /// Latency-first open: sample the first `chunk_size` rows to infer the
     /// schema, then seek back to the first data row and stream from there.
+    #[allow(clippy::too_many_arguments)]
     fn open_preview(
         path: &str,
         allow: Option<&[String]>,
         chunk_size: usize,
         prefilter: &[(String, CmpOp, f64)],
         header: bool,
+        declared: Option<&[(String, Option<DataType>)]>,
     ) -> Result<(Schema, CsvChunker), String> {
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut reader = BufReader::with_capacity(READ_BUF, f);
-        let (names, data_start) = read_header(&mut reader, header)?;
+        let (names, data_start) = read_header(&mut reader, header, declared)?;
         let ncols = names.len();
         if ncols == 0 {
             return Err("CSV has no columns".to_string());
@@ -242,7 +247,8 @@ impl CsvChunker {
                 bad += 1;
             }
         }
-        let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        apply_declared_types(&mut dtypes, &keep, declared);
         let mut fields = Vec::with_capacity(keep.len());
         for (k, &ci) in keep.iter().enumerate() {
             fields.push(Field::new(names[ci].clone(), dtypes[k]));
@@ -395,12 +401,14 @@ pub struct CsvParallelPlan {
 /// Build a [`CsvParallelPlan`]: read the header, snap `nthreads` byte ranges to
 /// newline boundaries, then infer the global column types by streaming those
 /// ranges in parallel and merging the per-range type flags. O(1) memory.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_parallel(
     path: &str,
     allow: Option<&[String]>,
     nthreads: usize,
     prefilter: &[(String, CmpOp, f64)],
     header: bool,
+    declared: Option<&[(String, Option<DataType>)]>,
 ) -> Result<CsvParallelPlan, String> {
     let file_len = std::fs::metadata(path)
         .map_err(|e| format!("cannot stat '{path}': {e}"))?
@@ -409,7 +417,7 @@ pub fn plan_parallel(
     // Header → column names, kept indices, and the first data byte offset.
     let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
     let mut r = BufReader::with_capacity(READ_BUF, f);
-    let (names, data_start) = read_header(&mut r, header)?;
+    let (names, data_start) = read_header(&mut r, header, declared)?;
     let ncols = names.len();
     if ncols == 0 {
         return Err("CSV has no columns".to_string());
@@ -444,7 +452,8 @@ pub fn plan_parallel(
             flags[k].merge(f);
         }
     }
-    let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+    let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+    apply_declared_types(&mut dtypes, &keep, declared);
     let mut fields = Vec::with_capacity(keep.len());
     for (k, &ci) in keep.iter().enumerate() {
         fields.push(Field::new(names[ci].clone(), dtypes[k]));
@@ -530,22 +539,50 @@ fn infer_range(
 }
 
 /// Read the column names and the byte offset of the first data row, leaving the
-/// reader positioned there. With `header`, the first line names the columns;
-/// without it, columns are named `c0, c1, …` from the first line's field count
-/// and that line is data (the reader rewinds to byte 0).
-fn read_header(r: &mut BufReader<File>, header: bool) -> Result<(Vec<String>, u64), String> {
+/// reader positioned there. Names come from a `declared` schema if given (which
+/// also names a header-less file); else from the header line (`header`); else
+/// `c0, c1, …` for a header-less file. A header line is always consumed when
+/// `header`, even if `declared` overrides its names.
+fn read_header(
+    r: &mut BufReader<File>,
+    header: bool,
+    declared: Option<&[(String, Option<DataType>)]>,
+) -> Result<(Vec<String>, u64), String> {
     let mut first = String::new();
     let n = r.read_line(&mut first).map_err(|e| e.to_string())?;
     if n == 0 {
         return Err("empty CSV".to_string());
     }
-    if header {
+    if let Some(d) = declared {
+        let names = d.iter().map(|(nm, _)| nm.clone()).collect();
+        if header {
+            Ok((names, n as u64)) // consume the header line, but use declared names
+        } else {
+            r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            Ok((names, 0)) // header-less: first line is data
+        }
+    } else if header {
         Ok((split_owned(trim_eol(&first)), n as u64))
     } else {
         let ncols = split_owned(trim_eol(&first)).len();
         let names = (0..ncols).map(|i| format!("c{i}")).collect();
         r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         Ok((names, 0))
+    }
+}
+
+/// Override inferred dtypes with any types declared at `open (col:type …)`.
+fn apply_declared_types(
+    dtypes: &mut [DataType],
+    keep: &[usize],
+    declared: Option<&[(String, Option<DataType>)]>,
+) {
+    if let Some(d) = declared {
+        for (k, &ci) in keep.iter().enumerate() {
+            if let Some((_, Some(t))) = d.get(ci) {
+                dtypes[k] = *t;
+            }
+        }
     }
 }
 

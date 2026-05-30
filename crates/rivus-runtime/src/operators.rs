@@ -183,6 +183,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             projection,
             prefilter,
             header,
+            declared,
         } => Box::new(SourceCsv::new(
             path.clone(),
             projection.clone(),
@@ -190,6 +191,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             preview,
             prefilter.clone(),
             *header,
+            declared.clone(),
         )),
         Op::OpenBinary {
             path,
@@ -264,6 +266,7 @@ struct SourceCsv {
     /// downstream FilterProject remains authoritative).
     prefilter: Vec<(String, CmpOp, f64)>,
     header: bool,
+    declared: Option<Vec<(String, Option<DataType>)>>,
     schema: Arc<Schema>,
     /// Streaming reader for a real file; `None` for stdin / after a load error.
     stream: Option<csv::CsvChunker>,
@@ -274,6 +277,7 @@ struct SourceCsv {
 }
 
 impl SourceCsv {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         path: String,
         projection: Option<Vec<String>>,
@@ -281,6 +285,7 @@ impl SourceCsv {
         preview: bool,
         prefilter: Vec<(String, CmpOp, f64)>,
         header: bool,
+        declared: Option<Vec<(String, Option<DataType>)>>,
     ) -> Self {
         SourceCsv {
             path,
@@ -290,6 +295,7 @@ impl SourceCsv {
             preview,
             prefilter,
             header,
+            declared,
             schema: Schema::empty(),
             stream: None,
             columns: Vec::new(),
@@ -309,6 +315,7 @@ impl SourceCsv {
             preview: false,
             prefilter: Vec::new(),
             header: true,
+            declared: None,
             schema,
             stream: Some(chunker),
             columns: Vec::new(),
@@ -329,6 +336,7 @@ impl SourceCsv {
                 self.preview,
                 &self.prefilter,
                 self.header,
+                self.declared.as_deref(),
             ) {
                 Ok((schema, chunker)) => {
                     if chunker.bad_rows > 0 {

@@ -26,6 +26,7 @@ mod tests {
             projection: None,
             prefilter: Vec::new(),
             header: true,
+            declared: None,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {
@@ -48,6 +49,7 @@ mod tests {
             projection: None,
             prefilter: Vec::new(),
             header: true,
+            declared: None,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {

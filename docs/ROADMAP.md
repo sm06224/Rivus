@@ -23,7 +23,7 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | Streaming + parallel CSV | byte-range workers, ordered part-file concat |
 | ✅ | JSON / JSON Lines / NDJSON, fixed-width binary | |
 | ✅ | **Header-less CSV** | `open f.csv noheader` → columns `c0,c1,…`; first line is data |
-| 📋 | **Typed / named columns at `open`** | `open f.csv (id:int, name:str, age:int)` — give a schema instead of inferring; also names a header-less file |
+| ✅ | **Typed / named columns at `open`** | `open f.csv (id:int, name:str, age:int)` — give a schema instead of inferring; also names a header-less file |
 | 📋 | **Compressed inputs** (`.gz` first) | feature `gzip` via **`flate2`** (pure-Rust backend), serial single-pass (compressed streams can't seek → no byte-range parallel); then `.zst` (`ruzstd`), `.zip`/tar. Vetting log in `SUPPLY-CHAIN.md`. |
 | 📋 | TSV / custom delimiter (real) | `as tsv` currently aliases CSV; add a `delim` to `OpenCsv`/`SinkCsv` (std-only) |
 | 📋 | **Parquet / Arrow** | feature `parquet` via apache **`arrow`/`parquet`** (isolated behind the source/sink trait) |
@@ -51,7 +51,7 @@ it in small, gated steps.
 | 📋 | **Readable filter** | `\|?` is terse; add a comma-separated form where `,` means AND, e.g. `where age >= 20, country == "JP"`. Keep `\|?` as an alias. |
 | 📋 | **Inline type casts** | `age:int`, `price:f64`, `flag:bool`, `id:str` usable in predicates and projections, e.g. `where age:int >= 20` and `\|> (amount:f64 * 1.1) as gross` |
 | 📋 | **Three ways to give types** (write them distinctly): | |
-| | • at the source | `open f.csv (id:int, name:str)` — declared schema (§A) |
+| ✅ | • at the source | `open f.csv (id:int name:str)` — declared schema (done) |
 | | • mid-flow cast | `cast age:int score:f64` — change a column's lane |
 | | • derive/add property | `\|> (age:int) as age2` or a `let age2 = …` form |
 | 📋 | String functions, `case when … then … else` | `upper/lower/len/substr/contains` (design doc 20 “その後”) |
@@ -94,7 +94,7 @@ it in small, gated steps.
 
 1. ~~Header-less CSV (A)~~ ✅ done — `open f.csv noheader`.
 2. ~~`describe` (B)~~ ✅ done — `open f.csv describe`.
-3. **Typed/named columns at `open`** (A/C) — declared schema; foundation for casts.
+3. ~~Typed/named columns at `open`~~ ✅ done — `open f.csv (id:int name:str)`.
 4. **stdin→stdout filter ergonomics** (B).
 5. **Inline type casts + comma filter** (C) — readable, typed flow.
 6. **Joins** (D), then **imputation** (D).

@@ -72,6 +72,49 @@ fn headerless_csv_positional_columns_chunk_size_independent() {
 }
 
 #[test]
+fn declared_schema_renames_and_types_chunk_size_independent() {
+    // A header file with columns a,b,c. Declare names (id, code, age) and force
+    // `code` to str so leading zeros survive (it would otherwise infer i64).
+    let rows = 5_000;
+    let mut text = String::from("a,b,c\n");
+    let mut kept = 0u64;
+    for i in 0..rows {
+        let age = (i % 90) as u64;
+        text.push_str(&format!("{i},0{i:05},{age}\n")); // code has a leading zero
+        if age >= 45 {
+            kept += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_decl", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1, 7, 1024, rows] {
+        // Declared names are used by the predicate/projection; `code:str` keeps
+        // the leading zero intact.
+        let res = run_src(
+            &format!("D:\n open {p} (id code:str age)\n |? age >= 45\n |> code\n;"),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), kept, "declared filter @cs={cs}");
+        // Every emitted `code` must still start with '0' (kept as a string).
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        for c in &o.chunks {
+            let ci = c.schema.index_of("code").unwrap();
+            assert_eq!(c.schema.fields[ci].dtype, rivus_core::DataType::Str);
+            for r in 0..c.len {
+                assert!(
+                    c.value(r, ci).to_string().starts_with('0'),
+                    "leading zero lost"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn describe_matches_oracle() {
     // One numeric column `v`; `describe` must report count/min/max/mean that
     // match an independent computation, for every chunk size.

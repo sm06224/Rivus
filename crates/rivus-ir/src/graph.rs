@@ -144,6 +144,11 @@ pub enum Op {
         /// Whether the first line is a header. `false` (`open f.csv noheader`)
         /// treats every line as data and names columns `c0, c1, …`.
         header: bool,
+        /// Declared column schema `(name[:type] ...)`, set by
+        /// `open f.csv (id:int name:str age:int)`. When present it names the
+        /// columns positionally (overriding the header / `c0…`) and, where a
+        /// type is given, fixes that column's lane instead of inferring it.
+        declared: Option<Vec<(String, Option<DataType>)>>,
     },
     /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
     /// binary records (a C struct dump). `endian` selects byte order;
@@ -246,10 +251,21 @@ impl Op {
                 projection,
                 prefilter,
                 header,
+                declared,
             } => {
                 let mut s = format!("open {path}");
                 if !header {
                     s.push_str(" noheader");
+                }
+                if let Some(cols) = declared {
+                    let parts: Vec<String> = cols
+                        .iter()
+                        .map(|(n, t)| match t {
+                            Some(t) => format!("{n}:{t}"),
+                            None => n.clone(),
+                        })
+                        .collect();
+                    s.push_str(&format!(" ({})", parts.join(" ")));
                 }
                 if let Some(cols) = projection {
                     s.push_str(&format!("  # read-only: {}", cols.join(",")));
