@@ -39,10 +39,24 @@ fn fingerprint(res: &RunResult) -> BTreeMap<String, Vec<String>> {
 
 fn run_both(src: &str) -> (RunResult, RunResult) {
     let g = rivus_parser::parse(src).expect("parse");
-    let raw = run(&g, RunOptions { chunk_size: 4096 }).expect("raw run");
+    let raw = run(
+        &g,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("raw run");
     let (opt_g, report) = rivus_optimizer::optimize(g);
     assert!(!report.is_empty(), "expected the optimizer to fire");
-    let opt = run(&opt_g, RunOptions { chunk_size: 4096 }).expect("opt run");
+    let opt = run(
+        &opt_g,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("opt run");
     (raw, opt)
 }
 

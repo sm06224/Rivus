@@ -12,6 +12,10 @@ pub enum Tok {
     Semicolon,        // ;
     Bang,             // !
     Plus,             // +
+    Minus,            // -   (expression mode only)
+    Star,             // *   (expression mode only)
+    Slash,            // /   (expression mode only)
+    Percent,          // %   (expression mode only)
     Amp,              // &
     Arrow,            // ->
     Dot,              // .
@@ -39,6 +43,11 @@ pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
     pub line: u32,
+    /// Parenthesis nesting depth. Inside `( … )` the lexer switches to
+    /// *expression mode*: `- * / %` become operator tokens and identifiers no
+    /// longer absorb `- / .`. Outside parens the path-friendly tokenization is
+    /// unchanged, so `open /tmp/a-b.csv` still lexes as one word.
+    depth: u32,
 }
 
 impl<'a> Lexer<'a> {
@@ -47,6 +56,7 @@ impl<'a> Lexer<'a> {
             src: src.as_bytes(),
             pos: 0,
             line: 1,
+            depth: 0,
         }
     }
 
@@ -114,10 +124,12 @@ impl<'a> Lexer<'a> {
                 }
                 b'(' => {
                     self.bump();
+                    self.depth += 1;
                     Tok::LParen
                 }
                 b')' => {
                     self.bump();
+                    self.depth = self.depth.saturating_sub(1);
                     Tok::RParen
                 }
                 b'{' => {
@@ -177,6 +189,24 @@ impl<'a> Lexer<'a> {
                 b'.' => {
                     self.bump();
                     Tok::Dot
+                }
+                // Expression-mode arithmetic operators (only inside parens, so
+                // they never shadow `->`, merge `+`, or path words like `a/b`).
+                b'-' if self.depth > 0 => {
+                    self.bump();
+                    Tok::Minus
+                }
+                b'*' if self.depth > 0 => {
+                    self.bump();
+                    Tok::Star
+                }
+                b'/' if self.depth > 0 => {
+                    self.bump();
+                    Tok::Slash
+                }
+                b'%' if self.depth > 0 => {
+                    self.bump();
+                    Tok::Percent
                 }
                 b'|' => {
                     self.bump();
@@ -279,11 +309,22 @@ impl<'a> Lexer<'a> {
 
     fn lex_word(&mut self) -> Tok {
         let start = self.pos;
-        while is_word_part(self.peek()) {
+        while self.word_part(self.peek()) {
             self.bump();
         }
         let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
         Tok::Word(text.to_string())
+    }
+
+    /// Word-continuation rule, depth-aware: inside parens an identifier is a
+    /// plain `[A-Za-z0-9_]+` so it splits cleanly from `- / .` operators;
+    /// outside parens it stays path-friendly (`users.csv`, `data/out`, `a-b`).
+    fn word_part(&self, c: u8) -> bool {
+        if self.depth > 0 {
+            c.is_ascii_alphanumeric() || c == b'_'
+        } else {
+            is_word_part(c)
+        }
     }
 }
 

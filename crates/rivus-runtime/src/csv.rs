@@ -1,9 +1,17 @@
-//! Minimal CSV reader with per-column type inference.
+//! CSV reader with per-column type inference, in two forms:
 //!
-//! MVP-grade: the whole file is read and materialized, then handed out in
-//! chunks. The design doc (03-stream-chunk-model.md) describes the streaming,
-//! Arrow-backed reader that replaces this behind the same `Operator` boundary.
-//! Quoting is handled just enough for simple fields.
+//! - [`CsvChunker`] — the **streaming** reader for a real file. Bounded memory
+//!   regardless of file size: pass 1 streams the file to infer a global schema
+//!   (only type flags kept), pass 2 streams it again yielding one chunk of rows
+//!   per call. A 1 GB file flows through in ~10 MiB of resident memory.
+//! - [`parse_projected`] — the whole-input parser, used for stdin (which can't
+//!   be re-read for two-pass inference) and in tests. Reads everything, then
+//!   hands out columns.
+//!
+//! Both share the same inference (`Flags`), split (`split_into`) and column
+//! builders, so they produce identical results; the streaming and whole-file
+//! paths are kept byte-for-byte equivalent by the stress tests. Quoting is
+//! handled just enough for simple fields.
 //!
 //! Performance: this is a **two-pass, allocation-light** parser. Pass 1 splits
 //! each record into borrowed `&str` field slices (no owned `String` per cell)
@@ -16,6 +24,441 @@
 
 use rivus_core::{Column, DataType, Field, Schema, StrColumn};
 use std::borrow::Cow;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+/// Streaming CSV reader: bounded memory regardless of file size.
+///
+/// Pass 1 streams the whole file once to infer a **global** schema (only
+/// per-column type flags are kept — O(1) memory), so the inferred types — and
+/// therefore the result — are independent of `chunk_size`, exactly like the
+/// whole-file parser. Pass 2 (`next_columns`) re-streams the file and yields one
+/// `chunk_size`-row batch of typed columns per call, so a 15 GB file flows
+/// through in chunk-sized pieces instead of being slurped into RAM.
+pub struct CsvChunker {
+    reader: BufReader<File>,
+    ncols: usize,
+    keep: Vec<usize>,
+    dtypes: Vec<DataType>,
+    chunk_size: usize,
+    line: String,
+    /// Rows skipped in pass 1 for wrong arity (reported once by the source).
+    pub bad_rows: usize,
+    eof: bool,
+    /// Current byte offset and an optional end (for streaming one byte range of
+    /// the file in a parallel worker). `limit == None` streams to EOF.
+    pos: u64,
+    limit: Option<u64>,
+}
+
+impl CsvChunker {
+    /// Open `path` for streaming, returning the inferred schema and the reader
+    /// positioned just after the header (ready for `next_columns`).
+    ///
+    /// `preview` trades correctness for latency: instead of streaming the whole
+    /// file to infer a global schema, it samples only the first `chunk_size`
+    /// rows and seeks back — so a sink-less `open big.csv` preview starts
+    /// instantly. Full runs (with a sink) use the global two-pass inference so
+    /// types stay chunk-size independent.
+    pub fn open(
+        path: &str,
+        allow: Option<&[String]>,
+        chunk_size: usize,
+        preview: bool,
+    ) -> Result<(Schema, CsvChunker), String> {
+        if preview {
+            return Self::open_preview(path, allow, chunk_size);
+        }
+        // ---- pass 1: infer a global schema by streaming the whole file ----
+        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut r = BufReader::new(f);
+        let mut header = String::new();
+        if r.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
+            return Err("empty CSV".to_string());
+        }
+        let names = split_owned(trim_eol(&header));
+        let ncols = names.len();
+        if ncols == 0 {
+            return Err("CSV header has no columns".to_string());
+        }
+        let keep: Vec<usize> = match allow {
+            None => (0..ncols).collect(),
+            Some(a) => (0..ncols)
+                .filter(|&i| a.iter().any(|n| n == &names[i]))
+                .collect(),
+        };
+
+        let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+        let mut bad = 0usize;
+        let mut line = String::new();
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
+        loop {
+            line.clear();
+            if r.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            let l = trim_eol(&line);
+            if l.trim().is_empty() {
+                continue;
+            }
+            if !observe_line(l, ncols, &keep, &mut flags, &mut offsets) {
+                bad += 1;
+            }
+        }
+        let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+
+        let mut fields = Vec::with_capacity(keep.len());
+        for (k, &ci) in keep.iter().enumerate() {
+            fields.push(Field::new(names[ci].clone(), dtypes[k]));
+        }
+        let schema = Schema::new(fields);
+
+        // ---- pass 2 setup: reopen and skip the header line ----
+        let f2 = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut reader = BufReader::new(f2);
+        let mut skip = String::new();
+        reader.read_line(&mut skip).map_err(|e| e.to_string())?;
+
+        Ok((
+            schema,
+            CsvChunker {
+                reader,
+                ncols,
+                keep,
+                dtypes,
+                chunk_size: chunk_size.max(1),
+                line: String::new(),
+                bad_rows: bad,
+                eof: false,
+                pos: 0,
+                limit: None,
+            },
+        ))
+    }
+
+    /// Latency-first open: sample the first `chunk_size` rows to infer the
+    /// schema, then seek back to the first data row and stream from there.
+    fn open_preview(
+        path: &str,
+        allow: Option<&[String]>,
+        chunk_size: usize,
+    ) -> Result<(Schema, CsvChunker), String> {
+        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut reader = BufReader::new(f);
+        let mut header = String::new();
+        let hlen = reader.read_line(&mut header).map_err(|e| e.to_string())?;
+        if hlen == 0 {
+            return Err("empty CSV".to_string());
+        }
+        let names = split_owned(trim_eol(&header));
+        let ncols = names.len();
+        if ncols == 0 {
+            return Err("CSV header has no columns".to_string());
+        }
+        let keep: Vec<usize> = match allow {
+            None => (0..ncols).collect(),
+            Some(a) => (0..ncols)
+                .filter(|&i| a.iter().any(|n| n == &names[i]))
+                .collect(),
+        };
+
+        let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+        let mut bad = 0usize;
+        let mut line = String::new();
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
+        for _ in 0..chunk_size {
+            line.clear();
+            if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            let l = trim_eol(&line);
+            if l.trim().is_empty() {
+                continue;
+            }
+            if !observe_line(l, ncols, &keep, &mut flags, &mut offsets) {
+                bad += 1;
+            }
+        }
+        let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        let mut fields = Vec::with_capacity(keep.len());
+        for (k, &ci) in keep.iter().enumerate() {
+            fields.push(Field::new(names[ci].clone(), dtypes[k]));
+        }
+        let schema = Schema::new(fields);
+
+        // Rewind to the first data row and stream from there with this schema.
+        reader
+            .seek(SeekFrom::Start(hlen as u64))
+            .map_err(|e| e.to_string())?;
+
+        Ok((
+            schema,
+            CsvChunker {
+                reader,
+                ncols,
+                keep,
+                dtypes,
+                chunk_size: chunk_size.max(1),
+                line: String::new(),
+                bad_rows: bad,
+                eof: false,
+                pos: 0,
+                limit: None,
+            },
+        ))
+    }
+
+    /// Stream one byte range `[start, end)` of the file with an already-inferred
+    /// global schema (used by the parallel streaming executor). `start`/`end`
+    /// must be newline-aligned offsets into the data region (see `plan_parallel`).
+    pub fn for_range(
+        path: &str,
+        dtypes: Vec<DataType>,
+        keep: Vec<usize>,
+        ncols: usize,
+        start: u64,
+        end: u64,
+        chunk_size: usize,
+    ) -> Result<CsvChunker, String> {
+        let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        Ok(CsvChunker {
+            reader: BufReader::new(f),
+            ncols,
+            keep,
+            dtypes,
+            chunk_size: chunk_size.max(1),
+            line: String::new(),
+            bad_rows: 0,
+            eof: false,
+            pos: start,
+            limit: Some(end),
+        })
+    }
+
+    /// Yield the next batch of up to `chunk_size` rows as typed columns, or
+    /// `None` at end of file. Malformed rows (wrong arity) are skipped — already
+    /// counted in `bad_rows` during pass 1.
+    pub fn next_columns(&mut self) -> Option<Vec<Column>> {
+        if self.eof {
+            return None;
+        }
+        let mut builders: Vec<ColBuilder> = self
+            .dtypes
+            .iter()
+            .map(|d| ColBuilder::with_capacity(*d, self.chunk_size))
+            .collect();
+        // Reused field byte-ranges (no per-row allocation on the unquoted fast
+        // path); quoted records fall back to an owned split.
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(self.ncols);
+        let mut got = 0usize;
+        while got < self.chunk_size {
+            // Stop at the worker's byte range end (lines never straddle a
+            // newline-aligned boundary, so the last line ends exactly at it).
+            if matches!(self.limit, Some(end) if self.pos >= end) {
+                self.eof = true;
+                break;
+            }
+            self.line.clear();
+            let n = match self.reader.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    self.eof = true;
+                    break;
+                }
+            };
+            self.pos += n as u64;
+            let l = trim_eol(&self.line);
+            if l.trim().is_empty() {
+                continue;
+            }
+            if split_offsets(l, &mut offsets) {
+                if offsets.len() != self.ncols {
+                    continue;
+                }
+                for (k, &ci) in self.keep.iter().enumerate() {
+                    let (s, e) = offsets[ci];
+                    builders[k].push(&l[s..e]);
+                }
+            } else {
+                let fields = split_record(l);
+                if fields.len() != self.ncols {
+                    continue;
+                }
+                for (k, &ci) in self.keep.iter().enumerate() {
+                    builders[k].push(&fields[ci]);
+                }
+            }
+            got += 1;
+        }
+        if got == 0 {
+            return None;
+        }
+        Some(builders.iter_mut().map(ColBuilder::finish).collect())
+    }
+}
+
+/// A plan for streaming-parallel CSV reading: a global schema plus the
+/// newline-aligned byte ranges each worker streams (covering the data region
+/// exactly once). Inference itself runs in parallel over the same ranges.
+pub struct CsvParallelPlan {
+    pub schema: Schema,
+    pub dtypes: Vec<DataType>,
+    pub keep: Vec<usize>,
+    pub ncols: usize,
+    pub ranges: Vec<(u64, u64)>,
+    pub bad_rows: usize,
+}
+
+/// Build a [`CsvParallelPlan`]: read the header, snap `nthreads` byte ranges to
+/// newline boundaries, then infer the global column types by streaming those
+/// ranges in parallel and merging the per-range type flags. O(1) memory.
+pub fn plan_parallel(
+    path: &str,
+    allow: Option<&[String]>,
+    nthreads: usize,
+) -> Result<CsvParallelPlan, String> {
+    let file_len = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat '{path}': {e}"))?
+        .len();
+
+    // Header → column names, kept indices, and the first data byte offset.
+    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let mut r = BufReader::new(f);
+    let mut header = String::new();
+    let hlen = r.read_line(&mut header).map_err(|e| e.to_string())?;
+    if hlen == 0 {
+        return Err("empty CSV".to_string());
+    }
+    let names = split_owned(trim_eol(&header));
+    let ncols = names.len();
+    if ncols == 0 {
+        return Err("CSV header has no columns".to_string());
+    }
+    let keep: Vec<usize> = match allow {
+        None => (0..ncols).collect(),
+        Some(a) => (0..ncols)
+            .filter(|&i| a.iter().any(|n| n == &names[i]))
+            .collect(),
+    };
+
+    let data_start = hlen as u64;
+    let ranges = snap_ranges(&mut r, data_start, file_len, nthreads.max(1))?;
+
+    // Infer types per range in parallel, then merge the flags.
+    let kept = keep.clone();
+    let infers: Vec<(Vec<Flags>, usize)> = std::thread::scope(|s| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(a, b)| {
+                let kref = &kept;
+                s.spawn(move || infer_range(path, kref, ncols, a, b))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+    let mut bad = 0usize;
+    for (fs, b) in &infers {
+        bad += *b;
+        for (k, f) in fs.iter().enumerate() {
+            flags[k].merge(f);
+        }
+    }
+    let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+    let mut fields = Vec::with_capacity(keep.len());
+    for (k, &ci) in keep.iter().enumerate() {
+        fields.push(Field::new(names[ci].clone(), dtypes[k]));
+    }
+
+    Ok(CsvParallelPlan {
+        schema: Schema::new(fields),
+        dtypes,
+        keep,
+        ncols,
+        ranges,
+        bad_rows: bad,
+    })
+}
+
+/// Snap `n` evenly-spaced offsets in `[data_start, file_len)` to the byte just
+/// after the next newline, yielding contiguous line-aligned ranges.
+fn snap_ranges(
+    r: &mut BufReader<File>,
+    data_start: u64,
+    file_len: u64,
+    n: usize,
+) -> Result<Vec<(u64, u64)>, String> {
+    let mut bounds = vec![data_start];
+    let span = file_len.saturating_sub(data_start);
+    let mut scratch = String::new();
+    for i in 1..n {
+        let target = data_start + span * (i as u64) / (n as u64);
+        if target <= *bounds.last().unwrap() {
+            continue;
+        }
+        r.seek(SeekFrom::Start(target)).map_err(|e| e.to_string())?;
+        scratch.clear();
+        let consumed = r.read_line(&mut scratch).map_err(|e| e.to_string())?;
+        let next = (target + consumed as u64).min(file_len);
+        if next > *bounds.last().unwrap() && next < file_len {
+            bounds.push(next);
+        }
+    }
+    bounds.push(file_len);
+    Ok(bounds.windows(2).map(|w| (w[0], w[1])).collect())
+}
+
+/// Infer column type flags over one byte range (streaming, O(1) memory).
+fn infer_range(
+    path: &str,
+    keep: &[usize],
+    ncols: usize,
+    start: u64,
+    end: u64,
+) -> (Vec<Flags>, usize) {
+    let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+    let mut bad = 0usize;
+    let f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (flags, bad),
+    };
+    let mut r = BufReader::new(f);
+    if r.seek(SeekFrom::Start(start)).is_err() {
+        return (flags, bad);
+    }
+    let mut pos = start;
+    let mut line = String::new();
+    let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
+    while pos < end {
+        line.clear();
+        match r.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(n) => pos += n as u64,
+            Err(_) => break,
+        }
+        let l = trim_eol(&line);
+        if l.trim().is_empty() {
+            continue;
+        }
+        if !observe_line(l, ncols, keep, &mut flags, &mut offsets) {
+            bad += 1;
+        }
+    }
+    (flags, bad)
+}
+
+/// Strip a trailing `\n` or `\r\n` (mirrors `str::lines` semantics).
+fn trim_eol(s: &str) -> &str {
+    s.strip_suffix('\n')
+        .map(|s| s.strip_suffix('\r').unwrap_or(s))
+        .unwrap_or(s)
+}
 
 pub struct CsvData {
     pub schema: Schema,
@@ -362,6 +805,56 @@ impl ColBuilder {
             ColBuilder::Str(v) => Column::Str(std::mem::take(v)),
         }
     }
+}
+
+/// Split an unquoted record into field byte-ranges `(start, end)` into `out`
+/// (cleared first), allocating nothing — `out` is reused across rows. Returns
+/// `false` when the line contains a `"` (the caller takes the owned slow path).
+fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>) -> bool {
+    out.clear();
+    let bytes = line.as_bytes();
+    if bytes.contains(&b'"') {
+        return false;
+    }
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b',' {
+            out.push((start, i));
+            start = i + 1;
+        }
+    }
+    out.push((start, bytes.len()));
+    true
+}
+
+/// Observe one record into per-column type `flags` (kept columns only), using
+/// the allocation-free offset split on the fast path. `offsets` is reused.
+/// Returns `false` for a malformed (wrong-arity) record.
+fn observe_line(
+    line: &str,
+    ncols: usize,
+    keep: &[usize],
+    flags: &mut [Flags],
+    offsets: &mut Vec<(usize, usize)>,
+) -> bool {
+    if split_offsets(line, offsets) {
+        if offsets.len() != ncols {
+            return false;
+        }
+        for (k, &ci) in keep.iter().enumerate() {
+            let (s, e) = offsets[ci];
+            flags[k].observe(&line[s..e]);
+        }
+    } else {
+        let fields = split_record(line);
+        if fields.len() != ncols {
+            return false;
+        }
+        for (k, &ci) in keep.iter().enumerate() {
+            flags[k].observe(&fields[ci]);
+        }
+    }
+    true
 }
 
 /// Split a record into fields. Fast path: records without `"` split into

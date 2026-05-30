@@ -1,0 +1,6 @@
+# Generated distribution artifacts — the scripts/docs here are tracked, the
+# built archives and staging dirs are not.
+*
+!.gitignore
+!build.sh
+!README.md

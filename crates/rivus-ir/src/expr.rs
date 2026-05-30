@@ -34,6 +34,28 @@ impl CmpOp {
     }
 }
 
+/// Binary arithmetic operators for computed columns (`(age * 12)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+impl ArithOp {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+            ArithOp::Mod => "%",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     /// `$_.field` — direct structural lookup.
@@ -61,6 +83,12 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     /// Logical OR of two predicates.
     Or(Box<Expr>, Box<Expr>),
+    /// Binary arithmetic (`left op right`) for computed columns.
+    Arith {
+        left: Box<Expr>,
+        op: ArithOp,
+        right: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -92,6 +120,9 @@ impl fmt::Display for Expr {
             }
             Expr::And(a, b) => write!(f, "{a} and {b}"),
             Expr::Or(a, b) => write!(f, "{a} or {b}"),
+            // Always parenthesized so the source round-trips and re-parses with
+            // the same structure regardless of precedence.
+            Expr::Arith { left, op, right } => write!(f, "({left} {} {right})", op.as_str()),
         }
     }
 }

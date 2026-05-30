@@ -14,7 +14,53 @@ use rivus_core::{
 };
 use rivus_ir::{AggFunc, BinType, Endian, Expr, NodeId, Op};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
+
+/// An incremental sink writer: opens the file (or stdout for `-`) on the first
+/// chunk and appends as chunks arrive, so a sink never buffers the whole output
+/// in memory. Shared by the streaming CSV and JSONL sinks.
+struct StreamWriter {
+    path: String,
+    inner: Option<BufWriter<Box<dyn Write>>>,
+    wrote_header: bool,
+    failed: bool,
+}
+
+impl StreamWriter {
+    fn new(path: String) -> Self {
+        StreamWriter {
+            path,
+            inner: None,
+            wrote_header: false,
+            failed: false,
+        }
+    }
+
+    fn writer(&mut self) -> std::io::Result<&mut BufWriter<Box<dyn Write>>> {
+        if self.inner.is_none() {
+            let w: Box<dyn Write> = if self.path == "-" {
+                Box::new(std::io::stdout())
+            } else {
+                Box::new(File::create(&self.path)?)
+            };
+            self.inner = Some(BufWriter::new(w));
+        }
+        Ok(self.inner.as_mut().unwrap())
+    }
+
+    /// Flush on completion; if no chunk ever arrived, still create an empty file
+    /// (matching the old whole-buffer sinks) — but never touch stdout.
+    fn finish(&mut self) -> std::io::Result<()> {
+        if let Some(w) = self.inner.as_mut() {
+            w.flush()?;
+        } else if self.path != "-" {
+            File::create(&self.path)?;
+        }
+        Ok(())
+    }
+}
 
 /// Per-call execution context handed to operators.
 pub struct OpCtx<'a> {
@@ -88,6 +134,29 @@ pub fn collector() -> Box<dyn Operator> {
     Box::new(Merge)
 }
 
+/// A streaming CSV source over one byte range `[start, end)` of a file, used by
+/// the parallel streaming executor. The global schema/types are pre-inferred
+/// (see [`csv::plan_parallel`]); on open error it yields nothing (continue-first
+/// — the worker simply contributes no rows).
+#[allow(clippy::too_many_arguments)]
+pub fn csv_range_source(
+    path: &str,
+    dtypes: Vec<rivus_core::DataType>,
+    keep: Vec<usize>,
+    ncols: usize,
+    schema: Arc<Schema>,
+    start: u64,
+    end: u64,
+    chunk_size: usize,
+) -> Box<dyn Operator> {
+    match csv::CsvChunker::for_range(path, dtypes, keep, ncols, start, end, chunk_size) {
+        Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch)),
+        Err(_) => Box::new(MemSource {
+            chunks: std::collections::VecDeque::new(),
+        }),
+    }
+}
+
 struct MemSource {
     chunks: std::collections::VecDeque<Chunk>,
 }
@@ -104,12 +173,16 @@ impl Operator for MemSource {
     }
 }
 
-/// Build the operator for a node from its IR op.
-pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator> {
+/// Build the operator for a node from its IR op. `preview` lets a CSV source
+/// sample-infer its schema (instant start) for sink-less preview runs.
+pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Box<dyn Operator> {
     match op {
-        Op::OpenCsv { path, projection } => {
-            Box::new(SourceCsv::new(path.clone(), projection.clone(), chunk_size))
-        }
+        Op::OpenCsv { path, projection } => Box::new(SourceCsv::new(
+            path.clone(),
+            projection.clone(),
+            chunk_size,
+            preview,
+        )),
         Op::OpenBinary {
             path,
             fields,
@@ -125,6 +198,12 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         Op::OpenJsonl { path } => Box::new(SourceJsonl::new(path.clone(), chunk_size)),
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
+        Op::Take { n } => Box::new(Take { remaining: *n }),
+        Op::Sort { key, desc } => Box::new(Sort::new(key.clone(), *desc)),
+        Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
+        Op::ProjectExpr { items } => Box::new(ProjectExpr {
+            items: items.clone(),
+        }),
         Op::Project { fields } => Box::new(Project {
             fields: fields.clone(),
         }),
@@ -149,35 +228,109 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
     }
 }
 
+/// A streaming CSV sink to `path` (used by the parallel executor to write a
+/// worker's byte-range partition to a part file).
+pub fn csv_sink(path: String) -> Box<dyn Operator> {
+    Box::new(SinkCsv::new(path))
+}
+
+/// A streaming JSONL sink to `path` (parallel worker part file).
+pub fn jsonl_sink(path: String) -> Box<dyn Operator> {
+    Box::new(SinkJsonl::new(path))
+}
+
 // ---------------------------------------------------------------- source (csv)
 
+/// CSV source. A real file streams (bounded memory, [`csv::CsvChunker`]); the
+/// `-` stdin sentinel can't be re-read for two-pass inference, so it falls back
+/// to the buffered whole-input parse (stdin is rarely the 15 GB case).
 struct SourceCsv {
     path: String,
     projection: Option<Vec<String>>,
     chunk_size: usize,
+    loaded: bool,
+    preview: bool,
     schema: Arc<Schema>,
+    /// Streaming reader for a real file; `None` for stdin / after a load error.
+    stream: Option<csv::CsvChunker>,
+    /// Buffered fallback (stdin): pre-parsed columns sliced by `pull`.
     columns: Vec<Column>,
     cursor: usize,
     total: usize,
-    loaded: bool,
 }
 
 impl SourceCsv {
-    fn new(path: String, projection: Option<Vec<String>>, chunk_size: usize) -> Self {
+    fn new(
+        path: String,
+        projection: Option<Vec<String>>,
+        chunk_size: usize,
+        preview: bool,
+    ) -> Self {
         SourceCsv {
             path,
             projection,
             chunk_size: chunk_size.max(1),
+            loaded: false,
+            preview,
             schema: Schema::empty(),
+            stream: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
-            loaded: false,
+        }
+    }
+
+    /// A source wrapping an already-built streaming reader (a parallel worker's
+    /// byte range), with a schema inferred globally beforehand.
+    fn from_stream(schema: Arc<Schema>, chunker: csv::CsvChunker) -> Self {
+        SourceCsv {
+            path: String::new(),
+            projection: None,
+            chunk_size: 0,
+            loaded: true,
+            preview: false,
+            schema,
+            stream: Some(chunker),
+            columns: Vec::new(),
+            cursor: 0,
+            total: 0,
         }
     }
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
+        if self.path == "-" {
+            self.load_stdin(ctx);
+        } else {
+            match csv::CsvChunker::open(
+                &self.path,
+                self.projection.as_deref(),
+                self.chunk_size,
+                self.preview,
+            ) {
+                Ok((schema, chunker)) => {
+                    if chunker.bad_rows > 0 {
+                        ctx.raise(
+                            ErrorEvent::new(
+                                Severity::Recoverable,
+                                ErrorScope::Item,
+                                format!("{} malformed row(s) skipped", chunker.bad_rows),
+                            )
+                            .at_node(ctx.label.clone()),
+                        );
+                    }
+                    self.schema = Arc::new(schema);
+                    self.stream = Some(chunker);
+                }
+                Err(e) => ctx.raise(
+                    ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
+                        .at_node(ctx.label.clone()),
+                ),
+            }
+        }
+    }
+
+    fn load_stdin(&mut self, ctx: &mut OpCtx) {
         let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
@@ -224,6 +377,12 @@ impl Operator for SourceCsv {
         if !self.loaded {
             self.load(ctx);
         }
+        if let Some(chunker) = self.stream.as_mut() {
+            let cols = chunker.next_columns()?;
+            let id = ctx.fresh_id();
+            return Some(Chunk::new(id, self.schema.clone(), cols));
+        }
+        // Buffered (stdin) path.
         if self.cursor >= self.total {
             return None;
         }
@@ -572,6 +731,220 @@ impl Operator for Filter {
     }
 }
 
+// ---------------------------------------------------------------------- take
+
+/// `take N` — forward at most `N` rows total, then drop everything else.
+/// Stateful: `remaining` is the global budget, so results are independent of
+/// `chunk_size` (a chunk straddling the limit is truncated to fit).
+struct Take {
+    remaining: usize,
+}
+
+impl Operator for Take {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.remaining == 0 {
+            return Vec::new();
+        }
+        if chunk.len <= self.remaining {
+            self.remaining -= chunk.len;
+            return vec![chunk];
+        }
+        // Chunk overruns the budget: keep just the first `remaining` rows.
+        let idx: Vec<usize> = (0..self.remaining).collect();
+        self.remaining = 0;
+        vec![chunk.gather(&idx)]
+    }
+}
+
+// ---------------------------------------------------------------------- sort
+
+/// `sort KEY [desc]` — a blocking sort. Buffers every chunk, then on finish
+/// concatenates them (in arrival = source order), stably sorts by the key
+/// column, and emits one ordered chunk. Stable + concatenate-then-sort makes
+/// the output independent of `chunk_size`; ties keep source order for both
+/// ascending and descending.
+struct Sort {
+    key: String,
+    desc: bool,
+    buf: Vec<Chunk>,
+    emitted: bool,
+}
+
+impl Sort {
+    fn new(key: String, desc: bool) -> Self {
+        Sort {
+            key,
+            desc,
+            buf: Vec::new(),
+            emitted: false,
+        }
+    }
+}
+
+/// Compare two rows of one column for ordering (NaN treated as equal).
+fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match col {
+        Column::Bool(v) => v[a].cmp(&v[b]),
+        Column::I64(v) => v[a].cmp(&v[b]),
+        Column::F64(v) => v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal),
+        Column::Str(v) => v.get(a).cmp(v.get(b)),
+    }
+}
+
+impl Operator for Sort {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !chunk.is_empty() {
+            self.buf.push(chunk);
+        }
+        Vec::new() // blocking boundary: output on finish
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.emitted || self.buf.is_empty() {
+            return Vec::new();
+        }
+        self.emitted = true;
+
+        // Concatenate buffered chunks into one set of columns (source order).
+        let mut iter = std::mem::take(&mut self.buf).into_iter();
+        let first = iter.next().unwrap();
+        let schema = first.schema.clone();
+        let mut cols = first.columns;
+        for c in iter {
+            for (i, col) in c.columns.iter().enumerate() {
+                cols[i].append(col);
+            }
+        }
+        let total = cols.first().map(|c| c.len()).unwrap_or(0);
+
+        let mut idx: Vec<usize> = (0..total).collect();
+        match schema.index_of(&self.key) {
+            Some(ki) => {
+                let key_col = &cols[ki];
+                let desc = self.desc;
+                idx.sort_by(|&a, &b| {
+                    let o = cmp_rows(key_col, a, b);
+                    if desc {
+                        o.reverse()
+                    } else {
+                        o
+                    }
+                });
+            }
+            None => {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!("sort: unknown key '{}' (emitting unsorted)", self.key),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+        }
+
+        let sorted: Vec<Column> = cols.iter().map(|c| c.gather(&idx)).collect();
+        vec![Chunk::new(ctx.fresh_id(), schema, sorted)]
+    }
+}
+
+// ------------------------------------------------------------------ distinct
+
+/// `distinct [keys...]` — keep the first occurrence of each distinct key,
+/// dropping later duplicates. Streaming (emits surviving rows per chunk) but
+/// stateful: a global seen-set spans chunks, so it runs serially. Output order
+/// is first-occurrence order, independent of `chunk_size`.
+struct Distinct {
+    keys: Vec<String>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl Distinct {
+    fn new(keys: Vec<String>) -> Self {
+        Distinct {
+            keys,
+            seen: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl Operator for Distinct {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        // Columns that form the dedup key: the named ones, or every column.
+        let idxs: Vec<usize> = if self.keys.is_empty() {
+            (0..chunk.columns.len()).collect()
+        } else {
+            self.keys
+                .iter()
+                .filter_map(|k| chunk.schema.index_of(k))
+                .collect()
+        };
+
+        let mut keep = Vec::new();
+        let mut key = String::new();
+        for row in 0..chunk.len {
+            key.clear();
+            for (j, &ci) in idxs.iter().enumerate() {
+                if j > 0 {
+                    key.push('\u{1f}'); // unit separator: unlikely in data
+                }
+                key.push_str(&chunk.value(row, ci).to_string());
+            }
+            if self.seen.insert(key.clone()) {
+                keep.push(row);
+            }
+        }
+
+        if keep.is_empty() {
+            return Vec::new();
+        }
+        if keep.len() == chunk.len {
+            return vec![chunk];
+        }
+        vec![chunk.gather(&keep)]
+    }
+}
+
+// -------------------------------------------------------- computed projection
+
+/// `|> field (expr) as alias …` — projection that can compute new columns.
+/// Each item is evaluated columnar-style over the chunk (see `eval::eval_column`)
+/// and emitted under its output name. Stateless and row-count preserving.
+struct ProjectExpr {
+    items: Vec<(Expr, String)>,
+}
+
+impl Operator for ProjectExpr {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let mut fields = Vec::with_capacity(self.items.len());
+        let mut cols = Vec::with_capacity(self.items.len());
+        for (expr, alias) in &self.items {
+            // Observe a bare reference to a missing column (continue-first).
+            if let Expr::Field { name, .. } = expr {
+                if chunk.column(name).is_none() {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Warn,
+                            ErrorScope::Chunk,
+                            format!("project: unknown field '{name}'"),
+                        )
+                        .at_node(ctx.label.clone())
+                        .at_chunk(chunk.meta.id),
+                    );
+                }
+            }
+            let col = eval::eval_column(expr, &chunk);
+            fields.push(Field::new(alias.clone(), col.dtype()));
+            cols.push(col);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let mut out = Chunk::new(chunk.meta.id, schema, cols);
+        out.meta = chunk.meta.clone(); // preserve mode / telemetry
+        vec![out]
+    }
+}
+
 // ------------------------------------------------------------------- project
 
 struct Project {
@@ -890,36 +1263,75 @@ impl Operator for SinkPrint {
 
 // ------------------------------------------------------------------ sink: csv
 
+/// Streaming CSV sink: writes the header on the first chunk and appends rows as
+/// chunks arrive (bounded memory), so `open big.csv |? … save out.csv` never
+/// buffers the whole output.
 struct SinkCsv {
-    path: String,
-    buf: Vec<Chunk>,
+    w: StreamWriter,
 }
 
 impl SinkCsv {
     fn new(path: String) -> Self {
         SinkCsv {
-            path,
-            buf: Vec::new(),
+            w: StreamWriter::new(path),
         }
+    }
+
+    fn write_chunk(&mut self, chunk: &Chunk) -> std::io::Result<()> {
+        let need_header = !self.w.wrote_header;
+        {
+            let w = self.w.writer()?;
+            if need_header {
+                writeln!(w, "{}", chunk.schema.field_names().join(","))?;
+            }
+            let mut line = String::new();
+            for row in 0..chunk.len {
+                line.clear();
+                for c in 0..chunk.columns.len() {
+                    if c > 0 {
+                        line.push(',');
+                    }
+                    line.push_str(&csv_escape(&chunk.value(row, c)));
+                }
+                writeln!(w, "{line}")?;
+            }
+        }
+        self.w.wrote_header = true;
+        Ok(())
     }
 }
 
 impl Operator for SinkCsv {
-    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
-        self.buf.push(chunk);
-        Vec::new() // consume: written to disk on finish
-    }
-
-    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        if let Err(e) = write_csv_file(&self.path, &self.buf) {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.w.failed {
+            return Vec::new();
+        }
+        if let Err(e) = self.write_chunk(&chunk) {
+            self.w.failed = true;
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,
                     ErrorScope::Graph,
-                    format!("cannot write '{}': {e}", self.path),
+                    format!("cannot write '{}': {e}", self.w.path),
                 )
                 .at_node(ctx.label.clone()),
             );
+        }
+        Vec::new()
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !self.w.failed {
+            if let Err(e) = self.w.finish() {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Critical,
+                        ErrorScope::Graph,
+                        format!("cannot write '{}': {e}", self.w.path),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
         }
         Vec::new()
     }
@@ -958,36 +1370,71 @@ fn csv_escape(v: &Value) -> String {
 
 /// Writes JSON Lines (one object per row), mirroring the JSONL source so a flow
 /// can read and write the same format. Buffered, written on finish.
+/// Streaming JSONL sink: appends one JSON object per row as chunks arrive.
 struct SinkJsonl {
-    path: String,
-    buf: Vec<Chunk>,
+    w: StreamWriter,
 }
 
 impl SinkJsonl {
     fn new(path: String) -> Self {
         SinkJsonl {
-            path,
-            buf: Vec::new(),
+            w: StreamWriter::new(path),
         }
+    }
+
+    fn write_chunk(&mut self, chunk: &Chunk) -> std::io::Result<()> {
+        let w = self.w.writer()?;
+        let names = chunk.schema.field_names();
+        let mut out = String::new();
+        for row in 0..chunk.len {
+            out.clear();
+            out.push('{');
+            for (c, name) in names.iter().enumerate() {
+                if c > 0 {
+                    out.push(',');
+                }
+                json_string(&mut out, name);
+                out.push(':');
+                json_value(&mut out, &chunk.value(row, c));
+            }
+            out.push('}');
+            writeln!(w, "{out}")?;
+        }
+        Ok(())
     }
 }
 
 impl Operator for SinkJsonl {
-    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
-        self.buf.push(chunk);
-        Vec::new() // consume: written on finish
-    }
-
-    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        if let Err(e) = write_jsonl_file(&self.path, &self.buf) {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.w.failed {
+            return Vec::new();
+        }
+        if let Err(e) = self.write_chunk(&chunk) {
+            self.w.failed = true;
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,
                     ErrorScope::Graph,
-                    format!("cannot write '{}': {e}", self.path),
+                    format!("cannot write '{}': {e}", self.w.path),
                 )
                 .at_node(ctx.label.clone()),
             );
+        }
+        Vec::new()
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !self.w.failed {
+            if let Err(e) = self.w.finish() {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Critical,
+                        ErrorScope::Graph,
+                        format!("cannot write '{}': {e}", self.w.path),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
         }
         Vec::new()
     }

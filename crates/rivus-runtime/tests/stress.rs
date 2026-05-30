@@ -18,7 +18,14 @@ impl Drop for TempCsv {
 
 fn run_src(src: &str, chunk_size: usize) -> rivus_runtime::RunResult {
     let graph = rivus_parser::parse(src).expect("parse");
-    run(&graph, RunOptions { chunk_size }).expect("run")
+    run(
+        &graph,
+        RunOptions {
+            chunk_size,
+            ..Default::default()
+        },
+    )
+    .expect("run")
 }
 
 /// Independent oracle: count clean rows with age >= threshold by regenerating
@@ -54,6 +61,137 @@ fn large_clean_filter_is_exact() {
         let res = run_src(&src, cs);
         assert_eq!(res.total_rows_out(), expected, "chunk_size={cs}");
         assert!(res.errors.is_empty(), "clean data should not error");
+    }
+}
+
+#[test]
+fn take_caps_rows_chunk_size_independent() {
+    let rows = 50_000;
+    let seed = 42;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_take", &data));
+    let p = f.0.display();
+
+    let matched = expected_clean_ge(rows, seed, 45);
+    // Limit below and above the number of matches; result is min(N, matched),
+    // and must not depend on chunk granularity (a chunk may straddle the cut).
+    for n in [
+        0u64,
+        1,
+        123,
+        matched.saturating_sub(1),
+        matched,
+        matched + 1000,
+    ] {
+        let want = n.min(matched);
+        for cs in [1, 7, 1024, 8192, rows] {
+            let src = format!("F:\n open {p}\n |? age >= 45\n take {n}\n;");
+            let res = run_src(&src, cs);
+            assert_eq!(res.total_rows_out(), want, "take {n} @ chunk_size={cs}");
+            assert!(res.errors.is_empty(), "clean data should not error");
+        }
+    }
+}
+
+/// Collect an integer column across all chunks of the output labeled `label`.
+fn collect_i64(res: &rivus_runtime::RunResult, label: &str, col: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    let o = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some(label))
+        .expect("labeled output");
+    for c in &o.chunks {
+        if let Some(ci) = c.schema.index_of(col) {
+            for r in 0..c.len {
+                out.push(c.value(r, ci).as_f64().unwrap() as i64);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn sort_orders_rows_chunk_size_independent() {
+    let rows = 20_000;
+    let seed = 7;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_sort", &data));
+    let p = f.0.display();
+
+    // Oracle: regenerate the age multiset and sort it independently.
+    let mut rng = Rng::new(seed);
+    let mut want_asc = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let age = rng.below(90) as i64;
+        let _score = rng.below(10_000);
+        let _country = rng.below(5);
+        let _active = rng.below(2);
+        want_asc.push(age);
+    }
+    want_asc.sort_unstable();
+    let mut want_desc = want_asc.clone();
+    want_desc.reverse();
+
+    // The sorted output must equal the oracle exactly, for every chunk size.
+    for cs in [1, 7, 1024, 8192, rows] {
+        let asc = run_src(&format!("S:\n open {p}\n sort age\n;"), cs);
+        assert_eq!(collect_i64(&asc, "S", "age"), want_asc, "asc @cs={cs}");
+
+        let desc = run_src(&format!("S:\n open {p}\n sort age desc\n;"), cs);
+        assert_eq!(collect_i64(&desc, "S", "age"), want_desc, "desc @cs={cs}");
+    }
+}
+
+#[test]
+fn distinct_dedups_chunk_size_independent() {
+    let rows = 20_000;
+    let seed = 11;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_distinct", &data));
+    let p = f.0.display();
+
+    // `country` is one of five fixed values; with 20k rows all five appear, so
+    // `distinct country` yields exactly 5 rows regardless of chunk size.
+    for cs in [1, 7, 1024, 8192, rows] {
+        let res = run_src(&format!("D:\n open {p}\n distinct country\n;"), cs);
+        assert_eq!(res.total_rows_out(), 5, "distinct country @cs={cs}");
+        assert!(res.errors.is_empty());
+    }
+
+    // Whole-row distinct: the surviving count must be identical across chunk
+    // sizes (first-occurrence dedup is order-deterministic, not chunk-bound).
+    let baseline = run_src(&format!("D:\n open {p}\n distinct\n;"), 4096).total_rows_out();
+    assert!(baseline > 0 && baseline <= rows as u64);
+    for cs in [1, 7, 8192, rows] {
+        let res = run_src(&format!("D:\n open {p}\n distinct\n;"), cs);
+        assert_eq!(
+            res.total_rows_out(),
+            baseline,
+            "whole-row distinct @cs={cs}"
+        );
+    }
+}
+
+#[test]
+fn computed_columns_are_exact_chunk_size_independent() {
+    let rows = 20_000;
+    let seed = 5;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_calc", &data));
+    let p = f.0.display();
+
+    // `(age * 2 + 1)` must equal the arithmetic on the source `age`, exactly and
+    // for every chunk size. Carry `age` through so we can check element-wise.
+    for cs in [1, 7, 1024, 8192, rows] {
+        let res = run_src(&format!("C:\n open {p}\n |> age (age * 2 + 1) as v\n;"), cs);
+        let age = collect_i64(&res, "C", "age");
+        let v = collect_i64(&res, "C", "v");
+        assert_eq!(age.len(), rows, "row count @cs={cs}");
+        assert_eq!(v.len(), rows, "computed row count @cs={cs}");
+        for (a, got) in age.iter().zip(&v) {
+            assert_eq!(*got, a * 2 + 1, "computed value @cs={cs}");
+        }
     }
 }
 

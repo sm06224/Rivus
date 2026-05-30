@@ -6,7 +6,7 @@
 //! that the optimizer rewrites and that [`PlanGraph::to_source`] regenerates
 //! back into readable Rivus source (Master principle #5: IR reversibility).
 
-use crate::expr::Expr;
+use crate::expr::{Access, Expr};
 use rivus_core::{DataType, Mode, Severity};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -153,8 +153,27 @@ pub enum Op {
     StreamRef { name: String },
     /// `|? <pred>`
     Filter { pred: Expr },
-    /// `|> field [field ...]`
+    /// `|> field [field ...]` — pure column selection.
     Project { fields: Vec<String> },
+    /// `|> field (expr) as alias ...` — projection with computed columns. Each
+    /// item is `(expr, output_name)`; a bare field is `(Field, name)`. Emitted
+    /// only when at least one item is computed (pure selection stays `Project`),
+    /// so existing fusion/pushdown are unaffected. Stateless (row-wise).
+    ProjectExpr { items: Vec<(Expr, String)> },
+    /// `take N` / `limit N` / `head N` — pass through at most `N` rows of the
+    /// stream flowing through this node, then drop the rest. Stateful (a global
+    /// running count), so it is a pipeline-breaker for the parallel executor.
+    Take { n: usize },
+    /// `sort KEY [asc|desc]` — order the whole stream by one key column. A
+    /// blocking operator (buffers every row, emits on finish); the sort is
+    /// stable, so equal keys keep source order and the result is chunk-size
+    /// independent. Pipeline-breaker for the parallel executor.
+    Sort { key: String, desc: bool },
+    /// `distinct [KEY ...]` — drop duplicate rows, keeping the first occurrence.
+    /// With no keys, the whole row is the dedup key; otherwise only the named
+    /// columns. Streaming (emits as it goes) but stateful (a global seen-set),
+    /// so it runs on the serial path. Output order = first-occurrence order.
+    Distinct { keys: Vec<String> },
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -192,6 +211,10 @@ impl Op {
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Project { .. } => "project",
+            Op::ProjectExpr { .. } => "project",
+            Op::Take { .. } => "take",
+            Op::Sort { .. } => "sort",
+            Op::Distinct { .. } => "distinct",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -233,6 +256,34 @@ impl Op {
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
+            Op::ProjectExpr { items } => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|(e, alias)| match e {
+                        Expr::Field {
+                            name,
+                            access: Access::Fast,
+                        } if name == alias => name.clone(),
+                        _ => format!("{e} as {alias}"),
+                    })
+                    .collect();
+                format!("|> {}", parts.join(" "))
+            }
+            Op::Take { n } => format!("take {n}"),
+            Op::Sort { key, desc } => {
+                if *desc {
+                    format!("sort {key} desc")
+                } else {
+                    format!("sort {key}")
+                }
+            }
+            Op::Distinct { keys } => {
+                if keys.is_empty() {
+                    "distinct".to_string()
+                } else {
+                    format!("distinct {}", keys.join(" "))
+                }
+            }
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {

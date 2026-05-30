@@ -326,3 +326,62 @@ rows) and parallel pipeline execution.
 
 Every optimization PR must attach its before/after row from this table and must
 keep `tests/stress.rs` green (correctness is the gate, speed is the reward).
+
+### Streaming ingestion — bounded memory at any file size
+
+The CSV source and sinks stream (read in chunks, write as results flow), so
+resident memory is independent of input size. Measured peak RSS (`os.wait4`
+`ru_maxrss`) on a 1.1 GB / 48 M-row CSV, release build, single thread:
+
+| pipeline | input | peak RSS | time | throughput |
+|---|---:|---:|---:|---:|
+| `open \|? age>=50 \|> name age save out.csv` (serial) | 1.1 GB | **10.1 MiB** | 14.4 s | ~3.3 M rows/s |
+| same, **streaming-parallel** (4 cores) | 1.1 GB | **10.2 MiB** | **4.5 s** | **~10.7 M rows/s** |
+| `open big.csv` (bare, no sink → **preview**) | 1.1 GB | **10.0 MiB** | **0.00 s** | instant |
+| `open \|? age>=50` (no sink → **preview**) | 1.1 GB | **10.4 MiB** | **0.00 s** | instant |
+
+A sink-less `rivus run` is a **preview**: the CSV source sample-infers its
+schema from the first chunk and the engine stops after the row cap (default
+1000), so eyeballing a 15 GB file is instant and flat-memory. Adding
+`save out.csv` switches to full global-inference streaming over every row.
+
+**Streaming-parallel** (files > 256 MiB with a file sink): the schema is
+inferred once over newline-aligned byte ranges *in parallel*, then each worker
+streams its range through an identical stateless sub-DAG and writes a **part
+file**; the parts are concatenated in source order (CSV headers de-duplicated).
+**2.7× on 4 cores while staying at ~10 MiB** — bounded memory is preserved
+because nothing is buffered (an earlier `collector`-based attempt hit 690 MiB;
+that regression is why workers stream to part files instead). A byte-identical
+oracle test (`engine::tests::streaming_parallel_matches_serial`) gates it.
+
+Before streaming, `open` alone read the whole file into a `String` and parsed
+every column up front (~2–3 GB resident for this input, with a long stall and no
+output). Now memory is flat at chunk scale and rows flow immediately; an
+interactive run shows a live `… N rows  T s  R rows/s` line on stderr.
+
+Files above 256 MiB use the streaming-parallel reader; the chunk-partition
+parallel parser (which materializes the whole input to split it) is kept for
+small files only.
+
+### External comparison — vs DuckDB / awk / Python (1.1 GB, 48 M rows)
+
+Same task as above (`filter age>=50`, project `name,age`, write CSV), release
+build, 4 vCPU, peak RSS via `os.wait4`:
+
+| tool | command | time | peak RSS |
+|---|---|---:|---:|
+| **Rivus** | `open … \|? age>=50 \|> name age save out.csv` | **4.5 s** | **10.2 MiB** |
+| DuckDB | `COPY (SELECT name,age … WHERE age>=50) TO …` | 4.4 s | 406.8 MiB |
+| gawk | `awk -F, 'NR>1&&$3>=50{print $2","$3}'` | 11.5 s | — |
+| Python | stdlib `csv` reader/writer | 30.9 s | 10.1 MiB |
+
+All four produce the same 22.4 M output rows. **Rivus matches DuckDB's wall
+time while using ~40× less memory** (10 MiB vs 407 MiB — DuckDB parallelizes
+the whole query but buffers; Rivus streams), and is **2.5× faster than awk**
+and **~7× faster than Python**. This is the headline target met: for everyday
+streaming ETL, Rivus is a credible replacement for reaching to DuckDB/Python —
+same speed, a fraction of the footprint. Reproduce with `bench/compare.sh`.
+
+The remaining lever to go *past* DuckDB is filter pushdown into the reader
+(skip building the columns of rows the predicate will drop — here ~half the
+string copies), tracked on the backlog.

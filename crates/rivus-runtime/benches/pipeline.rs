@@ -23,14 +23,28 @@ const SEED: u64 = 0x1234_5678_9ABC_DEF0; // fixed seed for reproducibility
 /// elide the work.
 fn run_source(src: &str) -> rivus_runtime::RunResult {
     let graph = rivus_parser::parse(src).expect("parse");
-    run(&graph, RunOptions { chunk_size: 8192 }).expect("run")
+    run(
+        &graph,
+        RunOptions {
+            chunk_size: 8192,
+            ..Default::default()
+        },
+    )
+    .expect("run")
 }
 
 /// Parse + optimize + run.
 fn run_source_opt(src: &str) -> rivus_runtime::RunResult {
     let graph = rivus_parser::parse(src).expect("parse");
     let (graph, _) = rivus_optimizer::optimize(graph);
-    run(&graph, RunOptions { chunk_size: 8192 }).expect("run")
+    run(
+        &graph,
+        RunOptions {
+            chunk_size: 8192,
+            ..Default::default()
+        },
+    )
+    .expect("run")
 }
 
 struct Fixture {

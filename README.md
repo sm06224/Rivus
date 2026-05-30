@@ -38,8 +38,88 @@ Merged:
 | operator | meaning |
 |---|---|
 | `\|?` filter · `\|>` map/project · `\|#` group | transforms |
+| `\|> name (age * 12) as months` | computed columns (`+ - * / %`, `as` alias) |
+| `take N` (`limit`/`head`) | cap the stream at N rows |
+| `sort KEY [asc\|desc]` | stable order by one key (blocking) |
+| `distinct [KEY ...]` | drop duplicate rows (whole-row or by key) |
 | `->` branch (tee) · `+` merge · `&` join | DAG fan-out / fan-in |
 | `on error ... : transition degraded ;` | continue-first lifecycle hook |
+
+## Installation
+
+Rivus ships **pre-built binaries for macOS (Apple Silicon) and Windows 11+
+(x64)**. Every other platform — Linux, Intel Mac, ARM Windows — builds from
+source, which is a single command because the runtime has **zero third-party
+dependencies**.
+
+Each platform offers two flavors so you can trade compatibility for speed:
+
+| flavor | meaning | pick it when |
+|---|---|---|
+| **portable** (multi-arch) | baseline codegen that runs on the widest range of CPUs in that family | you want it to *just run* anywhere (Intel included) |
+| **tuned** (CPU-specialized) | `-C target-cpu=…` build, faster but needs that CPU generation or newer | you know your CPU and want the extra speed |
+
+### Available downloads
+
+| OS | flavor | asset | runs on |
+|---|---|---|---|
+| macOS | portable | `rivus-<version>-macos-arm64.tar.gz` | any Apple Silicon (M1 and later) |
+| macOS | tuned | `rivus-<version>-macos-arm64-appleM-tuned.tar.gz` | all Apple Silicon (M-series tuned) |
+| Windows 11+ | portable | `rivus-<version>-windows-x64-portable.zip` | any x64 — **Intel** and older AMD |
+| Windows 11+ | AMD tuned | `rivus-<version>-windows-x64-amd-zen4.zip` | AMD Zen 4 (Ryzen 7000 / EPYC 9004) or newer |
+| Windows 11+ | AMD tuned | `rivus-<version>-windows-x64-amd-zen3.zip` | AMD Zen 3 (Ryzen 5000 / EPYC 7003) or newer |
+
+> On an **Intel** PC, use the Windows **portable** zip — the AMD-tuned builds
+> will fault with an illegal-instruction error. On any Mac, you need **Apple
+> Silicon**; Intel Macs are not supported (build from source instead).
+
+### Option A — download a pre-built binary
+
+1. Grab the asset for your OS/CPU from the
+   [**Releases**](https://github.com/sm06224/rivus/releases) page (see the table
+   above), plus its matching `.sha256`.
+2. Verify the checksum (optional but recommended):
+   - macOS: `shasum -a 256 -c rivus-<version>-macos-arm64.tar.gz.sha256`
+   - Windows (PowerShell): `Get-FileHash .\rivus-<version>-windows-x64-portable.zip -Algorithm SHA256`
+3. Extract and put `rivus` on your `PATH`:
+
+   **macOS** (Terminal):
+   ```sh
+   tar -xzf rivus-<version>-macos-arm64.tar.gz
+   cd rivus-<version>-macos-arm64
+   # macOS quarantines downloads; clear it so Gatekeeper lets it run:
+   xattr -d com.apple.quarantine ./rivus 2>/dev/null || true
+   sudo mv ./rivus /usr/local/bin/        # or any dir on your PATH
+   rivus --help
+   ```
+
+   **Windows** (PowerShell):
+   ```powershell
+   Expand-Archive .\rivus-<version>-windows-x64-portable.zip -DestinationPath .\rivus
+   # Add the folder to PATH for this session (use the GUI for a permanent one):
+   $env:Path = "$PWD\rivus;$env:Path"
+   rivus --help
+   ```
+
+### Option B — build from source (any platform)
+
+You need a Rust toolchain (`rustup` from <https://rustup.rs>). Then:
+
+```sh
+git clone https://github.com/sm06224/rivus
+cd rivus
+cargo build --release                  # binary at target/release/rivus
+./target/release/rivus run examples/branch.riv
+```
+
+Or install it straight onto your `PATH` with Cargo:
+
+```sh
+cargo install --path crates/rivus-cli  # provides the `rivus` command
+```
+
+> Building macOS/Windows x64 packages yourself? `dist/build.sh` produces the
+> same archive layout as the official releases — see [`dist/`](dist/README.md).
 
 ## Quick start
 
@@ -49,6 +129,49 @@ cargo run -p rivus-cli -- run     examples/branch.riv
 cargo run -p rivus-cli -- run     examples/recover.riv   # escalates to mode: degraded
 cargo run -p rivus-cli -- explain examples/branch.riv    # DAG IR + regenerated source
 ```
+
+> Already installed via Option A/B? Drop the `cargo run -p rivus-cli --` and
+> just call `rivus run examples/branch.riv`.
+
+### Run a flow without a file
+
+A program can be passed inline with `-c`, or piped on stdin (heredoc) — handy
+for one-liners and for embedding Rivus in another shell:
+
+```sh
+# inline string
+rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;'
+
+# heredoc on stdin (the `-` reads the program from stdin)
+rivus run - <<'RIV'
+Adults:
+    open users.csv
+    |? age >= 20
+    |> name age
+    save stdout as jsonl
+;
+RIV
+```
+
+The execution-graph visualization is written to **stderr**, so a `save stdout`
+sink leaves **stdout** as clean data you can pipe onward
+(`rivus run -c '…' | jq .`). The same `-c` / `-` input works for `explain` and
+`check` too.
+
+### Large files stream (bounded memory)
+
+CSV sources and sinks are **streaming**: a file is read in chunks and written as
+results flow, so memory stays flat regardless of size. A **1.1 GB** CSV through
+`open |? … |> … save out.csv` runs in **~10 MiB** of resident memory (it does
+*not* load the file). On an interactive terminal a live progress line shows on
+stderr:
+
+```
+  … 47,534,080 rows  15.3s  3,114,112 rows/s
+  ✓ 48,000,000 rows in 15.4s  (3,123,164 rows/s)
+```
+
+(stdin is the exception — it can't be re-read, so a piped-in CSV is buffered.)
 
 `rivus run` prints the live execution graph, the error stream, and captured outputs:
 
