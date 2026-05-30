@@ -179,6 +179,8 @@ pub enum Op {
     SinkPrint,
     /// `save path.csv`
     SinkCsv { path: String },
+    /// `save path.jsonl` — write JSON Lines (one object per row).
+    SinkJsonl { path: String },
 }
 
 impl Op {
@@ -197,6 +199,7 @@ impl Op {
             Op::Join { .. } => "join",
             Op::SinkPrint => "print",
             Op::SinkCsv { .. } => "save",
+            Op::SinkJsonl { .. } => "save",
         }
     }
 
@@ -252,6 +255,7 @@ impl Op {
             } => format!("& on {left_key} = {right_key}"),
             Op::SinkPrint => "print".to_string(),
             Op::SinkCsv { path } => format!("save {path}"),
+            Op::SinkJsonl { path } => format!("save {path}  # as jsonl"),
         }
     }
 }

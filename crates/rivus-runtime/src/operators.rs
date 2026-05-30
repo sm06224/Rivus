@@ -51,6 +51,28 @@ pub trait Operator {
     }
 }
 
+/// Read a text source: the `-` sentinel reads stdin, otherwise a file.
+fn read_input(path: &str) -> std::io::Result<String> {
+    if path == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path)
+    }
+}
+
+/// Write a text sink: the `-` sentinel writes stdout, otherwise a file.
+fn write_output(path: &str, data: &str) -> std::io::Result<()> {
+    if path == "-" {
+        use std::io::Write;
+        std::io::stdout().write_all(data.as_bytes())
+    } else {
+        std::fs::write(path, data)
+    }
+}
+
 /// Build the operator for a node from its IR op.
 pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator> {
     match op {
@@ -92,6 +114,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize) -> Box<dyn Operator>
         )),
         Op::SinkPrint => Box::new(SinkPrint),
         Op::SinkCsv { path } => Box::new(SinkCsv::new(path.clone())),
+        Op::SinkJsonl { path } => Box::new(SinkJsonl::new(path.clone())),
     }
 }
 
@@ -124,7 +147,7 @@ impl SourceCsv {
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -403,7 +426,7 @@ impl SourceJsonl {
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
-        let text = match std::fs::read_to_string(&self.path) {
+        let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -871,7 +894,7 @@ impl Operator for SinkCsv {
                 }
             }
         }
-        if let Err(e) = std::fs::write(&self.path, out) {
+        if let Err(e) = write_output(&self.path, &out) {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Critical,
@@ -892,4 +915,89 @@ fn csv_escape(v: &Value) -> String {
     } else {
         s
     }
+}
+
+// ----------------------------------------------------------------- sink: jsonl
+
+/// Writes JSON Lines (one object per row), mirroring the JSONL source so a flow
+/// can read and write the same format. Buffered, written on finish.
+struct SinkJsonl {
+    path: String,
+    buf: Vec<Chunk>,
+}
+
+impl SinkJsonl {
+    fn new(path: String) -> Self {
+        SinkJsonl {
+            path,
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl Operator for SinkJsonl {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        self.buf.push(chunk);
+        Vec::new() // consume: written on finish
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let mut out = String::new();
+        for chunk in &self.buf {
+            let names = chunk.schema.field_names();
+            for row in 0..chunk.len {
+                out.push('{');
+                for (c, name) in names.iter().enumerate() {
+                    if c > 0 {
+                        out.push(',');
+                    }
+                    json_string(&mut out, name);
+                    out.push(':');
+                    json_value(&mut out, &chunk.value(row, c));
+                }
+                out.push_str("}\n");
+            }
+        }
+        if let Err(e) = write_output(&self.path, &out) {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Critical,
+                    ErrorScope::Graph,
+                    format!("cannot write '{}': {e}", self.path),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        Vec::new()
+    }
+}
+
+/// Encode a JSON value from a Rivus scalar.
+fn json_value(out: &mut String, v: &Value) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::I64(n) => out.push_str(&n.to_string()),
+        // JSON has no NaN/Infinity → emit null (continue-first).
+        Value::F64(f) if f.is_finite() => out.push_str(&f.to_string()),
+        Value::F64(_) => out.push_str("null"),
+        Value::Str(s) => json_string(out, s),
+    }
+}
+
+/// Append a JSON-escaped string (with quotes) to `out`.
+fn json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }

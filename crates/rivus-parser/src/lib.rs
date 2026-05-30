@@ -212,10 +212,35 @@ impl Parser {
                     // no-op in the MVP (the boundary is implicit at a sink).
                     self.bump();
                 }
+                // `save PATH [as FMT]` — extension default, `as` overrides; the
+                // sink mirrors the source format set (write what you can read).
                 Tok::Word(w) if w == "save" => {
+                    self.bump();
+                    let path = norm_path(self.word()?);
+                    let explicit = if self.peek_is_word("as") {
+                        self.bump();
+                        Some(self.word()?)
+                    } else {
+                        None
+                    };
+                    let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
+                        self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
+                    })?;
+                    let n = self.g.add_node(fmt.into_sink_op(path));
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                Tok::Word(w) if w == "writecsv" => {
                     self.bump();
                     let path = self.word()?;
                     let n = self.g.add_node(Op::SinkCsv { path });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                Tok::Word(w) if w == "writejson" => {
+                    self.bump();
+                    let path = self.word()?;
+                    let n = self.g.add_node(Op::SinkJsonl { path });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -247,7 +272,7 @@ impl Parser {
             // equivalent explicit aliases (lower cognitive load, fewer surprises).
             Tok::Word(w) if w == "open" => {
                 self.bump();
-                let path = self.word()?;
+                let path = norm_path(self.word()?);
                 let explicit = if self.peek_is_word("as") {
                     self.bump();
                     Some(self.word()?)
@@ -261,7 +286,7 @@ impl Parser {
             }
             Tok::Word(w) if w == "readcsv" => {
                 self.bump();
-                let path = self.word()?;
+                let path = norm_path(self.word()?);
                 Ok(self.g.add_node(Op::OpenCsv {
                     path,
                     projection: None,
@@ -269,7 +294,7 @@ impl Parser {
             }
             Tok::Word(w) if w == "readjson" => {
                 self.bump();
-                let path = self.word()?;
+                let path = norm_path(self.word()?);
                 Ok(self.g.add_node(Op::OpenJsonl { path }))
             }
             Tok::Word(w) if w == "stream" => {
@@ -575,6 +600,16 @@ impl Parser {
     }
 }
 
+/// Normalize a source/sink path: `stdin` / `stdout` / `-` all map to the `-`
+/// sentinel (read stdin / write stdout, direction inferred from source vs sink).
+fn norm_path(p: String) -> String {
+    if p == "stdin" || p == "stdout" || p == "-" {
+        "-".to_string()
+    } else {
+        p
+    }
+}
+
 /// A text source format selectable on `open` (binary goes via `readbin`).
 enum Format {
     Csv,
@@ -589,6 +624,13 @@ impl Format {
                 projection: None,
             },
             Format::Jsonl => Op::OpenJsonl { path },
+        }
+    }
+
+    fn into_sink_op(self, path: String) -> Op {
+        match self {
+            Format::Csv => Op::SinkCsv { path },
+            Format::Jsonl => Op::SinkJsonl { path },
         }
     }
 }
@@ -620,6 +662,8 @@ fn is_keyword(w: &str) -> bool {
             | "readcsv"
             | "readjson"
             | "as"
+            | "writecsv"
+            | "writejson"
             | "stream"
             | "save"
             | "print"
@@ -657,6 +701,60 @@ mod tests {
     fn first_op(src: &str) -> Op {
         let g = parse(src).unwrap();
         g.nodes[0].op.clone()
+    }
+
+    fn nth_op(src: &str, n: usize) -> Op {
+        let g = parse(src).unwrap();
+        g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn stdio_paths_normalize() {
+        // `stdin`/`stdout` (and `-`) map to the "-" sentinel for source & sink.
+        let g = parse("F:\n open stdin\n save stdout\n;").unwrap();
+        match &g.nodes[0].op {
+            Op::OpenCsv { path, .. } => assert_eq!(path, "-"),
+            o => panic!("expected OpenCsv, got {o:?}"),
+        }
+        let sink = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::SinkCsv { path } => Some(path.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(sink, "-");
+        // stdin with an explicit format.
+        assert!(matches!(
+            &parse("F:\n open stdin as json\n;").unwrap().nodes[0].op,
+            Op::OpenJsonl { path } if path == "-"
+        ));
+    }
+
+    #[test]
+    fn sink_format_selection() {
+        // The sink mirrors the source format set: extension default + `as` + aliases.
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.csv\n;", 1),
+            Op::SinkCsv { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.jsonl\n;", 1),
+            Op::SinkJsonl { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.dat as json\n;", 1),
+            Op::SinkJsonl { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n writejson o.x\n;", 1),
+            Op::SinkJsonl { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n writecsv o.x\n;", 1),
+            Op::SinkCsv { .. }
+        ));
     }
 
     #[test]
