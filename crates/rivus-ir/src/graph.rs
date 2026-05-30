@@ -311,6 +311,8 @@ impl Op {
             Op::Describe => "describe",
             Op::DropNa { .. } => "dropna",
             Op::Fill { .. } => "fill",
+            Op::Rename { .. } => "rename",
+            Op::Drop { .. } => "drop",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
