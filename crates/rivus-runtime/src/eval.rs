@@ -12,9 +12,75 @@
 //! doesn't fit the fast paths falls back to the owned-`Value` interpreter, so
 //! results are identical.
 
-use rivus_core::{Chunk, Column, StrColumn, Value};
+use rivus_core::{Chunk, Column, DataType, StrColumn, Value};
 use rivus_ir::{Access, ArithOp, CmpOp, Expr};
 use std::cmp::Ordering;
+
+/// Coerce a value to an integer (truncating floats; parsing strings; bool→0/1).
+fn to_i64(v: Value) -> i64 {
+    match v {
+        Value::I64(x) => x,
+        Value::F64(x) => x as i64,
+        Value::Bool(b) => b as i64,
+        Value::Str(s) => s
+            .trim()
+            .parse::<i64>()
+            .or_else(|_| s.trim().parse::<f64>().map(|f| f as i64))
+            .unwrap_or(0),
+        Value::Null => 0,
+    }
+}
+
+/// Coerce a value to a float (parsing strings; bool→0/1).
+fn to_f64(v: Value) -> f64 {
+    match v {
+        Value::I64(x) => x as f64,
+        Value::F64(x) => x,
+        Value::Bool(b) => b as i64 as f64,
+        Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
+        Value::Null => f64::NAN,
+    }
+}
+
+/// Coerce a value to a bool (`true`/nonzero/non-empty-numeric).
+fn to_bool(v: Value) -> bool {
+    match v {
+        Value::Bool(b) => b,
+        Value::I64(x) => x != 0,
+        Value::F64(x) => x != 0.0,
+        Value::Str(s) => s.trim().eq_ignore_ascii_case("true") || s.trim() == "1",
+        Value::Null => false,
+    }
+}
+
+/// Cast a value to a target lane.
+fn cast_value(v: Value, ty: DataType) -> Value {
+    match ty {
+        DataType::I64 => Value::I64(to_i64(v)),
+        DataType::F64 => Value::F64(to_f64(v)),
+        DataType::Bool => Value::Bool(to_bool(v)),
+        DataType::Str => Value::Str(v.to_string()),
+        DataType::Null => Value::Null,
+    }
+}
+
+/// Cast a whole column to a target lane (columnar path for computed columns).
+fn cast_column(col: Column, ty: DataType) -> Column {
+    let n = col.len();
+    match ty {
+        DataType::I64 => Column::I64((0..n).map(|i| to_i64(col.value_at(i))).collect()),
+        DataType::F64 => Column::F64((0..n).map(|i| to_f64(col.value_at(i))).collect()),
+        DataType::Bool => Column::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
+        DataType::Str => {
+            let mut s = StrColumn::with_capacity(n, n * 8);
+            for i in 0..n {
+                s.push(&col.value_at(i).to_string());
+            }
+            Column::Str(s)
+        }
+        DataType::Null => col,
+    }
+}
 
 /// Evaluate an expression over a whole chunk, producing a column of `chunk.len`
 /// rows (the columnar path used by computed-column projection). A `Field` is the
@@ -28,6 +94,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
             None => Column::F64(vec![f64::NAN; chunk.len]),
         },
         Expr::Literal(v) => const_column(v, chunk.len),
+        Expr::Cast { expr, ty } => cast_column(eval_column(expr, chunk), *ty),
         Expr::Arith { left, op, right } => eval_arith(left, *op, right, chunk),
         // Compare / And / Or are predicates → a boolean column.
         _ => {
@@ -141,6 +208,7 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
             Value::Bool(eval_predicate(a, chunk, row) || eval_predicate(b, chunk, row))
         }
         Expr::Arith { left, op, right } => arith_value(left, *op, right, chunk, row),
+        Expr::Cast { expr, ty } => cast_value(eval(expr, chunk, row), *ty),
     }
 }
 

@@ -257,6 +257,15 @@ tighter than `+ -`; nest with parens.
 > `open /tmp/a-b.csv` keep lexing as a single word outside parens. Wrap any
 > computed expression in `( … )`.
 
+**Type casts** — `expr:type` reinterprets a value's lane (`int`/`i64`,
+`float`/`f64`, `str`/`string`, `bool`), binding tightest:
+
+```
+|? age:int >= 20            # compare a *string* column numerically
+|> id (price:f64 * 1.1) as gross
+|> (age:str) as age_text    # the add-property cast (3rd way to type a column)
+```
+
 Numeric arithmetic stays integer when both sides are integers (except `/`,
 which is always float, like SQL/pandas). Strings are parsed best-effort to a
 number where arithmetic needs one; division/modulo by zero yields NaN/0 rather

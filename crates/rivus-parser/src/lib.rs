@@ -698,7 +698,7 @@ impl Parser {
 
     /// Multiplicative level: `*` / `/` / `%` (binds tighter than `+`/`-`).
     fn parse_mul(&mut self) -> Result<Expr, RivusError> {
-        let mut e = self.parse_primary()?;
+        let mut e = self.parse_cast()?;
         loop {
             let op = match self.tok() {
                 Tok::Star => ArithOp::Mul,
@@ -707,12 +707,32 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.parse_primary()?;
+            let right = self.parse_cast()?;
             e = Expr::Arith {
                 left: Box::new(e),
                 op,
                 right: Box::new(right),
             };
+        }
+        Ok(e)
+    }
+
+    /// A primary with an optional trailing type cast `:type` (binds tightest),
+    /// e.g. `age:int`, `(price + tax):f64`. Only a recognized type word after
+    /// `:` is a cast; otherwise the `:` is left for the caller.
+    fn parse_cast(&mut self) -> Result<Expr, RivusError> {
+        let e = self.parse_primary()?;
+        if self.at(&Tok::Colon) {
+            if let Tok::Word(w) = &self.toks[self.pos + 1].0 {
+                if let Some(ty) = decl_type(w) {
+                    self.bump(); // ':'
+                    self.bump(); // type word
+                    return Ok(Expr::Cast {
+                        expr: Box::new(e),
+                        ty,
+                    });
+                }
+            }
         }
         Ok(e)
     }

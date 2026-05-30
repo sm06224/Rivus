@@ -115,6 +115,33 @@ fn declared_schema_renames_and_types_chunk_size_independent() {
 }
 
 #[test]
+fn inline_cast_numeric_compare_on_string_column() {
+    // `age` is declared str (so a bare compare would be lexical: "100" < "20").
+    // `age:int >= N` casts to numeric, so the result matches a numeric oracle and
+    // is chunk-size independent.
+    let rows = 8_000;
+    let mut rng = Rng::new(2);
+    let mut text = String::from("name,age\n");
+    let mut ge = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(1000);
+        text.push_str(&format!("u,{age}\n"));
+        if age >= 500 {
+            ge += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_cast", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1, 7, 1024, rows] {
+        let res = run_src(
+            &format!("C:\n open {p} (name age:str)\n |? age:int >= 500\n;"),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), ge, "cast compare @cs={cs}");
+    }
+}
+
+#[test]
 fn inner_hash_join_matches_oracle() {
     // Left: users (id, name). Right: orders (id, amount), many-to-one. The inner
     // join row count must equal an independent count of matching pairs, and be
