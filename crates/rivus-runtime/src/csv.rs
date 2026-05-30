@@ -23,9 +23,70 @@
 //! back to an owned, escape-aware split.
 
 use rivus_core::{Column, DataType, Field, Schema, StrColumn};
+use rivus_ir::CmpOp;
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+/// Read buffer for the streaming reader. Larger than the 8 KiB default to cut
+/// syscalls on big sequential scans (inference and build each stream the file).
+const READ_BUF: usize = 256 * 1024;
+
+/// A pushed-down numeric predicate compiled to a raw column index for the
+/// reader: `(raw_col, op, rhs)`. Used to skip *building* rows that are
+/// definitely out — conservatively (a parse failure never drops a row).
+type PreCmp = (usize, CmpOp, f64);
+
+/// Resolve optimizer prefilter `(name, op, rhs)` to compiled `(raw_idx, …)`,
+/// keeping only predicates on a kept **numeric** column (so reader-side f64
+/// comparison matches the engine's column evaluation).
+fn compile_prefilter(
+    names: &[String],
+    keep: &[usize],
+    dtypes: &[DataType],
+    pf: &[(String, CmpOp, f64)],
+) -> Vec<PreCmp> {
+    let mut out = Vec::new();
+    for (name, op, rhs) in pf {
+        if let Some(raw) = names.iter().position(|n| n == name) {
+            if let Some(k) = keep.iter().position(|&c| c == raw) {
+                if matches!(dtypes[k], DataType::I64 | DataType::F64) {
+                    out.push((raw, *op, *rhs));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does a numeric value satisfy `value op rhs`?
+#[inline]
+fn cmp_num(value: f64, op: CmpOp, rhs: f64) -> bool {
+    match op {
+        CmpOp::Eq => value == rhs,
+        CmpOp::Ne => value != rhs,
+        CmpOp::Lt => value < rhs,
+        CmpOp::Le => value <= rhs,
+        CmpOp::Gt => value > rhs,
+        CmpOp::Ge => value >= rhs,
+    }
+}
+
+/// Conservative reader-side prefilter: skip a row only when a cell parses and
+/// the comparison is **definitely false**. A parse failure keeps the row (the
+/// authoritative FilterProject downstream decides).
+#[inline]
+fn row_passes_prefilter(pf: &[PreCmp], line: &str, offsets: &[(usize, usize)]) -> bool {
+    for &(idx, op, rhs) in pf {
+        let (s, e) = offsets[idx];
+        if let Ok(v) = line[s..e].trim().parse::<f64>() {
+            if !cmp_num(v, op, rhs) {
+                return false;
+            }
+        }
+    }
+    true
+}
 
 /// Streaming CSV reader: bounded memory regardless of file size.
 ///
@@ -49,6 +110,8 @@ pub struct CsvChunker {
     /// the file in a parallel worker). `limit == None` streams to EOF.
     pos: u64,
     limit: Option<u64>,
+    /// Compiled pushed-down numeric predicates (skip building failing rows).
+    prefilter: Vec<PreCmp>,
 }
 
 impl CsvChunker {
@@ -60,26 +123,28 @@ impl CsvChunker {
     /// rows and seeks back — so a sink-less `open big.csv` preview starts
     /// instantly. Full runs (with a sink) use the global two-pass inference so
     /// types stay chunk-size independent.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         path: &str,
         allow: Option<&[String]>,
         chunk_size: usize,
         preview: bool,
+        prefilter: &[(String, CmpOp, f64)],
+        header: bool,
+        declared: Option<&[(String, Option<DataType>)]>,
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
-            return Self::open_preview(path, allow, chunk_size);
+            return Self::open_preview(path, allow, chunk_size, prefilter, header, declared);
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut r = BufReader::new(f);
-        let mut header = String::new();
-        if r.read_line(&mut header).map_err(|e| e.to_string())? == 0 {
-            return Err("empty CSV".to_string());
-        }
-        let names = split_owned(trim_eol(&header));
+        let mut r = BufReader::with_capacity(READ_BUF, f);
+        // `r` is left positioned at the first data row (after the header, or at
+        // byte 0 for a header-less file).
+        let (names, data_start) = read_header(&mut r, header, declared)?;
         let ncols = names.len();
         if ncols == 0 {
-            return Err("CSV header has no columns".to_string());
+            return Err("CSV has no columns".to_string());
         }
         let keep: Vec<usize> = match allow {
             None => (0..ncols).collect(),
@@ -105,19 +170,22 @@ impl CsvChunker {
                 bad += 1;
             }
         }
-        let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        apply_declared_types(&mut dtypes, &keep, declared);
 
         let mut fields = Vec::with_capacity(keep.len());
         for (k, &ci) in keep.iter().enumerate() {
             fields.push(Field::new(names[ci].clone(), dtypes[k]));
         }
         let schema = Schema::new(fields);
+        let pre = compile_prefilter(&names, &keep, &dtypes, prefilter);
 
-        // ---- pass 2 setup: reopen and skip the header line ----
+        // ---- pass 2 setup: reopen and seek to the first data row ----
         let f2 = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut reader = BufReader::new(f2);
-        let mut skip = String::new();
-        reader.read_line(&mut skip).map_err(|e| e.to_string())?;
+        let mut reader = BufReader::with_capacity(READ_BUF, f2);
+        reader
+            .seek(SeekFrom::Start(data_start))
+            .map_err(|e| e.to_string())?;
 
         Ok((
             schema,
@@ -130,6 +198,7 @@ impl CsvChunker {
                 line: String::new(),
                 bad_rows: bad,
                 eof: false,
+                prefilter: pre,
                 pos: 0,
                 limit: None,
             },
@@ -138,22 +207,21 @@ impl CsvChunker {
 
     /// Latency-first open: sample the first `chunk_size` rows to infer the
     /// schema, then seek back to the first data row and stream from there.
+    #[allow(clippy::too_many_arguments)]
     fn open_preview(
         path: &str,
         allow: Option<&[String]>,
         chunk_size: usize,
+        prefilter: &[(String, CmpOp, f64)],
+        header: bool,
+        declared: Option<&[(String, Option<DataType>)]>,
     ) -> Result<(Schema, CsvChunker), String> {
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut reader = BufReader::new(f);
-        let mut header = String::new();
-        let hlen = reader.read_line(&mut header).map_err(|e| e.to_string())?;
-        if hlen == 0 {
-            return Err("empty CSV".to_string());
-        }
-        let names = split_owned(trim_eol(&header));
+        let mut reader = BufReader::with_capacity(READ_BUF, f);
+        let (names, data_start) = read_header(&mut reader, header, declared)?;
         let ncols = names.len();
         if ncols == 0 {
-            return Err("CSV header has no columns".to_string());
+            return Err("CSV has no columns".to_string());
         }
         let keep: Vec<usize> = match allow {
             None => (0..ncols).collect(),
@@ -179,16 +247,18 @@ impl CsvChunker {
                 bad += 1;
             }
         }
-        let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        apply_declared_types(&mut dtypes, &keep, declared);
         let mut fields = Vec::with_capacity(keep.len());
         for (k, &ci) in keep.iter().enumerate() {
             fields.push(Field::new(names[ci].clone(), dtypes[k]));
         }
         let schema = Schema::new(fields);
+        let pre = compile_prefilter(&names, &keep, &dtypes, prefilter);
 
         // Rewind to the first data row and stream from there with this schema.
         reader
-            .seek(SeekFrom::Start(hlen as u64))
+            .seek(SeekFrom::Start(data_start))
             .map_err(|e| e.to_string())?;
 
         Ok((
@@ -202,6 +272,7 @@ impl CsvChunker {
                 line: String::new(),
                 bad_rows: bad,
                 eof: false,
+                prefilter: pre,
                 pos: 0,
                 limit: None,
             },
@@ -211,6 +282,7 @@ impl CsvChunker {
     /// Stream one byte range `[start, end)` of the file with an already-inferred
     /// global schema (used by the parallel streaming executor). `start`/`end`
     /// must be newline-aligned offsets into the data region (see `plan_parallel`).
+    #[allow(clippy::too_many_arguments)]
     pub fn for_range(
         path: &str,
         dtypes: Vec<DataType>,
@@ -219,11 +291,12 @@ impl CsvChunker {
         start: u64,
         end: u64,
         chunk_size: usize,
+        prefilter: Vec<PreCmp>,
     ) -> Result<CsvChunker, String> {
         let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
         Ok(CsvChunker {
-            reader: BufReader::new(f),
+            reader: BufReader::with_capacity(READ_BUF, f),
             ncols,
             keep,
             dtypes,
@@ -231,6 +304,7 @@ impl CsvChunker {
             line: String::new(),
             bad_rows: 0,
             eof: false,
+            prefilter,
             pos: start,
             limit: Some(end),
         })
@@ -280,11 +354,19 @@ impl CsvChunker {
                 if offsets.len() != self.ncols {
                     continue;
                 }
+                // Pushed-down prefilter: skip building rows that are definitely
+                // out (conservative; the downstream FilterProject is final).
+                if !self.prefilter.is_empty() && !row_passes_prefilter(&self.prefilter, l, &offsets)
+                {
+                    continue;
+                }
                 for (k, &ci) in self.keep.iter().enumerate() {
                     let (s, e) = offsets[ci];
                     builders[k].push(&l[s..e]);
                 }
             } else {
+                // Quoted records take the owned slow path and skip the prefilter
+                // (rare; FilterProject still filters them downstream).
                 let fields = split_record(l);
                 if fields.len() != self.ncols {
                     continue;
@@ -312,15 +394,21 @@ pub struct CsvParallelPlan {
     pub ncols: usize,
     pub ranges: Vec<(u64, u64)>,
     pub bad_rows: usize,
+    /// Compiled pushed-down prefilter (raw col index, op, rhs) for each worker.
+    pub prefilter: Vec<PreCmp>,
 }
 
 /// Build a [`CsvParallelPlan`]: read the header, snap `nthreads` byte ranges to
 /// newline boundaries, then infer the global column types by streaming those
 /// ranges in parallel and merging the per-range type flags. O(1) memory.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_parallel(
     path: &str,
     allow: Option<&[String]>,
     nthreads: usize,
+    prefilter: &[(String, CmpOp, f64)],
+    header: bool,
+    declared: Option<&[(String, Option<DataType>)]>,
 ) -> Result<CsvParallelPlan, String> {
     let file_len = std::fs::metadata(path)
         .map_err(|e| format!("cannot stat '{path}': {e}"))?
@@ -328,16 +416,11 @@ pub fn plan_parallel(
 
     // Header → column names, kept indices, and the first data byte offset.
     let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-    let mut r = BufReader::new(f);
-    let mut header = String::new();
-    let hlen = r.read_line(&mut header).map_err(|e| e.to_string())?;
-    if hlen == 0 {
-        return Err("empty CSV".to_string());
-    }
-    let names = split_owned(trim_eol(&header));
+    let mut r = BufReader::with_capacity(READ_BUF, f);
+    let (names, data_start) = read_header(&mut r, header, declared)?;
     let ncols = names.len();
     if ncols == 0 {
-        return Err("CSV header has no columns".to_string());
+        return Err("CSV has no columns".to_string());
     }
     let keep: Vec<usize> = match allow {
         None => (0..ncols).collect(),
@@ -346,7 +429,6 @@ pub fn plan_parallel(
             .collect(),
     };
 
-    let data_start = hlen as u64;
     let ranges = snap_ranges(&mut r, data_start, file_len, nthreads.max(1))?;
 
     // Infer types per range in parallel, then merge the flags.
@@ -370,11 +452,13 @@ pub fn plan_parallel(
             flags[k].merge(f);
         }
     }
-    let dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+    let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+    apply_declared_types(&mut dtypes, &keep, declared);
     let mut fields = Vec::with_capacity(keep.len());
     for (k, &ci) in keep.iter().enumerate() {
         fields.push(Field::new(names[ci].clone(), dtypes[k]));
     }
+    let pre = compile_prefilter(&names, &keep, &dtypes, prefilter);
 
     Ok(CsvParallelPlan {
         schema: Schema::new(fields),
@@ -383,6 +467,7 @@ pub fn plan_parallel(
         ncols,
         ranges,
         bad_rows: bad,
+        prefilter: pre,
     })
 }
 
@@ -428,7 +513,7 @@ fn infer_range(
         Ok(f) => f,
         Err(_) => return (flags, bad),
     };
-    let mut r = BufReader::new(f);
+    let mut r = BufReader::with_capacity(READ_BUF, f);
     if r.seek(SeekFrom::Start(start)).is_err() {
         return (flags, bad);
     }
@@ -451,6 +536,54 @@ fn infer_range(
         }
     }
     (flags, bad)
+}
+
+/// Read the column names and the byte offset of the first data row, leaving the
+/// reader positioned there. Names come from a `declared` schema if given (which
+/// also names a header-less file); else from the header line (`header`); else
+/// `c0, c1, …` for a header-less file. A header line is always consumed when
+/// `header`, even if `declared` overrides its names.
+fn read_header(
+    r: &mut BufReader<File>,
+    header: bool,
+    declared: Option<&[(String, Option<DataType>)]>,
+) -> Result<(Vec<String>, u64), String> {
+    let mut first = String::new();
+    let n = r.read_line(&mut first).map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("empty CSV".to_string());
+    }
+    if let Some(d) = declared {
+        let names = d.iter().map(|(nm, _)| nm.clone()).collect();
+        if header {
+            Ok((names, n as u64)) // consume the header line, but use declared names
+        } else {
+            r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            Ok((names, 0)) // header-less: first line is data
+        }
+    } else if header {
+        Ok((split_owned(trim_eol(&first)), n as u64))
+    } else {
+        let ncols = split_owned(trim_eol(&first)).len();
+        let names = (0..ncols).map(|i| format!("c{i}")).collect();
+        r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        Ok((names, 0))
+    }
+}
+
+/// Override inferred dtypes with any types declared at `open (col:type …)`.
+fn apply_declared_types(
+    dtypes: &mut [DataType],
+    keep: &[usize],
+    declared: Option<&[(String, Option<DataType>)]>,
+) {
+    if let Some(d) = declared {
+        for (k, &ci) in keep.iter().enumerate() {
+            if let Some((_, Some(t))) = d.get(ci) {
+                dtypes[k] = *t;
+            }
+        }
+    }
 }
 
 /// Strip a trailing `\n` or `\r\n` (mirrors `str::lines` semantics).

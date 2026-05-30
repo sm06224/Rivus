@@ -8,7 +8,7 @@
 //! Each carries an `access` tag so the optimizer / JIT can specialize the fast
 //! path and fall back only where required (Master principle #7).
 
-use rivus_core::Value;
+use rivus_core::{DataType, Value};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +89,12 @@ pub enum Expr {
         op: ArithOp,
         right: Box<Expr>,
     },
+    /// Type cast `expr:type` — reinterpret a value as another lane (e.g. a
+    /// string column compared numerically: `age:int >= 20`).
+    Cast {
+        expr: Box<Expr>,
+        ty: DataType,
+    },
 }
 
 impl Expr {
@@ -123,6 +129,7 @@ impl fmt::Display for Expr {
             // Always parenthesized so the source round-trips and re-parses with
             // the same structure regardless of precedence.
             Expr::Arith { left, op, right } => write!(f, "({left} {} {right})", op.as_str()),
+            Expr::Cast { expr, ty } => write!(f, "{expr}:{ty}"),
         }
     }
 }

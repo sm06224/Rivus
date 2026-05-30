@@ -94,6 +94,7 @@ fn must_drain(graph: &PlanGraph) -> bool {
                 | Op::GroupBy { .. }
                 | Op::Sort { .. }
                 | Op::Distinct { .. }
+                | Op::Describe
                 | Op::Join { .. }
                 | Op::StreamRef { .. }
         )
@@ -392,8 +393,19 @@ fn try_streaming_parallel(
     path: &str,
     threads: usize,
 ) -> Option<RunResult> {
-    let projection = match &graph.nodes[src_id].op {
-        Op::OpenCsv { projection, .. } => projection.clone(),
+    let (projection, prefilter, header, declared) = match &graph.nodes[src_id].op {
+        Op::OpenCsv {
+            projection,
+            prefilter,
+            header,
+            declared,
+            ..
+        } => (
+            projection.clone(),
+            prefilter.clone(),
+            *header,
+            declared.clone(),
+        ),
         _ => return None, // only CSV has a streaming-parallel plan for now
     };
 
@@ -421,7 +433,16 @@ fn try_streaming_parallel(
         ncols,
         ranges,
         bad_rows,
-    } = crate::csv::plan_parallel(path, projection.as_deref(), threads).ok()?;
+        prefilter: pre,
+    } = crate::csv::plan_parallel(
+        path,
+        projection.as_deref(),
+        threads,
+        &prefilter,
+        header,
+        declared.as_deref(),
+    )
+    .ok()?;
     let nparts = ranges.len();
     if nparts < 2 {
         return None; // not worth threading; let the caller's serial path run
@@ -435,6 +456,7 @@ fn try_streaming_parallel(
         let schema = &schema;
         let dtypes = &dtypes;
         let keep = &keep;
+        let pre = &pre;
         let handles: Vec<_> = ranges
             .iter()
             .enumerate()
@@ -449,6 +471,7 @@ fn try_streaming_parallel(
                         a,
                         b,
                         opts.chunk_size,
+                        pre.clone(),
                     ));
                     let ops: Vec<Box<dyn Operator>> = graph
                         .nodes
@@ -612,7 +635,8 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             | Op::StreamRef { .. }
             | Op::Take { .. }
             | Op::Sort { .. }
-            | Op::Distinct { .. } => return None,
+            | Op::Distinct { .. }
+            | Op::Describe => return None,
             _ => {}
         }
     }

@@ -11,7 +11,7 @@
 //!
 //! Rules are added incrementally (design doc 08). The first is `dedup_sources`.
 
-use rivus_ir::{Edge, EdgeKind, Expr, Node, NodeId, Op, PlanGraph};
+use rivus_ir::{CmpOp, Edge, EdgeKind, Expr, Node, NodeId, Op, PlanGraph};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -50,7 +50,95 @@ pub fn optimize(graph: PlanGraph) -> (PlanGraph, OptReport) {
     let graph = dedup_sources(graph, &mut report);
     let graph = fuse_linear(graph, &mut report);
     let graph = project_pushdown(graph, &mut report);
+    let graph = filter_pushdown(graph, &mut report);
     (graph, report)
+}
+
+/// **Filter pushdown.** Annotate a CSV source with the simple numeric
+/// `field <cmp> number` predicates of its single `FilterProject` consumer, so
+/// the reader can skip *building* rows that are definitely out. Conservative
+/// and additive: the `FilterProject` is left untouched (it re-checks every
+/// surviving row), so the result is unchanged — this only avoids work.
+///
+/// Restricted to a source with exactly one consumer (fan-out would need a
+/// predicate common to every branch). Only `Field CMP NumericLiteral` atoms are
+/// lifted; `and`/`or`/string/computed predicates stay solely in the consumer.
+fn filter_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
+    let mut pushed = 0usize;
+    for sid in 0..graph.nodes.len() {
+        if !matches!(&graph.nodes[sid].op, Op::OpenCsv { prefilter, .. } if prefilter.is_empty()) {
+            continue;
+        }
+        let consumers = graph.outputs_of(sid);
+        if consumers.len() != 1 {
+            continue;
+        }
+        let preds = match &graph.nodes[consumers[0]].op {
+            Op::FilterProject { preds, .. } => preds.clone(),
+            _ => continue,
+        };
+        // Flatten top-level `and` chains; an atom under `or` is *not* a
+        // conjunct and must not be lifted.
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        for p in &preds {
+            collect_conjuncts(p, &mut conjuncts);
+        }
+        let pf: Vec<(String, CmpOp, f64)> = conjuncts
+            .into_iter()
+            .filter_map(simple_numeric_atom)
+            .collect();
+        if pf.is_empty() {
+            continue;
+        }
+        if let Op::OpenCsv { prefilter, .. } = &mut graph.nodes[sid].op {
+            *prefilter = pf;
+            pushed += 1;
+        }
+    }
+    if pushed > 0 {
+        report.applied.push(format!(
+            "filter_pushdown: pre-filtered {pushed} source read(s) at the reader"
+        ));
+    }
+    graph
+}
+
+/// Flatten a top-level `and` chain into its conjuncts (an `or`, comparison,
+/// etc. is itself one conjunct — we never descend into `or`).
+fn collect_conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::And(a, b) => {
+            collect_conjuncts(a, out);
+            collect_conjuncts(b, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Extract `field <cmp> number` (in either operand order) as `(col, op, rhs)`.
+fn simple_numeric_atom(e: &Expr) -> Option<(String, CmpOp, f64)> {
+    let Expr::Compare { left, op, right } = e else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Field { name, .. }, Expr::Literal(v)) => v.as_f64().map(|r| (name.clone(), *op, r)),
+        (Expr::Literal(v), Expr::Field { name, .. }) => {
+            v.as_f64().map(|r| (name.clone(), flip_cmp(*op), r))
+        }
+        _ => None,
+    }
+}
+
+/// `lit op field` ⇒ `field flip(op) lit`.
+fn flip_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+    }
 }
 
 /// **Projection pushdown.** When every consumer of a CSV source is a
@@ -130,6 +218,7 @@ fn collect_fields(e: &Expr, out: &mut Vec<String>) {
             collect_fields(a, out);
             collect_fields(b, out);
         }
+        Expr::Cast { expr, .. } => collect_fields(expr, out),
         Expr::Arith { left, right, .. } => {
             collect_fields(left, out);
             collect_fields(right, out);
@@ -431,6 +520,31 @@ B:\n open data.csv\n |# country\n;";
             .iter()
             .filter(|n| matches!(n.op, Op::FilterProject { .. }))
             .count()
+    }
+
+    #[test]
+    fn filter_pushdown_sets_numeric_prefilter() {
+        // `age >= 20` (numeric atom) is lifted onto the reader; the
+        // FilterProject still carries it (re-checks), so results are unchanged
+        // (gated separately by tests/optimizer_equiv.rs).
+        let src = "F:\n open d.csv\n |? age >= 20 and country == \"JP\"\n |> name age\n;";
+        let g = rivus_parser::parse(src).unwrap();
+        let (opt, report) = optimize(g);
+        let s = opt
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::OpenCsv { .. }))
+            .unwrap();
+        match &s.op {
+            Op::OpenCsv { prefilter, .. } => {
+                // Only the numeric atom is lifted; the string compare stays put.
+                assert_eq!(prefilter.len(), 1);
+                assert_eq!(prefilter[0].0, "age");
+                assert_eq!(prefilter[0].2, 20.0);
+            }
+            other => panic!("expected OpenCsv, got {other:?}"),
+        }
+        assert!(report.applied.iter().any(|l| l.contains("filter_pushdown")));
     }
 
     #[test]

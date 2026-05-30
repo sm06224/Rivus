@@ -27,14 +27,21 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let cmd = args[1].as_str();
+    let mut cmd = args[1].as_str();
     if matches!(cmd, "-h" | "--help" | "help") {
         usage();
         return ExitCode::SUCCESS;
     }
 
+    // Bare Unix-filter form: `rivus '|? age >= 20 |> name age'` (no subcommand).
+    // If arg 1 is a transform-only program rather than a known subcommand, run
+    // it as a stdin→stdout filter. Flags still parse from arg 2.
     let mut path: Option<String> = None;
     let mut inline: Option<String> = None;
+    if !matches!(cmd, "run" | "explain" | "check") && is_transform_only(cmd) {
+        inline = Some(args[1].clone());
+        cmd = "run";
+    }
     let mut chunk_size = RunOptions::default().chunk_size;
     let mut optimize = true;
     let mut i = 2;
@@ -74,23 +81,25 @@ fn main() -> ExitCode {
     }
 
     // Resolve the program text and a human-facing label from exactly one of:
-    // an inline `-c` string, stdin (`-`/`stdin`), or a file path.
-    let (label, source) = match (inline, path) {
+    // an inline `-c` string, stdin (`-`/`stdin`), or a file path. `prog_stdin`
+    // marks the case where the *program* came from stdin (so it can't also be
+    // the data source for the filter shorthand below).
+    let (label, mut source, prog_stdin) = match (inline, path) {
         (Some(_), Some(p)) => {
             eprintln!("error: give a program with -c OR a path '{p}', not both");
             return ExitCode::from(2);
         }
-        (Some(text), None) => ("<command>".to_string(), text),
+        (Some(text), None) => ("<command>".to_string(), text, false),
         (None, Some(p)) if p == "-" || p == "stdin" => {
             let mut text = String::new();
             if let Err(e) = std::io::stdin().read_to_string(&mut text) {
                 eprintln!("error: cannot read program from stdin: {e}");
                 return ExitCode::FAILURE;
             }
-            ("<stdin>".to_string(), text)
+            ("<stdin>".to_string(), text, true)
         }
         (None, Some(p)) => match std::fs::read_to_string(&p) {
-            Ok(s) => (p, s),
+            Ok(s) => (p, s, false),
             Err(e) => {
                 eprintln!("error: cannot read '{p}': {e}");
                 return ExitCode::FAILURE;
@@ -102,6 +111,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Unix-filter shorthand: a transform-only program (one that starts with a
+    // pipe `|…` or a transform verb, i.e. has no source/scope) is wrapped to
+    // read CSV from stdin and write CSV to stdout. So this just works:
+    //   cat data.csv | rivus run -c '|? age >= 20 |> name age'
+    if !prog_stdin && is_transform_only(&source) {
+        let has_sink = source.contains("save ")
+            || source.contains("writecsv")
+            || source.contains("writejson")
+            || source.contains("print");
+        let sink = if has_sink { "" } else { " save stdout as csv" };
+        source = format!("Pipe: open stdin {}{} ;", source.trim(), sink);
+    }
 
     let parsed = match rivus_parser::parse(&source) {
         Ok(g) => g,
@@ -177,6 +199,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// A transform-only program (no source/scope): starts with a pipe operator or a
+/// transform verb. Such a program is wrapped as a stdin→stdout CSV filter.
+fn is_transform_only(src: &str) -> bool {
+    let s = src.trim_start();
+    if s.starts_with('|') {
+        return true;
+    }
+    let first = s.split_whitespace().next().unwrap_or("");
+    matches!(
+        first,
+        "where" | "take" | "limit" | "head" | "sort" | "distinct" | "describe"
+    )
+}
+
 fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
@@ -193,6 +229,9 @@ fn usage() {
          \x20 rivus run -c 'U: open users.csv |? age >= 20 |> name age ;'\n\
          \x20 rivus run - <<'RIV'\n\
          \x20     U: open users.csv |? age >= 20 ;\n\
-         \x20 RIV\n"
+         \x20 RIV\n\n\
+         UNIX FILTER (transform-only program → reads CSV from stdin, writes stdout):\n\
+         \x20 cat data.csv | rivus '|? age >= 20 |> name age'\n\
+         \x20 cat data.csv | rivus 'describe'\n"
     );
 }

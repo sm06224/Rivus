@@ -25,7 +25,7 @@
 mod lexer;
 
 use lexer::{Lexer, Tok};
-use rivus_core::{Mode, RivusError, Severity, Value};
+use rivus_core::{DataType, Mode, RivusError, Severity, Value};
 use rivus_ir::{
     Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent,
     NodeId, Op, PlanGraph,
@@ -158,9 +158,17 @@ impl Parser {
 
         loop {
             match self.tok().clone() {
+                // `|? pred` / `|? a, b` (comma = AND). `where` is a readable alias.
                 Tok::PipeFilter => {
                     self.bump();
-                    let pred = self.parse_expr()?;
+                    let pred = self.parse_filter_preds()?;
+                    let n = self.g.add_node(Op::Filter { pred });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                Tok::Word(w) if w == "where" => {
+                    self.bump();
+                    let pred = self.parse_filter_preds()?;
                     let n = self.g.add_node(Op::Filter { pred });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
@@ -298,6 +306,13 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `describe` — replace the stream with a per-column summary.
+                Tok::Word(w) if w == "describe" => {
+                    self.bump();
+                    let n = self.g.add_node(Op::Describe);
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
                 Tok::Word(w) if w == "print" => {
                     self.bump();
                     let n = self.g.add_node(Op::SinkPrint);
@@ -317,6 +332,30 @@ impl Parser {
 
     /// Parse the first element of a body: a source, a stream replay, a
     /// merge/join over named scopes, or (for branch children) the inherited
+    /// Parse a declared column schema `( name[:type] name[:type] … )` for
+    /// `open`. Space-separated (like `readbin`); a type fixes that column's
+    /// lane, otherwise it is inferred. Types: `int`/`i64`, `float`/`f64`,
+    /// `str`/`string`, `bool`.
+    fn parse_decl_schema(&mut self) -> Result<Vec<(String, Option<DataType>)>, RivusError> {
+        self.expect(&Tok::LParen)?;
+        let mut cols = Vec::new();
+        while !self.at(&Tok::RParen) && !self.at(&Tok::Eof) {
+            let name = self.word()?;
+            let ty = if self.eat(&Tok::Colon) {
+                let t = self.word()?;
+                Some(decl_type(&t).ok_or_else(|| self.err(format!("unknown column type '{t}'")))?)
+            } else {
+                None
+            };
+            cols.push((name, ty));
+        }
+        self.expect(&Tok::RParen)?;
+        if cols.is_empty() {
+            return Err(self.err("declared schema `( … )` needs at least one column"));
+        }
+        Ok(cols)
+    }
+
     /// upstream node.
     fn parse_body_head(&mut self, input: Option<NodeId>) -> Result<NodeId, RivusError> {
         match self.tok().clone() {
@@ -333,10 +372,31 @@ impl Parser {
                 } else {
                     None
                 };
+                // Optional `noheader`: the file has no header row (CSV only).
+                let noheader = self.peek_is_word("noheader");
+                if noheader {
+                    self.bump();
+                }
+                // Optional declared schema `(col[:type] ...)` (CSV only).
+                let decl = if self.at(&Tok::LParen) {
+                    Some(self.parse_decl_schema()?)
+                } else {
+                    None
+                };
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                 })?;
-                Ok(self.g.add_node(fmt.into_op(path)))
+                let mut op = fmt.into_op(path);
+                if let Op::OpenCsv {
+                    header, declared, ..
+                } = &mut op
+                {
+                    if noheader {
+                        *header = false;
+                    }
+                    *declared = decl;
+                }
+                Ok(self.g.add_node(op))
             }
             Tok::Word(w) if w == "readcsv" => {
                 self.bump();
@@ -344,6 +404,9 @@ impl Parser {
                 Ok(self.g.add_node(Op::OpenCsv {
                     path,
                     projection: None,
+                    prefilter: Vec::new(),
+                    header: true,
+                    declared: None,
                 }))
             }
             Tok::Word(w) if w == "readjson" => {
@@ -428,10 +491,20 @@ impl Parser {
                         .labels
                         .get(&rhs)
                         .ok_or_else(|| self.err(format!("unknown flow '{rhs}'")))?;
-                    // MVP: join on a key named after the right scope, refined later.
+                    // `on key` (same name both sides) or `on lkey:rkey`.
+                    if !self.peek_is_word("on") {
+                        return Err(self.err("join `A & B` requires `on <key>` (or `on lk:rk`)"));
+                    }
+                    self.bump(); // `on`
+                    let left_key = self.word()?;
+                    let right_key = if self.eat(&Tok::Colon) {
+                        self.word()?
+                    } else {
+                        left_key.clone()
+                    };
                     let join = self.g.add_node(Op::Join {
-                        left_key: "id".into(),
-                        right_key: "id".into(),
+                        left_key,
+                        right_key,
                     });
                     self.g.add_edge(first, join, EdgeKind::Stream);
                     self.g.add_edge(rid, join, EdgeKind::Stream);
@@ -576,6 +649,17 @@ impl Parser {
         self.parse_or()
     }
 
+    /// A filter predicate, optionally comma-separated where `,` means AND —
+    /// `|? age >= 20, country == "JP"` reads better than chained `and`.
+    fn parse_filter_preds(&mut self) -> Result<Expr, RivusError> {
+        let mut pred = self.parse_expr()?;
+        while self.eat(&Tok::Comma) {
+            let rhs = self.parse_expr()?;
+            pred = Expr::And(Box::new(pred), Box::new(rhs));
+        }
+        Ok(pred)
+    }
+
     fn parse_or(&mut self) -> Result<Expr, RivusError> {
         let mut e = self.parse_and()?;
         while self.peek_is_word("or") {
@@ -633,7 +717,7 @@ impl Parser {
 
     /// Multiplicative level: `*` / `/` / `%` (binds tighter than `+`/`-`).
     fn parse_mul(&mut self) -> Result<Expr, RivusError> {
-        let mut e = self.parse_primary()?;
+        let mut e = self.parse_cast()?;
         loop {
             let op = match self.tok() {
                 Tok::Star => ArithOp::Mul,
@@ -642,12 +726,32 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.parse_primary()?;
+            let right = self.parse_cast()?;
             e = Expr::Arith {
                 left: Box::new(e),
                 op,
                 right: Box::new(right),
             };
+        }
+        Ok(e)
+    }
+
+    /// A primary with an optional trailing type cast `:type` (binds tightest),
+    /// e.g. `age:int`, `(price + tax):f64`. Only a recognized type word after
+    /// `:` is a cast; otherwise the `:` is left for the caller.
+    fn parse_cast(&mut self) -> Result<Expr, RivusError> {
+        let e = self.parse_primary()?;
+        if self.at(&Tok::Colon) {
+            if let Tok::Word(w) = &self.toks[self.pos + 1].0 {
+                if let Some(ty) = decl_type(w) {
+                    self.bump(); // ':'
+                    self.bump(); // type word
+                    return Ok(Expr::Cast {
+                        expr: Box::new(e),
+                        ty,
+                    });
+                }
+            }
         }
         Ok(e)
     }
@@ -736,6 +840,17 @@ impl Parser {
 
 /// Normalize a source/sink path: `stdin` / `stdout` / `-` all map to the `-`
 /// sentinel (read stdin / write stdout, direction inferred from source vs sink).
+/// Map a declared column type name to a `DataType` lane.
+fn decl_type(s: &str) -> Option<DataType> {
+    Some(match s.to_ascii_lowercase().as_str() {
+        "int" | "i64" | "integer" => DataType::I64,
+        "float" | "f64" | "double" => DataType::F64,
+        "str" | "string" | "text" => DataType::Str,
+        "bool" | "boolean" => DataType::Bool,
+        _ => return None,
+    })
+}
+
 fn norm_path(p: String) -> String {
     if p == "stdin" || p == "stdout" || p == "-" {
         "-".to_string()
@@ -756,6 +871,9 @@ impl Format {
             Format::Csv => Op::OpenCsv {
                 path,
                 projection: None,
+                prefilter: Vec::new(),
+                header: true,
+                declared: None,
             },
             Format::Jsonl => Op::OpenJsonl { path },
         }
@@ -796,6 +914,7 @@ fn is_keyword(w: &str) -> bool {
             | "readcsv"
             | "readjson"
             | "as"
+            | "noheader"
             | "writecsv"
             | "writejson"
             | "stream"
@@ -806,6 +925,8 @@ fn is_keyword(w: &str) -> bool {
             | "head"
             | "sort"
             | "distinct"
+            | "describe"
+            | "where"
             | "on"
             | "map"
             | "mode"
@@ -845,6 +966,32 @@ mod tests {
     fn nth_op(src: &str, n: usize) -> Op {
         let g = parse(src).unwrap();
         g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn comma_filter_is_and_and_where_is_an_alias() {
+        // `|? a, b`, `|? a and b`, and `where a, b` all lower to the same
+        // Filter(And(a, b)).
+        let want = |op: &Op| {
+            matches!(
+                op,
+                Op::Filter {
+                    pred: Expr::And(..)
+                }
+            )
+        };
+        assert!(want(&nth_op(
+            "F:\n open d.csv\n |? age >= 20, country == \"JP\"\n;",
+            1
+        )));
+        assert!(want(&nth_op(
+            "F:\n open d.csv\n |? age >= 20 and country == \"JP\"\n;",
+            1
+        )));
+        assert!(want(&nth_op(
+            "F:\n open d.csv\n where age >= 20, country == \"JP\"\n;",
+            1
+        )));
     }
 
     #[test]

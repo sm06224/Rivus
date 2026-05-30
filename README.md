@@ -49,8 +49,9 @@ Merged:
 
 Rivus ships **pre-built binaries for macOS (Apple Silicon) and Windows 11+
 (x64)**. Every other platform — Linux, Intel Mac, ARM Windows — builds from
-source, which is a single command because the runtime has **zero third-party
-dependencies**.
+source, which is a single command because the default build has **zero
+third-party dependencies** (heavy formats like compression/Parquet are opt-in,
+vetted, feature-gated — see [`docs/SUPPLY-CHAIN.md`](docs/SUPPLY-CHAIN.md)).
 
 Each platform offers two flavors so you can trade compatibility for speed:
 
@@ -194,8 +195,15 @@ crates/
   rivus-runtime   single-thread chunk execution engine / operators / telemetry
   rivus-cli       `rivus run | explain | check`  (ASCII visualization)
 examples/         *.riv programs + users.csv
-docs/design/      full 17-section design (architecture → distributed)
+docs/GUIDE.md     syntax & usage reference (start here)
+docs/design/      full design (architecture → distributed)
 ```
+
+## Guide
+
+[**`docs/GUIDE.md`**](docs/GUIDE.md) is the full syntax & usage reference: every
+source, transform and sink, the expression language, computed columns, a
+one-liner cookbook (`-c` / stdin / pipes), and the complete grammar.
 
 ## Design
 
@@ -207,10 +215,15 @@ staged as **MVP → optimization → JIT → distributed**.
 
 ## Status
 
-MVP (Phase 0) is implemented and runnable: the headline goal — *a working DAG
-flow and its visualization* — is met. See
-[`docs/design/16-mvp-scope.md`](docs/design/16-mvp-scope.md) for exactly what
-is implemented vs. designed-but-pending.
+**v1.0.0** — stable. Streaming engine (bounded memory, parallel) that **beats
+DuckDB** on everyday ETL (~1.45× faster at ~40× less memory — see
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)), with a full data-wrangling language:
+filter/`where` · project & computed columns · inline casts · group · sort ·
+distinct · describe · **inner hash join** · branch/merge · CSV (header-less,
+declared schema, quoted) / JSON(L) / binary · stdin↔stdout Unix-filter
+shorthand. See the [**Guide**](docs/GUIDE.md), the [`CHANGELOG`](CHANGELOG.md),
+and the [`ROADMAP`](docs/ROADMAP.md) for what's next (compression, Parquet,
+SIMD, imputation).
 
 ## License
 

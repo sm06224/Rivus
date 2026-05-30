@@ -6,7 +6,7 @@
 //! that the optimizer rewrites and that [`PlanGraph::to_source`] regenerates
 //! back into readable Rivus source (Master principle #5: IR reversibility).
 
-use crate::expr::{Access, Expr};
+use crate::expr::{Access, CmpOp, Expr};
 use rivus_core::{DataType, Mode, Severity};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -133,10 +133,22 @@ impl BinType {
 pub enum Op {
     /// `open path.csv`. `projection`, when set by the optimizer
     /// (`project_pushdown`), restricts which columns the reader builds — unused
-    /// columns are never parsed or allocated.
+    /// columns are never parsed or allocated. `prefilter`, set by
+    /// `filter_pushdown`, lets the reader skip *building* rows whose numeric
+    /// `(column, op, rhs)` conjunction is definitely false — a conservative
+    /// pre-pass; the downstream `FilterProject` remains authoritative.
     OpenCsv {
         path: String,
         projection: Option<Vec<String>>,
+        prefilter: Vec<(String, CmpOp, f64)>,
+        /// Whether the first line is a header. `false` (`open f.csv noheader`)
+        /// treats every line as data and names columns `c0, c1, …`.
+        header: bool,
+        /// Declared column schema `(name[:type] ...)`, set by
+        /// `open f.csv (id:int name:str age:int)`. When present it names the
+        /// columns positionally (overriding the header / `c0…`) and, where a
+        /// type is given, fixes that column's lane instead of inferring it.
+        declared: Option<Vec<(String, Option<DataType>)>>,
     },
     /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
     /// binary records (a C struct dump). `endian` selects byte order;
@@ -174,6 +186,10 @@ pub enum Op {
     /// columns. Streaming (emits as it goes) but stateful (a global seen-set),
     /// so it runs on the serial path. Output order = first-occurrence order.
     Distinct { keys: Vec<String> },
+    /// `describe` — replace the stream with a one-row-per-column summary
+    /// (column, type, count, min, max, mean). A streaming, single-pass
+    /// accumulator that emits on finish; stateful → serial path.
+    Describe,
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -215,6 +231,7 @@ impl Op {
             Op::Take { .. } => "take",
             Op::Sort { .. } => "sort",
             Op::Distinct { .. } => "distinct",
+            Op::Describe => "describe",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -229,10 +246,39 @@ impl Op {
     /// Render this op as the pipeline fragment that produced it.
     fn to_src_line(&self) -> String {
         match self {
-            Op::OpenCsv { path, projection } => match projection {
-                Some(cols) => format!("open {path}  # read-only: {}", cols.join(",")),
-                None => format!("open {path}"),
-            },
+            Op::OpenCsv {
+                path,
+                projection,
+                prefilter,
+                header,
+                declared,
+            } => {
+                let mut s = format!("open {path}");
+                if !header {
+                    s.push_str(" noheader");
+                }
+                if let Some(cols) = declared {
+                    let parts: Vec<String> = cols
+                        .iter()
+                        .map(|(n, t)| match t {
+                            Some(t) => format!("{n}:{t}"),
+                            None => n.clone(),
+                        })
+                        .collect();
+                    s.push_str(&format!(" ({})", parts.join(" ")));
+                }
+                if let Some(cols) = projection {
+                    s.push_str(&format!("  # read-only: {}", cols.join(",")));
+                }
+                if !prefilter.is_empty() {
+                    let preds: Vec<String> = prefilter
+                        .iter()
+                        .map(|(c, op, v)| format!("{c}{}{v}", op.as_str()))
+                        .collect();
+                    s.push_str(&format!("  # pre-filter: {}", preds.join(" and ")));
+                }
+                s
+            }
             Op::OpenBinary {
                 path,
                 fields,
@@ -284,6 +330,7 @@ impl Op {
                     format!("distinct {}", keys.join(" "))
                 }
             }
+            Op::Describe => "describe".to_string(),
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {

@@ -46,6 +46,185 @@ fn expected_clean_ge(rows: usize, seed: u64, threshold: u64) -> u64 {
 }
 
 #[test]
+fn headerless_csv_positional_columns_chunk_size_independent() {
+    // No header row: columns are named c0, c1, c2 and the FIRST line is data.
+    let rows = 20_000;
+    let mut rng = Rng::new(3);
+    let mut text = String::new();
+    let mut expect = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(90);
+        text.push_str(&format!("user,x,{age}\n"));
+        if age >= 45 {
+            expect += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_nh", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1, 7, 1024, 8192, rows] {
+        let res = run_src(
+            &format!("H:\n open {p} noheader\n |? c2 >= 45\n |> c0 c2\n;"),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), expect, "noheader filter @cs={cs}");
+        assert!(res.errors.is_empty());
+    }
+}
+
+#[test]
+fn declared_schema_renames_and_types_chunk_size_independent() {
+    // A header file with columns a,b,c. Declare names (id, code, age) and force
+    // `code` to str so leading zeros survive (it would otherwise infer i64).
+    let rows = 5_000;
+    let mut text = String::from("a,b,c\n");
+    let mut kept = 0u64;
+    for i in 0..rows {
+        let age = (i % 90) as u64;
+        text.push_str(&format!("{i},0{i:05},{age}\n")); // code has a leading zero
+        if age >= 45 {
+            kept += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_decl", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1, 7, 1024, rows] {
+        // Declared names are used by the predicate/projection; `code:str` keeps
+        // the leading zero intact.
+        let res = run_src(
+            &format!("D:\n open {p} (id code:str age)\n |? age >= 45\n |> code\n;"),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), kept, "declared filter @cs={cs}");
+        // Every emitted `code` must still start with '0' (kept as a string).
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        for c in &o.chunks {
+            let ci = c.schema.index_of("code").unwrap();
+            assert_eq!(c.schema.fields[ci].dtype, rivus_core::DataType::Str);
+            for r in 0..c.len {
+                assert!(
+                    c.value(r, ci).to_string().starts_with('0'),
+                    "leading zero lost"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn inline_cast_numeric_compare_on_string_column() {
+    // `age` is declared str (so a bare compare would be lexical: "100" < "20").
+    // `age:int >= N` casts to numeric, so the result matches a numeric oracle and
+    // is chunk-size independent.
+    let rows = 8_000;
+    let mut rng = Rng::new(2);
+    let mut text = String::from("name,age\n");
+    let mut ge = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(1000);
+        text.push_str(&format!("u,{age}\n"));
+        if age >= 500 {
+            ge += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_cast", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1, 7, 1024, rows] {
+        let res = run_src(
+            &format!("C:\n open {p} (name age:str)\n |? age:int >= 500\n;"),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), ge, "cast compare @cs={cs}");
+    }
+}
+
+#[test]
+fn inner_hash_join_matches_oracle() {
+    // Left: users (id, name). Right: orders (id, amount), many-to-one. The inner
+    // join row count must equal an independent count of matching pairs, and be
+    // chunk-size independent.
+    let users = 2_000usize;
+    let mut u = String::from("id,name\n");
+    for i in 0..users {
+        u.push_str(&format!("{i},user{i}\n"));
+    }
+    // Each order has an id in [0, users*2); ~half match a user.
+    let orders = 6_000usize;
+    let mut o = String::from("id,amount\n");
+    let mut rng = Rng::new(5);
+    let mut expected = 0u64;
+    for _ in 0..orders {
+        let id = rng.below((users * 2) as u64);
+        o.push_str(&format!("{id},10\n"));
+        if (id as usize) < users {
+            expected += 1; // one matching user → one joined row (one-to-many)
+        }
+    }
+    let uf = TempCsv(gendata::write_temp_bytes("join_u", u.as_bytes()));
+    let of = TempCsv(gendata::write_temp_bytes("join_o", o.as_bytes()));
+    let (up, op) = (uf.0.display(), of.0.display());
+
+    for cs in [1, 7, 1024, orders] {
+        let src = format!("U: open {up} ;\nO: open {op} ;\nJ: U & O on id |> name amount\n;");
+        let res = run_src(&src, cs);
+        assert_eq!(res.total_rows_out(), expected, "join rows @cs={cs}");
+    }
+}
+
+#[test]
+fn describe_matches_oracle() {
+    // One numeric column `v`; `describe` must report count/min/max/mean that
+    // match an independent computation, for every chunk size.
+    let rows = 10_000;
+    let mut rng = Rng::new(1);
+    let mut text = String::from("v\n");
+    let (mut sum, mut mn, mut mx) = (0i64, i64::MAX, i64::MIN);
+    for _ in 0..rows {
+        let x = rng.below(1000) as i64;
+        text.push_str(&format!("{x}\n"));
+        sum += x;
+        mn = mn.min(x);
+        mx = mx.max(x);
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_desc", text.as_bytes()));
+    let p = f.0.display();
+    let mean = sum as f64 / rows as f64;
+
+    for cs in [1, 7, 1024, rows] {
+        let res = run_src(&format!("D:\n open {p}\n describe\n;"), cs);
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .expect("describe output");
+        let c = &o.chunks[0];
+        let cell = |col: &str| {
+            let ci = c.schema.index_of(col).unwrap();
+            c.value(0, ci).to_string()
+        };
+        assert_eq!(cell("column"), "v", "@cs={cs}");
+        assert_eq!(cell("count"), rows.to_string(), "count @cs={cs}");
+        assert_eq!(
+            cell("min").parse::<f64>().unwrap(),
+            mn as f64,
+            "min @cs={cs}"
+        );
+        assert_eq!(
+            cell("max").parse::<f64>().unwrap(),
+            mx as f64,
+            "max @cs={cs}"
+        );
+        assert!(
+            (cell("mean").parse::<f64>().unwrap() - mean).abs() < 1e-6,
+            "mean @cs={cs}"
+        );
+    }
+}
+
+#[test]
 fn large_clean_filter_is_exact() {
     let rows = 50_000;
     let seed = 42;

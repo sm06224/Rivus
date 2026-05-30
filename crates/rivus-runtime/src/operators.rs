@@ -12,8 +12,8 @@ use crate::kernel;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
-use rivus_ir::{AggFunc, BinType, Endian, Expr, NodeId, Op};
-use std::collections::BTreeMap;
+use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, NodeId, Op};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
@@ -45,7 +45,7 @@ impl StreamWriter {
             } else {
                 Box::new(File::create(&self.path)?)
             };
-            self.inner = Some(BufWriter::new(w));
+            self.inner = Some(BufWriter::with_capacity(256 * 1024, w));
         }
         Ok(self.inner.as_mut().unwrap())
     }
@@ -148,8 +148,9 @@ pub fn csv_range_source(
     start: u64,
     end: u64,
     chunk_size: usize,
+    prefilter: Vec<(usize, CmpOp, f64)>,
 ) -> Box<dyn Operator> {
-    match csv::CsvChunker::for_range(path, dtypes, keep, ncols, start, end, chunk_size) {
+    match csv::CsvChunker::for_range(path, dtypes, keep, ncols, start, end, chunk_size, prefilter) {
         Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
@@ -177,11 +178,20 @@ impl Operator for MemSource {
 /// sample-infer its schema (instant start) for sink-less preview runs.
 pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Box<dyn Operator> {
     match op {
-        Op::OpenCsv { path, projection } => Box::new(SourceCsv::new(
+        Op::OpenCsv {
+            path,
+            projection,
+            prefilter,
+            header,
+            declared,
+        } => Box::new(SourceCsv::new(
             path.clone(),
             projection.clone(),
             chunk_size,
             preview,
+            prefilter.clone(),
+            *header,
+            declared.clone(),
         )),
         Op::OpenBinary {
             path,
@@ -201,6 +211,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Take { n } => Box::new(Take { remaining: *n }),
         Op::Sort { key, desc } => Box::new(Sort::new(key.clone(), *desc)),
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
+        Op::Describe => Box::new(Describe::default()),
         Op::ProjectExpr { items } => Box::new(ProjectExpr {
             items: items.clone(),
         }),
@@ -250,6 +261,12 @@ struct SourceCsv {
     chunk_size: usize,
     loaded: bool,
     preview: bool,
+    /// Numeric `(column, op, rhs)` predicates pushed down by the optimizer; the
+    /// reader uses them to skip *building* rows that definitely fail (the
+    /// downstream FilterProject remains authoritative).
+    prefilter: Vec<(String, CmpOp, f64)>,
+    header: bool,
+    declared: Option<Vec<(String, Option<DataType>)>>,
     schema: Arc<Schema>,
     /// Streaming reader for a real file; `None` for stdin / after a load error.
     stream: Option<csv::CsvChunker>,
@@ -260,11 +277,15 @@ struct SourceCsv {
 }
 
 impl SourceCsv {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         path: String,
         projection: Option<Vec<String>>,
         chunk_size: usize,
         preview: bool,
+        prefilter: Vec<(String, CmpOp, f64)>,
+        header: bool,
+        declared: Option<Vec<(String, Option<DataType>)>>,
     ) -> Self {
         SourceCsv {
             path,
@@ -272,6 +293,9 @@ impl SourceCsv {
             chunk_size: chunk_size.max(1),
             loaded: false,
             preview,
+            prefilter,
+            header,
+            declared,
             schema: Schema::empty(),
             stream: None,
             columns: Vec::new(),
@@ -289,6 +313,9 @@ impl SourceCsv {
             chunk_size: 0,
             loaded: true,
             preview: false,
+            prefilter: Vec::new(),
+            header: true,
+            declared: None,
             schema,
             stream: Some(chunker),
             columns: Vec::new(),
@@ -307,6 +334,9 @@ impl SourceCsv {
                 self.projection.as_deref(),
                 self.chunk_size,
                 self.preview,
+                &self.prefilter,
+                self.header,
+                self.declared.as_deref(),
             ) {
                 Ok((schema, chunker)) => {
                     if chunker.bad_rows > 0 {
@@ -906,6 +936,119 @@ impl Operator for Distinct {
     }
 }
 
+// ------------------------------------------------------------------ describe
+
+/// `describe` — a one-pass streaming summary: per input column, its type, row
+/// count, and (for numeric columns) min / max / mean. Accumulates across chunks
+/// and emits a single summary chunk on finish (one row per column). Stateful →
+/// serial path. The summary is rendered as string cells for clean display.
+#[derive(Default)]
+struct Describe {
+    names: Vec<String>,
+    types: Vec<DataType>,
+    count: u64,
+    // Per-column numeric accumulators (used only for I64/F64 columns).
+    n: Vec<u64>,
+    sum: Vec<f64>,
+    min: Vec<f64>,
+    max: Vec<f64>,
+    inited: bool,
+    emitted: bool,
+}
+
+impl Describe {
+    fn init(&mut self, chunk: &Chunk) {
+        self.names = chunk
+            .schema
+            .field_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        self.types = chunk.columns.iter().map(|c| c.dtype()).collect();
+        let k = self.names.len();
+        self.n = vec![0; k];
+        self.sum = vec![0.0; k];
+        self.min = vec![f64::INFINITY; k];
+        self.max = vec![f64::NEG_INFINITY; k];
+        self.inited = true;
+    }
+}
+
+impl Operator for Describe {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !self.inited {
+            self.init(&chunk);
+        }
+        self.count += chunk.len as u64;
+        for (ci, col) in chunk.columns.iter().enumerate() {
+            let vals: &mut dyn Iterator<Item = f64> = match col {
+                Column::I64(v) => &mut v.iter().map(|&x| x as f64),
+                Column::F64(v) => &mut v.iter().copied(),
+                _ => continue, // non-numeric: only type + count are reported
+            };
+            for x in vals {
+                self.n[ci] += 1;
+                self.sum[ci] += x;
+                self.min[ci] = self.min[ci].min(x);
+                self.max[ci] = self.max[ci].max(x);
+            }
+        }
+        Vec::new() // summary emitted on finish
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.emitted || !self.inited {
+            return Vec::new();
+        }
+        self.emitted = true;
+
+        let fmt = |x: f64| {
+            if x.fract() == 0.0 && x.abs() < 1e15 {
+                format!("{x:.0}")
+            } else {
+                format!("{x}")
+            }
+        };
+        let mut column = StrColumn::default();
+        let mut typ = StrColumn::default();
+        let mut count = Vec::new();
+        let mut min = StrColumn::default();
+        let mut max = StrColumn::default();
+        let mut mean = StrColumn::default();
+        for (i, name) in self.names.iter().enumerate() {
+            column.push(name);
+            typ.push(&self.types[i].to_string());
+            count.push(self.count as i64);
+            if self.n[i] > 0 {
+                min.push(&fmt(self.min[i]));
+                max.push(&fmt(self.max[i]));
+                mean.push(&fmt(self.sum[i] / self.n[i] as f64));
+            } else {
+                min.push("");
+                max.push("");
+                mean.push("");
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("column", DataType::Str),
+            Field::new("type", DataType::Str),
+            Field::new("count", DataType::I64),
+            Field::new("min", DataType::Str),
+            Field::new("max", DataType::Str),
+            Field::new("mean", DataType::Str),
+        ]));
+        let columns = vec![
+            Column::Str(column),
+            Column::Str(typ),
+            Column::I64(count),
+            Column::Str(min),
+            Column::Str(max),
+            Column::Str(mean),
+        ];
+        vec![Chunk::new(ctx.fresh_id(), schema, columns)]
+    }
+}
+
 // -------------------------------------------------------- computed projection
 
 /// `|> field (expr) as alias …` — projection that can compute new columns.
@@ -1208,14 +1351,18 @@ impl Operator for Merge {
 
 // ----------------------------------------------------------------------- join
 
-/// MVP join: buffers both sides and emits the left side on finish, recording
-/// that the synchronized join executor is not yet wired (continue-first). The
-/// IR and source already model it fully (design doc 04/05).
+/// Inner hash join `A & B on lkey:rkey`. Buffers both inputs (a blocking,
+/// serial pipeline-breaker like sort/group), builds a hash map of the right
+/// side keyed by `right_key`, then probes with the left side. The output is the
+/// left columns followed by the right columns (minus the join key); a name that
+/// collides with a left column is suffixed `_r`. Keys compare by string value,
+/// so `30` (i64) and `"30"` (str) match — convenient for loosely-typed CSV.
 struct Join {
     left_key: String,
     right_key: String,
     left_id: NodeId,
     left_buf: Vec<Chunk>,
+    right_buf: Vec<Chunk>,
 }
 
 impl Join {
@@ -1225,28 +1372,107 @@ impl Join {
             right_key,
             left_id,
             left_buf: Vec::new(),
+            right_buf: Vec::new(),
         }
     }
+}
+
+/// Concatenate buffered chunks (sharing a schema) into one.
+fn concat_chunks(bufs: Vec<Chunk>) -> Option<Chunk> {
+    let mut it = bufs.into_iter();
+    let first = it.next()?;
+    let schema = first.schema.clone();
+    let mut cols = first.columns;
+    for c in it {
+        for (i, col) in c.columns.iter().enumerate() {
+            cols[i].append(col);
+        }
+    }
+    Some(Chunk::new(0, schema, cols))
 }
 
 impl Operator for Join {
     fn process(&mut self, from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
         if from == self.left_id {
             self.left_buf.push(chunk);
+        } else {
+            self.right_buf.push(chunk);
         }
-        Vec::new()
+        Vec::new() // blocking: join emitted on finish
     }
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        ctx.raise(ErrorEvent::new(
-            Severity::Info,
-            ErrorScope::Branch,
-            format!(
-                "synchronized join on {} = {} not yet executed (MVP): forwarding left input",
-                self.left_key, self.right_key
-            ),
-        ));
-        std::mem::take(&mut self.left_buf)
+        let (Some(left), Some(right)) = (
+            concat_chunks(std::mem::take(&mut self.left_buf)),
+            concat_chunks(std::mem::take(&mut self.right_buf)),
+        ) else {
+            return Vec::new(); // one side empty → inner join is empty
+        };
+
+        let warn = |ctx: &mut OpCtx, side: &str, key: &str| {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Warn,
+                    ErrorScope::Branch,
+                    format!("join: unknown {side} key '{key}'"),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        };
+        let Some(lk) = left.schema.index_of(&self.left_key) else {
+            warn(ctx, "left", &self.left_key);
+            return Vec::new();
+        };
+        let Some(rk) = right.schema.index_of(&self.right_key) else {
+            warn(ctx, "right", &self.right_key);
+            return Vec::new();
+        };
+
+        // Build the hash table on the right side, then probe with the left.
+        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        for ri in 0..right.len {
+            table
+                .entry(right.value(ri, rk).to_string())
+                .or_default()
+                .push(ri);
+        }
+        let mut lidx = Vec::new();
+        let mut ridx = Vec::new();
+        for li in 0..left.len {
+            if let Some(rs) = table.get(&left.value(li, lk).to_string()) {
+                for &ri in rs {
+                    lidx.push(li);
+                    ridx.push(ri);
+                }
+            }
+        }
+
+        // Output schema: left fields, then right fields except the join key
+        // (collisions suffixed `_r`).
+        let mut fields = left.schema.fields.clone();
+        let mut right_cols = Vec::new();
+        for (ci, f) in right.schema.fields.iter().enumerate() {
+            if ci == rk {
+                continue;
+            }
+            let name = if left.schema.index_of(&f.name).is_some() {
+                format!("{}_r", f.name)
+            } else {
+                f.name.clone()
+            };
+            fields.push(Field::new(name, f.dtype));
+            right_cols.push(ci);
+        }
+
+        let mut out: Vec<Column> = left.columns.iter().map(|c| c.gather(&lidx)).collect();
+        for &ci in &right_cols {
+            out.push(right.columns[ci].gather(&ridx));
+        }
+        vec![Chunk::new(
+            ctx.fresh_id(),
+            Arc::new(Schema::new(fields)),
+            out,
+        )]
     }
 }
 
