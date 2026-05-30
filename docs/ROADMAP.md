@@ -64,7 +64,7 @@ it in small, gated steps.
 | ✅ | **Joins (inner hash join)** | hash join: buffer the build side, probe the stream. `A & B on k`. Inner first, then left/right/outer. Memory: build side bounded by its cardinality (document it as a pipeline-breaker like sort). |
 | 🚧 | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅ and `fill col VALUE` ✅ done; `fill col mean\|median\|ffill\|bfill` still planned. |
 | ✅ | More aggregates | `std` (sample), `count_distinct`/`nunique`, `first`, `last` done; `p50/p90` still planned |
-| 📋 | `rename`, `drop`, `reorder` columns | sugar over project |
+| 🚧 | `rename`, `drop`, `reorder` columns | `rename OLD NEW …` ✅ and `drop COL …` ✅ done (stateless, parallel-safe, reversible); `reorder` via `\|>` today |
 
 ## E. Performance — keep beating DuckDB
 
