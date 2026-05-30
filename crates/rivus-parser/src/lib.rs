@@ -313,6 +313,38 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `dropna [col ...]` — drop rows with empty values.
+                Tok::Word(w) if w == "dropna" => {
+                    self.bump();
+                    let mut cols = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump();
+                        cols.push(name);
+                    }
+                    let n = self.g.add_node(Op::DropNa { cols });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `fill col VALUE` — fill empty cells of a text column.
+                Tok::Word(w) if w == "fill" => {
+                    self.bump();
+                    let col = self.word()?;
+                    let value = match self.bump() {
+                        Tok::Str(s) => s,
+                        Tok::Word(s) => s,
+                        Tok::Int(n) => n.to_string(),
+                        Tok::Float(f) => f.to_string(),
+                        other => {
+                            return Err(self.err(format!("fill expects a value, found {other:?}")))
+                        }
+                    };
+                    let n = self.g.add_node(Op::Fill { col, value });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
                 Tok::Word(w) if w == "print" => {
                     self.bump();
                     let n = self.g.add_node(Op::SinkPrint);
@@ -926,6 +958,8 @@ fn is_keyword(w: &str) -> bool {
             | "sort"
             | "distinct"
             | "describe"
+            | "dropna"
+            | "fill"
             | "where"
             | "on"
             | "map"

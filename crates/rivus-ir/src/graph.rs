@@ -190,6 +190,12 @@ pub enum Op {
     /// (column, type, count, min, max, mean). A streaming, single-pass
     /// accumulator that emits on finish; stateful → serial path.
     Describe,
+    /// `dropna [col ...]` — drop rows with a missing (empty) value in any of the
+    /// named columns (or any column when none named). Streaming, stateless.
+    DropNa { cols: Vec<String> },
+    /// `fill col VALUE` — replace missing (empty) cells of `col` with `VALUE`
+    /// (the column becomes text). Streaming, stateless.
+    Fill { col: String, value: String },
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -232,6 +238,8 @@ impl Op {
             Op::Sort { .. } => "sort",
             Op::Distinct { .. } => "distinct",
             Op::Describe => "describe",
+            Op::DropNa { .. } => "dropna",
+            Op::Fill { .. } => "fill",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -331,6 +339,14 @@ impl Op {
                 }
             }
             Op::Describe => "describe".to_string(),
+            Op::DropNa { cols } => {
+                if cols.is_empty() {
+                    "dropna".to_string()
+                } else {
+                    format!("dropna {}", cols.join(" "))
+                }
+            }
+            Op::Fill { col, value } => format!("fill {col} \"{value}\""),
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {

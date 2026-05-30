@@ -62,7 +62,7 @@ it in small, gated steps.
 |---|---|---|
 | ✅ | filter · project · group(sum/avg/min/max/count) · sort · distinct · take | |
 | ✅ | **Joins (inner hash join)** | hash join: buffer the build side, probe the stream. `A & B on k`. Inner first, then left/right/outer. Memory: build side bounded by its cardinality (document it as a pipeline-breaker like sort). |
-| 📋 | **Missing-value imputation** (欠測補完) | `fill col with <value>` · `fill col mean\|median\|ffill\|bfill` · `dropna [cols]`. Mean/median need a stat pass (or streaming approx); ffill/bfill are streaming with carried state. |
+| 🚧 | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅ and `fill col VALUE` ✅ done; `fill col mean\|median\|ffill\|bfill` still planned. |
 | 📋 | More aggregates | `count_distinct`, `std`, `p50/p90`, first/last |
 | 📋 | `rename`, `drop`, `reorder` columns | sugar over project |
 

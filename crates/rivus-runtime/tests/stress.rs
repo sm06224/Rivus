@@ -175,6 +175,50 @@ fn inner_hash_join_matches_oracle() {
 }
 
 #[test]
+fn dropna_and_fill_chunk_size_independent() {
+    // city is blank on every 3rd row. dropna city drops those; fill city
+    // replaces them. Both must be exact and chunk-size independent.
+    let rows = 9_000usize;
+    let mut text = String::from("id,city\n");
+    let mut nonblank = 0u64;
+    for i in 0..rows {
+        if i % 3 == 0 {
+            text.push_str(&format!("{i},\n")); // blank city
+        } else {
+            text.push_str(&format!("{i},town\n"));
+            nonblank += 1;
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_na", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1, 7, 1024, rows] {
+        let dn = run_src(&format!("D:\n open {p} (id city:str)\n dropna city\n;"), cs);
+        assert_eq!(dn.total_rows_out(), nonblank, "dropna @cs={cs}");
+
+        // fill keeps all rows; none should be blank afterwards.
+        let fl = run_src(
+            &format!("D:\n open {p} (id city:str)\n fill city \"NA\"\n;"),
+            cs,
+        );
+        assert_eq!(fl.total_rows_out(), rows as u64, "fill keeps rows @cs={cs}");
+        let o = fl
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        for c in &o.chunks {
+            let ci = c.schema.index_of("city").unwrap();
+            for r in 0..c.len {
+                assert!(
+                    !c.value(r, ci).to_string().is_empty(),
+                    "blank survived fill"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn describe_matches_oracle() {
     // One numeric column `v`; `describe` must report count/min/max/mean that
     // match an independent computation, for every chunk size.

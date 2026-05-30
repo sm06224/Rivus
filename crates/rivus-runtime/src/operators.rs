@@ -212,6 +212,11 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Sort { key, desc } => Box::new(Sort::new(key.clone(), *desc)),
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
         Op::Describe => Box::new(Describe::default()),
+        Op::DropNa { cols } => Box::new(DropNa { cols: cols.clone() }),
+        Op::Fill { col, value } => Box::new(Fill {
+            col: col.clone(),
+            value: value.clone(),
+        }),
         Op::ProjectExpr { items } => Box::new(ProjectExpr {
             items: items.clone(),
         }),
@@ -1046,6 +1051,81 @@ impl Operator for Describe {
             Column::Str(mean),
         ];
         vec![Chunk::new(ctx.fresh_id(), schema, columns)]
+    }
+}
+
+// ------------------------------------------------------------ dropna / fill
+
+/// `dropna [cols]` — drop rows whose value in any target column is missing
+/// (renders empty: an empty string cell or null). With no columns, any column.
+/// Streaming and stateless. (Numeric columns can't carry an "empty" cell — a
+/// blank parses to 0 — so dropna is meaningful on text columns; declare a
+/// column `:str` first if you need to detect its blanks.)
+struct DropNa {
+    cols: Vec<String>,
+}
+
+impl Operator for DropNa {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        let idxs: Vec<usize> = if self.cols.is_empty() {
+            (0..chunk.columns.len()).collect()
+        } else {
+            self.cols
+                .iter()
+                .filter_map(|c| chunk.schema.index_of(c))
+                .collect()
+        };
+        let keep: Vec<usize> = (0..chunk.len)
+            .filter(|&r| {
+                !idxs
+                    .iter()
+                    .any(|&ci| chunk.value(r, ci).to_string().is_empty())
+            })
+            .collect();
+        if keep.is_empty() {
+            return Vec::new();
+        }
+        if keep.len() == chunk.len {
+            return vec![chunk];
+        }
+        vec![chunk.gather(&keep)]
+    }
+}
+
+/// `fill col VALUE` — replace missing (empty) cells of a text column with
+/// `VALUE`. Streaming, stateless. A non-text column is passed through unchanged
+/// (its blanks already became 0 at parse time).
+struct Fill {
+    col: String,
+    value: String,
+}
+
+impl Operator for Fill {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let Some(ci) = chunk.schema.index_of(&self.col) else {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Warn,
+                    ErrorScope::Chunk,
+                    format!("fill: unknown column '{}'", self.col),
+                )
+                .at_node(ctx.label.clone()),
+            );
+            return vec![chunk];
+        };
+        let Column::Str(s) = &chunk.columns[ci] else {
+            return vec![chunk]; // numeric column: no empty cells to fill
+        };
+        let mut filled = StrColumn::with_capacity(chunk.len, 0);
+        for r in 0..chunk.len {
+            let v = s.get(r);
+            filled.push(if v.is_empty() { &self.value } else { v });
+        }
+        let mut columns = chunk.columns.clone();
+        columns[ci] = Column::Str(filled);
+        let mut out = Chunk::new(chunk.meta.id, chunk.schema.clone(), columns);
+        out.meta = chunk.meta.clone();
+        vec![out]
     }
 }
 

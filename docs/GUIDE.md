@@ -169,6 +169,17 @@ distinct user_id        # first row per user_id
 distinct country region # first row per (country, region)
 ```
 
+### `dropna` / `fill` — missing values
+
+```
+dropna                 # drop rows blank in ANY column
+dropna city region     # drop rows blank in these columns
+fill city "UNKNOWN"    # replace blank cells of `city`
+```
+
+A "missing" cell is an empty string. Numeric columns can't hold a blank (it
+parses to 0), so declare a column `:str` if you need to detect/clean its blanks.
+
 ### `describe` — one-pass column summary
 
 Replace the stream with a per-column summary (like pandas `.describe()` / SQL
