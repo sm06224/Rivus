@@ -48,7 +48,7 @@ it in small, gated steps.
 | | item | note |
 |---|---|---|
 | ✅ | Computed columns `\|> (age*12) as months` (add-property style) | arithmetic `+ - * / %`, `as` alias |
-| 📋 | **Readable filter** | `\|?` is terse; add a comma-separated form where `,` means AND, e.g. `where age >= 20, country == "JP"`. Keep `\|?` as an alias. |
+| ✅ | **Readable filter** | `\|?` is terse; add a comma-separated form where `,` means AND, e.g. `where age >= 20, country == "JP"`. Keep `\|?` as an alias. |
 | ✅ | **Inline type casts** | `age:int`, `price:f64`, `flag:bool`, `id:str` usable in predicates and projections, e.g. `where age:int >= 20` and `\|> (amount:f64 * 1.1) as gross` |
 | 📋 | **Three ways to give types** (write them distinctly): | |
 | ✅ | • at the source | `open f.csv (id:int name:str)` — declared schema (done) |
@@ -96,7 +96,7 @@ it in small, gated steps.
 2. ~~`describe` (B)~~ ✅ done — `open f.csv describe`.
 3. ~~Typed/named columns at `open`~~ ✅ done — `open f.csv (id:int name:str)`.
 4. ~~stdin→stdout filter ergonomics~~ ✅ done — `cat x | rivus '|? …'`.
-5. ~~Inline type casts~~ ✅ done (`age:int`); comma-filter `where a, b` next.
+5. ~~Inline type casts + comma filter~~ ✅ done (`age:int`, `where a, b`).
 6. ~~Joins~~ ✅ inner hash join done; then **imputation** (D).
 7. **SIMD CSV scan** (E) — the next big speed lever vs DuckDB.
 8. **Compressed inputs** (A) — after the supply-chain decision.

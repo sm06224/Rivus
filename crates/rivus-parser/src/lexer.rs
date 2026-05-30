@@ -10,6 +10,7 @@ use rivus_ir::CmpOp;
 pub enum Tok {
     Colon,            // :
     Semicolon,        // ;
+    Comma,            // ,
     Bang,             // !
     Plus,             // +
     Minus,            // -   (expression mode only)
@@ -113,6 +114,10 @@ impl<'a> Lexer<'a> {
                 b';' => {
                     self.bump();
                     Tok::Semicolon
+                }
+                b',' => {
+                    self.bump();
+                    Tok::Comma
                 }
                 b'+' => {
                     self.bump();

@@ -102,8 +102,11 @@ Applied left to right; each consumes the stream and produces a new one.
 
 Keep rows where the predicate is true.
 
+You can use `where` as a readable alias, and **commas mean AND**:
+
 ```
 |? age >= 20
+where age >= 20, country == "JP"      # comma = AND (same as `and`)
 |? country == "JP" and active == true
 |? score > 90 or age < 18
 |? (score / age) > 3          # arithmetic in parens (see §6)
@@ -429,7 +432,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | 'stream' IDENT
            | IDENT (('+' IDENT)+ | ('&' IDENT))? ;            (merge / join over scopes)
 
-transform  = '|?' expr                                        (filter)
+transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT (('sum'|'avg'|'min'|'max') ':' IDENT)*  (group)
            | ('take'|'limit'|'head') INT

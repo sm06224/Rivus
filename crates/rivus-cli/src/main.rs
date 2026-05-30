@@ -209,7 +209,7 @@ fn is_transform_only(src: &str) -> bool {
     let first = s.split_whitespace().next().unwrap_or("");
     matches!(
         first,
-        "take" | "limit" | "head" | "sort" | "distinct" | "describe"
+        "where" | "take" | "limit" | "head" | "sort" | "distinct" | "describe"
     )
 }
 

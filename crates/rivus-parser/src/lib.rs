@@ -158,9 +158,17 @@ impl Parser {
 
         loop {
             match self.tok().clone() {
+                // `|? pred` / `|? a, b` (comma = AND). `where` is a readable alias.
                 Tok::PipeFilter => {
                     self.bump();
-                    let pred = self.parse_expr()?;
+                    let pred = self.parse_filter_preds()?;
+                    let n = self.g.add_node(Op::Filter { pred });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                Tok::Word(w) if w == "where" => {
+                    self.bump();
+                    let pred = self.parse_filter_preds()?;
                     let n = self.g.add_node(Op::Filter { pred });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
@@ -641,6 +649,17 @@ impl Parser {
         self.parse_or()
     }
 
+    /// A filter predicate, optionally comma-separated where `,` means AND —
+    /// `|? age >= 20, country == "JP"` reads better than chained `and`.
+    fn parse_filter_preds(&mut self) -> Result<Expr, RivusError> {
+        let mut pred = self.parse_expr()?;
+        while self.eat(&Tok::Comma) {
+            let rhs = self.parse_expr()?;
+            pred = Expr::And(Box::new(pred), Box::new(rhs));
+        }
+        Ok(pred)
+    }
+
     fn parse_or(&mut self) -> Result<Expr, RivusError> {
         let mut e = self.parse_and()?;
         while self.peek_is_word("or") {
@@ -907,6 +926,7 @@ fn is_keyword(w: &str) -> bool {
             | "sort"
             | "distinct"
             | "describe"
+            | "where"
             | "on"
             | "map"
             | "mode"
@@ -946,6 +966,32 @@ mod tests {
     fn nth_op(src: &str, n: usize) -> Op {
         let g = parse(src).unwrap();
         g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn comma_filter_is_and_and_where_is_an_alias() {
+        // `|? a, b`, `|? a and b`, and `where a, b` all lower to the same
+        // Filter(And(a, b)).
+        let want = |op: &Op| {
+            matches!(
+                op,
+                Op::Filter {
+                    pred: Expr::And(..)
+                }
+            )
+        };
+        assert!(want(&nth_op(
+            "F:\n open d.csv\n |? age >= 20, country == \"JP\"\n;",
+            1
+        )));
+        assert!(want(&nth_op(
+            "F:\n open d.csv\n |? age >= 20 and country == \"JP\"\n;",
+            1
+        )));
+        assert!(want(&nth_op(
+            "F:\n open d.csv\n where age >= 20, country == \"JP\"\n;",
+            1
+        )));
     }
 
     #[test]
