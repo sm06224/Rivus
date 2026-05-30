@@ -13,7 +13,7 @@ use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
 use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, NodeId, Op};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
@@ -1351,14 +1351,18 @@ impl Operator for Merge {
 
 // ----------------------------------------------------------------------- join
 
-/// MVP join: buffers both sides and emits the left side on finish, recording
-/// that the synchronized join executor is not yet wired (continue-first). The
-/// IR and source already model it fully (design doc 04/05).
+/// Inner hash join `A & B on lkey:rkey`. Buffers both inputs (a blocking,
+/// serial pipeline-breaker like sort/group), builds a hash map of the right
+/// side keyed by `right_key`, then probes with the left side. The output is the
+/// left columns followed by the right columns (minus the join key); a name that
+/// collides with a left column is suffixed `_r`. Keys compare by string value,
+/// so `30` (i64) and `"30"` (str) match — convenient for loosely-typed CSV.
 struct Join {
     left_key: String,
     right_key: String,
     left_id: NodeId,
     left_buf: Vec<Chunk>,
+    right_buf: Vec<Chunk>,
 }
 
 impl Join {
@@ -1368,28 +1372,107 @@ impl Join {
             right_key,
             left_id,
             left_buf: Vec::new(),
+            right_buf: Vec::new(),
         }
     }
+}
+
+/// Concatenate buffered chunks (sharing a schema) into one.
+fn concat_chunks(bufs: Vec<Chunk>) -> Option<Chunk> {
+    let mut it = bufs.into_iter();
+    let first = it.next()?;
+    let schema = first.schema.clone();
+    let mut cols = first.columns;
+    for c in it {
+        for (i, col) in c.columns.iter().enumerate() {
+            cols[i].append(col);
+        }
+    }
+    Some(Chunk::new(0, schema, cols))
 }
 
 impl Operator for Join {
     fn process(&mut self, from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
         if from == self.left_id {
             self.left_buf.push(chunk);
+        } else {
+            self.right_buf.push(chunk);
         }
-        Vec::new()
+        Vec::new() // blocking: join emitted on finish
     }
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        ctx.raise(ErrorEvent::new(
-            Severity::Info,
-            ErrorScope::Branch,
-            format!(
-                "synchronized join on {} = {} not yet executed (MVP): forwarding left input",
-                self.left_key, self.right_key
-            ),
-        ));
-        std::mem::take(&mut self.left_buf)
+        let (Some(left), Some(right)) = (
+            concat_chunks(std::mem::take(&mut self.left_buf)),
+            concat_chunks(std::mem::take(&mut self.right_buf)),
+        ) else {
+            return Vec::new(); // one side empty → inner join is empty
+        };
+
+        let warn = |ctx: &mut OpCtx, side: &str, key: &str| {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Warn,
+                    ErrorScope::Branch,
+                    format!("join: unknown {side} key '{key}'"),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        };
+        let Some(lk) = left.schema.index_of(&self.left_key) else {
+            warn(ctx, "left", &self.left_key);
+            return Vec::new();
+        };
+        let Some(rk) = right.schema.index_of(&self.right_key) else {
+            warn(ctx, "right", &self.right_key);
+            return Vec::new();
+        };
+
+        // Build the hash table on the right side, then probe with the left.
+        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        for ri in 0..right.len {
+            table
+                .entry(right.value(ri, rk).to_string())
+                .or_default()
+                .push(ri);
+        }
+        let mut lidx = Vec::new();
+        let mut ridx = Vec::new();
+        for li in 0..left.len {
+            if let Some(rs) = table.get(&left.value(li, lk).to_string()) {
+                for &ri in rs {
+                    lidx.push(li);
+                    ridx.push(ri);
+                }
+            }
+        }
+
+        // Output schema: left fields, then right fields except the join key
+        // (collisions suffixed `_r`).
+        let mut fields = left.schema.fields.clone();
+        let mut right_cols = Vec::new();
+        for (ci, f) in right.schema.fields.iter().enumerate() {
+            if ci == rk {
+                continue;
+            }
+            let name = if left.schema.index_of(&f.name).is_some() {
+                format!("{}_r", f.name)
+            } else {
+                f.name.clone()
+            };
+            fields.push(Field::new(name, f.dtype));
+            right_cols.push(ci);
+        }
+
+        let mut out: Vec<Column> = left.columns.iter().map(|c| c.gather(&lidx)).collect();
+        for &ci in &right_cols {
+            out.push(right.columns[ci].gather(&ridx));
+        }
+        vec![Chunk::new(
+            ctx.fresh_id(),
+            Arc::new(Schema::new(fields)),
+            out,
+        )]
     }
 }
 

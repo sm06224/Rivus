@@ -483,10 +483,20 @@ impl Parser {
                         .labels
                         .get(&rhs)
                         .ok_or_else(|| self.err(format!("unknown flow '{rhs}'")))?;
-                    // MVP: join on a key named after the right scope, refined later.
+                    // `on key` (same name both sides) or `on lkey:rkey`.
+                    if !self.peek_is_word("on") {
+                        return Err(self.err("join `A & B` requires `on <key>` (or `on lk:rk`)"));
+                    }
+                    self.bump(); // `on`
+                    let left_key = self.word()?;
+                    let right_key = if self.eat(&Tok::Colon) {
+                        self.word()?
+                    } else {
+                        left_key.clone()
+                    };
                     let join = self.g.add_node(Op::Join {
-                        left_key: "id".into(),
-                        right_key: "id".into(),
+                        left_key,
+                        right_key,
                     });
                     self.g.add_edge(first, join, EdgeKind::Stream);
                     self.g.add_edge(rid, join, EdgeKind::Stream);

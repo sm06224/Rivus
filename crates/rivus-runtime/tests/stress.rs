@@ -115,6 +115,39 @@ fn declared_schema_renames_and_types_chunk_size_independent() {
 }
 
 #[test]
+fn inner_hash_join_matches_oracle() {
+    // Left: users (id, name). Right: orders (id, amount), many-to-one. The inner
+    // join row count must equal an independent count of matching pairs, and be
+    // chunk-size independent.
+    let users = 2_000usize;
+    let mut u = String::from("id,name\n");
+    for i in 0..users {
+        u.push_str(&format!("{i},user{i}\n"));
+    }
+    // Each order has an id in [0, users*2); ~half match a user.
+    let orders = 6_000usize;
+    let mut o = String::from("id,amount\n");
+    let mut rng = Rng::new(5);
+    let mut expected = 0u64;
+    for _ in 0..orders {
+        let id = rng.below((users * 2) as u64);
+        o.push_str(&format!("{id},10\n"));
+        if (id as usize) < users {
+            expected += 1; // one matching user → one joined row (one-to-many)
+        }
+    }
+    let uf = TempCsv(gendata::write_temp_bytes("join_u", u.as_bytes()));
+    let of = TempCsv(gendata::write_temp_bytes("join_o", o.as_bytes()));
+    let (up, op) = (uf.0.display(), of.0.display());
+
+    for cs in [1, 7, 1024, orders] {
+        let src = format!("U: open {up} ;\nO: open {op} ;\nJ: U & O on id |> name amount\n;");
+        let res = run_src(&src, cs);
+        assert_eq!(res.total_rows_out(), expected, "join rows @cs={cs}");
+    }
+}
+
+#[test]
 fn describe_matches_oracle() {
     // One numeric column `v`; `describe` must report count/min/max/mean that
     // match an independent computation, for every chunk size.

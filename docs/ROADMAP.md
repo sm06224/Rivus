@@ -61,7 +61,7 @@ it in small, gated steps.
 | | item | note |
 |---|---|---|
 | ✅ | filter · project · group(sum/avg/min/max/count) · sort · distinct · take | |
-| 📋 | **Joins (real execution)** | hash join: buffer the build side, probe the stream. `A & B on k`. Inner first, then left/right/outer. Memory: build side bounded by its cardinality (document it as a pipeline-breaker like sort). |
+| ✅ | **Joins (inner hash join)** | hash join: buffer the build side, probe the stream. `A & B on k`. Inner first, then left/right/outer. Memory: build side bounded by its cardinality (document it as a pipeline-breaker like sort). |
 | 📋 | **Missing-value imputation** (欠測補完) | `fill col with <value>` · `fill col mean\|median\|ffill\|bfill` · `dropna [cols]`. Mean/median need a stat pass (or streaming approx); ffill/bfill are streaming with carried state. |
 | 📋 | More aggregates | `count_distinct`, `std`, `p50/p90`, first/last |
 | 📋 | `rename`, `drop`, `reorder` columns | sugar over project |
@@ -97,7 +97,7 @@ it in small, gated steps.
 3. ~~Typed/named columns at `open`~~ ✅ done — `open f.csv (id:int name:str)`.
 4. ~~stdin→stdout filter ergonomics~~ ✅ done — `cat x | rivus '|? …'`.
 5. **Inline type casts + comma filter** (C) — readable, typed flow.
-6. **Joins** (D), then **imputation** (D).
+6. ~~Joins~~ ✅ inner hash join done; then **imputation** (D).
 7. **SIMD CSV scan** (E) — the next big speed lever vs DuckDB.
 8. **Compressed inputs** (A) — after the supply-chain decision.
 

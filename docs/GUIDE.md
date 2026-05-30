@@ -212,10 +212,19 @@ Merged:
 
 - `-> Child: body ;` — **branch (tee)**: every chunk is forwarded to the child.
 - `A + B [+ C …]` — **merge**: union of the named streams.
-- `A & B` — **join** on keys (MVP: forwards the left input; full sync-join is
-  designed but not yet executing).
+- `A & B on key` — **inner join** on a key (use `on lkey:rkey` when the two
+  sides name the key differently). Output = left columns + right columns (minus
+  the join key; a name clashing with a left column is suffixed `_r`).
+
+```
+# inner join two CSVs on `id`
+Users:  open users.csv ;
+Orders: open orders.csv ;
+Joined: Users & Orders on id  |> name amount  save out.csv ;
+```
 
 Reference scopes by the names you gave them. The CLI prints the whole graph.
+Join is a blocking step (it buffers both inputs), like `sort`/`|#`.
 
 ---
 
