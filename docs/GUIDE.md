@@ -65,7 +65,8 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | syntax | reads |
 |---|---|
 | `open PATH` | format from the extension (`.csv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSON) |
-| `open PATH as FMT` | force the format (`FMT` = `csv` \| `json` \| `jsonl` \| `ndjson`) |
+| `open PATH as FMT` | force the format (`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
+| `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`. e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros |
 | `readcsv PATH` | CSV, explicitly |
@@ -299,8 +300,8 @@ than crashing (continue-first).
 
 | syntax | writes |
 |---|---|
-| `save PATH` | format from the extension (mirrors the sources) |
-| `save PATH as FMT` | force the format (`csv` \| `json` \| `jsonl` \| `ndjson`) |
+| `save PATH` | format from the extension (mirrors the sources; `.tsv`/`.tab` → tab-delimited) |
+| `save PATH as FMT` | force the format (`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
 | `writecsv PATH` / `writejson PATH` | explicit verbs |
 | `save stdout` | write to standard output |
 | `print` | capture for the on-screen preview |
@@ -467,7 +468,7 @@ expr       = or ; or = and ('or' and)* ; and = cmp ('and' cmp)* ;
 cmp        = add (CMP add)? ; add = mul (('+'|'-') mul)* ; mul = primary (('*'|'/'|'%') primary)* ;
 primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
            | IDENT | '$_' field-tail | '$_:'N field-tail | 'item' '(' STRING ')' ;
-FMT        = 'csv' | 'json' | 'jsonl' | 'ndjson' ;
+FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
 CMP        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
 ```
 
