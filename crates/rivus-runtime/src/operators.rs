@@ -1435,15 +1435,12 @@ impl AggAcc {
                     0.0
                 }
             }
-            AggFunc::Std => {
-                if self.n > 1 {
-                    // Sample standard deviation (ddof=1): √((Σx² − Σx·mean)/(n−1)).
-                    let mean = self.sum / self.n as f64;
-                    let var = (self.sum_sq - self.sum * mean) / (self.n as f64 - 1.0);
-                    var.max(0.0).sqrt()
-                } else {
-                    0.0
-                }
+            // ddof=1 sample std needs ≥2 values; otherwise it falls to `_ => 0.0`.
+            AggFunc::Std if self.n > 1 => {
+                // Sample standard deviation (ddof=1): √((Σx² − Σx·mean)/(n−1)).
+                let mean = self.sum / self.n as f64;
+                let var = (self.sum_sq - self.sum * mean) / (self.n as f64 - 1.0);
+                var.max(0.0).sqrt()
             }
             _ => 0.0,
         }
