@@ -1323,3 +1323,42 @@ fn like_and_glob_chunk_size_independent() {
         assert!(l.errors.is_empty() && g.errors.is_empty());
     }
 }
+
+#[cfg(feature = "gzip")]
+#[test]
+fn gzip_csv_matches_uncompressed_oracle() {
+    use std::io::Write;
+
+    // Build a CSV, gzip it, and assert that reading the `.csv.gz` filters to the
+    // same rows as an independent oracle — across chunk sizes (so the single-pass
+    // reader's sample-buffer + stream split is exercised at every boundary).
+    let rows = 6_000usize;
+    let mut text = String::from("id,age\n");
+    let mut ge = 0u64;
+    let mut rng = Rng::new(11);
+    for i in 0..rows {
+        let age = rng.below(100);
+        text.push_str(&format!("{i},{age}\n"));
+        if age >= 50 {
+            ge += 1;
+        }
+    }
+
+    // Write a real .gz fixture with flate2 (available under the gzip feature).
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("rivus_gz_{}.csv.gz", std::process::id()));
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        enc.write_all(text.as_bytes()).unwrap();
+        enc.finish().unwrap();
+    }
+    let _guard = TempCsv(path.clone());
+    let p = path.display();
+
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(&format!("G:\n open {p}\n |? age >= 50\n;"), cs);
+        assert_eq!(res.total_rows_out(), ge, "gzip filter @cs={cs}");
+        assert!(res.errors.is_empty(), "gzip errors @cs={cs}");
+    }
+}

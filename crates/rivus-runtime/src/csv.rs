@@ -1063,6 +1063,204 @@ fn split_record(line: &str, delim: u8) -> Vec<String> {
     out
 }
 
+// ------------------------------------------------------------------ gzip input
+
+/// Streaming CSV reader for a **gzip-compressed** file (`.csv.gz` / `.tsv.gz`).
+///
+/// A compressed stream can't be seeked, so the two-pass / byte-range readers
+/// don't apply. Instead this does a single forward pass with *sample inference*:
+/// it reads and buffers the first `chunk_size` data rows, infers the schema from
+/// them (exactly like `open_preview`), then yields the whole file — buffered
+/// sample first, then the rest decoded on the fly. Bounded memory (one chunk of
+/// buffered rows + the decode buffer), serial, no parallelism. Inference is over
+/// a sample, so on a column whose type only "widens" after the sample (e.g. an
+/// int column that turns float/text deep in the file) it can mis-type — the
+/// documented trade-off for not being able to re-read a compressed stream.
+#[cfg(feature = "gzip")]
+pub struct GzCsvReader {
+    reader: BufReader<flate2::read::MultiGzDecoder<File>>,
+    ncols: usize,
+    keep: Vec<usize>,
+    dtypes: Vec<DataType>,
+    chunk_size: usize,
+    delim: u8,
+    /// Sample rows buffered during inference, emitted before streaming the rest.
+    pending: Vec<String>,
+    pending_pos: usize,
+    line: String,
+    eof: bool,
+    pub bad_rows: usize,
+}
+
+#[cfg(feature = "gzip")]
+impl GzCsvReader {
+    /// Open `path`, decode the gzip header, read the CSV header + a sample to
+    /// infer the schema, and return the reader positioned to yield every row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        path: &str,
+        allow: Option<&[String]>,
+        chunk_size: usize,
+        header: bool,
+        declared: Option<&[(String, Option<DataType>)]>,
+        delim: u8,
+    ) -> Result<(Schema, GzCsvReader), String> {
+        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut reader = BufReader::with_capacity(READ_BUF, flate2::read::MultiGzDecoder::new(f));
+
+        // Column names: a declared schema, else the header line, else c0,c1,….
+        // A header line is consumed when `header` even if `declared` overrides.
+        let mut first = String::new();
+        if reader.read_line(&mut first).map_err(|e| e.to_string())? == 0 {
+            return Err("empty gzip CSV".to_string());
+        }
+        let mut pending: Vec<String> = Vec::new();
+        let names: Vec<String> = if let Some(d) = declared {
+            if !header {
+                pending.push(trim_eol(&first).to_string()); // first line is data
+            }
+            d.iter().map(|(nm, _)| nm.clone()).collect()
+        } else if header {
+            split_owned(trim_eol(&first), delim)
+        } else {
+            let n = split_owned(trim_eol(&first), delim).len();
+            pending.push(trim_eol(&first).to_string());
+            (0..n).map(|i| format!("c{i}")).collect()
+        };
+        let ncols = names.len();
+        if ncols == 0 {
+            return Err("gzip CSV has no columns".to_string());
+        }
+        let keep: Vec<usize> = match allow {
+            None => (0..ncols).collect(),
+            Some(a) => (0..ncols)
+                .filter(|&i| a.iter().any(|n| n == &names[i]))
+                .collect(),
+        };
+
+        // Sample up to `chunk_size` data rows, buffering them and inferring types.
+        let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+        let mut bad = 0usize;
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
+        while pending.len() < chunk_size.max(1) {
+            let mut l = String::new();
+            if reader.read_line(&mut l).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            let t = trim_eol(&l);
+            if t.trim().is_empty() {
+                continue;
+            }
+            if !observe_line(t, ncols, &keep, &mut flags, &mut offsets, delim) {
+                bad += 1;
+                continue;
+            }
+            pending.push(t.to_string());
+        }
+        let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        apply_declared_types(&mut dtypes, &keep, declared);
+
+        let mut fields = Vec::with_capacity(keep.len());
+        for (k, &ci) in keep.iter().enumerate() {
+            fields.push(Field::new(names[ci].clone(), dtypes[k]));
+        }
+        let schema = Schema::new(fields);
+
+        Ok((
+            schema,
+            GzCsvReader {
+                reader,
+                ncols,
+                keep,
+                dtypes,
+                chunk_size: chunk_size.max(1),
+                delim,
+                pending,
+                pending_pos: 0,
+                line: String::new(),
+                eof: false,
+                bad_rows: bad,
+            },
+        ))
+    }
+
+    /// Push one record's kept cells into the per-column builders, honoring the
+    /// quoted slow path. Returns `false` for a wrong-arity record (skipped).
+    fn push_record(&self, builders: &mut [ColBuilder], line: &str) -> bool {
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(self.ncols);
+        if split_offsets(line, &mut offsets, self.delim) {
+            if offsets.len() != self.ncols {
+                return false;
+            }
+            for (k, &ci) in self.keep.iter().enumerate() {
+                let (s, e) = offsets[ci];
+                builders[k].push(&line[s..e]);
+            }
+        } else {
+            let fields = split_record(line, self.delim);
+            if fields.len() != self.ncols {
+                return false;
+            }
+            for (k, &ci) in self.keep.iter().enumerate() {
+                builders[k].push(&fields[ci]);
+            }
+        }
+        true
+    }
+
+    /// Yield the next chunk of up to `chunk_size` typed rows, or `None` at EOF.
+    pub fn next_columns(&mut self) -> Option<Vec<Column>> {
+        if self.eof && self.pending_pos >= self.pending.len() {
+            return None;
+        }
+        let mut builders: Vec<ColBuilder> = self
+            .dtypes
+            .iter()
+            .map(|d| ColBuilder::with_capacity(*d, self.chunk_size))
+            .collect();
+        let mut got = 0usize;
+
+        // Drain the buffered sample rows first (already arity-checked).
+        while got < self.chunk_size && self.pending_pos < self.pending.len() {
+            let idx = self.pending_pos;
+            self.pending_pos += 1;
+            // Borrow-safe: clone the small line out before the &mut builders call.
+            let line = std::mem::take(&mut self.pending[idx]);
+            if self.push_record(&mut builders, &line) {
+                got += 1;
+            }
+        }
+        // Then stream the rest of the file.
+        while got < self.chunk_size && !self.eof {
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.eof = true;
+                    break;
+                }
+            }
+            let t = trim_eol(&self.line).to_string();
+            if t.trim().is_empty() {
+                continue;
+            }
+            if self.push_record(&mut builders, &t) {
+                got += 1;
+            } else {
+                self.bad_rows += 1;
+            }
+        }
+        if got == 0 {
+            return None;
+        }
+        Some(builders.iter_mut().map(ColBuilder::finish).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

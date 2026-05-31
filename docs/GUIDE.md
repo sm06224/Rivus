@@ -67,6 +67,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH` | format from the extension (`.csv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSON) |
 | `open PATH as FMT` | force the format (`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
 | `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
+| `open PATH.gz` | **gzip-compressed** CSV/TSV (`.csv.gz` / `.tsv.gz`), opt-in `--features gzip` — serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`. e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros |
 | `readcsv PATH` | CSV, explicitly |

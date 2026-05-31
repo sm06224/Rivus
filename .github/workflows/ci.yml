@@ -70,6 +70,14 @@ jobs:
       - name: Test (regex feature)
         run: cargo test -p rivus-runtime --features regex
 
+      # Exercise the off-by-default `gzip` feature (flate2, pure-Rust backend)
+      # so the `.gz` source path stays green; default CI stays zero-dependency.
+      - name: Clippy (gzip feature)
+        run: cargo clippy -p rivus-runtime -p rivus-cli --features rivus-cli/gzip --all-targets
+
+      - name: Test (gzip feature)
+        run: cargo test -p rivus-runtime --features gzip
+
       - name: Build release
         run: cargo build --workspace --release
 

@@ -597,6 +597,12 @@ fn source_path(op: &Op) -> Option<&str> {
     }
 }
 
+/// Is this source path gzip-compressed? Such sources are read serially in a
+/// single pass (a compressed stream can't be seeked for byte-range parallelism).
+fn is_gzip_source(path: &str) -> bool {
+    path != "-" && path.to_ascii_lowercase().ends_with(".gz")
+}
+
 /// Rank for escalating runtime modes when merging parallel partitions.
 fn mode_rank(m: Mode) -> u8 {
     match m {
@@ -694,6 +700,13 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
     // A sink-less preview (CLI `rivus run open big.csv`) wants the instant,
     // bounded-memory serial path — never materialize for it.
     if opts.max_capture.is_some() && !must_drain(graph) {
+        return None;
+    }
+
+    // A gzip source can't be seeked (so no byte-range parallel or two-pass) and
+    // its on-disk size is the *compressed* size — force the serial, single-pass
+    // streaming reader (bounded memory), which `run()` falls through to.
+    if source_path(&graph.nodes[src_id].op).is_some_and(is_gzip_source) {
         return None;
     }
 

@@ -21,3 +21,4 @@ rivus-runtime.workspace = true
 [features]
 default = []
 regex = ["rivus-runtime/regex"]
+gzip = ["rivus-runtime/gzip"]

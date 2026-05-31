@@ -29,6 +29,20 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **gzip input: `open data.csv.gz` (opt-in `--features gzip`).** Reads
+  gzip-compressed CSV/TSV (`.csv.gz` / `.tsv.gz`) through `flate2`'s pure-Rust
+  `miniz_oxide` backend (no C toolchain). A compressed stream can't be seeked,
+  so this uses a **serial, single-pass** reader with *sample inference* (buffer
+  the first chunk of rows, infer the schema, then stream the rest) — bounded
+  memory, no byte-range parallelism (the engine forces `.gz` sources serial).
+  **The default build stays zero-dependency**: the dependency is optional and
+  feature-gated, and a default binary reading a `.gz` raises an actionable error
+  (`rebuild with --features gzip`). The `.gz` suffix is stripped before the
+  delimiter is chosen, so `.tsv.gz` is still tab-delimited. Vetted per
+  `docs/SUPPLY-CHAIN.md` (flate2 + its pure-Rust tree; `cargo deny check
+  --all-features` green). Oracle-tested across chunk sizes. Sample inference is
+  the documented trade-off: a type that only widens deep past the sample can
+  mis-infer (unlike the seekable two-pass reader).
 - **Left outer join: `A &left B on key` (std-only).** Alongside the inner join
   (`A & B`), `&left` keeps every left row; an unmatched left row is emitted once
   with the right columns padded to type defaults (`0` / `0.0` / `false` / empty

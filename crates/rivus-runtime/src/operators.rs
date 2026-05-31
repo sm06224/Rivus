@@ -109,6 +109,11 @@ fn read_input(path: &str) -> std::io::Result<String> {
     }
 }
 
+/// A `.gz` source path needs the single-pass gzip reader (feature `gzip`).
+fn is_gzip_path(path: &str) -> bool {
+    path != "-" && path.to_ascii_lowercase().ends_with(".gz")
+}
+
 /// Write a text sink: the `-` sentinel writes stdout, otherwise a file.
 fn write_output(path: &str, data: &str) -> std::io::Result<()> {
     if path == "-" {
@@ -294,6 +299,9 @@ struct SourceCsv {
     schema: Arc<Schema>,
     /// Streaming reader for a real file; `None` for stdin / after a load error.
     stream: Option<csv::CsvChunker>,
+    /// Streaming reader for a gzip file (`--features gzip`); single-pass.
+    #[cfg(feature = "gzip")]
+    gz_stream: Option<csv::GzCsvReader>,
     /// Buffered fallback (stdin): pre-parsed columns sliced by `pull`.
     columns: Vec<Column>,
     cursor: usize,
@@ -324,6 +332,8 @@ impl SourceCsv {
             delim,
             schema: Schema::empty(),
             stream: None,
+            #[cfg(feature = "gzip")]
+            gz_stream: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -345,6 +355,8 @@ impl SourceCsv {
             delim: b',',
             schema,
             stream: Some(chunker),
+            #[cfg(feature = "gzip")]
+            gz_stream: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -355,6 +367,8 @@ impl SourceCsv {
         self.loaded = true;
         if self.path == "-" {
             self.load_stdin(ctx);
+        } else if is_gzip_path(&self.path) {
+            self.load_gzip(ctx);
         } else {
             match csv::CsvChunker::open(
                 &self.path,
@@ -386,6 +400,53 @@ impl SourceCsv {
                 ),
             }
         }
+    }
+
+    /// Open a `.gz` source via the single-pass gzip reader (feature `gzip`).
+    /// Without the feature, raise a fatal, actionable error.
+    #[cfg(feature = "gzip")]
+    fn load_gzip(&mut self, ctx: &mut OpCtx) {
+        match csv::GzCsvReader::open(
+            &self.path,
+            self.projection.as_deref(),
+            self.chunk_size,
+            self.header,
+            self.declared.as_deref(),
+            self.delim,
+        ) {
+            Ok((schema, reader)) => {
+                if reader.bad_rows > 0 {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Recoverable,
+                            ErrorScope::Item,
+                            format!("{} malformed row(s) skipped", reader.bad_rows),
+                        )
+                        .at_node(ctx.label.clone()),
+                    );
+                }
+                self.schema = Arc::new(schema);
+                self.gz_stream = Some(reader);
+            }
+            Err(e) => ctx.raise(
+                ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
+            ),
+        }
+    }
+
+    #[cfg(not(feature = "gzip"))]
+    fn load_gzip(&mut self, ctx: &mut OpCtx) {
+        ctx.raise(
+            ErrorEvent::new(
+                Severity::Fatal,
+                ErrorScope::Graph,
+                format!(
+                    "'{}' is gzip-compressed; rebuild with `--features gzip` to read it",
+                    self.path
+                ),
+            )
+            .at_node(ctx.label.clone()),
+        );
     }
 
     fn load_stdin(&mut self, ctx: &mut OpCtx) {
@@ -437,6 +498,12 @@ impl Operator for SourceCsv {
         }
         if let Some(chunker) = self.stream.as_mut() {
             let cols = chunker.next_columns()?;
+            let id = ctx.fresh_id();
+            return Some(Chunk::new(id, self.schema.clone(), cols));
+        }
+        #[cfg(feature = "gzip")]
+        if let Some(gz) = self.gz_stream.as_mut() {
+            let cols = gz.next_columns()?;
             let id = ctx.fresh_id();
             return Some(Chunk::new(id, self.schema.clone(), cols));
         }

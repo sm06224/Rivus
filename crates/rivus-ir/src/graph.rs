@@ -322,7 +322,12 @@ pub const COMMA: u8 = b',';
 /// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
 /// feature — `open f.tsv` and `save out.tsv` just work.
 pub fn delim_for_path(path: &str) -> u8 {
-    let lower = path.to_ascii_lowercase();
+    let mut lower = path.to_ascii_lowercase();
+    // A compression suffix doesn't change the field delimiter: `.tsv.gz` is
+    // still tab-delimited. Strip it before checking the data extension.
+    if let Some(stripped) = lower.strip_suffix(".gz") {
+        lower = stripped.to_string();
+    }
     if lower.ends_with(".tsv") || lower.ends_with(".tab") {
         b'\t'
     } else {
