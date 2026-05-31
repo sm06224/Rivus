@@ -387,3 +387,21 @@ optimizer lifts `age>=50` onto the CSV source, so the reader skips *building*
 the `name` column for the ~half of rows the predicate drops (4.1 s → 3.0 s).
 The downstream FilterProject stays authoritative, so output is byte-identical
 (gated by `tests/optimizer_equiv.rs`).
+
+### Negative result — SWAR delimiter scan (not landed)
+
+Tried replacing the per-byte delimiter loop in `split_offsets` with a
+dependency-free SWAR (SIMD-within-a-register) word-at-a-time scan (8 bytes/step,
+the `(x-0x01..)&!x&0x80..` zero-byte trick, no `unsafe`). Measured on a 92 MiB /
+3 M-row CSV (`filter age>=50`, project `name age`, write), release, 3 runs each:
+
+| scan | time |
+|---|---:|
+| scalar byte loop | 1.13 s |
+| SWAR 8-byte | 1.14 s |
+
+**No measurable win** — IO and typed column-building dominate this path, not the
+delimiter split. Per the project rule ("'faster' is never asserted without a
+measured number"), the change was dropped rather than add a hand-rolled bit
+trick for nothing. Revisit only if a future profile shows the split as hot
+(e.g. after mmap + buffer-reuse remove the IO/alloc overhead).
