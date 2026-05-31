@@ -383,6 +383,24 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `reorder COL [COL ...]` — move named columns to the front.
+                Tok::Word(w) if w == "reorder" => {
+                    self.bump();
+                    let mut cols = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump();
+                        cols.push(name);
+                    }
+                    if cols.is_empty() {
+                        return Err(self.err("reorder expects at least one column name"));
+                    }
+                    let n = self.g.add_node(Op::Reorder { cols });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
                 // `rename OLD NEW [OLD NEW ...]` — rename columns in place.
                 Tok::Word(w) if w == "rename" => {
                     self.bump();
@@ -1101,6 +1119,7 @@ fn is_keyword(w: &str) -> bool {
             | "dropna"
             | "fill"
             | "drop"
+            | "reorder"
             | "rename"
             | "where"
             | "on"
@@ -1502,6 +1521,23 @@ Import:
         assert!(s.contains("rename age years"), "got: {s}");
         assert!(s.contains("drop city"), "got: {s}");
         assert_eq!(s, parse(&s).unwrap().to_source());
+    }
+
+    #[test]
+    fn reorder_parses_and_round_trips() {
+        match nth_op("F:\n open a.csv\n reorder city age\n;", 1) {
+            Op::Reorder { cols } => {
+                assert_eq!(cols, vec!["city".to_string(), "age".to_string()])
+            }
+            o => panic!("expected Reorder, got {o:?}"),
+        }
+        let s = parse("F:\n open a.csv\n reorder city age\n;")
+            .unwrap()
+            .to_source();
+        assert!(s.contains("reorder city age"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+        // Empty operand list is rejected.
+        assert!(parse("F:\n open a.csv\n reorder\n;").is_err());
     }
 
     #[test]

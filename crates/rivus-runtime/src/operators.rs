@@ -242,6 +242,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             pairs: pairs.clone(),
         }),
         Op::Drop { cols } => Box::new(Drop { cols: cols.clone() }),
+        Op::Reorder { cols } => Box::new(Reorder { cols: cols.clone() }),
         Op::ProjectExpr { items } => Box::new(ProjectExpr {
             items: items.clone(),
         }),
@@ -1552,6 +1553,47 @@ impl Operator for Drop {
             .map(|&i| chunk.schema.fields[i].clone())
             .collect();
         let columns: Vec<Column> = keep.iter().map(|&i| chunk.columns[i].clone()).collect();
+        let schema = Arc::new(Schema::new(fields));
+        let mut out = Chunk::new(chunk.meta.id, schema, columns);
+        out.meta = chunk.meta.clone();
+        vec![out]
+    }
+}
+
+/// `reorder COL [COL ...]` — move the named columns to the front in the given
+/// order; the remaining columns follow in their original order. Unknown names
+/// are ignored. Stateless, streaming, type/value preserving (a permutation).
+struct Reorder {
+    cols: Vec<String>,
+}
+
+impl Operator for Reorder {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        // Front: the named columns that exist, in request order (dedup so a
+        // repeated name doesn't duplicate a column). Then every other column in
+        // its original order.
+        let mut order: Vec<usize> = Vec::with_capacity(chunk.schema.fields.len());
+        for name in &self.cols {
+            if let Some(i) = chunk.schema.index_of(name) {
+                if !order.contains(&i) {
+                    order.push(i);
+                }
+            }
+        }
+        for i in 0..chunk.schema.fields.len() {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+        // A no-op permutation (already in this order) passes through untouched.
+        if order.iter().enumerate().all(|(pos, &i)| pos == i) {
+            return vec![chunk];
+        }
+        let fields: Vec<Field> = order
+            .iter()
+            .map(|&i| chunk.schema.fields[i].clone())
+            .collect();
+        let columns: Vec<Column> = order.iter().map(|&i| chunk.columns[i].clone()).collect();
         let schema = Arc::new(Schema::new(fields));
         let mut out = Chunk::new(chunk.meta.id, schema, columns);
         out.meta = chunk.meta.clone();

@@ -1291,6 +1291,48 @@ fn rename_and_drop_are_chunk_size_independent() {
 }
 
 #[test]
+fn reorder_is_chunk_size_independent() {
+    // `reorder city age` moves those columns to the front; the rest follow in
+    // original order. A permutation — types/values preserved, row count and
+    // schema independent of chunk size.
+    let rows = 12_000;
+    let mut rng = Rng::new(17);
+    let mut text = String::from("id,name,age,city\n");
+    let mut ages: Vec<u64> = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let age = rng.below(90);
+        ages.push(age);
+        text.push_str(&format!("{i},user,{age},NYC\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_reorder", text.as_bytes()));
+    let p = f.0.display();
+    let src = format!("R:\n open {p}\n reorder city age\n;");
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(&src, cs);
+        assert!(res.errors.is_empty(), "errors @cs={cs}");
+        let out = &res.outputs[0];
+        let total: usize = out.chunks.iter().map(|c| c.len).sum();
+        assert_eq!(total, rows, "row count @cs={cs}");
+        assert_eq!(
+            out.chunks[0].schema.field_names(),
+            vec!["city", "age", "id", "name"],
+            "reordered schema @cs={cs}"
+        );
+    }
+    // `age` values survive the permutation, in order.
+    let res = run_src(&src, 4096);
+    let out = &res.outputs[0];
+    let mut got = Vec::with_capacity(rows);
+    for c in &out.chunks {
+        let ai = c.schema.index_of("age").unwrap();
+        for r in 0..c.len {
+            got.push(c.value(r, ai).as_f64().unwrap() as u64);
+        }
+    }
+    assert_eq!(got, ages, "reordered column values preserved in order");
+}
+
+#[test]
 fn case_when_is_chunk_size_independent() {
     // `case when … then … else … end` computed column buckets each row by its
     // age band, identically across chunk sizes.

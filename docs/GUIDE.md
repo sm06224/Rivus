@@ -220,6 +220,21 @@ open data.csv describe save stdout as csv
 # name,str,1000,,,
 ```
 
+### `rename` / `drop` / `reorder` — column shape
+
+Stateless, streaming column operations (no `|>` needed):
+
+```
+rename age years city loc   # rename in place: age→years, city→loc
+drop zip notes              # remove columns, keep the rest in order
+reorder name id             # move name,id to the front; rest follow in order
+```
+
+`rename` keeps each column's position, type and values (unknown names warn);
+`drop` removes the named columns (unknown names are ignored); `reorder` is a
+pure permutation that floats the named columns to the front (unknown names
+ignored, duplicates deduped). All three round-trip through `to_source`.
+
 ### Composing them
 
 Transforms chain in any order:
@@ -509,7 +524,7 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'distinct' IDENT*
            | 'describe'
            | 'dropna' IDENT* | 'fill' IDENT (VALUE | 'ffill' | 'bfill' | 'mean' | 'median')
-           | 'rename' (IDENT IDENT)+ | 'drop' IDENT+
+           | 'rename' (IDENT IDENT)+ | 'drop' IDENT+ | 'reorder' IDENT+
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)

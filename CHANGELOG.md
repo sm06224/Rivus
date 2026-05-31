@@ -29,6 +29,13 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **`reorder COL [COL ...]` column reordering (std-only).** Moves the named
+  columns to the front in the given order; every other column follows in its
+  original order. Unknown names are ignored and a repeated name is deduped. A
+  pure permutation — types and values are untouched, stateless and streaming
+  (works on the parallel path), and round-trips through `to_source`. Completes
+  the `rename` / `drop` / `reorder` trio. Oracle-tested (schema + values
+  chunk-size independent). No new dependencies.
 - **String functions `replace` / `split_part` / `concat` (std-only).** Usable
   anywhere an expression is (computed columns, filters). `replace(s, from, to)`
   swaps every literal occurrence (an empty `from` is a no-op); `split_part(s,

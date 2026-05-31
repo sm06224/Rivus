@@ -302,6 +302,10 @@ pub enum Op {
     /// projection, but resolved against the live schema since `drop` names the
     /// columns to remove rather than the ones to keep.)
     Drop { cols: Vec<String> },
+    /// `reorder COL [COL ...]` — move the named columns to the front in the
+    /// given order; all other columns follow in their original order. Unknown
+    /// names are ignored. Streaming, stateless, type/value preserving.
+    Reorder { cols: Vec<String> },
     /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
     /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
     GroupBy {
@@ -404,6 +408,7 @@ impl Op {
             Op::Fill { .. } => "fill",
             Op::Rename { .. } => "rename",
             Op::Drop { .. } => "drop",
+            Op::Reorder { .. } => "reorder",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -539,6 +544,7 @@ impl Op {
                 format!("rename {}", parts.join(" "))
             }
             Op::Drop { cols } => format!("drop {}", cols.join(" ")),
+            Op::Reorder { cols } => format!("reorder {}", cols.join(" ")),
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {
