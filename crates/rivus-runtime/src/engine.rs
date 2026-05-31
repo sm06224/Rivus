@@ -140,9 +140,19 @@ pub fn run_with_progress(
         res.strategy = has_file_source.then(|| format!("{note}; {why}"));
         return Ok(res);
     }
+    // A live hook (TUI / --serve) forces this serial path so the dashboard sees
+    // a single coherent stream. If the autotuner would otherwise have gone
+    // parallel, say so in the rationale rather than mislabel the run "parallel".
+    let live = hook.is_some();
     let ops = build_ops(graph, &opts, None, preview);
     let mut res = drive(graph, ops, 0, opts.progress, opts.max_capture, hook);
-    res.strategy = has_file_source.then(|| note.clone());
+    res.strategy = has_file_source.then(|| {
+        if live && strat == crate::analytics::Strategy::Parallel {
+            format!("{note}; live observation → serial")
+        } else {
+            note.clone()
+        }
+    });
     Ok(res)
 }
 

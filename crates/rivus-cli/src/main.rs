@@ -240,11 +240,11 @@ fn main() -> ExitCode {
             // Live dashboard: run the flow on a worker thread that publishes
             // snapshots to a Hub, and serve the embedded HTML/SSE UI here.
             if let Some(addr) = &serve_addr {
-                return run_served(&graph, addr, chunk_size);
+                return run_served(&graph, addr, chunk_size, memory);
             }
             // `--tui`: repaint a live ANSI frame on stderr each tick.
             if tui {
-                return run_tui(&graph, chunk_size);
+                return run_tui(&graph, chunk_size, memory);
             }
             // Live progress only when stderr is a terminal (keep logs/pipes
             // clean) and not in JSONL mode.
@@ -313,7 +313,12 @@ fn send_telemetry(addr: &str, jsonl: &str) -> std::io::Result<()> {
 /// `rivus run … --serve [ADDR]`: run the flow on a worker thread that publishes
 /// live snapshots to a [`serve::Hub`], while this thread serves the embedded
 /// HTML/SSE dashboard. Falls back to a plain run if the address can't be bound.
-fn run_served(graph: &rivus_ir::PlanGraph, addr: &str, chunk_size: usize) -> ExitCode {
+fn run_served(
+    graph: &rivus_ir::PlanGraph,
+    addr: &str,
+    chunk_size: usize,
+    memory: MemoryPref,
+) -> ExitCode {
     let (listener, local) = match serve::bind(addr) {
         Ok(x) => x,
         Err(e) => {
@@ -324,7 +329,7 @@ fn run_served(graph: &rivus_ir::PlanGraph, addr: &str, chunk_size: usize) -> Exi
                     chunk_size,
                     progress: false,
                     max_capture: Some(1000),
-                    memory: MemoryPref::Low,
+                    memory,
                 },
             ) {
                 Ok(res) if res.final_mode == rivus_core::Mode::Halted => ExitCode::FAILURE,
@@ -350,7 +355,7 @@ fn run_served(graph: &rivus_ir::PlanGraph, addr: &str, chunk_size: usize) -> Exi
                 chunk_size,
                 progress: false,
                 max_capture: Some(1000),
-                memory: MemoryPref::Low,
+                memory,
             },
             Some(&mut hook),
         );
@@ -371,7 +376,7 @@ fn run_served(graph: &rivus_ir::PlanGraph, addr: &str, chunk_size: usize) -> Exi
 /// `rivus run … --tui`: repaint a live ANSI dashboard frame on stderr each tick
 /// (Pillar B, B1). Uses the same progress hook as `--serve`; the run stays on
 /// the serial path so frames are coherent.
-fn run_tui(graph: &rivus_ir::PlanGraph, chunk_size: usize) -> ExitCode {
+fn run_tui(graph: &rivus_ir::PlanGraph, chunk_size: usize, memory: MemoryPref) -> ExitCode {
     use std::io::Write as _;
     let to_tty = std::io::stderr().is_terminal();
     let mut hook = |s: &RuntimeSnapshot| {
@@ -391,7 +396,7 @@ fn run_tui(graph: &rivus_ir::PlanGraph, chunk_size: usize) -> ExitCode {
             chunk_size,
             progress: false,
             max_capture: Some(1000),
-            memory: MemoryPref::Low,
+            memory,
         },
         Some(&mut hook),
     ) {

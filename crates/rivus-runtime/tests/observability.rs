@@ -475,3 +475,59 @@ fn string_prefilter_engages_on_parallel_path() {
         "parallel prefilter-skip telemetry must sum to (total − matching)"
     );
 }
+
+/// #36: a live progress hook (TUI / --serve) forces the serial path so the
+/// dashboard sees one coherent stream. When the autotuner would otherwise pick
+/// parallel, the surfaced rationale must say so ("live observation → serial")
+/// rather than mislabel the run "parallel", and no per-worker telemetry appears.
+#[test]
+fn live_hook_forces_serial_and_says_so() {
+    let rows = 50_000usize;
+    let csv = TempCsv(gendata::write_temp(
+        "obs_live_serial",
+        &gendata::clean(rows, 5),
+    ));
+    let mut out = csv.0.clone();
+    out.set_extension("live.out.csv");
+    let _oguard = TempCsv(out.clone());
+    let src = format!(
+        "F:\n open {}\n |? age >= 30\n |> name age\n save {}\n;",
+        csv.0.display(),
+        out.display()
+    );
+    let graph = rivus_parser::parse(&src).expect("parse");
+    let (graph, _r) = rivus_optimizer::optimize(graph);
+
+    // Push the autotuner toward parallel (multicore + zero threshold), then
+    // attach a hook — the engine must still run serial and label it honestly.
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_CPUS", "4");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let mut frames = 0usize;
+    let mut hook = |_snap: &RuntimeSnapshot| {
+        frames += 1;
+    };
+    let res = run_with_progress(
+        &graph,
+        RunOptions {
+            chunk_size: 4096,
+            memory: rivus_runtime::MemoryPref::Auto,
+            ..Default::default()
+        },
+        Some(&mut hook),
+    )
+    .expect("run_with_progress");
+    std::env::remove_var("RIVUS_CPUS");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    assert!(
+        res.workers.is_empty(),
+        "a live (hooked) run must be serial, with no worker breakdown"
+    );
+    assert!(frames > 0, "the hook must observe at least one snapshot");
+    let note = res.strategy.unwrap_or_default();
+    assert!(
+        note.contains("live observation → serial"),
+        "live run must label its serial fallback honestly, got: {note}"
+    );
+}

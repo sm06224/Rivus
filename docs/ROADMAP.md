@@ -95,7 +95,7 @@ read-throughput, in priority order:
 |---|---|---|
 | ✅ | Live progress, execution-graph viz, error stream | |
 | ✅ | Structured telemetry stream (JSONL on stderr/socket) | **done** — `rivus run … --json` emits one JSON object per node (counters: chunks/rows in·out, busy_ms, rows/s, selectivity, mode) + per error event + a summary; stdout stays clean. `--telemetry-addr HOST:PORT` streams the same JSONL to a TCP socket (a live feed for an external viewer), falling back to stderr on a connection error. std-only (no serde, `std::net`). |
-| ✅ | Live dashboard (TUI + browser) | **done** (Epic #30 Pillar B) — `rivus run … --tui` repaints an ANSI dashboard on stderr; `--serve [ADDR]` runs a std-only HTTP/1.1 + SSE server (embedded HTML/JS/SVG at `GET /`, `GET /snapshot`, live `GET /events`). Browser does the drawing; Rust ships JSON snapshots from `RuntimeSnapshot`. Zero new deps. |
+| ✅ | Live dashboard (TUI + browser) | **done** (Epic #30 Pillar B) — `rivus run … --tui` repaints an ANSI dashboard on stderr; `--serve [ADDR]` runs a std-only HTTP/1.1 + SSE server (embedded HTML/JS/SVG at `GET /`, `GET /snapshot`, live `GET /events`). Browser does the drawing; Rust ships JSON snapshots from `RuntimeSnapshot`. Zero new deps. **#36**: `--tui`/`--serve` now honor `--memory` (live observation still runs serial for a coherent stream, and the surfaced strategy says so — `…→ parallel; live observation → serial`); per-worker breakdown (A2) exposed in the `--json` summary as `worker_breakdown`; serve hardened with a read timeout + connection cap. |
 | 📋 | `\| view` interactive grid (Out-GridView), live analytics GUI | design doc 19; streaming, never full-materialize |
 | 📋 | Shell completion from IR/schema; nushell value interop | design doc 19 |
 

@@ -370,3 +370,45 @@ fn serve_dashboard_responds_over_http() {
     let _ = std::fs::remove_file(&csv);
     let _ = std::fs::remove_file(&out);
 }
+
+/// #36 (A2 exposure): a parallel run's `--json` summary carries a
+/// `worker_breakdown` array (per-worker rows_out / busy), not just the count.
+/// We force the streaming-parallel reader with `RIVUS_PARALLEL_MIN_BYTES=0`.
+#[test]
+fn json_summary_exposes_worker_breakdown_on_parallel_runs() {
+    // A file with enough rows to split into ≥2 byte ranges, and a real `save`
+    // sink (parallel needs a file sink).
+    let mut body = String::from("id,age\n");
+    for i in 0..20_000u32 {
+        body.push_str(&format!("{i},{}\n", i % 90));
+    }
+    let csv = tmp_csv("wbreak_src", &body);
+    let mut out = csv.clone();
+    out.set_extension("wbreak.out.csv");
+    let prog = format!(
+        "F:\n open {}\n |? age >= 30\n |> id age\n save {}\n;",
+        csv.display(),
+        out.display()
+    );
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rivus"))
+        .args(["run", "-c", &prog, "--json"])
+        .env("RIVUS_PARALLEL_MIN_BYTES", "0")
+        .env_remove("RIVUS_NO_PARALLEL")
+        .output()
+        .expect("run rivus --json");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let summary = stderr
+        .lines()
+        .find(|l| l.contains("\"event\":\"summary\""))
+        .expect("a summary line on stderr");
+    assert!(
+        summary.contains("\"workers\":"),
+        "parallel summary must report a worker count: {summary}"
+    );
+    assert!(
+        summary.contains("\"worker_breakdown\":[{\"worker\":0,"),
+        "parallel summary must expose the per-worker breakdown: {summary}"
+    );
+    let _ = std::fs::remove_file(&out);
+}

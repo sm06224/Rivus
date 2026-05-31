@@ -276,6 +276,22 @@ pub fn render_telemetry_jsonl(graph: &PlanGraph, res: &RunResult) -> String {
     o.num("parse_busy_ms", parse_busy_ms);
     if !res.workers.is_empty() {
         o.num("workers", res.workers.len() as f64);
+        // A2 exposure (#36): per-worker rows_out / busy so parallel skew is
+        // visible, not just the worker count. Hand-rolled JSON array.
+        let mut arr = String::from("[");
+        for (i, w) in res.workers.iter().enumerate() {
+            if i > 0 {
+                arr.push(',');
+            }
+            arr.push_str(&format!(
+                "{{\"worker\":{},\"rows_out\":{},\"busy_ms\":{:.3}}}",
+                w.worker,
+                w.rows_out,
+                w.busy.as_secs_f64() * 1000.0
+            ));
+        }
+        arr.push(']');
+        o.raw("worker_breakdown", &arr);
     }
     // A4: columns whose inferred type widened (int→float). Summary-only; the
     // node/error line contract stays byte-stable.
@@ -355,6 +371,12 @@ impl JsonObj {
     fn null(&mut self, k: &str) {
         self.key(k);
         self.buf.push_str("null");
+    }
+    /// Emit `key:json` with the value inserted verbatim (already-valid JSON,
+    /// e.g. a nested array). Used for the per-worker breakdown (A2 exposure).
+    fn raw(&mut self, k: &str, json: &str) {
+        self.key(k);
+        self.buf.push_str(json);
     }
     fn finish(mut self) -> String {
         self.buf.push('}');
