@@ -274,7 +274,10 @@ pub enum Op {
     /// blocking operator (buffers every row, emits on finish); the sort is
     /// stable, so equal keys keep source order and the result is chunk-size
     /// independent. Pipeline-breaker for the parallel executor.
-    Sort { key: String, desc: bool },
+    /// `sort KEY [asc|desc] [KEY [asc|desc] ...]` — order the whole stream by
+    /// one or more keys, each with its own direction (default ascending).
+    /// Blocking (buffers all rows) → serial path.
+    Sort { keys: Vec<(String, bool)> },
     /// `distinct [KEY ...]` — drop duplicate rows, keeping the first occurrence.
     /// With no keys, the whole row is the dedup key; otherwise only the named
     /// columns. Streaming (emits as it goes) but stateful (a global seen-set),
@@ -531,12 +534,18 @@ impl Op {
                 format!("|> {}", parts.join(" "))
             }
             Op::Take { n } => format!("take {n}"),
-            Op::Sort { key, desc } => {
-                if *desc {
-                    format!("sort {key} desc")
-                } else {
-                    format!("sort {key}")
-                }
+            Op::Sort { keys } => {
+                let parts: Vec<String> = keys
+                    .iter()
+                    .map(|(k, desc)| {
+                        if *desc {
+                            format!("{k} desc")
+                        } else {
+                            k.clone()
+                        }
+                    })
+                    .collect();
+                format!("sort {}", parts.join(" "))
             }
             Op::Distinct { keys } => {
                 if keys.is_empty() {

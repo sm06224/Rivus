@@ -60,7 +60,7 @@ it in small, gated steps.
 
 | | item | note |
 |---|---|---|
-| ✅ | filter · project · group(sum/avg/min/max/count, **multi-key**) · sort · distinct · take | `\|# country region sum:score` groups by the column tuple |
+| ✅ | filter · project · group(sum/avg/min/max/count, **multi-key**) · **multi-key sort** · distinct · take | `\|# country region sum:score`; `sort team score desc` (per-key direction) |
 | ✅ | **Joins (hash join)** | `A & B on k` **inner**, `A &left B`, `A &right B`, `A &full B`, plus **composite keys** `on k1 k2 …` (join on the column tuple) all done (outer joins pad the missing side with type defaults and preserve the join keys; build side buffered, a pipeline-breaker like sort). |
 | ✅ | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅, `fill col VALUE` ✅, `fill col ffill\|bfill` ✅ (directional carry across chunks), **`fill col mean\|median`** ✅ (whole-column statistic over the non-empty numeric cells). All chunk-size independent; bfill/mean/median are pipeline-breakers. Declare a column `:str` so its blanks survive parsing (a numeric column's blank becomes 0 at parse time). |
 | ✅ | More aggregates | `std` (sample), `count_distinct`/`nunique`, `first`, `last`, `median`/`pNN` percentiles (linear interp) all done |

@@ -833,6 +833,51 @@ fn sort_orders_rows_chunk_size_independent() {
 }
 
 #[test]
+fn multi_key_sort_orders_by_each_key_chunk_size_independent() {
+    // `sort team score desc` orders by team ascending, then by score descending
+    // within a team. Build rows with deliberate team ties so the secondary key
+    // is exercised; compare against an independent Rust sort, every chunk size.
+    let rows = 12_000usize;
+    let mut rng = Rng::new(23);
+    let mut text = String::from("team,score\n");
+    let mut tuples: Vec<(i64, i64)> = Vec::with_capacity(rows); // (team, score)
+    for _ in 0..rows {
+        let team = rng.below(5) as i64; // few teams → many ties
+        let score = rng.below(1000) as i64;
+        text.push_str(&format!("{team},{score}\n"));
+        tuples.push((team, score));
+    }
+    // Oracle: team asc, then score desc.
+    let mut want = tuples.clone();
+    want.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    let f = TempCsv(gendata::write_temp_bytes("stress_msort", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(&format!("S:\n open {p}\n sort team score desc\n;"), cs);
+        let out = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("S"))
+            .unwrap();
+        let mut got: Vec<(i64, i64)> = Vec::with_capacity(rows);
+        for c in &out.chunks {
+            let (ti, si) = (
+                c.schema.index_of("team").unwrap(),
+                c.schema.index_of("score").unwrap(),
+            );
+            for r in 0..c.len {
+                got.push((
+                    c.value(r, ti).as_f64().unwrap() as i64,
+                    c.value(r, si).as_f64().unwrap() as i64,
+                ));
+            }
+        }
+        assert_eq!(got, want, "multi-key sort @cs={cs}");
+    }
+}
+
+#[test]
 fn distinct_dedups_chunk_size_independent() {
     let rows = 20_000;
     let seed = 11;

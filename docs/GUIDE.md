@@ -166,14 +166,16 @@ limit 100       # alias
 head 100        # alias
 ```
 
-### `sort` — order by a key
+### `sort` — order by one or more keys
 
 A stable sort over the whole stream (a blocking step). Ties keep source order.
+Multiple keys sort by each in turn, each with its own direction.
 
 ```
-sort age            # ascending (default)
+sort age              # ascending (default)
 sort age asc
 sort score desc
+sort team score desc  # team ascending, then score descending within a team
 ```
 
 ### `distinct` — drop duplicates
@@ -525,7 +527,7 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
            | ('take'|'limit'|'head') INT
-           | 'sort' IDENT ('asc'|'desc')?
+           | 'sort' (IDENT ('asc'|'desc')?)+
            | 'distinct' IDENT*
            | 'describe'
            | 'dropna' IDENT* | 'fill' IDENT (VALUE | 'ffill' | 'bfill' | 'mean' | 'median')

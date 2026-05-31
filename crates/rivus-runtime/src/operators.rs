@@ -224,7 +224,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Take { n } => Box::new(Take { remaining: *n }),
-        Op::Sort { key, desc } => Box::new(Sort::new(key.clone(), *desc)),
+        Op::Sort { keys } => Box::new(Sort::new(keys.clone())),
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
         Op::Describe => Box::new(Describe::default()),
         Op::DropNa { cols } => Box::new(DropNa { cols: cols.clone() }),
@@ -898,17 +898,15 @@ impl Operator for Take {
 /// the output independent of `chunk_size`; ties keep source order for both
 /// ascending and descending.
 struct Sort {
-    key: String,
-    desc: bool,
+    keys: Vec<(String, bool)>,
     buf: Vec<Chunk>,
     emitted: bool,
 }
 
 impl Sort {
-    fn new(key: String, desc: bool) -> Self {
+    fn new(keys: Vec<(String, bool)>) -> Self {
         Sort {
-            key,
-            desc,
+            keys,
             buf: Vec::new(),
             emitted: false,
         }
@@ -952,30 +950,36 @@ impl Operator for Sort {
         }
         let total = cols.first().map(|c| c.len()).unwrap_or(0);
 
-        let mut idx: Vec<usize> = (0..total).collect();
-        match schema.index_of(&self.key) {
-            Some(ki) => {
-                let key_col = &cols[ki];
-                let desc = self.desc;
-                idx.sort_by(|&a, &b| {
-                    let o = cmp_rows(key_col, a, b);
-                    if desc {
-                        o.reverse()
-                    } else {
-                        o
-                    }
-                });
-            }
-            None => {
-                ctx.raise(
+        // Resolve each sort key to (column index, descending). An unknown key
+        // warns once and is skipped (continue-first); if none resolve the stream
+        // is emitted in source order.
+        let mut key_cols: Vec<(usize, bool)> = Vec::with_capacity(self.keys.len());
+        for (k, desc) in &self.keys {
+            match schema.index_of(k) {
+                Some(ki) => key_cols.push((ki, *desc)),
+                None => ctx.raise(
                     ErrorEvent::new(
                         Severity::Warn,
                         ErrorScope::Chunk,
-                        format!("sort: unknown key '{}' (emitting unsorted)", self.key),
+                        format!("sort: unknown key '{k}' (ignored)"),
                     )
                     .at_node(ctx.label.clone()),
-                );
+                ),
             }
+        }
+
+        let mut idx: Vec<usize> = (0..total).collect();
+        if !key_cols.is_empty() {
+            idx.sort_by(|&a, &b| {
+                for &(ki, desc) in &key_cols {
+                    let o = cmp_rows(&cols[ki], a, b);
+                    let o = if desc { o.reverse() } else { o };
+                    if o != std::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
         }
 
         let sorted: Vec<Column> = cols.iter().map(|c| c.gather(&idx)).collect();

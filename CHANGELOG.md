@@ -29,6 +29,12 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Multi-key sort: `sort k1 [asc|desc] k2 [asc|desc] …` (std-only).** `sort`
+  now accepts more than one key, each with its own direction (default ascending),
+  comparing by each key in turn — e.g. `sort team score desc` orders by team
+  ascending, then by score descending within a team. Still a stable sort (ties
+  keep source order) and chunk-size independent (oracle-tested). Single-key
+  `sort age [desc]` is unchanged; round-trips through `to_source`. No new deps.
 - **Composite-key joins: `A & B on k1 k2 …` (std-only).** Every join kind
   (`&`/`&left`/`&right`/`&full`) now joins on one *or more* key columns — e.g.
   `A & B on country region` matches rows agreeing on the (country, region)

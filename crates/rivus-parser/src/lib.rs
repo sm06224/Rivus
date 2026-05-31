@@ -305,20 +305,32 @@ impl Parser {
                     self.g.add_edge(current, node, EdgeKind::Stream);
                     current = node;
                 }
-                // `sort KEY [asc|desc]` — order the whole stream by one column.
+                // `sort KEY [asc|desc] [KEY [asc|desc] ...]` — order by one or
+                // more keys, each with its own direction (default ascending).
                 Tok::Word(w) if w == "sort" => {
                     self.bump();
-                    let key = self.word()?;
-                    let desc = if self.peek_is_word("desc") {
-                        self.bump();
-                        true
-                    } else if self.peek_is_word("asc") {
-                        self.bump();
-                        false
-                    } else {
-                        false
-                    };
-                    let n = self.g.add_node(Op::Sort { key, desc });
+                    let mut keys = Vec::new();
+                    while let Tok::Word(k) = self.tok().clone() {
+                        if is_keyword(&k) {
+                            break;
+                        }
+                        self.bump(); // key
+                                     // `asc`/`desc` apply to the key just read; absence = asc.
+                        let desc = if self.peek_is_word("desc") {
+                            self.bump();
+                            true
+                        } else if self.peek_is_word("asc") {
+                            self.bump();
+                            false
+                        } else {
+                            false
+                        };
+                        keys.push((k, desc));
+                    }
+                    if keys.is_empty() {
+                        return Err(self.err("sort expects at least one key"));
+                    }
+                    let n = self.g.add_node(Op::Sort { keys });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
