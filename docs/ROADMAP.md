@@ -93,7 +93,7 @@ read-throughput, in priority order:
 | | item | note |
 |---|---|---|
 | ✅ | Live progress, execution-graph viz, error stream | |
-| 📋 | Structured telemetry stream (JSONL on stderr/socket) | design doc 19 — base for editor/GUI |
+| 🚧 | Structured telemetry stream (JSONL on stderr/socket) | **stderr ✅ done** — `rivus run … --json` emits one JSON object per node (counters: chunks/rows in·out, busy_ms, rows/s, selectivity, mode) + per error event + a summary; stdout stays clean. std-only (no serde). Socket transport still planned. |
 | 📋 | `\| view` interactive grid (Out-GridView), live analytics GUI | design doc 19; streaming, never full-materialize |
 | 📋 | Shell completion from IR/schema; nushell value interop | design doc 19 |
 

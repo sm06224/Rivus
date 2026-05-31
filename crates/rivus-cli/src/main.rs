@@ -50,10 +50,25 @@ fn main() -> ExitCode {
     }
     let mut chunk_size = RunOptions::default().chunk_size;
     let mut optimize = true;
+    let mut telemetry_json = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--no-opt" => optimize = false,
+            // Emit machine-readable JSONL telemetry to stderr (Observability
+            // spec §19: base for editor/GUI). `--telemetry json` or `--json`.
+            "--json" => telemetry_json = true,
+            "--telemetry" => {
+                i += 1;
+                match args.get(i).map(|s| s.as_str()) {
+                    Some("json") => telemetry_json = true,
+                    Some("ascii") | None => {}
+                    Some(other) => {
+                        eprintln!("error: --telemetry expects 'json' or 'ascii', got '{other}'");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--chunk-size" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
@@ -159,19 +174,24 @@ fn main() -> ExitCode {
         "run" => {
             // Human-facing visualization goes to STDERR so that a `save stdout`
             // sink leaves STDOUT as clean data for shell pipes (`… | rivus run
-            // flow.riv | …`). Interactive terminals still show stderr.
-            eprintln!("\u{2550}\u{2550} Rivus \u{2550}\u{2550}  flow: {label}\n");
+            // flow.riv | …`). Interactive terminals still show stderr. With
+            // `--json`, stderr is machine-readable JSONL instead — so the banner,
+            // opt-report and live progress are suppressed to keep it clean.
+            if !telemetry_json {
+                eprintln!("\u{2550}\u{2550} Rivus \u{2550}\u{2550}  flow: {label}\n");
+            }
             let (graph, report) = if optimize {
                 rivus_optimizer::optimize(parsed)
             } else {
                 (parsed, rivus_optimizer::OptReport::default())
             };
-            if !report.is_empty() {
+            if !telemetry_json && !report.is_empty() {
                 eprint!("{}", viz::render_opt_report(&report));
                 eprintln!();
             }
-            // Live progress only when stderr is a terminal (keep logs/pipes clean).
-            let progress = std::io::stderr().is_terminal();
+            // Live progress only when stderr is a terminal (keep logs/pipes
+            // clean) and not in JSONL mode.
+            let progress = !telemetry_json && std::io::stderr().is_terminal();
             // Sink-less flows are previews: cap captured rows so `rivus run
             // 'open big.csv'` shows the head instantly in bounded memory. A
             // `save` sink overrides this and writes every row.
@@ -184,7 +204,11 @@ fn main() -> ExitCode {
                 },
             ) {
                 Ok(res) => {
-                    eprint!("{}", viz::render_run(&graph, &res));
+                    if telemetry_json {
+                        eprint!("{}", viz::render_telemetry_jsonl(&graph, &res));
+                    } else {
+                        eprint!("{}", viz::render_run(&graph, &res));
+                    }
                     // A fatal error on the stream means the graph halted.
                     if res.final_mode == rivus_core::Mode::Halted {
                         return ExitCode::FAILURE;
@@ -292,7 +316,7 @@ fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
-         \x20 rivus run     <program> [--chunk-size N] [--no-opt]    run and visualize a flow\n\
+         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--json]  run a flow\n\
          \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
          \x20 rivus check   <program>                                parse only\n\
          \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\

@@ -48,7 +48,10 @@ rivus check   <program>     # parse only (report syntax errors)
 | stdin (`-`, heredoc) | `rivus run - <<'RIV' … RIV` |
 
 Flags: `--chunk-size N` (rows per chunk, default 4096), `--no-opt` (disable the
-optimizer).
+optimizer), `--json` (emit machine-readable **JSONL telemetry** to stderr
+instead of the ASCII view — one object per node + per error + a summary; stdout
+stays clean data, so `rivus run flow.riv --json 2>telemetry.jsonl >out.csv`
+splits data and metrics cleanly).
 
 **stdout vs stderr.** The execution graph, telemetry and error stream go to
 **stderr**; a `save stdout` sink writes clean data to **stdout**. So Rivus drops
@@ -459,7 +462,7 @@ rivus run -c 'B: open big.csv ;'        # instant head, ~10 MiB RAM
 ## 11. Full CLI reference
 
 ```
-rivus run     <program> [--chunk-size N] [--no-opt]   run and visualize a flow
+rivus run     <program> [--chunk-size N] [--no-opt] [--json]  run a flow
 rivus explain <program> [--no-opt]                    show DAG IR + optimizer report
 rivus check   <program>                               parse only
 rivus gen     <shape>   [--rows N --seed S --ratio R] write seeded data to stdout

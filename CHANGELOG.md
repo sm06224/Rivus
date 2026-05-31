@@ -29,6 +29,16 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Structured telemetry: `rivus run … --json` (std-only).** Emits the run as
+  **JSON Lines** on stderr — one `{"event":"node",…}` per flow node (counters:
+  `chunks_in/out`, `rows_in/out`, `errors`, `busy_ms`, `rows_per_sec`,
+  `selectivity`, `mode`, `finished`), one `{"event":"error",…}` per error-stream
+  event (severity, scope, message, node, chunk_id), and a final
+  `{"event":"summary",…}`. stdout stays clean data, so a `save -` sink still
+  pipes downstream while a tool reads telemetry from stderr (the base for an
+  editor/GUI integration, Observability spec §19). `--telemetry json` is an
+  alias; in JSON mode the ASCII banner, optimizer report and live progress are
+  suppressed. A tiny hand-rolled JSON writer — no serde, no new dependencies.
 - **zstd input: `open data.csv.zst` (opt-in `--features zstd`).** Reads
   zstd-compressed CSV/TSV (`.zst` / `.zstd`) through the **pure-Rust `ruzstd`
   decoder** (no C toolchain). Same serial single-pass, sample-inference path as
