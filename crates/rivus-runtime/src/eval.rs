@@ -148,6 +148,13 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 }
             }
         }
+        // `case … end` is row-wise; evaluate each row and pick a column lane
+        // from the resulting values (all-int → I64, all-numeric → F64,
+        // all-bool → Bool, otherwise Str — mirroring schema inference).
+        Expr::Case { .. } => {
+            let vals: Vec<Value> = (0..chunk.len).map(|r| eval(expr, chunk, r)).collect();
+            column_from_values(vals)
+        }
         // Compare / And / Or are predicates → a boolean column.
         _ => {
             let v: Vec<bool> = (0..chunk.len)
@@ -155,6 +162,40 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 .collect();
             Column::Bool(v)
         }
+    }
+}
+
+/// Build a typed column from row values, choosing the narrowest lane that fits
+/// (all-int → I64, all-numeric → F64, all-bool → Bool, else Str). Used by
+/// row-wise expressions like `case` that don't have a native columnar form.
+fn column_from_values(vals: Vec<Value>) -> Column {
+    let all_int = vals
+        .iter()
+        .all(|v| matches!(v, Value::I64(_) | Value::Bool(_)));
+    let all_num = vals
+        .iter()
+        .all(|v| matches!(v, Value::I64(_) | Value::F64(_) | Value::Bool(_)));
+    let all_bool = !vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Bool(_)));
+    if all_bool {
+        Column::Bool(
+            vals.iter()
+                .map(|v| matches!(v, Value::Bool(true)))
+                .collect(),
+        )
+    } else if all_int {
+        Column::I64(
+            vals.iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as i64)
+                .collect(),
+        )
+    } else if all_num {
+        Column::F64(vals.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect())
+    } else {
+        let mut s = StrColumn::with_capacity(vals.len(), vals.len() * 8);
+        for v in &vals {
+            s.push(&v.to_string());
+        }
+        Column::Str(s)
     }
 }
 
@@ -262,6 +303,17 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
         Expr::Arith { left, op, right } => arith_value(left, *op, right, chunk, row),
         Expr::Cast { expr, ty } => cast_value(eval(expr, chunk, row), *ty),
         Expr::Func { func, args } => call_func(*func, args, chunk, row),
+        Expr::Case { branches, default } => {
+            for (cond, val) in branches {
+                if eval_predicate(cond, chunk, row) {
+                    return eval(val, chunk, row);
+                }
+            }
+            match default {
+                Some(d) => eval(d, chunk, row),
+                None => Value::Str(String::new()),
+            }
+        }
     }
 }
 

@@ -469,7 +469,9 @@ proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;
 expr       = or ; or = and ('or' and)* ; and = cmp ('and' cmp)* ;
 cmp        = add (CMP add)? ; add = mul (('+'|'-') mul)* ; mul = primary (('*'|'/'|'%') primary)* ;
 primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
-           | IDENT | '$_' field-tail | '$_:'N field-tail | 'item' '(' STRING ')' ;
+           | IDENT | '$_' field-tail | '$_:'N field-tail | 'item' '(' STRING ')'
+           | FUNC '(' expr (',' expr)* ')'
+           | 'case' ('when' expr 'then' expr)+ ('else' expr)? 'end' ;
 FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
 AGG        = 'sum' | 'avg' | 'min' | 'max' | 'std'
            | 'count_distinct' | 'nunique' | 'first' | 'last' ;

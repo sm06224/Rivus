@@ -135,6 +135,13 @@ pub enum Expr {
         func: Func,
         args: Vec<Expr>,
     },
+    /// `case when COND then VAL [when COND then VAL ...] [else VAL] end`. The
+    /// first branch whose condition is truthy yields its value; if none match,
+    /// `default` (the `else`) is used, or an empty string when absent. Row-wise.
+    Case {
+        branches: Vec<(Expr, Expr)>,
+        default: Option<Box<Expr>>,
+    },
 }
 
 impl Expr {
@@ -173,6 +180,16 @@ impl fmt::Display for Expr {
             Expr::Func { func, args } => {
                 let a: Vec<String> = args.iter().map(|e| e.to_string()).collect();
                 write!(f, "{}({})", func.as_str(), a.join(", "))
+            }
+            Expr::Case { branches, default } => {
+                write!(f, "case")?;
+                for (cond, val) in branches {
+                    write!(f, " when {cond} then {val}")?;
+                }
+                if let Some(d) = default {
+                    write!(f, " else {d}")?;
+                }
+                write!(f, " end")
             }
         }
     }

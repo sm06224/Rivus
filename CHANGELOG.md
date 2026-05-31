@@ -7,6 +7,11 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **`case when … then … [else …] end` expression (std-only).** A row-wise
+  conditional usable anywhere an expression is (computed columns, filters).
+  The first truthy `when` branch yields its value; with no match the `else`
+  value (or an empty string) is used. Lowers to `Expr::Case`, round-trips
+  through `to_source`, and is chunk-size independent. No new dependencies.
 - **Column `rename` / `drop` (std-only).** `rename OLD NEW [OLD NEW ...]`
   renames columns in place (position, type and values untouched); `drop COL
   [COL ...]` removes columns, keeping the rest in order. Both are stateless,

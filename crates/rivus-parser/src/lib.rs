@@ -899,6 +899,11 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 Ok(Expr::Func { func, args })
             }
+            // `case when COND then VAL [when …] [else VAL] end` conditional.
+            Tok::Word(ref w) if w == "case" => {
+                self.bump(); // case
+                self.parse_case()
+            }
             // Bare field of the current object: `age`.
             Tok::Word(name) => {
                 self.bump();
@@ -909,6 +914,37 @@ impl Parser {
             }
             other => Err(self.err(format!("unexpected token in expression: {other:?}"))),
         }
+    }
+
+    /// Parse the tail of `case when COND then VAL [when COND then VAL ...]
+    /// [else VAL] end` (the `case` keyword is already consumed). At least one
+    /// `when` branch is required; `else` is optional (defaults to "" at eval).
+    fn parse_case(&mut self) -> Result<Expr, RivusError> {
+        let mut branches = Vec::new();
+        while self.peek_is_word("when") {
+            self.bump(); // when
+            let cond = self.parse_expr()?;
+            if !self.peek_is_word("then") {
+                return Err(self.err("case: expected `then` after a `when` condition"));
+            }
+            self.bump(); // then
+            let val = self.parse_expr()?;
+            branches.push((cond, val));
+        }
+        if branches.is_empty() {
+            return Err(self.err("case: expected at least one `when … then …` branch"));
+        }
+        let default = if self.peek_is_word("else") {
+            self.bump();
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        if !self.peek_is_word("end") {
+            return Err(self.err("case: expected `end` to close the expression"));
+        }
+        self.bump(); // end
+        Ok(Expr::Case { branches, default })
     }
 
     /// After consuming `$_` / `$_:N`, read the field accessor tail.
@@ -1396,5 +1432,44 @@ Import:
         // Both verbs require at least one operand.
         assert!(parse("F:\n open a.csv\n rename\n;").is_err());
         assert!(parse("F:\n open a.csv\n drop\n;").is_err());
+    }
+
+    #[test]
+    fn case_when_parses_and_round_trips() {
+        // `case when … then … [else …] end` lowers to Expr::Case and survives a
+        // source -> IR -> source round-trip (re-parses identically).
+        let src = "F:\n open a.csv\n |> (case when age >= 60 then \"senior\" else \"other\" end) as bucket\n;";
+        let g = parse(src).unwrap();
+        match &g.nodes[1].op {
+            Op::ProjectExpr { items } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].1, "bucket");
+                match &items[0].0 {
+                    Expr::Case { branches, default } => {
+                        assert_eq!(branches.len(), 1);
+                        assert!(default.is_some());
+                    }
+                    other => panic!("expected Case, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProjectExpr, got {other:?}"),
+        }
+        let s1 = g.to_source();
+        assert!(s1.contains("(case when"), "got: {s1}");
+        assert!(s1.contains("then \"senior\""), "got: {s1}");
+        assert!(s1.contains("else \"other\" end)"), "got: {s1}");
+        assert_eq!(s1, parse(&s1).unwrap().to_source(), "case not reversible");
+    }
+
+    #[test]
+    fn case_without_else_and_errors() {
+        // `else` is optional.
+        let g =
+            parse("F:\n open a.csv\n |> (case when age >= 60 then \"old\" end) as b\n;").unwrap();
+        assert!(matches!(&g.nodes[1].op, Op::ProjectExpr { .. }));
+        // A `case` with no branch, or missing `then`/`end`, is a parse error.
+        assert!(parse("F:\n open a.csv\n |> (case end) as b\n;").is_err());
+        assert!(parse("F:\n open a.csv\n |> (case when age >= 1 \"x\" end) as b\n;").is_err());
+        assert!(parse("F:\n open a.csv\n |> (case when age >= 1 then \"x\") as b\n;").is_err());
     }
 }

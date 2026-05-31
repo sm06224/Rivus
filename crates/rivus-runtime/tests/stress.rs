@@ -938,3 +938,42 @@ fn rename_and_drop_are_chunk_size_independent() {
     }
     assert_eq!(got, ages, "renamed column values preserved in order");
 }
+
+#[test]
+fn case_when_is_chunk_size_independent() {
+    // `case when … then … else … end` computed column buckets each row by its
+    // age band, identically across chunk sizes.
+    let rows = 20_000;
+    let mut rng = Rng::new(13);
+    let mut text = String::from("name,age\n");
+    let mut expect: Vec<&str> = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let age = rng.below(90);
+        text.push_str(&format!("user,{age}\n"));
+        expect.push(if age >= 60 {
+            "senior"
+        } else if age >= 18 {
+            "adult"
+        } else {
+            "minor"
+        });
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_case", text.as_bytes()));
+    let p = f.0.display();
+    let src = format!(
+        "C:\n open {p}\n |> name (case when age >= 60 then \"senior\" when age >= 18 then \"adult\" else \"minor\" end) as bucket\n;"
+    );
+    for cs in [1usize, 7, 1024, 8192, rows] {
+        let res = run_src(&src, cs);
+        assert!(res.errors.is_empty(), "errors @cs={cs}: {:?}", res.errors);
+        let out = &res.outputs[0];
+        let mut got = Vec::with_capacity(rows);
+        for c in &out.chunks {
+            let bi = c.schema.index_of("bucket").unwrap();
+            for r in 0..c.len {
+                got.push(c.value(r, bi).to_string());
+            }
+        }
+        assert_eq!(got, expect, "case buckets @cs={cs}");
+    }
+}
