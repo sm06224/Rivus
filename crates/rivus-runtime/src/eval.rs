@@ -89,13 +89,6 @@ fn regexp_match(_text: &str, _pat: &str) -> bool {
     false
 }
 
-/// Whether `regexp()` is usable in this build (the `regex` feature is on).
-/// The engine checks this once and raises a recoverable error if a flow uses
-/// `regexp` in a default (feature-off) build, so the failure is explicit.
-pub fn regexp_available() -> bool {
-    cfg!(feature = "regex")
-}
-
 /// The literal pattern of `regexp(col, "lit")`, if arg 1 is a string literal
 /// (the common case) — lets the columnar path compile the regex exactly once.
 fn regex_literal(args: &[Expr]) -> Option<&str> {
@@ -322,13 +315,19 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                         .map(|r| to_i64(call_func(*func, args, chunk, r)))
                         .collect(),
                 ),
-                Func::Contains | Func::StartsWith | Func::EndsWith | Func::Like | Func::Glob => {
-                    Column::Bool(
-                        (0..n)
-                            .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
-                            .collect(),
-                    )
-                }
+                // `regexp(col, "literal")` compiles the pattern once for the
+                // whole chunk (per-row compilation is catastrophic — ~10× slower).
+                Func::Regexp if regex_literal(args).is_some() => regexp_column(args, chunk),
+                Func::Contains
+                | Func::StartsWith
+                | Func::EndsWith
+                | Func::Like
+                | Func::Glob
+                | Func::Regexp => Column::Bool(
+                    (0..n)
+                        .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
+                        .collect(),
+                ),
                 _ => {
                     let mut s = StrColumn::with_capacity(n, n * 8);
                     for r in 0..n {
