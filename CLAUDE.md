@@ -38,6 +38,32 @@ The maintainer squash-merges and wants near-zero merge effort. So:
   cargo deny check bans sources licenses    # advisories needs network → CI
   ```
 
+## Tool & edit discipline (hard-won; violating this has shipped broken pushes)
+
+Root cause of past breakage: firing many tool calls in one batch — especially
+**dependent** read→edit→build chains in parallel — corrupts the output stream,
+desyncs my view of disk state, and produces edits I *think* landed but didn't.
+That has caused over-claiming commit messages and broken pushes. So:
+
+- **Small batches, verify, then proceed.** One logical step per turn
+  (a few *independent* calls at most). NEVER batch dependent calls
+  (`Read`→`Edit`, `Edit`→`build`, `commit`→`push`) — each needs the prior result.
+- **Trust disk, not memory.** Before editing, `Read` the exact lines; after a
+  surprising result, re-Read rather than assume. A failed `Edit` (string not
+  found) means the change did NOT apply — fix it before moving on, never paper over.
+- **Gate is a numeric checkpoint, not a vibe.** Before every push confirm with
+  counts: clippy `warning/error` count **= 0**, `test result` FAILED **= 0**,
+  zero-dep (`cargo tree -p rivus-cli --edges normal` = rivus-* only). Build must
+  succeed — a build failure makes `cargo test` report `0 passed`, which is NOT green.
+- **Commit messages claim only what's on disk.** If a message says "hardens X",
+  `git show HEAD:path` must contain that change. No aspirational wording.
+- **Recover forward, don't rewrite history.** Force-push is denied here. If a
+  broken commit was pushed, fix on top (or `reset --soft` onto the remote then
+  re-commit) and fast-forward push. Note the supersession in the new message.
+- **GitHub posts are expensive and permanent.** Get hashes/facts right the first
+  time (read them from `git`, don't recall them); avoid bursts of corrective
+  comments. One accurate comment beats three retractions.
+
 ## Benchmarking discipline
 
 - Target the three regimes explicitly: **large**, **error-heavy**, **mixed-type**
