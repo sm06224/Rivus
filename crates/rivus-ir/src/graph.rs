@@ -349,6 +349,11 @@ pub enum Op {
     SinkCsv { path: String, delim: u8 },
     /// `save path.jsonl` — write JSON Lines (one object per row).
     SinkJsonl { path: String },
+    /// `save path.json` — write a single JSON array (`[{…},{…}]`). Unlike
+    /// `SinkJsonl` (one object per line, streaming), this brackets the whole
+    /// result; still written incrementally (open bracket, comma-separated rows,
+    /// close bracket) so it stays bounded-memory.
+    SinkJson { path: String },
 }
 
 /// The default CSV field delimiter.
@@ -447,6 +452,7 @@ impl Op {
             Op::SinkPrint => "print",
             Op::SinkCsv { .. } => "save",
             Op::SinkJsonl { .. } => "save",
+            Op::SinkJson { .. } => "save",
         }
     }
 
@@ -611,7 +617,23 @@ impl Op {
                 Some(m) => format!("save {path} {m}"),
                 None => format!("save {path}"),
             },
-            Op::SinkJsonl { path } => format!("save {path}  # as jsonl"),
+            Op::SinkJsonl { path } => {
+                // `.jsonl`/`.ndjson` paths imply jsonl; otherwise be explicit.
+                let lower = path.to_ascii_lowercase();
+                if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
+                    format!("save {path}")
+                } else {
+                    format!("save {path} as jsonl")
+                }
+            }
+            Op::SinkJson { path } => {
+                // A `.json` path implies a JSON array; otherwise be explicit.
+                if path.to_ascii_lowercase().ends_with(".json") {
+                    format!("save {path}")
+                } else {
+                    format!("save {path} as json")
+                }
+            }
         }
     }
 }

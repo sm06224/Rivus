@@ -1270,6 +1270,52 @@ fn csv_to_jsonl_roundtrip_preserves_data() {
 }
 
 #[test]
+fn csv_to_json_array_roundtrips_and_is_valid() {
+    // open CSV -> save a single JSON array (.json) -> re-open it: the JSON
+    // reader accepts the array, and the filtered count round-trips. Also assert
+    // the file is one bracketed array (starts `[`, ends `]`), not NDJSON.
+    let rows = 3_000;
+    let csv = TempCsv(gendata::write_temp("rt_jsoncsv", &gendata::clean(rows, 5)));
+    let mut jpath = csv.0.clone();
+    jpath.set_extension("json");
+    let _jguard = TempCsv(jpath.clone());
+
+    // `.json` extension implies a JSON array (no `as` needed).
+    run_src(
+        &format!(
+            "C:\n open {}\n save {}\n;",
+            csv.0.display(),
+            jpath.display()
+        ),
+        4096,
+    );
+
+    let text = std::fs::read_to_string(&jpath).unwrap();
+    let t = text.trim_end();
+    assert!(
+        t.starts_with('['),
+        "JSON array must start with [: {:.40}",
+        t
+    );
+    assert!(t.ends_with(']'), "JSON array must end with ]");
+    // A JSON array joins objects with `},{` — NDJSON would have none.
+    assert!(t.contains("},{"), "expected array-joined objects");
+
+    let want = run_src(
+        &format!("C:\n open {}\n |? age >= 45\n;", csv.0.display()),
+        4096,
+    )
+    .total_rows_out();
+    let got = run_src(
+        &format!("J:\n open {}\n |? age >= 45\n;", jpath.display()),
+        4096,
+    )
+    .total_rows_out();
+    assert!(want > 0 && want < rows as u64);
+    assert_eq!(want, got, "CSV->JSON-array->read must preserve the count");
+}
+
+#[test]
 fn fanout_merge_conserves_rows() {
     let rows = 20_000;
     let data = gendata::clean(rows, 99);

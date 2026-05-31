@@ -272,6 +272,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::SinkPrint => Box::new(SinkPrint),
         Op::SinkCsv { path, delim } => Box::new(SinkCsv::new(path.clone(), *delim)),
         Op::SinkJsonl { path } => Box::new(SinkJsonl::new(path.clone())),
+        Op::SinkJson { path } => Box::new(SinkJson::new(path.clone())),
     }
 }
 
@@ -2565,6 +2566,125 @@ pub fn write_jsonl_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
             out.push_str("}\n");
         }
     }
+    write_output(path, &out)
+}
+
+/// Append one row as a JSON object to `out`.
+fn json_object_row(out: &mut String, chunk: &Chunk, names: &[&str], row: usize) {
+    out.push('{');
+    for (c, name) in names.iter().enumerate() {
+        if c > 0 {
+            out.push(',');
+        }
+        json_string(out, name);
+        out.push(':');
+        json_value(out, &chunk.value(row, c));
+    }
+    out.push('}');
+}
+
+/// Streaming sink for a single JSON **array** (`[{…},{…}]`). Writes the opening
+/// `[` on the first row, comma-separates rows across chunks (bounded memory),
+/// and closes with `]` on finish. `wrote_header` doubles as "array opened".
+struct SinkJson {
+    w: StreamWriter,
+}
+
+impl SinkJson {
+    fn new(path: String) -> Self {
+        SinkJson {
+            w: StreamWriter::new(path),
+        }
+    }
+
+    fn write_chunk(&mut self, chunk: &Chunk) -> std::io::Result<()> {
+        // Build the chunk's fragment first (no `self.w` borrow), then write it.
+        let mut opened = self.w.wrote_header;
+        let names = chunk.schema.field_names();
+        let mut out = String::new();
+        if !opened {
+            out.push('['); // open the array on the very first write
+        }
+        for row in 0..chunk.len {
+            // A comma precedes every row except the very first of the array.
+            if opened {
+                out.push(',');
+            } else {
+                opened = true;
+            }
+            json_object_row(&mut out, chunk, &names, row);
+        }
+        let w = self.w.writer()?;
+        write!(w, "{out}")?;
+        self.w.wrote_header = opened;
+        Ok(())
+    }
+}
+
+impl Operator for SinkJson {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.w.failed {
+            return Vec::new();
+        }
+        if let Err(e) = self.write_chunk(&chunk) {
+            self.w.failed = true;
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Critical,
+                    ErrorScope::Graph,
+                    format!("cannot write '{}': {e}", self.w.path),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        Vec::new()
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.w.failed {
+            return Vec::new();
+        }
+        // Close the array. If no row ever arrived, emit `[]`.
+        let opened = self.w.wrote_header;
+        let res = (|| {
+            let w = self.w.writer()?;
+            if !opened {
+                write!(w, "[")?;
+            }
+            writeln!(w, "]")
+        })();
+        let res = res.and_then(|_| self.w.finish());
+        if let Err(e) = res {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Critical,
+                    ErrorScope::Graph,
+                    format!("cannot write '{}': {e}", self.w.path),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        Vec::new()
+    }
+}
+
+/// Render `chunks` as a single JSON array. Shared by the parallel executor's
+/// single-write merge (the serial sink streams it incrementally instead).
+pub fn write_json_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
+    let mut out = String::from("[");
+    let mut first = true;
+    for chunk in chunks {
+        let names = chunk.schema.field_names();
+        for row in 0..chunk.len {
+            if first {
+                first = false;
+            } else {
+                out.push(',');
+            }
+            json_object_row(&mut out, chunk, &names, row);
+        }
+    }
+    out.push_str("]\n");
     write_output(path, &out)
 }
 

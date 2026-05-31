@@ -1105,6 +1105,9 @@ fn norm_path(p: String) -> String {
 enum Format {
     Csv,
     Jsonl,
+    /// JSON array output (`[{…},{…}]`). On the *read* side it behaves like
+    /// `Jsonl` (the JSON reader already accepts both an array and NDJSON).
+    Json,
 }
 
 impl Format {
@@ -1118,7 +1121,9 @@ impl Format {
                 declared: None,
                 delim,
             },
-            Format::Jsonl => Op::OpenJsonl { path },
+            // The JSON reader accepts both NDJSON and a top-level array, so both
+            // surface forms open the same source.
+            Format::Jsonl | Format::Json => Op::OpenJsonl { path },
         }
     }
 
@@ -1126,6 +1131,7 @@ impl Format {
         match self {
             Format::Csv => Op::SinkCsv { path, delim },
             Format::Jsonl => Op::SinkJsonl { path },
+            Format::Json => Op::SinkJson { path },
         }
     }
 }
@@ -1148,13 +1154,17 @@ fn resolve_format(path: &str, explicit: Option<&str>) -> Option<Format> {
     if let Some(f) = explicit {
         return match f.to_ascii_lowercase().as_str() {
             "csv" | "tsv" => Some(Format::Csv),
-            "json" | "jsonl" | "ndjson" => Some(Format::Jsonl),
+            // `json` = a single JSON array; `jsonl`/`ndjson` = one object per line.
+            "json" => Some(Format::Json),
+            "jsonl" | "ndjson" => Some(Format::Jsonl),
             _ => None,
         };
     }
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") || lower.ends_with(".json") {
+    if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
         Some(Format::Jsonl)
+    } else if lower.ends_with(".json") {
+        Some(Format::Json) // a `.json` file is conventionally a JSON array
     } else {
         Some(Format::Csv) // default
     }
@@ -1369,14 +1379,33 @@ mod tests {
             nth_op("F:\n open a.csv\n save o.jsonl\n;", 1),
             Op::SinkJsonl { .. }
         ));
+        // `as json` (and a `.json` extension) is a JSON *array*; `.jsonl` /
+        // `.ndjson` / `as jsonl` stay one-object-per-line.
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.dat as json\n;", 1),
+            Op::SinkJson { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.json\n;", 1),
+            Op::SinkJson { .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.dat as jsonl\n;", 1),
             Op::SinkJsonl { .. }
         ));
+        // `writejson` keeps emitting NDJSON (backward-compatible).
         assert!(matches!(
             nth_op("F:\n open a.csv\n writejson o.x\n;", 1),
             Op::SinkJsonl { .. }
         ));
+        // Round-trip: `save o.json` (array) and `save o.jsonl` survive to_source.
+        for prog in [
+            "F:\n open a.csv\n save o.json\n;",
+            "F:\n open a.csv\n save o.jsonl\n;",
+        ] {
+            let s = parse(prog).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "round-trip: {s}");
+        }
         assert!(matches!(
             nth_op("F:\n open a.csv\n writecsv o.x\n;", 1),
             Op::SinkCsv { .. }
