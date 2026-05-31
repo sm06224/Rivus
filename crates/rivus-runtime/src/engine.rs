@@ -679,11 +679,11 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
     // The chunk-partition path materializes the whole input to split it. For a
     // large file, stream it in parallel instead (byte ranges, no buffering);
     // non-CSV large sources fall back to the serial streaming reader.
-    const PARALLEL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+    let min_bytes = parallel_min_bytes();
     if let Some(path) = source_path(&graph.nodes[src_id].op) {
         if path != "-" {
             if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > PARALLEL_MAX_BYTES {
+                if meta.len() >= min_bytes {
                     return try_streaming_parallel(graph, opts, src_id, path, threads);
                 }
             }

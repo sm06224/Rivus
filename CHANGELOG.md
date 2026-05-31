@@ -16,9 +16,17 @@ All notable changes to Rivus. Format loosely follows
   and order-preserving vs the serial path (CLI-tested). The streaming-parallel
   reader engages for any single-CSV file source at/above
   `RIVUS_PARALLEL_MIN_BYTES` (default **8 MiB**); `RIVUS_NO_PARALLEL` forces the
-  serial path (a true single-thread baseline). The realized speedup is
-  host-dependent — on a memory-bandwidth-bound or low-core host the parallel and
-  serial paths can measure near-identical; the output is byte-identical either way.
+  serial path (a true single-thread baseline).
+- **Actually lower the parallel threshold to 8 MiB (was a docs-only change).**
+  A prior commit lowered the documented threshold from 256 MiB to 8 MiB but the
+  engine const stayed at 256 MiB, so files between 8 and 256 MiB silently fell to
+  the *in-memory* chunk-partition path — which materializes the whole file and
+  measured **slower than serial** (171 MiB numeric filter: serial 1.5 s vs
+  in-memory 1.7 s). The threshold is now read from `parallel_min_bytes()`
+  (default 8 MiB, `RIVUS_PARALLEL_MIN_BYTES`-overridable), so mid-size files use
+  the byte-range streaming reader. Measured win where it now engages: a 380 MiB
+  numeric filter to stdout drops **3.33 s → 0.91 s (3.7×)**; output stays
+  byte-identical to serial.
 
 ### Added
 - **`like` / `glob` pattern matching (std-only, no regex dependency).**
