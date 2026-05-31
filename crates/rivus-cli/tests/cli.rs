@@ -130,3 +130,53 @@ fn gen_is_deterministic_and_self_describing() {
         .lines()
         .all(|l| l.starts_with('{') && l.ends_with('}')));
 }
+
+/// The parallel byte-range reader must produce the *same* stdout — same rows,
+/// same order — as the serial path, including for a `save -` (stdout) sink.
+/// `RIVUS_PARALLEL_MIN_BYTES=0` forces the parallel path on a small file;
+/// `RIVUS_NO_PARALLEL=1` forces serial. The two outputs must be byte-identical.
+#[test]
+fn parallel_stdout_matches_serial() {
+    // Build a CSV big enough to split into several byte ranges.
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_par_{}.csv", std::process::id()));
+    let mut text = String::from("id,name,age\n");
+    for i in 0..50_000 {
+        text.push_str(&format!("{i},user{i},{}\n", 18 + (i % 70)));
+    }
+    std::fs::write(&csv, &text).unwrap();
+
+    let prog = format!(
+        "F: open {} |? age >= 50 |> id name age save - ;",
+        csv.display()
+    );
+    let run = |force_serial: bool| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["run", "-c", &prog]);
+        if force_serial {
+            cmd.env("RIVUS_NO_PARALLEL", "1");
+        } else {
+            cmd.env("RIVUS_PARALLEL_MIN_BYTES", "0"); // force parallel
+        }
+        let out = cmd.output().expect("spawn rivus");
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+
+    let serial = run(true);
+    let parallel = run(false);
+    let _ = std::fs::remove_file(&csv);
+
+    assert_eq!(
+        serial, parallel,
+        "parallel stdout differs from serial (rows/order must match)"
+    );
+    // Sanity: header + at least one data row survived the filter.
+    let s = String::from_utf8(serial).unwrap();
+    assert!(s.starts_with("id,name,age\n"));
+    assert!(s.lines().count() > 1);
+}

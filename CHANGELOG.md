@@ -6,6 +6,17 @@ All notable changes to Rivus. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+- **Parallel reads now cover `stdout` sinks too.** The byte-range parallel CSV
+  reader previously bailed to serial whenever the sink was `save -` (stdout);
+  it now assembles the ordered part files to stdout, so the Unix-filter form
+  (`… | rivus '… save -'` / `rivus run … > out`) is parallel as well. On a
+  363 MiB file `… |? age>=50 |> id name age save -` drops **5.2 s → 1.8 s**
+  (2.8×), closing the gap to DuckDB from ~5× to ~1.8×. Output is byte-identical
+  and order-preserving vs the serial path (CLI-tested). New
+  `RIVUS_PARALLEL_MIN_BYTES` env knob (default 256 MiB) and `RIVUS_NO_PARALLEL`
+  escape hatch.
+
 ### Added
 - **`like` / `glob` pattern matching (std-only, no regex dependency).**
   `like(s, "JP-%")` is SQL `LIKE` (`%` any run, `_` any single char);

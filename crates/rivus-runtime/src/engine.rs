@@ -413,9 +413,10 @@ fn try_streaming_parallel(
 
     // Each worker streams its byte range to a per-worker *part file* (bounded
     // memory — no output buffering), then the parts are concatenated in source
-    // order. Map every file sink to its final path; bail to serial if any sink
-    // writes stdout (can't split an ordered stream across workers) or if there
-    // is no file sink (nothing to write in parallel without buffering).
+    // order into the final destination. A `-` sink assembles to stdout (so the
+    // Unix-filter form is parallel too). Bail only when there is no file/stdout
+    // sink (a preview/print flow has nothing to write in parallel without
+    // buffering — that stays on the serial path).
     let mut sinks: Vec<(NodeId, String, bool, u8)> = Vec::new();
     for nd in &graph.nodes {
         match &nd.op {
@@ -424,7 +425,7 @@ fn try_streaming_parallel(
             _ => {}
         }
     }
-    if sinks.is_empty() || sinks.iter().any(|(_, p, _, _)| p == "-") {
+    if sinks.is_empty() {
         return None;
     }
 
@@ -541,7 +542,14 @@ fn try_streaming_parallel(
 /// Streams part-by-part (bounded memory) and removes the parts when done.
 fn concat_parts(final_path: &str, parts: &[String], jsonl: bool) -> std::io::Result<()> {
     use std::io::{BufRead, Write};
-    let mut out = std::io::BufWriter::new(std::fs::File::create(final_path)?);
+    // `-` writes the assembled stream to stdout (keeps the Unix-filter contract
+    // working under the parallel path); any other path is a real output file.
+    let sink: Box<dyn Write> = if final_path == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(std::fs::File::create(final_path)?)
+    };
+    let mut out = std::io::BufWriter::new(sink);
     let mut header_done = jsonl;
     for part in parts {
         let f = match std::fs::File::open(part) {
