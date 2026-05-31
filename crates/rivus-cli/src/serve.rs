@@ -161,6 +161,9 @@ pub fn serve(listener: TcpListener, hub: Arc<Hub>) {
 }
 
 fn handle(mut stream: TcpStream, hub: Arc<Hub>) {
+    // A stalled client that never sends a full request line must not pin this
+    // thread; the SSE stream only writes, so this read bound doesn't affect it.
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let path = match read_request_target(&mut stream) {
         Some(p) => p,
         None => return,
