@@ -634,3 +634,48 @@ earlier `contains(country,"JP")` serial measurement), and #35's value is making
 it **engage on the default parallel path at all** (previously a silent no-op
 there) with exact, surfaced accounting. Pushing the pre-scan into *pass-1
 inference* — so it can skip the dominant scan too — is a tracked follow-up.
+
+### SIMD predicate kernel — branch-free mask refactor + measured AVX2 negative result (Epic #38 / #39)
+
+Lever 1 of the "aggressive structural bets" Epic (#38) is the vectorized
+predicate kernel. Two things were done, both measured:
+
+**1. Branch-free byte-mask refactor (landed).** The kernel
+(`crates/rivus-runtime/src/kernel.rs`) used to build surviving-index `Vec`s and
+narrow them predicate-by-predicate. It now writes a **byte mask** (`(v <cmp>
+rhs) as u8`, no branch, no `push`) over each contiguous `&[i64]`/`&[f64]` lane,
+ANDs masks for a conjunction, and collects indices in one final pass. This is
+what LLVM auto-vectorizes into packed SIMD compares — **zero `unsafe`, zero
+deps**. Measured on the 5 M-row / 179 MiB clean set, serial, `--no-opt` (so all
+rows reach `FilterProject`), `age >= 30 and score < 50.0` (the `filter` node's
+own `busy_ms` from `--json`, best of 5):
+
+| kernel | filter node busy_ms |
+|---|---:|
+| previous (index-narrowing) | ~81 ms |
+| **branch-free mask (this PR)** | **~77 ms** |
+
+A small (~5%) but real win, and a cleaner base for the columnar gather (#40).
+
+**2. Hand-written AVX2 `f64` kernel (prototyped, measured, NOT landed).** An
+explicit `core::arch::x86_64` AVX2 compare (`_mm256_cmp_pd` + movemask, runtime
+`is_x86_feature_detected!`, scalar fallback, byte-identical incl. NaN via the
+ordered `_OQ` predicates) was implemented and benchmarked against the
+auto-vectorized scalar form on a 5 M-element `f64` column (30 iters, release):
+
+| stage | scalar | AVX2 |
+|---|---:|---:|
+| mask production only (compare) | 5.5 ms | 5.8 ms |
+| full `run()` hi-sel (70%) | 44.1 ms | 42.1 ms |
+| full `run()` lo-sel (2%) | 9.5 ms | 9.8 ms |
+
+The compare is **memory-bandwidth-bound** (~40 MB read for 5 M `f64`), so
+explicit AVX2 ties or slightly *loses* to LLVM's auto-vectorization — and the
+full-run cost is dominated by **index collection** (the `keep.push(i)` gather),
+not the compare (5.5 ms of a 44 ms run). Per the project law — *faster is never
+asserted without a measured number* — the `unsafe` intrinsic path was **dropped**
+rather than shipped for no measured gain. The real lever is the gather itself: a
+columnar selection-vector / late-materialization design, which is Epic #38 lever
+2 (#40). On CSV today the whole filter node is only ~3% of wall (parse dominates
+at ~2.1 s of 2.7 s), so this kernel work matters for the *columnar* core to come,
+not for end-to-end CSV wall time yet.
