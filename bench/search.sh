@@ -61,3 +61,11 @@ if have duckdb; then
   bench "duckdb age>=50" duckdb -c \
     "SELECT name,age FROM read_csv('$DATA') WHERE age >= 50;"
 fi
+
+echo "== regex: name matches ^aki[0-9]+\$ (Rivus needs --features regex) =="
+have rg && bench "rg" rg -ce '^[0-9]+,aki[0-9]+,' "$DATA"
+bench "rivus regexp" "$RIVUS" run -c "F: open $DATA |? regexp(name, \"^aki[0-9]+\$\") save - ;"
+if have duckdb; then
+  bench "duckdb regexp_matches" duckdb -c \
+    "SELECT count(*) FROM read_csv('$DATA') WHERE regexp_matches(name,'^aki[0-9]+\$');"
+fi

@@ -62,6 +62,14 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Exercise the off-by-default `regex` feature so the gated `regexp()`
+      # path can't rot (the rest of CI builds default = zero-dependency).
+      - name: Clippy (regex feature)
+        run: cargo clippy -p rivus-runtime -p rivus-cli --features rivus-cli/regex --all-targets
+
+      - name: Test (regex feature)
+        run: cargo test -p rivus-runtime --features regex
+
       - name: Build release
         run: cargo build --workspace --release
 
