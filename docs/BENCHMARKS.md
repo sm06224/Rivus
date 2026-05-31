@@ -481,31 +481,42 @@ Self-generated (`rivus gen clean --rows 5000000`), release (Rivus built
 `--features regex`), median of 3, warm cache, **both writing the full projected
 result to stdout** (`COPY … TO '/dev/stdout'` for DuckDB). DuckDB 1.1.3 CLI.
 
-After lowering the parallel threshold to 8 MiB (this file is 171 MiB, so it now
-parallelizes — it used to run serial under the old 256 MiB gate):
+With the 8 MiB threshold now wired into the engine (this file is 171 MiB, so it
+takes the byte-range streaming-parallel reader; re-measured 2026-05-31, best of 3):
 
 | pattern | DuckDB | Rivus (serial) | Rivus (parallel) | note |
 |---|---:|---:|---:|---|
-| regex `^aki[0-9]+$` | **0.69 s** | 2.28 s | 1.10 s | `regexp(name,…)` vs `regexp_matches`, compiled-once |
-| IN-set `country∈{JP,DE,BR}` | **0.55 s** | 3.30 s | 1.05 s | DuckDB `IN` vs Rivus `or`-chain |
-| numeric `age >= 50` → project | **0.69 s** | 1.97 s | 1.10 s | grep can't express; Rivus filter-pushdown |
+| regex `^aki[0-9]+$` | **0.34 s** | 2.02 s | 0.54 s | `regexp(name,…)` vs `regexp_matches`, compiled-once |
+| IN-set `country∈{JP,DE,BR}` | **0.41 s** | 2.08 s | 0.66 s | DuckDB `IN` vs Rivus `or`-chain |
+| numeric `age >= 50` → project | **0.36 s** | 1.59 s | 0.43 s | grep can't express; Rivus filter-pushdown |
 
-**The wall is now ~1.6–1.9×, down from 6–10×.** Parallel-by-default reads (incl.
-stdout) closed most of it: every shape dropped ~2–3× and the gap to DuckDB went
-from ~5–10× to under 2×. The remaining difference is still the **CSV read path**,
-not the predicate engine (rust-lang regex matches at DuckDB's RE2-class speed):
-Rivus does a *two-pass* streaming read (infer types, then build typed columns)
-where DuckDB reads once into vectors. (On a 363 MiB file the same numeric query
-is 1.8 s vs DuckDB ~1.0 s — the bigger the file, the more the second pass costs.)
+**The wall is now ~1.2–1.6×, down from 6–10×.** The byte-range streaming reader
+gives a clean ~3× over serial here (171 MiB: numeric 1.59 s → 0.43 s, regex
+2.02 s → 0.54 s, IN-set 2.08 s → 0.66 s), byte-identical to the serial path
+(`RIVUS_NO_PARALLEL=1`). Numeric is now within ~1.2× of DuckDB; the string-set /
+regex shapes ~1.6×. The remaining difference is the **CSV read path**, not the
+predicate engine (rust-lang regex matches at DuckDB's RE2-class speed): Rivus
+does a *two-pass* streaming read (infer types, then build typed columns) where
+DuckDB reads once into vectors. (On a 380 MiB file the same numeric query is
+0.91 s parallel vs 3.33 s serial — the win grows with file size.)
+
+> **Note (2026-05-31):** the parallel speedup above only materialized once the
+> 8 MiB threshold was *actually wired into the engine*. The earlier "lower to
+> 8 MiB" change edited only the docs — the engine const stayed at 256 MiB, so
+> 8–256 MiB files silently used the in-memory chunk-partition path, which
+> materialized the whole file and ran *slower than serial* (171 MiB numeric:
+> 1.7 s in-memory vs 1.5 s serial). `try_parallel` now reads the threshold from
+> `parallel_min_bytes()` (default 8 MiB, `RIVUS_PARALLEL_MIN_BYTES`-overridable).
 
 Read-throughput levers, by remaining impact:
 1. ✅ **Parallel reads for stdout sinks** — done. The byte-range reader used to
    bail to serial on a `save -` sink; it now assembles ordered parts to stdout.
-2. ✅ **Lower the parallel threshold to 8 MiB** — done. Measured crossover: below
-   ~6 MiB the thread/part-file overhead makes parallel ~3% slower; from ~8 MiB
-   up it wins 1.7×→3×. Was 256 MiB (so 171 MiB ran serial); now `RIVUS_PARALLEL_MIN_BYTES`-overridable, default 8 MiB.
+2. ✅ **Lower the parallel threshold to 8 MiB — *and wire it into the engine*** —
+   done. Mid-size files (8–256 MiB) now take the streaming-parallel reader
+   instead of the slower in-memory path. `RIVUS_PARALLEL_MIN_BYTES`-overridable
+   (default 8 MiB); `RIVUS_NO_PARALLEL=1` forces serial.
 3. 📋 **Single-pass inference** (sample + adaptive widen) to drop the second
-   scan — the largest remaining gap (the two-pass read is most of the ~1.7×).
+   scan — the largest remaining single-thread gap.
 4. 📋 **mmap + overlap decode with IO**; reuse per-chunk buffers.
 
 DuckDB still buffers (~400 MiB RSS on the 1.1 GB set earlier) where Rivus
