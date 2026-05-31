@@ -73,15 +73,35 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
     }
 }
 
+/// Run `f` with the compiled regex for `pat`, caching it per thread so a
+/// row-wise predicate (`|? regexp(col, "…")`) compiles the pattern once, not
+/// once per row. An invalid pattern is cached as `None` (→ no match), keeping
+/// continue-first semantics. The cache is keyed by the pattern string; flows
+/// use a tiny number of distinct patterns, so it never grows unbounded in
+/// practice.
+#[cfg(feature = "regex")]
+fn with_regex<R>(pat: &str, f: impl FnOnce(Option<&regex::Regex>) -> R) -> R {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Option<regex::Regex>>> =
+            RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        let entry = m
+            .entry(pat.to_string())
+            .or_insert_with(|| regex::Regex::new(pat).ok());
+        f(entry.as_ref())
+    })
+}
+
 /// Does `text` contain a match for `pat` (unanchored)? Behind the off-by-default
-/// `regex` feature; without it, always `false` (the engine raises a recoverable
-/// error once per run via `regexp_available`).
+/// `regex` feature; without it, always `false`. Uses the per-thread compiled-
+/// regex cache so repeated calls with the same pattern don't recompile.
 #[cfg(feature = "regex")]
 fn regexp_match(text: &str, pat: &str) -> bool {
-    match regex::Regex::new(pat) {
-        Ok(re) => re.is_match(text),
-        Err(_) => false,
-    }
+    with_regex(pat, |re| re.map(|r| r.is_match(text)).unwrap_or(false))
 }
 
 #[cfg(not(feature = "regex"))]
@@ -103,16 +123,15 @@ fn regex_literal(args: &[Expr]) -> Option<&str> {
 fn regexp_column(args: &[Expr], chunk: &Chunk) -> Column {
     let pat = regex_literal(args).unwrap_or("");
     let col = eval_column(&args[0], chunk);
-    match regex::Regex::new(pat) {
-        Ok(re) => Column::Bool(
+    with_regex(pat, |re| match re {
+        Some(re) => Column::Bool(
             (0..chunk.len)
                 .map(|r| re.is_match(&col.value_at(r).to_string()))
                 .collect(),
         ),
-        // Invalid pattern → all-false (a parse-time check would be better, but
-        // this keeps continue-first semantics: the run doesn't panic).
-        Err(_) => Column::Bool(vec![false; chunk.len]),
-    }
+        // Invalid pattern → all-false (continue-first: the run doesn't panic).
+        None => Column::Bool(vec![false; chunk.len]),
+    })
 }
 
 #[cfg(not(feature = "regex"))]
