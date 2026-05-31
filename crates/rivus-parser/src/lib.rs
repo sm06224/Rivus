@@ -1265,6 +1265,31 @@ mod tests {
     }
 
     #[test]
+    fn scalar_funcs_parse_and_round_trip() {
+        use rivus_ir::Func;
+        // Each name maps to its Func variant.
+        for (name, want) in [
+            ("replace", Func::Replace),
+            ("split_part", Func::SplitPart),
+            ("concat", Func::Concat),
+            ("abs", Func::Abs),
+            ("round", Func::Round),
+            ("floor", Func::Floor),
+            ("ceil", Func::Ceil),
+            ("coalesce", Func::Coalesce),
+        ] {
+            assert_eq!(Func::parse(name), Some(want), "parse {name}");
+        }
+        // String + numeric + coalesce funcs survive source -> IR -> source.
+        let src = "F:\n open a.csv\n |> (abs(v)) as a (round(v)) as r (floor(v)) as fl (ceil(v)) as c (coalesce(name, \"NA\")) as nm (replace(p, \"/\", \"-\")) as rp\n;";
+        let s = parse(src).unwrap().to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        for needle in ["abs(", "round(", "floor(", "ceil(", "coalesce(", "replace("] {
+            assert!(s.contains(needle), "missing {needle} in {s}");
+        }
+    }
+
+    #[test]
     fn stdio_paths_normalize() {
         // `stdin`/`stdout` (and `-`) map to the "-" sentinel for source & sink.
         let g = parse("F:\n open stdin\n save stdout\n;").unwrap();

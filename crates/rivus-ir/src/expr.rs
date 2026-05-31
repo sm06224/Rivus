@@ -83,6 +83,17 @@ pub enum Func {
     SplitPart,
     /// `concat(a, b, …)` — concatenate all arguments as text (any arity).
     Concat,
+    /// `abs(x)` — absolute value (numeric).
+    Abs,
+    /// `round(x)` — round to the nearest integer (ties away from zero).
+    Round,
+    /// `floor(x)` — largest integer ≤ x.
+    Floor,
+    /// `ceil(x)` — smallest integer ≥ x.
+    Ceil,
+    /// `coalesce(a, b, …)` — the first argument whose text is non-empty (any
+    /// arity); empty string if all are empty. The SQL/pandas null-coalesce.
+    Coalesce,
 }
 
 impl Func {
@@ -102,6 +113,11 @@ impl Func {
             "replace" => Func::Replace,
             "split_part" => Func::SplitPart,
             "concat" => Func::Concat,
+            "abs" => Func::Abs,
+            "round" => Func::Round,
+            "floor" => Func::Floor,
+            "ceil" => Func::Ceil,
+            "coalesce" => Func::Coalesce,
             _ => return None,
         })
     }
@@ -121,6 +137,11 @@ impl Func {
             Func::Replace => "replace",
             Func::SplitPart => "split_part",
             Func::Concat => "concat",
+            Func::Abs => "abs",
+            Func::Round => "round",
+            Func::Floor => "floor",
+            Func::Ceil => "ceil",
+            Func::Coalesce => "coalesce",
         }
     }
 }

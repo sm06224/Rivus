@@ -29,6 +29,15 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Numeric functions `abs` / `round` / `floor` / `ceil` and null-coalesce
+  `coalesce` (std-only).** Usable anywhere an expression is. `abs/round/floor/
+  ceil` coerce a numeric string (e.g. a `:str`-declared column) by parsing it,
+  return an integer when the result is whole (else a float), and a non-numeric
+  value yields null (continue-first); `round` rounds ties away from zero.
+  `coalesce(a, b, …)` returns the first argument whose text is non-empty (empty
+  string if all are), preserving its lane. All lower to `Expr::Func`, round-trip
+  through `to_source`, and are chunk-size independent (oracle-tested). No new
+  dependencies.
 - **Multi-key sort: `sort k1 [asc|desc] k2 [asc|desc] …` (std-only).** `sort`
   now accepts more than one key, each with its own direction (default ascending),
   comparing by each key in turn — e.g. `sort team score desc` orders by team

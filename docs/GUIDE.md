@@ -317,12 +317,23 @@ Used in `|?` predicates and `(…)` computed columns.
 | deep / dynamic field | `$_..age` (recursive), `item("age")` (dynamic) |
 | parent scope field | `$_:1.country` (`$_:0` = current, `$_:1` = parent …) |
 
-**Functions** — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
-`substr(s, start, len)`, `contains(s, sub)` → bool:
+**Functions**
+
+- *string* — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
+  `substr(s, start, len)`, `replace(s, from, to)`, `split_part(s, sep, n)`
+  (1-based field), `concat(a, b, …)`.
+- *predicates* (→ bool) — `contains(s, sub)`, `starts_with(s, p)`,
+  `ends_with(s, p)`, `like(s, pat)`, `glob(s, pat)`, and (with `--features
+  regex`) `regexp(s, re)`.
+- *numeric* — `abs(x)`, `round(x)` (ties away from zero), `floor(x)`, `ceil(x)`;
+  each returns an integer when the result is whole, else a float.
+- *null-coalesce* — `coalesce(a, b, …)`: the first argument whose text is
+  non-empty (the SQL/pandas null-coalesce).
 
 ```
 |? contains(email, "@gmail")
 |> (upper(name)) as NAME (len(name)) as nlen (substr(zip, 0, 3)) as area
+|> (round(price * 1.1)) as gross (coalesce(nick, name)) as display
 ```
 
 **Comparison** — `==  !=  <  <=  >  >=`

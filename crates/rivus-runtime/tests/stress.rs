@@ -411,6 +411,79 @@ fn replace_split_concat_chunk_size_independent() {
 }
 
 #[test]
+fn numeric_and_coalesce_funcs_chunk_size_independent() {
+    // abs/round/floor/ceil over a signed-decimal column, and coalesce over a
+    // sometimes-blank text column. Each output is checked against an independent
+    // oracle and must be chunk-size independent.
+    let rows = 4_000usize;
+    let mut text = String::from("id,v,name\n");
+    let mut vs: Vec<f64> = Vec::with_capacity(rows);
+    for i in 0..rows {
+        // deterministic signed decimals in [-50.0, 49.5] stepping by 0.5
+        let v = (i as f64 % 200.0) * 0.5 - 50.0;
+        vs.push(v);
+        let name = if i % 3 == 0 {
+            String::new()
+        } else {
+            format!("n{i}")
+        };
+        text.push_str(&format!("{i},{v},{name}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_numfn", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(
+            &format!(
+                "N:\n open {p}\n |> id (abs(v)) as a (round(v)) as r (floor(v)) as fl (ceil(v)) as ce (coalesce(name, \"NA\")) as nm\n;"
+            ),
+            cs,
+        );
+        let out = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("N"))
+            .unwrap();
+        for c in &out.chunks {
+            let ii = c.schema.index_of("id").unwrap();
+            let (ai, ri, fi, ci, ni) = (
+                c.schema.index_of("a").unwrap(),
+                c.schema.index_of("r").unwrap(),
+                c.schema.index_of("fl").unwrap(),
+                c.schema.index_of("ce").unwrap(),
+                c.schema.index_of("nm").unwrap(),
+            );
+            for row in 0..c.len {
+                let id = c.value(row, ii).to_string().parse::<usize>().unwrap();
+                let v = vs[id];
+                assert_eq!(c.value(row, ai).as_f64().unwrap(), v.abs(), "abs @cs={cs}");
+                assert_eq!(
+                    c.value(row, ri).as_f64().unwrap(),
+                    v.round(),
+                    "round @cs={cs}"
+                );
+                assert_eq!(
+                    c.value(row, fi).as_f64().unwrap(),
+                    v.floor(),
+                    "floor @cs={cs}"
+                );
+                assert_eq!(
+                    c.value(row, ci).as_f64().unwrap(),
+                    v.ceil(),
+                    "ceil @cs={cs}"
+                );
+                let want_nm = if id % 3 == 0 {
+                    "NA".to_string()
+                } else {
+                    format!("n{id}")
+                };
+                assert_eq!(c.value(row, ni).to_string(), want_nm, "coalesce @cs={cs}");
+            }
+        }
+        assert!(res.errors.is_empty(), "errors @cs={cs}");
+    }
+}
+
+#[test]
 fn dropna_and_fill_chunk_size_independent() {
     // city is blank on every 3rd row. dropna city drops those; fill city
     // replaces them. Both must be exact and chunk-size independent.

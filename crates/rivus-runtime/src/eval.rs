@@ -105,6 +105,44 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             }
             Value::Str(out)
         }
+        Func::Abs => num_value(arg(0), f64::abs),
+        Func::Round => num_value(arg(0), f64::round),
+        Func::Floor => num_value(arg(0), f64::floor),
+        Func::Ceil => num_value(arg(0), f64::ceil),
+        Func::Coalesce => {
+            // First argument whose text form is non-empty, kept as-is (preserves
+            // its lane). Empty string if every argument is empty/null.
+            for i in 0..args.len() {
+                let v = arg(i);
+                if !v.to_string().is_empty() {
+                    return v;
+                }
+            }
+            Value::Str(String::new())
+        }
+    }
+}
+
+/// Apply a unary numeric function to a value, coercing a numeric *string* (e.g.
+/// from a `:str`-declared column) by parsing it. A non-numeric value yields
+/// `Null` (continue-first). An integral result is returned as `I64` so an
+/// integer-looking column stays integer-looking; otherwise `F64`.
+fn num_value(v: Value, f: impl Fn(f64) -> f64) -> Value {
+    let x = match v.as_f64() {
+        Some(x) => x,
+        None => match v {
+            Value::Str(s) => match s.trim().parse::<f64>() {
+                Ok(x) => x,
+                Err(_) => return Value::Null,
+            },
+            _ => return Value::Null,
+        },
+    };
+    let r = f(x);
+    if r.is_finite() && r.fract() == 0.0 && r.abs() < 9.007_199_254_740_992e15 {
+        Value::I64(r as i64)
+    } else {
+        Value::F64(r)
     }
 }
 
@@ -382,6 +420,14 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                         .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
                         .collect(),
                 ),
+                // Numeric / coalesce funcs produce a value whose lane depends on
+                // the data (e.g. `round` is integral, `coalesce` may be text),
+                // so pick the narrowest fitting lane per chunk.
+                Func::Abs | Func::Round | Func::Floor | Func::Ceil | Func::Coalesce => {
+                    let vals: Vec<Value> =
+                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    column_from_values(vals)
+                }
                 _ => {
                     let mut s = StrColumn::with_capacity(n, n * 8);
                     for r in 0..n {

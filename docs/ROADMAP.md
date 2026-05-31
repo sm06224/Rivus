@@ -54,7 +54,7 @@ it in small, gated steps.
 | ✅ | • at the source | `open f.csv (id:int name:str)` — declared schema (done) |
 | ✅ | • mid-flow cast | `\|> (age:int) as age` — cast via a computed column (a `cast` verb is sugar, 1.x) |
 | ✅ | • derive/add property | `\|> (expr) as name` computed columns (done) |
-| ✅ | String functions, `case when … then … else` | `upper/lower/trim/len/substr/contains` ✅ and `case when … then … [else …] end` ✅ done |
+| ✅ | String / numeric functions, `case when … then … else` | `upper/lower/trim/len/substr/contains/replace/split_part/concat`, `starts_with/ends_with/like/glob/regexp`, numeric `abs/round/floor/ceil`, null-coalesce `coalesce`, and `case when … then … [else …] end` all done |
 
 ## D. Relational & cleaning operators
 
