@@ -1152,6 +1152,54 @@ fn group_aggregates_are_exact() {
 }
 
 #[test]
+fn multi_key_group_matches_oracle() {
+    // `|# country active sum:age` groups by the (country, active) tuple. The
+    // per-group count and sum must match an independent oracle that buckets the
+    // regenerated PRNG stream by the same tuple, and be chunk-size independent.
+    use std::collections::BTreeMap;
+    let rows = 20_000;
+    let seed = 271;
+    let data = gendata::clean(rows, seed);
+    let f = TempCsv(gendata::write_temp("stress_mkgroup", &data));
+    let p = f.0.display();
+
+    // Oracle: replay clean()'s exact PRNG sequence (age, score, country, active).
+    let countries = ["JP", "US", "DE", "FR", "BR"];
+    let mut rng = Rng::new(seed);
+    let mut oracle: BTreeMap<(String, String), (i64, f64)> = BTreeMap::new();
+    for _ in 0..rows {
+        let age = rng.below(90) as f64;
+        let _score = rng.below(10_000);
+        let country = countries[rng.below(5) as usize].to_string();
+        let active = (rng.below(2) == 1).to_string();
+        let e = oracle.entry((country, active)).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += age;
+    }
+
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(&format!("G:\n open {p}\n |# country active sum:age\n;"), cs);
+        let out = &res.outputs[0];
+        let chunk = &out.chunks[0];
+        assert_eq!(
+            chunk.schema.field_names(),
+            vec!["country", "active", "count", "sum_age"],
+            "schema @cs={cs}"
+        );
+        assert_eq!(chunk.len, oracle.len(), "group count @cs={cs}");
+        for row in 0..chunk.len {
+            let country = chunk.value(row, 0).to_string();
+            let active = chunk.value(row, 1).to_string();
+            let count = chunk.value(row, 2).as_f64().unwrap() as i64;
+            let sum = chunk.value(row, 3).as_f64().unwrap();
+            let (oc, os) = oracle[&(country.clone(), active.clone())];
+            assert_eq!(count, oc, "count[{country},{active}] @cs={cs}");
+            assert_eq!(sum, os, "sum[{country},{active}] @cs={cs}");
+        }
+    }
+}
+
+#[test]
 fn tsv_read_filter_project_chunk_size_independent() {
     // A `.tsv` source must split on tabs, infer per-column types (so the numeric
     // filter works), and stay chunk-size independent — exactly like CSV.

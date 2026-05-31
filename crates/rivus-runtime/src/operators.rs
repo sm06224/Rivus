@@ -253,7 +253,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             preds: preds.clone(),
             fields: fields.clone(),
         }),
-        Op::GroupBy { key, aggs } => Box::new(GroupBy::new(key.clone(), aggs.clone())),
+        Op::GroupBy { keys, aggs } => Box::new(GroupBy::new(keys.clone(), aggs.clone())),
         Op::Merge => Box::new(Merge),
         Op::Branch => Box::new(Merge), // identity forwarder; fan-out is structural
         Op::Join {
@@ -1887,21 +1887,24 @@ impl AggAcc {
 }
 
 struct GroupState {
+    /// The group's key values, one per group key (in key order). Stored so the
+    /// output can emit one column per key (the map key is a packed composite).
+    key_parts: Vec<String>,
     count: i64,
     accs: Vec<AggAcc>,
 }
 
 struct GroupBy {
-    key: String,
+    keys: Vec<String>,
     aggs: Vec<(AggFunc, String)>,
     groups: BTreeMap<String, GroupState>,
     emitted: bool,
 }
 
 impl GroupBy {
-    fn new(key: String, aggs: Vec<(AggFunc, String)>) -> Self {
+    fn new(keys: Vec<String>, aggs: Vec<(AggFunc, String)>) -> Self {
         GroupBy {
-            key,
+            keys,
             aggs,
             groups: BTreeMap::new(),
             emitted: false,
@@ -1911,17 +1914,26 @@ impl GroupBy {
 
 impl Operator for GroupBy {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let Some(key_idx) = chunk.schema.index_of(&self.key) else {
-            ctx.raise(
-                ErrorEvent::new(
-                    Severity::Warn,
-                    ErrorScope::Chunk,
-                    format!("group: unknown key '{}'", self.key),
-                )
-                .at_node(ctx.label.clone()),
-            );
-            return Vec::new();
-        };
+        // Resolve every group-key column index; an unknown key warns once and
+        // drops the chunk (continue-first — a later, well-formed chunk still
+        // aggregates).
+        let mut key_idx = Vec::with_capacity(self.keys.len());
+        for k in &self.keys {
+            match chunk.schema.index_of(k) {
+                Some(i) => key_idx.push(i),
+                None => {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Warn,
+                            ErrorScope::Chunk,
+                            format!("group: unknown key '{k}'"),
+                        )
+                        .at_node(ctx.label.clone()),
+                    );
+                    return Vec::new();
+                }
+            }
+        }
         // Resolve aggregate column indices once per chunk.
         let agg_idx: Vec<Option<usize>> = self
             .aggs
@@ -1933,8 +1945,17 @@ impl Operator for GroupBy {
         let funcs: Vec<AggFunc> = self.aggs.iter().map(|(f, _)| *f).collect();
 
         for row in 0..chunk.len {
-            let k = chunk.value(row, key_idx).to_string();
-            let state = self.groups.entry(k).or_insert_with(|| GroupState {
+            // Composite map key: the key values joined by the ASCII unit
+            // separator (0x1F), which can't appear in a parsed CSV field, so
+            // distinct key tuples never collide. The parts are kept on the state
+            // for output.
+            let parts: Vec<String> = key_idx
+                .iter()
+                .map(|&i| chunk.value(row, i).to_string())
+                .collect();
+            let composite = parts.join("\u{1f}");
+            let state = self.groups.entry(composite).or_insert_with(|| GroupState {
+                key_parts: parts,
                 count: 0,
                 accs: funcs.iter().map(|f| AggAcc::new(*f)).collect(),
             });
@@ -1955,14 +1976,26 @@ impl Operator for GroupBy {
         }
         self.emitted = true;
 
-        let keys: StrColumn = self.groups.keys().map(String::as_str).collect();
-        let counts: Vec<i64> = self.groups.values().map(|s| s.count).collect();
+        // One Str column per group key (values pulled from each group's stored
+        // key parts), then the count, then the aggregate columns.
+        let mut fields: Vec<Field> = self
+            .keys
+            .iter()
+            .map(|k| Field::new(k.clone(), DataType::Str))
+            .collect();
+        fields.push(Field::new("count", DataType::I64));
 
-        let mut fields = vec![
-            Field::new(self.key.clone(), DataType::Str),
-            Field::new("count", DataType::I64),
-        ];
-        let mut columns: Vec<Column> = vec![Column::Str(keys), Column::I64(counts)];
+        let mut columns: Vec<Column> = Vec::with_capacity(self.keys.len() + 1 + self.aggs.len());
+        for ki in 0..self.keys.len() {
+            let col: StrColumn = self
+                .groups
+                .values()
+                .map(|s| s.key_parts[ki].as_str())
+                .collect();
+            columns.push(Column::Str(col));
+        }
+        let counts: Vec<i64> = self.groups.values().map(|s| s.count).collect();
+        columns.push(Column::I64(counts));
 
         for (j, (func, col)) in self.aggs.iter().enumerate() {
             let name = format!("{}_{}", func.label(), col);

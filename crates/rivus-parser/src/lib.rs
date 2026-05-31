@@ -193,9 +193,26 @@ impl Parser {
                 }
                 Tok::PipeGroup => {
                     self.bump();
-                    let key = self.word()?;
-                    // Optional aggregates: `sum:col avg:col ...` (a func word
-                    // followed by `:`); anything else ends the group clause.
+                    // One or more group keys, then optional aggregates. A word is
+                    // an aggregate (not a key) when it's a known func immediately
+                    // followed by `:` (e.g. `sum:score`); every other leading
+                    // word is a key. At least one key is required.
+                    let is_agg = |p: &Self| {
+                        matches!(p.tok(), Tok::Word(w)
+                            if AggFunc::parse(w).is_some()
+                                && p.toks[p.pos + 1].0 == Tok::Colon)
+                    };
+                    let mut keys = Vec::new();
+                    while let Tok::Word(_) = self.tok() {
+                        if is_agg(self) {
+                            break;
+                        }
+                        keys.push(self.word()?);
+                    }
+                    if keys.is_empty() {
+                        return Err(self.err("group `|#` requires at least one key"));
+                    }
+                    // Aggregates: `func:col` repeated.
                     let mut aggs = Vec::new();
                     while let Tok::Word(w) = self.tok().clone() {
                         match AggFunc::parse(&w) {
@@ -208,7 +225,7 @@ impl Parser {
                             _ => break,
                         }
                     }
-                    let n = self.g.add_node(Op::GroupBy { key, aggs });
+                    let n = self.g.add_node(Op::GroupBy { keys, aggs });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }

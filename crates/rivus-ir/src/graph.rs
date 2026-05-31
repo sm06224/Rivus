@@ -306,10 +306,11 @@ pub enum Op {
     /// given order; all other columns follow in their original order. Unknown
     /// names are ignored. Streaming, stateless, type/value preserving.
     Reorder { cols: Vec<String> },
-    /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
-    /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
+    /// `|# key [key ...] [agg:col ...]` — group by one or more keys. Always
+    /// emits a `count`; each `(func, col)` adds an aggregate column (e.g.
+    /// `sum:score`, `avg:age`). Each key becomes a column in the output.
     GroupBy {
-        key: String,
+        keys: Vec<String>,
         aggs: Vec<(AggFunc, String)>,
     },
     /// Fused linear chain of filters and an optional trailing projection,
@@ -552,8 +553,8 @@ impl Op {
                 }
                 s.trim_end().to_string()
             }
-            Op::GroupBy { key, aggs } => {
-                let mut s = format!("|# {key}");
+            Op::GroupBy { keys, aggs } => {
+                let mut s = format!("|# {}", keys.join(" "));
                 for (f, c) in aggs {
                     s.push_str(&format!(" {}:{c}", f.label()));
                 }

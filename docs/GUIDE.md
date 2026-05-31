@@ -137,8 +137,8 @@ Select columns, rename them, or compute new ones. Each item is one of:
 
 ### `|#` — group by
 
-Partition by a key column and aggregate. A `count` column is always emitted;
-each `func:col` adds one aggregate. Functions:
+Partition by one or more key columns and aggregate. A `count` column is always
+emitted; each `func:col` adds one aggregate. Functions:
 
 - numeric: `sum avg min max std` (std is sample, ddof=1)
 - percentiles: `median` and `pNN` (`p50 p90 p99 …`, linear interpolation)
@@ -146,13 +146,15 @@ each `func:col` adds one aggregate. Functions:
 - positional: `first last` (first/last non-empty value in source order)
 
 ```
-|# country                        # → country, count
-|# country sum:score avg:age      # → country, count, sum_score, avg_age
-|# country median:score p90:score # → country, count, median_score, p90_score
-|# country count_distinct:city    # → country, count, count_distinct_city
+|# country                          # → country, count
+|# country region sum:score         # multi-key: → country, region, count, sum_score
+|# country sum:score avg:age        # → country, count, sum_score, avg_age
+|# country median:score p90:score   # → country, count, median_score, p90_score
+|# country count_distinct:city      # → country, count, count_distinct_city
 ```
 
-Output columns are named `count` and `<func>_<col>` (e.g. `sum_score`,
+Multiple keys partition by the column *tuple* (each key becomes its own output
+column, before `count`). Output columns are named `count` and `<func>_<col>` (e.g. `sum_score`,
 `p90_score`). `std`/percentiles buffer each group's values (a pipeline-breaker
 like `sort`); the rest stream in O(1) memory per group.
 
@@ -518,7 +520,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
            | '|>' proj+                                       (project / compute)
-           | '|#' IDENT ((AGG) ':' IDENT)*                     (group)
+           | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
            | ('take'|'limit'|'head') INT
            | 'sort' IDENT ('asc'|'desc')?
            | 'distinct' IDENT*

@@ -29,6 +29,14 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Multi-key grouping: `|# key1 key2 … [func:col …]` (std-only).** `|#` now
+  accepts more than one group key — e.g. `|# country region sum:score` groups by
+  the (country, region) tuple. Each key becomes its own output column (in key
+  order, before `count`), then the aggregate columns. Groups are keyed on the
+  key values joined by the ASCII unit separator (`0x1F`, which can't appear in a
+  parsed field), so distinct tuples never collide. Single-key `|#` is unchanged.
+  Round-trips through `to_source`; oracle-tested (count + sum per tuple,
+  chunk-size independent). No new dependencies.
 - **`reorder COL [COL ...]` column reordering (std-only).** Moves the named
   columns to the front in the given order; every other column follows in its
   original order. Unknown names are ignored and a repeated name is deduped. A
