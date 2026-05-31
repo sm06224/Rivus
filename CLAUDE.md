@@ -3,6 +3,11 @@
 This file is the durable memory for how to develop Rivus. Read it first. It is
 binding unless the user overrides it.
 
+## Addressing the user (experimental)
+
+- When speaking to the user, address them as **「統括」** (e.g. 「承知しました、
+  統括」). Japanese replies, per the user's standing preference.
+
 ## Mode: autonomous
 
 - **Do not ask for confirmation.** Proceed. When something is ambiguous, consult
