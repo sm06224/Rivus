@@ -376,7 +376,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
 /// Build a typed column from row values, choosing the narrowest lane that fits
 /// (all-int → I64, all-numeric → F64, all-bool → Bool, else Str). Used by
 /// row-wise expressions like `case` that don't have a native columnar form.
-fn column_from_values(vals: Vec<Value>) -> Column {
+pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
     let all_int = vals
         .iter()
         .all(|v| matches!(v, Value::I64(_) | Value::Bool(_)));

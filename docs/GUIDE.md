@@ -254,6 +254,11 @@ Merged:
 - `A &left B on key` — **left outer join**: every left row is kept; when no
   right row matches, the right columns are padded with type defaults (`0` /
   `0.0` / `false` / empty string).
+- `A &right B on key` — **right outer join**: every right row is kept (the left
+  columns padded with defaults). The join-key column keeps the right key, so an
+  orphan right row never loses its key.
+- `A &full B on key` — **full outer join**: every row from both sides; unmatched
+  rows are padded on the missing side.
 
 ```
 # inner join two CSVs on `id`
@@ -489,7 +494,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | 'readcsv' PATH | 'readjson' PATH
            | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
            | 'stream' IDENT
-           | IDENT (('+' IDENT)+ | ('&' IDENT))? ;            (merge / join over scopes)
+           | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY))? ;  (merge / join)
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
            | '|>' proj+                                       (project / compute)

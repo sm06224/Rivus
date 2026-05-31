@@ -576,11 +576,17 @@ impl Parser {
                     }
                     Ok(merge)
                 } else if self.eat(&Tok::Amp) {
-                    // `&` is an inner join; `&left` is a left outer join (the
-                    // `left` qualifier lexes as a bare word right after `&`).
+                    // `&` is an inner join; `&left`/`&right`/`&full` are outer
+                    // joins (the qualifier lexes as a bare word right after `&`).
                     let kind = if self.peek_is_word("left") {
                         self.bump();
                         JoinKind::Left
+                    } else if self.peek_is_word("right") {
+                        self.bump();
+                        JoinKind::Right
+                    } else if self.peek_is_word("full") {
+                        self.bump();
+                        JoinKind::Full
                     } else {
                         JoinKind::Inner
                     };
@@ -1529,11 +1535,26 @@ Import:
             None => panic!("expected a join node"),
         }
 
-        // Reversible: inner, left, and distinct-key joins each survive a
+        // right/full lower to their kinds.
+        match parse("U: open u.csv ;\nO: open o.csv ;\nJ: U &right O on id ;")
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::Join { kind, .. } => Some(*kind),
+                _ => None,
+            }) {
+            Some(k) => assert_eq!(k, JoinKind::Right),
+            None => panic!("expected join"),
+        }
+
+        // Reversible: every join kind (and a distinct-key join) survives a
         // source -> IR -> source round-trip.
         for prog in [
             "U: open u.csv ;\nO: open o.csv ;\nJ: U & O on id ;",
             "U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on id ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &right O on id ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &full O on id ;",
             "U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on uid:oid ;",
         ] {
             let s = parse(prog).unwrap().to_source();

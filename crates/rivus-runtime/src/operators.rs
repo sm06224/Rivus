@@ -2013,6 +2013,16 @@ fn concat_chunks(bufs: Vec<Chunk>) -> Option<Chunk> {
     Some(Chunk::new(0, schema, cols))
 }
 
+impl Join {
+    /// Emit one side unchanged (its own schema) — used when the other side has
+    /// no rows at all and this join kind keeps the present side.
+    fn pass_through(&self, ctx: &mut OpCtx, side: &Chunk) -> Chunk {
+        let idx: Vec<usize> = (0..side.len).collect();
+        let cols: Vec<Column> = side.columns.iter().map(|c| c.gather(&idx)).collect();
+        Chunk::new(ctx.fresh_id(), side.schema.clone(), cols)
+    }
+}
+
 impl Operator for Join {
     fn process(&mut self, from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
         if from == self.left_id {
@@ -2026,18 +2036,26 @@ impl Operator for Join {
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
         let left = concat_chunks(std::mem::take(&mut self.left_buf));
         let right = concat_chunks(std::mem::take(&mut self.right_buf));
-        let Some(left) = left else {
-            return Vec::new(); // no left rows → nothing to emit (both kinds)
-        };
-        // An empty right side: inner join is empty; a left join keeps every
-        // left row but has no right schema to pad with, so it emits left-only.
-        let Some(right) = right else {
-            if self.kind == JoinKind::Left {
-                let idx: Vec<usize> = (0..left.len).collect();
-                let cols: Vec<Column> = left.columns.iter().map(|c| c.gather(&idx)).collect();
-                return vec![Chunk::new(ctx.fresh_id(), left.schema.clone(), cols)];
+
+        // One side entirely absent (no chunks). With no schema to pad against we
+        // can only emit the *present* side, and only when this kind keeps it.
+        let (left, right) = match (left, right) {
+            (Some(l), Some(r)) => (l, r),
+            (Some(l), None) => {
+                return if self.kind.keeps_left() {
+                    vec![self.pass_through(ctx, &l)]
+                } else {
+                    Vec::new()
+                };
             }
-            return Vec::new();
+            (None, Some(r)) => {
+                return if self.kind.keeps_right() {
+                    vec![self.pass_through(ctx, &r)]
+                } else {
+                    Vec::new()
+                };
+            }
+            (None, None) => return Vec::new(),
         };
 
         let warn = |ctx: &mut OpCtx, side: &str, key: &str| {
@@ -2060,9 +2078,11 @@ impl Operator for Join {
         };
 
         // Build the hash table on the right side, then probe with the left.
-        // `ridx` is `Option<usize>`: `None` marks a left row that matched no
-        // right row (only produced for a left join), which pads the right
-        // columns with type defaults.
+        // Each output row is a `(Option<left>, Option<right>)` pair: an unmatched
+        // left row (left/full) has `None` on the right and pads the right columns
+        // with defaults; an unmatched right row (right/full) has `None` on the
+        // left and pads the left columns — except the join-key column, which
+        // takes the right key so the key is never lost.
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for ri in 0..right.len {
             table
@@ -2070,22 +2090,32 @@ impl Operator for Join {
                 .or_default()
                 .push(ri);
         }
-        let left_join = self.kind == JoinKind::Left;
-        let mut lidx = Vec::new();
+        let mut right_matched = vec![false; right.len];
+        let mut lidx: Vec<Option<usize>> = Vec::new();
         let mut ridx: Vec<Option<usize>> = Vec::new();
         for li in 0..left.len {
             match table.get(&left.value(li, lk).to_string()) {
                 Some(rs) => {
                     for &ri in rs {
-                        lidx.push(li);
+                        right_matched[ri] = true;
+                        lidx.push(Some(li));
                         ridx.push(Some(ri));
                     }
                 }
-                None if left_join => {
-                    lidx.push(li);
+                None if self.kind.keeps_left() => {
+                    lidx.push(Some(li));
                     ridx.push(None);
                 }
                 None => {}
+            }
+        }
+        // Right/full: append the right rows that no left row matched.
+        if self.kind.keeps_right() {
+            for (ri, matched) in right_matched.iter().enumerate() {
+                if !*matched {
+                    lidx.push(None);
+                    ridx.push(Some(ri));
+                }
             }
         }
 
@@ -2106,7 +2136,17 @@ impl Operator for Join {
             right_cols.push(ci);
         }
 
-        let mut out: Vec<Column> = left.columns.iter().map(|c| c.gather(&lidx)).collect();
+        // Left columns: gather by `lidx`, but the join-key column borrows the
+        // right key when the left side is absent (key-preservation for
+        // right/full joins). Other left columns pad with the type default.
+        let mut out: Vec<Column> = Vec::with_capacity(fields.len());
+        for (ci, col) in left.columns.iter().enumerate() {
+            if ci == lk {
+                out.push(join_key_column(col, &lidx, &ridx, &right.columns[rk]));
+            } else {
+                out.push(col.gather_opt(&lidx));
+            }
+        }
         for &ci in &right_cols {
             out.push(right.columns[ci].gather_opt(&ridx));
         }
@@ -2116,6 +2156,34 @@ impl Operator for Join {
             out,
         )]
     }
+}
+
+/// Build the output join-key column. For a matched/left-present row it takes the
+/// left key (`lidx`); for an unmatched-right row (`lidx == None`) it takes the
+/// right key (`ridx`), so a right/full join never drops the key value. Falls
+/// back to the left column's lane, widening to text only if the right key's
+/// string form can't be represented there.
+fn join_key_column(
+    left_key: &Column,
+    lidx: &[Option<usize>],
+    ridx: &[Option<usize>],
+    right_key: &Column,
+) -> Column {
+    // Fast path: every row has a left value → a plain gather_opt suffices.
+    if lidx.iter().all(|o| o.is_some()) {
+        return left_key.gather_opt(lidx);
+    }
+    // Mixed: assemble values, taking the right key when the left is absent.
+    let vals: Vec<rivus_core::Value> = lidx
+        .iter()
+        .zip(ridx)
+        .map(|(l, r)| match (l, r) {
+            (Some(i), _) => left_key.value_at(*i),
+            (None, Some(j)) => right_key.value_at(*j),
+            (None, None) => rivus_core::Value::Str(String::new()),
+        })
+        .collect();
+    eval::column_from_values(vals)
 }
 
 // ----------------------------------------------------------------- sink: print

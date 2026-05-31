@@ -61,7 +61,7 @@ it in small, gated steps.
 | | item | note |
 |---|---|---|
 | ✅ | filter · project · group(sum/avg/min/max/count) · sort · distinct · take | |
-| 🚧 | **Joins (hash join)** | `A & B on k` **inner** ✅ and `A &left B on k` **left outer** ✅ done (unmatched left rows kept, right columns padded with type defaults; build side buffered, a pipeline-breaker like sort). Right/full outer still planned. |
+| ✅ | **Joins (hash join)** | `A & B on k` **inner**, `A &left B`, `A &right B`, `A &full B` all done (outer joins pad the missing side with type defaults and preserve the join key; build side buffered, a pipeline-breaker like sort). |
 | ✅ | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅, `fill col VALUE` ✅, `fill col ffill\|bfill` ✅ (directional carry across chunks), **`fill col mean\|median`** ✅ (whole-column statistic over the non-empty numeric cells). All chunk-size independent; bfill/mean/median are pipeline-breakers. Declare a column `:str` so its blanks survive parsing (a numeric column's blank becomes 0 at parse time). |
 | ✅ | More aggregates | `std` (sample), `count_distinct`/`nunique`, `first`, `last`, `median`/`pNN` percentiles (linear interp) all done |
 | 🚧 | `rename`, `drop`, `reorder` columns | `rename OLD NEW …` ✅ and `drop COL …` ✅ done (stateless, parallel-safe, reversible); `reorder` via `\|>` today |

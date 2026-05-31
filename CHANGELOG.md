@@ -29,6 +29,16 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Right & full outer joins: `A &right B` / `A &full B` (std-only).** Complete
+  the join family alongside `&` (inner) and `&left`. `&right` keeps every right
+  row (left columns padded with type defaults); `&full` keeps every row from
+  both sides. Outer joins **preserve the join key**: an unmatched right row
+  carries its key into the output key column (so a right/full join never drops
+  it). Same buffered hash-join machinery and blocking/serial semantics. Lowers
+  to `Op::Join { kind: Right|Full }`, round-trips through `to_source`.
+  Oracle-tested (right rows = matched + orphan-right; full = matched +
+  unmatched-left + orphan-right; key never empty), chunk-size independent. No
+  new dependencies.
 - **gzip input: `open data.csv.gz` (opt-in `--features gzip`).** Reads
   gzip-compressed CSV/TSV (`.csv.gz` / `.tsv.gz`) through `flate2`'s pure-Rust
   `miniz_oxide` backend (no C toolchain). A compressed stream can't be seeked,

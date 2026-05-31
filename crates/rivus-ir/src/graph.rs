@@ -26,6 +26,28 @@ pub enum Endian {
 pub enum JoinKind {
     Inner,
     Left,
+    Right,
+    Full,
+}
+
+impl JoinKind {
+    /// The `&`-operator spelling used in source (`&`, `&left`, `&right`, `&full`).
+    pub fn amp(&self) -> &'static str {
+        match self {
+            JoinKind::Inner => "&",
+            JoinKind::Left => "&left",
+            JoinKind::Right => "&right",
+            JoinKind::Full => "&full",
+        }
+    }
+    /// Keep left rows that matched nothing (left / full outer).
+    pub fn keeps_left(&self) -> bool {
+        matches!(self, JoinKind::Left | JoinKind::Full)
+    }
+    /// Keep right rows that matched nothing (right / full outer).
+    pub fn keeps_right(&self) -> bool {
+        matches!(self, JoinKind::Right | JoinKind::Full)
+    }
 }
 
 /// How `fill col …` replaces a column's missing (empty) cells.
@@ -534,13 +556,7 @@ impl Op {
                 left_key,
                 right_key,
                 kind,
-            } => {
-                let amp = match kind {
-                    JoinKind::Inner => "&",
-                    JoinKind::Left => "&left",
-                };
-                format!("{amp} on {left_key} = {right_key}")
-            }
+            } => format!("{} on {left_key} = {right_key}", kind.amp()),
             Op::SinkPrint => "print".to_string(),
             Op::SinkCsv { path, delim } => match delim_modifier_for(path, *delim) {
                 Some(m) => format!("save {path} {m}"),
@@ -764,11 +780,8 @@ impl PlanGraph {
                     right_key,
                     kind,
                 } => {
-                    let sep = match kind {
-                        JoinKind::Inner => " & ",
-                        JoinKind::Left => " &left ",
-                    };
-                    let names = self.input_labels(&inputs).join(sep);
+                    let sep = format!(" {} ", kind.amp());
+                    let names = self.input_labels(&inputs).join(&sep);
                     let on = if left_key == right_key {
                         format!("on {left_key}")
                     } else {

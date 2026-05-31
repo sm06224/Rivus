@@ -397,6 +397,77 @@ fn fill_ffill_bfill_chunk_size_independent() {
 }
 
 #[test]
+fn right_and_full_outer_join_match_oracle() {
+    // Users 0..users; orders carry an id in [0, users*2). So some users have no
+    // order (unmatched left) and some orders reference a non-existent user
+    // (unmatched right). Build independent oracles for the row counts of a RIGHT
+    // and a FULL outer join, and assert chunk-size independence.
+    let users = 1_200usize;
+    let mut u = String::from("id,name\n");
+    for i in 0..users {
+        u.push_str(&format!("{i},user{i}\n"));
+    }
+    let norders = 3_500usize;
+    let mut o = String::from("id,amount\n");
+    let mut rng = Rng::new(13);
+    let mut matched_pairs = 0u64; // (user, order) matches
+    let mut orphan_orders = 0u64; // orders with no user
+    let mut matched_users = vec![false; users];
+    for _ in 0..norders {
+        let id = rng.below((users * 2) as u64);
+        o.push_str(&format!("{id},10\n"));
+        if (id as usize) < users {
+            matched_pairs += 1;
+            matched_users[id as usize] = true;
+        } else {
+            orphan_orders += 1;
+        }
+    }
+    let unmatched_users = matched_users.iter().filter(|m| !**m).count() as u64;
+
+    // RIGHT join = every order row: matched pairs + orphan orders (one each).
+    let right_rows = matched_pairs + orphan_orders;
+    // FULL join = matched pairs + unmatched users + orphan orders.
+    let full_rows = matched_pairs + unmatched_users + orphan_orders;
+
+    let uf = TempCsv(gendata::write_temp_bytes("rjoin_u", u.as_bytes()));
+    let of = TempCsv(gendata::write_temp_bytes("rjoin_o", o.as_bytes()));
+    let (up, op) = (uf.0.display(), of.0.display());
+
+    for cs in [1, 7, 1024, norders] {
+        let r = run_src(
+            &format!("U: open {up} ;\nO: open {op} ;\nJ: U &right O on id |> id name amount\n;"),
+            cs,
+        );
+        assert_eq!(r.total_rows_out(), right_rows, "right join rows @cs={cs}");
+        assert!(r.errors.is_empty(), "right join errors @cs={cs}");
+
+        let f = run_src(
+            &format!("U: open {up} ;\nO: open {op} ;\nJ: U &full O on id |> id name amount\n;"),
+            cs,
+        );
+        assert_eq!(f.total_rows_out(), full_rows, "full join rows @cs={cs}");
+
+        // Every output row must carry a non-empty `id` (key-preservation: an
+        // orphan order with no user still keeps its id in the key column).
+        let o_out = f
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("J"))
+            .unwrap();
+        for c in &o_out.chunks {
+            let ci = c.schema.index_of("id").unwrap();
+            for row in 0..c.len {
+                assert!(
+                    !c.value(row, ci).to_string().is_empty(),
+                    "full join lost a key @cs={cs}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn fill_mean_median_chunk_size_independent() {
     // score is blank on every 4th row; the rest are a known numeric sequence.
     // `fill score mean|median` must replace blanks with the column statistic of
