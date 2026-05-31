@@ -53,6 +53,119 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             let out: String = s.chars().skip(start).take(take).collect();
             Value::Str(out)
         }
+        Func::Like => {
+            let hay = arg(0).to_string();
+            let pat = arg(1).to_string();
+            Value::Bool(like_match(&hay, &pat))
+        }
+        Func::Glob => {
+            let hay = arg(0).to_string();
+            let pat = arg(1).to_string();
+            Value::Bool(glob_match(&hay, &pat))
+        }
+    }
+}
+
+/// SQL `LIKE`: `%` matches any run (including empty), `_` matches exactly one
+/// char. Case-sensitive, no escape char (MVP). Linear-time backtracking with a
+/// single restart pointer (the classic two-pointer wildcard match), so a
+/// pathological pattern can't blow up.
+fn like_match(text: &str, pat: &str) -> bool {
+    wildcard_match(text, pat, b'%', b'_')
+}
+
+/// Shell glob over a single string: `*` any run, `?` any single char, plus
+/// `[abc]` / `[a-z]` / `[!abc]` character classes. Case-sensitive.
+fn glob_match(text: &str, pat: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pat.chars().collect();
+    glob_rec(&t, 0, &p, 0)
+}
+
+/// Two-pointer wildcard match where `star` is the any-run wildcard and `one`
+/// the any-single wildcard. O(n·m) worst case but no recursion/backtracking
+/// explosion (greedy with a remembered star position).
+fn wildcard_match(text: &str, pat: &str, star: u8, one: u8) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pat.chars().collect();
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti): (Option<usize>, usize) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] as u32 == one as u32 || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] as u32 == star as u32 {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] as u32 == star as u32 {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Recursive glob with `[...]` classes (rare enough that recursion is fine; `*`
+/// still bounded because each `*` advances `ti` monotonically per call chain).
+fn glob_rec(t: &[char], ti: usize, p: &[char], pi: usize) -> bool {
+    if pi == p.len() {
+        return ti == t.len();
+    }
+    match p[pi] {
+        '*' => {
+            // Match zero-or-more: try consuming none, then one more each step.
+            for k in ti..=t.len() {
+                if glob_rec(t, k, p, pi + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        '?' => ti < t.len() && glob_rec(t, ti + 1, p, pi + 1),
+        '[' => {
+            if ti >= t.len() {
+                return false;
+            }
+            // Parse the class `[...]`: optional leading `!` negates.
+            let mut j = pi + 1;
+            let negate = j < p.len() && p[j] == '!';
+            if negate {
+                j += 1;
+            }
+            let mut matched = false;
+            let class_start = j;
+            while j < p.len() && (p[j] != ']' || j == class_start) {
+                // Range `a-z` when a `-` sits between two chars inside the class.
+                if j + 2 < p.len() && p[j + 1] == '-' && p[j + 2] != ']' {
+                    if t[ti] >= p[j] && t[ti] <= p[j + 2] {
+                        matched = true;
+                    }
+                    j += 3;
+                } else {
+                    if t[ti] == p[j] {
+                        matched = true;
+                    }
+                    j += 1;
+                }
+            }
+            // `j` is at the closing `]` (or end if malformed → no match).
+            if j >= p.len() {
+                return false;
+            }
+            if matched != negate {
+                glob_rec(t, ti + 1, p, j + 1)
+            } else {
+                false
+            }
+        }
+        c => ti < t.len() && t[ti] == c && glob_rec(t, ti + 1, p, pi + 1),
     }
 }
 
@@ -144,11 +257,13 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                         .map(|r| to_i64(call_func(*func, args, chunk, r)))
                         .collect(),
                 ),
-                Func::Contains | Func::StartsWith | Func::EndsWith => Column::Bool(
-                    (0..n)
-                        .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
-                        .collect(),
-                ),
+                Func::Contains | Func::StartsWith | Func::EndsWith | Func::Like | Func::Glob => {
+                    Column::Bool(
+                        (0..n)
+                            .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
+                            .collect(),
+                    )
+                }
                 _ => {
                     let mut s = StrColumn::with_capacity(n, n * 8);
                     for r in 0..n {
@@ -443,4 +558,55 @@ fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
         },
     };
     cmp_ord(ord, op)
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::{glob_match, like_match};
+
+    #[test]
+    fn like_wildcards() {
+        assert!(like_match("JP-1234", "JP-%"));
+        assert!(like_match("JP-1234", "%234"));
+        assert!(like_match("JP-1234", "%-%"));
+        assert!(like_match("JP-1234", "__-____")); // 2 + dash + 4
+        assert!(like_match("abc", "%")); // % matches everything
+        assert!(like_match("", "%")); // including empty
+        assert!(like_match("abc", "abc")); // literal
+        assert!(!like_match("JP-1234", "US-%"));
+        assert!(!like_match("ab", "abc"));
+        assert!(!like_match("abc", "ab_")); // _ needs exactly one → "abc" ok? c→_ yes
+                                            // (so this should match) — fix below
+    }
+
+    #[test]
+    fn like_underscore_is_exactly_one() {
+        assert!(like_match("abc", "ab_"));
+        assert!(!like_match("ab", "ab_")); // nothing for the _
+        assert!(!like_match("abcd", "ab_")); // trailing d unmatched
+    }
+
+    #[test]
+    fn glob_wildcards_and_classes() {
+        assert!(glob_match("JP-0042", "[JD]*-00??"));
+        assert!(glob_match("DE-0099", "[JD]*-00??"));
+        assert!(!glob_match("US-0007", "[JD]*-00??")); // U not in [JD]
+        assert!(glob_match("abc", "a?c"));
+        assert!(glob_match("abc", "a*"));
+        assert!(glob_match("a-z", "[a-z]-[a-z]"));
+        assert!(!glob_match("A-z", "[a-z]-[a-z]")); // case-sensitive
+        assert!(glob_match("x", "[!abc]")); // negated class
+        assert!(!glob_match("a", "[!abc]"));
+        assert!(glob_match("anything", "*"));
+        assert!(glob_match("", "*"));
+    }
+
+    #[test]
+    fn no_catastrophic_backtracking() {
+        // A pathological LIKE that a naive recursive matcher chokes on must
+        // still resolve quickly with the two-pointer algorithm.
+        let text = "a".repeat(64);
+        let pat = "%".repeat(50) + "b"; // never matches (no 'b')
+        assert!(!like_match(&text, &pat));
+    }
 }

@@ -7,6 +7,12 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **`like` / `glob` pattern matching (std-only, no regex dependency).**
+  `like(s, "JP-%")` is SQL `LIKE` (`%` any run, `_` any single char);
+  `glob(s, "[JD]*-00??")` is shell glob (`*`, `?`, `[abc]`/`[a-z]`/`[!..]`
+  classes). `like` uses a two-pointer matcher (no catastrophic backtracking).
+  Covers DuckDB `LIKE`/`GLOB`-class patterns; true regex (`regexp_matches`)
+  would need a vetted, feature-gated crate (deferred, needs sign-off).
 - **`starts_with` / `ends_with` string functions (std-only).** Prefix/suffix
   predicates (`|? starts_with(code, "JP")`, `|? ends_with(name, "e")`) — the
   typed equivalent of grep `^…` / `…$`. Emit a boolean column. No new deps.

@@ -67,6 +67,11 @@ pub enum Func {
     Contains,
     StartsWith,
     EndsWith,
+    /// SQL `LIKE` pattern: `%` = any run, `_` = any single char (case-sensitive).
+    Like,
+    /// Shell glob: `*` = any run, `?` = any single char, `[abc]`/`[a-z]`/`[!..]`
+    /// character classes.
+    Glob,
 }
 
 impl Func {
@@ -80,6 +85,8 @@ impl Func {
             "contains" => Func::Contains,
             "starts_with" => Func::StartsWith,
             "ends_with" => Func::EndsWith,
+            "like" => Func::Like,
+            "glob" => Func::Glob,
             _ => return None,
         })
     }
@@ -88,11 +95,13 @@ impl Func {
             Func::Upper => "upper",
             Func::Lower => "lower",
             Func::Len => "len",
-            Func::Trim => "trim",
             Func::Substr => "substr",
+            Func::Trim => "trim",
             Func::Contains => "contains",
             Func::StartsWith => "starts_with",
             Func::EndsWith => "ends_with",
+            Func::Like => "like",
+            Func::Glob => "glob",
         }
     }
 }
