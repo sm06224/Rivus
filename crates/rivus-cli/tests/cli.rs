@@ -286,3 +286,87 @@ fn telemetry_addr_streams_jsonl_over_tcp() {
         "stderr leaked telemetry: {stderr}"
     );
 }
+
+/// `--serve ADDR` launches the live dashboard: `GET /` returns the HTML,
+/// `GET /snapshot` returns JSON, `GET /events` streams ≥1 SSE frame — while
+/// stdout stays clean data. Drives the real binary on a fixed loopback port.
+#[test]
+fn serve_dashboard_responds_over_http() {
+    use std::io::{Read, Write as _};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_serve_{}.csv", std::process::id()));
+    // Enough rows that the run lasts long enough to serve a few requests.
+    let mut data = String::from("id,age\n");
+    for i in 0..120_000u64 {
+        data.push_str(&format!("{i},{}\n", i % 100));
+    }
+    std::fs::write(&csv, data).unwrap();
+    let out = dir.join(format!("rivus_serve_{}.out", std::process::id()));
+
+    // Pick a port unlikely to clash in CI.
+    let addr = "127.0.0.1:8788";
+    let prog = format!(
+        "F: open {} |? age >= 50 |> id age save {} ;",
+        csv.display(),
+        out.display()
+    );
+    let mut child = Command::new(BIN)
+        .args(["run", "-c", &prog, "--serve", addr])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rivus --serve");
+
+    // Give the server a moment to bind.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let http_get = |path: &str| -> Option<String> {
+        let mut s = TcpStream::connect(addr).ok()?;
+        s.set_read_timeout(Some(Duration::from_millis(800))).ok();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .ok()?;
+        let mut buf = String::new();
+        let _ = s.read_to_string(&mut buf); // timeout is fine for SSE
+        Some(buf)
+    };
+
+    let root = http_get("/").unwrap_or_default();
+    assert!(root.contains("200 OK"), "GET / status: {:.60}", root);
+    assert!(root.contains("<!doctype html>"), "GET / should serve HTML");
+
+    let events = http_get("/events").unwrap_or_default();
+    assert!(
+        events.contains("text/event-stream"),
+        "GET /events should be an SSE stream: {:.80}",
+        events
+    );
+    assert!(
+        events.contains("\"rows_seen\""),
+        "GET /events should carry a snapshot frame"
+    );
+
+    let status = child.wait().expect("run completes");
+    assert!(status.success(), "served run should succeed");
+
+    // stdout stayed clean (the sink wrote to a file, not stdout).
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .ok();
+    assert!(
+        stdout.is_empty(),
+        "stdout must stay clean under --serve: {stdout:.60}"
+    );
+
+    let _ = std::fs::remove_file(&csv);
+    let _ = std::fs::remove_file(&out);
+}

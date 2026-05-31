@@ -587,6 +587,12 @@ Ids:
   (rows in/out, busy_ms, rows/s, selectivity, mode) + errors + a summary to
   stderr (stdout stays clean data); `--telemetry-addr HOST:PORT` streams it to a
   TCP socket for a live viewer.
+- **Live dashboard.** `rivus run … --tui` repaints an ANSI dashboard on stderr
+  (per-node bars, rows/s, state) as the run streams. `rivus run … --serve [ADDR]`
+  launches a tiny std-only HTTP server (default an ephemeral loopback port):
+  open the printed URL for a live browser dashboard (`GET /`), poll `GET
+  /snapshot`, or subscribe to `GET /events` (Server-Sent Events). Heavy drawing
+  is in the browser; Rust ships only JSON snapshots — no extra dependencies.
 - **The optimizer runs by default** (dedup sources, fuse filter+project,
   projection pushdown, filter pushdown into the reader). `rivus explain` shows
   exactly what it did and regenerates the source from the optimized IR.

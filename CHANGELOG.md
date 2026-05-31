@@ -29,6 +29,18 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Live observability: `rivus run … --tui` and `--serve [ADDR]` (Epic #30 /
+  Pillar B — issue #32, std-only).** Built on Pillar A's `RuntimeSnapshot`.
+  `--tui` repaints an ANSI dashboard on stderr each tick (rows/s, per-node bars,
+  state). `--serve` launches a **std-only HTTP/1.1 + SSE** server (a
+  `TcpListener`, hand-written request parsing, no third-party crates): `GET /`
+  serves an embedded HTML/JS/SVG dashboard, `GET /snapshot` the latest snapshot
+  JSON, `GET /events` a live `text/event-stream`. Heavy rendering lives in the
+  browser; Rust ships only JSON snapshots. The flow runs on a worker thread that
+  publishes to a shared `Hub`; stdout stays clean (a `save -` sink still pipes).
+  A bind failure falls back to a normal run. **Zero new dependencies**
+  (`cargo deny --all-features` green). CLI-tested over loopback (HTML + SSE
+  frame + clean stdout).
 - **Inference-decision telemetry (Epic #30 / Pillar A — issue #31, A4).** A CSV
   source now records its per-column inference outcome `(name, type, widened)` in
   `RunResult.inference`; the `--json` summary lists `widened_columns` (columns an
