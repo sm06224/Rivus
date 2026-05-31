@@ -12,7 +12,7 @@
 //! accumulates on the error stream and the flow keeps running.
 
 use crate::operators::{self, OpCtx, Operator};
-use crate::telemetry::{NodeTelemetry, WorkerTelemetry};
+use crate::telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
 use rivus_core::{Chunk, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
 use rivus_ir::{HookAction, HookEvent, NodeId, Op, PlanGraph};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -73,19 +73,67 @@ impl RunResult {
     }
 }
 
+/// A live-progress subscriber: called with a [`RuntimeSnapshot`] periodically as
+/// a (serial) run streams. The base for live TUI / HTTP dashboards (Pillar B).
+/// `None` everywhere is the default and costs nothing (no snapshot is built).
+pub type ProgressHook<'a> = &'a mut dyn FnMut(&RuntimeSnapshot);
+
 pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError> {
+    run_with_progress(graph, opts, None)
+}
+
+/// Like [`run`], but with an optional live-progress hook (Observability §14.4 /
+/// Epic #30 A5). The hook fires on the serial path only — the parallel path runs
+/// workers silently and reports per-worker telemetry in the final `RunResult`.
+pub fn run_with_progress(
+    graph: &PlanGraph,
+    opts: RunOptions,
+    hook: Option<ProgressHook>,
+) -> Result<RunResult, RivusError> {
     if graph.topo_order().is_none() {
         return Err(RivusError::Build("flow graph contains a cycle".into()));
     }
     // Data-parallel fast path for stateless, single-source flows; else serial.
-    if let Some(res) = try_parallel(graph, &opts) {
-        return Ok(res);
+    // (A subscriber forces the serial path so it sees a coherent live stream.)
+    if hook.is_none() {
+        if let Some(res) = try_parallel(graph, &opts) {
+            return Ok(res);
+        }
     }
     // Sink-less, non-blocking flows with a capture cap are previews: let the
     // CSV source sample-infer its schema so it starts instantly.
     let preview = opts.max_capture.is_some() && !must_drain(graph);
     let ops = build_ops(graph, &opts, None, preview);
-    Ok(drive(graph, ops, 0, opts.progress, opts.max_capture))
+    Ok(drive(graph, ops, 0, opts.progress, opts.max_capture, hook))
+}
+
+/// Build a cheap point-in-time [`RuntimeSnapshot`] from the live node telemetry.
+/// O(nodes); only called when a progress hook is attached.
+fn build_snapshot(
+    elapsed: Duration,
+    rows_seen: u64,
+    mode: Mode,
+    telemetry: &[NodeTelemetry],
+) -> RuntimeSnapshot {
+    let nodes = telemetry
+        .iter()
+        .map(|t| NodeSnapshot {
+            node_id: t.node_id,
+            label: t.label.clone(),
+            kind: t.kind.clone(),
+            rows_in: t.rows_in,
+            rows_out: t.rows_out,
+            errors: t.errors,
+            mode: t.mode,
+            finished: t.finished,
+        })
+        .collect();
+    RuntimeSnapshot {
+        elapsed,
+        rows_seen,
+        mode,
+        nodes,
+    }
 }
 
 /// A flow that must read all input to be correct: a file sink (writes every
@@ -159,15 +207,22 @@ fn build_ops(
 
 /// Drive the DAG to completion with a pre-built operator set (the chunk-granular
 /// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
+#[allow(clippy::too_many_arguments)]
 fn drive(
     graph: &PlanGraph,
     mut ops: Vec<Box<dyn Operator>>,
     chunk_id_base: u64,
     progress: bool,
     max_capture: Option<usize>,
+    mut hook: Option<ProgressHook>,
 ) -> RunResult {
+    // (hook is mutated in place via as_mut() to publish snapshots)
     let n = graph.nodes.len();
     let topo = graph.topo_order().expect("acyclic (checked by caller)");
+    // Publish a live snapshot every `SNAPSHOT_EVERY` source chunks when a hook
+    // is attached (cheap, O(nodes), and only when subscribed).
+    const SNAPSHOT_EVERY: u64 = 8;
+    let mut chunks_pulled: u64 = 0;
 
     // Only a sink-less, non-blocking flow may stop the source early on a cap.
     let must_drain = must_drain(graph);
@@ -237,6 +292,18 @@ fn drive(
                             rows_seen += chunk.len as u64;
                             produced.push(chunk);
                             prog.tick(rows_seen);
+                            // A5: publish a periodic live snapshot to a subscriber.
+                            chunks_pulled += 1;
+                            if let Some(h) = hook.as_mut() {
+                                if chunks_pulled.is_multiple_of(SNAPSHOT_EVERY) {
+                                    h(&build_snapshot(
+                                        run_start.elapsed(),
+                                        rows_seen,
+                                        mode,
+                                        &telemetry,
+                                    ));
+                                }
+                            }
                         }
                         None => finished_now = true,
                     }
@@ -305,6 +372,16 @@ fn drive(
     }
 
     prog.finish(rows_seen);
+
+    // A5: a final snapshot so a subscriber always observes the terminal state.
+    if let Some(h) = hook.as_mut() {
+        h(&build_snapshot(
+            run_start.elapsed(),
+            rows_seen,
+            mode,
+            &telemetry,
+        ));
+    }
 
     if truncated {
         if let Some(cap) = max_capture {
@@ -532,7 +609,7 @@ fn try_streaming_parallel(
                             }
                         })
                         .collect();
-                    drive(graph, ops, (i as u64) << 40, false, None)
+                    drive(graph, ops, (i as u64) << 40, false, None, None)
                 })
             })
             .collect();
@@ -774,7 +851,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             Some((src_id, operators::mem_source(all))),
             false,
         );
-        let mut res = drive(graph, ops, 0, false, None);
+        let mut res = drive(graph, ops, 0, false, None, None);
         // Write any collected sink (build_ops made it a collector).
         flush_parallel_sinks(graph, &mut res);
         res.errors.splice(0..0, src_errors);
@@ -794,7 +871,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
                 scope.spawn(move || {
                     let src = operators::mem_source(chunks);
                     let ops = build_ops(graph, opts, Some((src_id, src)), false);
-                    drive(graph, ops, (i as u64) << 40, false, None)
+                    drive(graph, ops, (i as u64) << 40, false, None, None)
                 })
             })
             .collect();
@@ -1067,7 +1144,7 @@ mod tests {
         ))
         .unwrap();
         let ops = build_ops(&gs, &opts, None, false);
-        let _ = drive(&gs, ops, 0, false, None);
+        let _ = drive(&gs, ops, 0, false, None, None);
 
         // Forced streaming-parallel over 4 byte ranges → ordered part-file concat.
         let gp = rivus_parser::parse(&format!(

@@ -5,7 +5,7 @@
 //! checks the data is exactly what an unmeasured run would produce.
 
 use rivus_runtime::gendata::{self, Rng};
-use rivus_runtime::{run, RunOptions};
+use rivus_runtime::{run, run_with_progress, RunOptions, RuntimeSnapshot};
 
 struct TempCsv(std::path::PathBuf);
 impl Drop for TempCsv {
@@ -207,5 +207,64 @@ fn first_row_latency_is_recorded() {
     assert!(
         res.first_row_latency.is_none(),
         "an empty source produces no first row"
+    );
+}
+
+/// A5: a progress subscriber receives ≥1 live snapshot during a run, the final
+/// snapshot's rows_seen matches the data, and the result is unchanged whether or
+/// not a hook is attached.
+#[test]
+fn progress_hook_publishes_live_snapshots() {
+    let rows = 60_000usize; // enough chunks to trigger several snapshots
+    let csv = TempCsv(gendata::write_temp(
+        "obs_snapshot",
+        &gendata::clean(rows, 31),
+    ));
+    let p = csv.0.display();
+    let src = format!("F:\n open {p}\n |> name age\n;");
+    let graph = rivus_parser::parse(&src).expect("parse");
+
+    // Baseline (no hook) for result-invariance.
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    let baseline = run(
+        &graph,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("run");
+
+    // With a subscriber: collect the snapshots.
+    let mut snaps: Vec<RuntimeSnapshot> = Vec::new();
+    let mut hook = |s: &RuntimeSnapshot| snaps.push(s.clone());
+    let res = run_with_progress(
+        &graph,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+        Some(&mut hook),
+    )
+    .expect("run");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+
+    // Result invariance: hook changes nothing.
+    assert_eq!(res.total_rows_out(), baseline.total_rows_out());
+    assert_eq!(res.total_rows_out(), rows as u64);
+
+    // At least one snapshot, monotonically non-decreasing rows_seen, and the
+    // final snapshot saw every row.
+    assert!(!snaps.is_empty(), "subscriber received no snapshots");
+    let mut last = 0u64;
+    for s in &snaps {
+        assert!(s.rows_seen >= last, "rows_seen must be monotonic");
+        assert_eq!(s.nodes.len(), graph.nodes.len(), "all nodes in snapshot");
+        last = s.rows_seen;
+    }
+    assert_eq!(
+        snaps.last().unwrap().rows_seen,
+        rows as u64,
+        "final snapshot must have seen every row"
     );
 }

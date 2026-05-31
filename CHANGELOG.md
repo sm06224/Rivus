@@ -29,6 +29,16 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Streaming runtime snapshots (Epic #30 / Pillar A — issue #31, A5).** New
+  `RuntimeSnapshot` / `NodeSnapshot` (a cheap point-in-time view: elapsed,
+  rows_seen, mode, per-node counters) and `run_with_progress(graph, opts, hook)`
+  — the engine calls an optional `ProgressHook` (`&mut dyn FnMut(&RuntimeSnapshot)`)
+  every few source chunks and once at the end. The base for live TUI / HTTP
+  dashboards (Pillar B / §14.4 `RuntimeHandle::subscribe`). `run` is unchanged
+  (calls it with no hook); with no subscriber nothing is built, so the cost is
+  ~0. A subscriber forces the serial path for a coherent live stream; results
+  are identical. Oracle-tested (≥1 snapshot, monotonic rows_seen, final snapshot
+  sees every row, result invariant). No new dependencies.
 - **First-row latency & parse phase in `--json` summary (Epic #30 / Pillar A —
   issue #31, A3).** `RunResult` gains `first_row_latency: Option<Duration>` (wall
   to the first produced chunk; min across workers in parallel), and the JSONL

@@ -16,8 +16,8 @@ mod telemetry;
 #[doc(hidden)]
 pub mod gendata;
 
-pub use engine::{run, Output, RunOptions, RunResult};
-pub use telemetry::{NodeTelemetry, WorkerTelemetry};
+pub use engine::{run, run_with_progress, Output, ProgressHook, RunOptions, RunResult};
+pub use telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
 
 #[cfg(test)]
 mod tests {
