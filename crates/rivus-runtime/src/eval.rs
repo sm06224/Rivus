@@ -71,7 +71,7 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
 /// single restart pointer (the classic two-pointer wildcard match), so a
 /// pathological pattern can't blow up.
 fn like_match(text: &str, pat: &str) -> bool {
-    wildcard_match(text, pat, b'%', b'_')
+    wildcard_match(text, pat, '%', '_')
 }
 
 /// Shell glob over a single string: `*` any run, `?` any single char, plus
@@ -84,29 +84,33 @@ fn glob_match(text: &str, pat: &str) -> bool {
 
 /// Two-pointer wildcard match where `star` is the any-run wildcard and `one`
 /// the any-single wildcard. O(n·m) worst case but no recursion/backtracking
-/// explosion (greedy with a remembered star position).
-fn wildcard_match(text: &str, pat: &str, star: u8, one: u8) -> bool {
+/// explosion: on a mismatch it backtracks only to just-after the last `star`,
+/// advancing how much that star consumed by one (the canonical greedy algo).
+fn wildcard_match(text: &str, pat: &str, star: char, one: char) -> bool {
     let t: Vec<char> = text.chars().collect();
     let p: Vec<char> = pat.chars().collect();
     let (mut ti, mut pi) = (0usize, 0usize);
-    let (mut star_pi, mut star_ti): (Option<usize>, usize) = (None, 0);
+    // `last_star` = pattern index of the most recent `star`; `consumed` = how
+    // many text chars it currently absorbs (grows by one on each backtrack).
+    let mut last_star: Option<usize> = None;
+    let mut consumed = 0usize;
     while ti < t.len() {
-        if pi < p.len() && (p[pi] as u32 == one as u32 || p[pi] == t[ti]) {
+        if pi < p.len() && (p[pi] == one || p[pi] == t[ti]) {
             ti += 1;
             pi += 1;
-        } else if pi < p.len() && p[pi] as u32 == star as u32 {
-            star_pi = Some(pi);
-            star_ti = ti;
+        } else if pi < p.len() && p[pi] == star {
+            last_star = Some(pi);
+            consumed = ti;
             pi += 1;
-        } else if let Some(sp) = star_pi {
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
+        } else if let Some(ls) = last_star {
+            pi = ls + 1;
+            consumed += 1;
+            ti = consumed;
         } else {
             return false;
         }
     }
-    while pi < p.len() && p[pi] as u32 == star as u32 {
+    while pi < p.len() && p[pi] == star {
         pi += 1;
     }
     pi == p.len()
