@@ -616,6 +616,17 @@ fn partition(all: Vec<Chunk>, n: usize) -> Vec<Vec<Chunk>> {
     out
 }
 
+/// Minimum CSV file size (bytes) for the byte-range streaming-parallel reader.
+/// Below it, the in-memory chunk-partition path handles the file (or the serial
+/// reader, for tiny inputs). Override with `RIVUS_PARALLEL_MIN_BYTES` (e.g. `0`
+/// to always stream-parallel a file source); default 8 MiB.
+fn parallel_min_bytes() -> u64 {
+    std::env::var("RIVUS_PARALLEL_MIN_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(8 * 1024 * 1024)
+}
+
 /// Attempt data-parallel execution. Eligible flows have exactly one file source
 /// and no stateful operators (group/join/stream). The source is parsed once
 /// (its parse is already internally parallel), then contiguous chunk partitions
@@ -626,6 +637,11 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
         .map(|t| t.get())
         .unwrap_or(1);
     if threads < 2 {
+        return None;
+    }
+    // Escape hatch: force the serial streaming path. A true single-thread
+    // baseline for benchmarking, and a safety valve on constrained hosts.
+    if std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
         return None;
     }
 
