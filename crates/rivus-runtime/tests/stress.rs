@@ -977,3 +977,42 @@ fn case_when_is_chunk_size_independent() {
         assert_eq!(got, expect, "case buckets @cs={cs}");
     }
 }
+
+#[test]
+fn group_percentiles_are_correct_and_chunk_independent() {
+    // median / p90 over a known group. Group A: 10,20,30,40 → median 25, p90 37
+    // (linear interp: rank=0.9*3=2.7 → 30+(40-30)*0.7=37). Group B: 5,100 →
+    // median 52.5, p90 90.5. Must be identical across chunk sizes.
+    let text = "team,score\nA,10\nA,20\nA,30\nA,40\nB,5\nB,100\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_pct", text.as_bytes()));
+    let p = f.0.display();
+    let src = format!("G:\n open {p}\n |# team median:score p90:score\n;");
+
+    let base = run_src(&src, 4096);
+    let bchunk = &base.outputs[0].chunks[0];
+    assert_eq!(
+        bchunk.schema.field_names(),
+        vec!["team", "count", "median_score", "p90_score"]
+    );
+    let num = |row: usize, col: usize| bchunk.value(row, col).as_f64().unwrap();
+    // Row 0 = A, row 1 = B (BTreeMap key order).
+    assert!((num(0, 2) - 25.0).abs() < 1e-9, "A median");
+    assert!((num(0, 3) - 37.0).abs() < 1e-9, "A p90");
+    assert!((num(1, 2) - 52.5).abs() < 1e-9, "B median");
+    assert!((num(1, 3) - 90.5).abs() < 1e-9, "B p90");
+
+    // Chunk-size independence: every cell matches the base.
+    for cs in [1usize, 2, 3, 5] {
+        let r = run_src(&src, cs);
+        let c = &r.outputs[0].chunks[0];
+        for row in 0..c.len {
+            for col in 0..bchunk.schema.fields.len() {
+                assert_eq!(
+                    c.value(row, col).to_string(),
+                    bchunk.value(row, col).to_string(),
+                    "cell[{row}][{col}] @cs={cs}"
+                );
+            }
+        }
+    }
+}

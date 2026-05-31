@@ -132,14 +132,23 @@ Select columns, rename them, or compute new ones. Each item is one of:
 ### `|#` — group by
 
 Partition by a key column and aggregate. A `count` column is always emitted;
-each `func:col` adds one aggregate. Functions: `sum avg min max`.
+each `func:col` adds one aggregate. Functions:
+
+- numeric: `sum avg min max std` (std is sample, ddof=1)
+- percentiles: `median` and `pNN` (`p50 p90 p99 …`, linear interpolation)
+- distinct count: `count_distinct` (alias `nunique`)
+- positional: `first last` (first/last non-empty value in source order)
 
 ```
 |# country                        # → country, count
 |# country sum:score avg:age      # → country, count, sum_score, avg_age
+|# country median:score p90:score # → country, count, median_score, p90_score
+|# country count_distinct:city    # → country, count, count_distinct_city
 ```
 
-Output columns are named `count` and `<func>_<col>` (e.g. `sum_score`).
+Output columns are named `count` and `<func>_<col>` (e.g. `sum_score`,
+`p90_score`). `std`/percentiles buffer each group's values (a pipeline-breaker
+like `sort`); the rest stream in O(1) memory per group.
 
 ### `take` / `limit` / `head` — cap rows
 
@@ -474,7 +483,8 @@ primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
            | 'case' ('when' expr 'then' expr)+ ('else' expr)? 'end' ;
 FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
 AGG        = 'sum' | 'avg' | 'min' | 'max' | 'std'
-           | 'count_distinct' | 'nunique' | 'first' | 'last' ;
+           | 'count_distinct' | 'nunique' | 'first' | 'last'
+           | 'median' | 'p' DIGITS ;   (percentile, 0..=100)
 CMP        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
 ```
 

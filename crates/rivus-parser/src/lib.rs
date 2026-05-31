@@ -1435,6 +1435,30 @@ Import:
     }
 
     #[test]
+    fn group_parses_percentiles_and_round_trips() {
+        // `median` is p50; `pNN` parses to Pct(NN); out-of-range / bad names fail.
+        use rivus_ir::AggFunc;
+        let op = nth_op("G:\n open a.csv\n |# t median:s p90:s p99:s\n;", 1);
+        let Op::GroupBy { aggs, .. } = op else {
+            panic!("expected GroupBy, got {op:?}");
+        };
+        let funcs: Vec<AggFunc> = aggs.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            funcs,
+            vec![AggFunc::Pct(50), AggFunc::Pct(90), AggFunc::Pct(99)]
+        );
+        // Reversible: median stays `median`, others render `pNN`.
+        let g = parse("G:\n open a.csv\n |# t median:s p90:s\n;").unwrap();
+        let s = g.to_source();
+        assert!(s.contains("median:s"), "got: {s}");
+        assert!(s.contains("p90:s"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+        // `p101` is out of range → not an aggregate; the leftover `p101:s`
+        // tokens are then invalid flow, so the whole program fails to parse.
+        assert!(parse("G:\n open a.csv\n |# t p101:s\n;").is_err());
+    }
+
+    #[test]
     fn rename_and_drop_parse_and_round_trip() {
         // `rename OLD NEW ...` lowers to Op::Rename with ordered pairs.
         match nth_op("F:\n open a.csv\n rename age years city loc\n;", 1) {

@@ -1357,6 +1357,9 @@ struct AggAcc {
     first: Option<String>,
     last: Option<String>,
     distinct: std::collections::HashSet<String>,
+    /// Buffered numeric values, only for percentile aggregates (`Pct`). Bounded
+    /// by group cardinality, so percentiles are pipeline-breakers like sort.
+    values: Vec<f64>,
 }
 
 impl AggAcc {
@@ -1371,6 +1374,7 @@ impl AggAcc {
             first: None,
             last: None,
             distinct: std::collections::HashSet::new(),
+            values: Vec::new(),
         }
     }
 
@@ -1405,6 +1409,11 @@ impl AggAcc {
                 let s = v.to_string();
                 if !s.is_empty() {
                     self.last = Some(s);
+                }
+            }
+            AggFunc::Pct(_) => {
+                if let Some(x) = v.as_f64() {
+                    self.values.push(x);
                 }
             }
         }
@@ -1442,8 +1451,29 @@ impl AggAcc {
                 let var = (self.sum_sq - self.sum * mean) / (self.n as f64 - 1.0);
                 var.max(0.0).sqrt()
             }
+            AggFunc::Pct(p) => self.percentile(p),
             _ => 0.0,
         }
+    }
+
+    /// Linear-interpolated percentile of the buffered values (numpy/pandas
+    /// default: rank = p/100·(n−1), interpolate between the two nearest order
+    /// statistics). `0.0` for an empty group. Sorts a clone, so the accumulator
+    /// stays reusable; the buffer is bounded by group cardinality.
+    fn percentile(&self, p: u8) -> f64 {
+        if self.values.is_empty() {
+            return 0.0;
+        }
+        let mut v = self.values.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if v.len() == 1 {
+            return v[0];
+        }
+        let rank = (p as f64 / 100.0) * (v.len() - 1) as f64;
+        let lo = rank.floor() as usize;
+        let hi = rank.ceil() as usize;
+        let frac = rank - lo as f64;
+        v[lo] + (v[hi] - v[lo]) * frac
     }
 
     fn distinct_count(&self) -> i64 {
@@ -1536,7 +1566,7 @@ impl Operator for GroupBy {
         let mut columns: Vec<Column> = vec![Column::Str(keys), Column::I64(counts)];
 
         for (j, (func, col)) in self.aggs.iter().enumerate() {
-            let name = format!("{}_{}", func.as_str(), col);
+            let name = format!("{}_{}", func.label(), col);
             let (dtype, column) = match func {
                 AggFunc::CountDistinct => (
                     DataType::I64,

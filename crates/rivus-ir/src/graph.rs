@@ -35,6 +35,11 @@ pub enum AggFunc {
     First,
     /// Last non-empty value seen in the group (source order).
     Last,
+    /// Percentile of the numeric values in the group (linear interpolation,
+    /// like numpy/pandas default). The `u8` is the percentile in 0..=100;
+    /// `median` is p50. These buffer every numeric value per group, so — like
+    /// `sort`/`join` — they are pipeline-breakers bounded by group cardinality.
+    Pct(u8),
 }
 
 impl AggFunc {
@@ -48,10 +53,31 @@ impl AggFunc {
             "count_distinct" | "nunique" => AggFunc::CountDistinct,
             "first" => AggFunc::First,
             "last" => AggFunc::Last,
-            _ => return None,
+            "median" => AggFunc::Pct(50),
+            // `pN` / `pNN` percentile, N in 0..=100 (e.g. `p50`, `p90`, `p99`).
+            other => {
+                let n = other.strip_prefix('p')?;
+                let pct: u8 = n.parse().ok()?;
+                if pct > 100 {
+                    return None;
+                }
+                AggFunc::Pct(pct)
+            }
         })
     }
 
+    /// A heap-allocated label (most variants are static; `Pct` is `pNN`, and
+    /// p50 renders as `median` to round-trip the `median` alias).
+    pub fn label(&self) -> String {
+        match self {
+            AggFunc::Pct(50) => "median".to_string(),
+            AggFunc::Pct(n) => format!("p{n}"),
+            other => other.as_str().to_string(),
+        }
+    }
+
+    /// Static name for the non-percentile variants (used in column headers and
+    /// `to_source`). Percentiles have no static name — use [`AggFunc::label`].
     pub fn as_str(&self) -> &'static str {
         match self {
             AggFunc::Sum => "sum",
@@ -62,6 +88,7 @@ impl AggFunc {
             AggFunc::CountDistinct => "count_distinct",
             AggFunc::First => "first",
             AggFunc::Last => "last",
+            AggFunc::Pct(_) => "pct",
         }
     }
 }
@@ -452,7 +479,7 @@ impl Op {
             Op::GroupBy { key, aggs } => {
                 let mut s = format!("|# {key}");
                 for (f, c) in aggs {
-                    s.push_str(&format!(" {}:{c}", f.as_str()));
+                    s.push_str(&format!(" {}:{c}", f.label()));
                 }
                 s
             }

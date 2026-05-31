@@ -7,6 +7,11 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Percentile group aggregates (std-only).** `|#` gains `median` and `pNN`
+  (`p50`, `p90`, `p99`, …) — linear-interpolated percentiles (numpy/pandas
+  default). They buffer each group's numeric values (bounded by group
+  cardinality, a pipeline-breaker like `sort`), emit an `F64` column, and are
+  chunk-size independent. `median` round-trips as `median`; others as `pNN`.
 - **`-` sentinel for `open`/`save`.** `open -` reads stdin and `save -` writes
   stdout, alongside the existing `stdin`/`stdout` keywords — so a Rivus flow
   drops into a Unix pipe the conventional way (`… | rivus -c '… open - … save -'`).
