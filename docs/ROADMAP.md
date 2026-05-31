@@ -78,7 +78,8 @@ read-throughput, in priority order:
 |---|---|---|
 | ✅ | Optimizer: dedup · fuse · projection pushdown · **filter pushdown** | |
 | ✅ | Allocation-free field split, 256 KiB IO buffers | |
-| 📋 | **Parallel-by-default reads** (incl. stdout sinks) | today byte-range parallel only fires for file sinks > 256 MiB; biggest single win vs DuckDB |
+| ✅ | **Parallel reads incl. stdout sinks** | `save -` now assembles ordered parts to stdout; 363 MiB filter 5.2 s → 1.8 s (2.8×). Env knobs `RIVUS_PARALLEL_MIN_BYTES` / `RIVUS_NO_PARALLEL` |
+| 📋 | **Auto-tune / lower the parallel threshold** | 256 MiB is conservative; mid-size files (e.g. 171 MiB) still run serial — measure the crossover and lower it |
 | 📋 | **Single-pass inference** (sample + adaptive widen) | drop the second full scan that streaming type-inference costs |
 | 📋 | **SIMD CSV scan** (`std::arch`, no deps) | find `,`/`\n` with SSE2/AVX2; bench-gated (SWAR tried, no win at current bottleneck — revisit after the above) |
 | 📋 | **Vectorized / SIMD predicate kernels** for more shapes | extend `kernel.rs` beyond numeric conjunctions |

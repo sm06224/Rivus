@@ -495,10 +495,16 @@ does a *serial, two-pass* streaming read (infer types, then build typed columns)
 for these stdout queries; DuckDB reads once, in parallel, into vectors.
 
 So the next lever is read throughput, not features:
-1. **Parallel-by-default reads** even for stdout sinks (today the byte-range
-   parallel path only triggers for file sinks > 256 MiB) — the biggest single win.
+1. ✅ **Parallel reads for stdout sinks** — done. The byte-range parallel reader
+   used to bail to serial on a `save -` (stdout) sink; it now assembles to
+   stdout. On a **363 MiB** file `|? age>=50 |> id name age save -` dropped
+   **5.2 s → 1.8 s** (2.8×), closing the DuckDB gap (1.03 s) from ~5× to ~1.8×.
+   (The 5 M-row / 171 MiB rows above are *below* the 256 MiB threshold so still
+   run serial — lowering/auto-tuning the threshold is the next step.)
 2. **Single-pass inference** (sample + adaptive widen) to drop the second scan.
 3. **mmap + overlap decode with IO**; reuse per-chunk buffers.
+4. **Auto-tune the parallel threshold** (currently 256 MiB, env-overridable via
+   `RIVUS_PARALLEL_MIN_BYTES`) so mid-size files parallelize when it pays.
 
 DuckDB still buffers (~400 MiB RSS on the 1.1 GB set earlier) where Rivus
 streams at ~10 MiB, so the honest framing stays "Rivus trades some speed for
