@@ -1,10 +1,8 @@
 //! Execution-environment analytics (Epic #30, Pillar C — issue #33).
 //!
 //! A small, std-only probe of the host that the autotuner uses to choose an
-//! execution strategy. No third-party crates: CPU count comes from `std`,
-//! available RAM is read from the OS the cheap way per platform, and both can be
-//! overridden with env vars for deterministic tests (`RIVUS_CPUS`,
-//! `RIVUS_RAM_BYTES`).
+//! execution strategy. No third-party crates: the CPU count comes from `std`
+//! and is overridable with an env var for deterministic tests (`RIVUS_CPUS`).
 //!
 //! ## What the strategy actually trades (measured, not asserted)
 //!
@@ -21,21 +19,22 @@
 //! measured adaptive decision is **serial vs parallel**, driven by CPU count and
 //! input size — not a memory-vs-speed reader swap. `--memory low` is the opt-in
 //! "force single-thread" floor; the default autotunes.
+//!
+//! (An earlier draft probed available RAM for a single-pass retain-buffer
+//! reader; that reader was measured *slower* and dropped, so the RAM probe went
+//! with it — no dead code. See the "dropped idea" note in `docs/BENCHMARKS.md`.)
 
 /// A snapshot of the host's resources the autotuner reads.
 #[derive(Debug, Clone, Copy)]
 pub struct Analytics {
-    /// Best estimate of *available* RAM in bytes (conservative; 0 if unknown).
-    pub ram_bytes: u64,
     /// Logical CPUs available to the process.
     pub cpus: usize,
 }
 
 impl Analytics {
-    /// Probe the environment. Honors `RIVUS_RAM_BYTES` / `RIVUS_CPUS` overrides
-    /// (for deterministic tests) before falling back to OS probes.
+    /// Probe the environment. Honors the `RIVUS_CPUS` override (for deterministic
+    /// tests) before falling back to `std::thread::available_parallelism`.
     pub fn probe() -> Analytics {
-        let ram_bytes = env_u64("RIVUS_RAM_BYTES").unwrap_or_else(available_ram_bytes);
         let cpus = env_u64("RIVUS_CPUS")
             .map(|n| n.max(1) as usize)
             .unwrap_or_else(|| {
@@ -43,41 +42,12 @@ impl Analytics {
                     .map(|n| n.get())
                     .unwrap_or(1)
             });
-        Analytics { ram_bytes, cpus }
+        Analytics { cpus }
     }
 }
 
 fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key).ok()?.trim().parse().ok()
-}
-
-/// Available RAM in bytes, best-effort per OS. Returns 0 when it can't be
-/// determined (callers then treat memory as unknown and stay conservative).
-fn available_ram_bytes() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        linux_available_ram().unwrap_or(0)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // macOS (`sysctl`) and Windows (`GlobalMemoryStatusEx`) probes can be
-        // added with `cfg` + minimal FFI (no crate) later; until then, unknown.
-        0
-    }
-}
-
-/// Parse `MemAvailable` (preferred) or `MemFree` from `/proc/meminfo` (kB → B).
-#[cfg(target_os = "linux")]
-fn linux_available_ram() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let pick = |key: &str| -> Option<u64> {
-        text.lines().find_map(|l| {
-            let rest = l.strip_prefix(key)?;
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            Some(kb * 1024)
-        })
-    };
-    pick("MemAvailable:").or_else(|| pick("MemFree:"))
 }
 
 /// Which execution strategy to use (Epic #30 / Pillar C). Both strategies return
@@ -190,22 +160,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn overrides_are_honored() {
-        std::env::set_var("RIVUS_RAM_BYTES", "8000000000");
+    fn cpu_override_is_honored() {
         std::env::set_var("RIVUS_CPUS", "4");
         let a = Analytics::probe();
-        assert_eq!(a.ram_bytes, 8_000_000_000);
         assert_eq!(a.cpus, 4);
-        std::env::remove_var("RIVUS_RAM_BYTES");
         std::env::remove_var("RIVUS_CPUS");
     }
 
     #[test]
     fn strategy_respects_cpus_size_and_floor() {
-        let quad = Analytics {
-            ram_bytes: 8_000_000_000,
-            cpus: 4,
-        };
+        let quad = Analytics { cpus: 4 };
         let min = 8 << 20; // 8 MiB
                            // low: always serial regardless of size/cpus.
         assert_eq!(
@@ -228,10 +192,7 @@ mod tests {
             Strategy::Parallel
         );
         // single cpu → serial even for a huge file.
-        let uni = Analytics {
-            ram_bytes: 8_000_000_000,
-            cpus: 1,
-        };
+        let uni = Analytics { cpus: 1 };
         assert_eq!(
             choose_strategy(MemoryPref::Fast, &uni, Some(1 << 30), min).0,
             Strategy::Serial
@@ -240,10 +201,7 @@ mod tests {
 
     #[test]
     fn fast_threshold_is_more_aggressive_than_auto() {
-        let quad = Analytics {
-            ram_bytes: 8_000_000_000,
-            cpus: 4,
-        };
+        let quad = Analytics { cpus: 4 };
         let n = Some(2 << 20); // 2 MiB
                                // Auto threshold 8 MiB → serial; Fast threshold 1 MiB → parallel.
         assert_eq!(

@@ -84,7 +84,7 @@ read-throughput, in priority order:
 | ✅ | **Adaptive execution strategy** (Epic #30 / Pillar C, #33) | std-only host probe (`Analytics`: cpus + `/proc/meminfo`) → autotuner picks **serial vs parallel** and surfaces the decision (`RunResult.strategy`, `--json` `"strategy"`). `--memory low\|auto\|fast`; default `auto` parallelizes ≥8 MiB on multicore. 288 MB filter: serial 3.53 s → parallel **1.13 s** (3.1×), byte-identical |
 | 📋 | **SIMD CSV scan** (`std::arch`, no deps) | find `,`/`\n` with SSE2/AVX2; bench-gated (SWAR tried, no win at current bottleneck — revisit after the above) |
 | 📋 | **Vectorized / SIMD predicate kernels** for more shapes | extend `kernel.rs` beyond numeric conjunctions |
-| 🚧 | Push computed-column / string predicates into the reader | **string literal-substring prefilter ✅** (`contains`/`starts_with`/`ends_with`/`==`/`like`-literal → ripgrep-style raw-line pre-scan, ~2× serial on `contains`, result-invariant superset; Epic #30 C4(i)). Computed-column predicates + the parallel byte-range path still planned |
+| 🚧 | Push computed-column / string predicates into the reader | **string literal-substring prefilter ✅** (`contains`/`starts_with`/`ends_with`/`==`/`like`-literal → ripgrep-style raw-line pre-scan, result-invariant superset; Epic #30 C4(i)), now also on the **parallel byte-range path ✅** (#35, with per-worker skip telemetry; quote/newline needles declined for safety, #37). Computed-column predicates + pushing the pre-scan into pass-1 inference still planned |
 | 📋 | mmap the source; overlap decode with IO | |
 | 📋 | Re-use buffers across chunks; arena-per-chunk recycling | |
 | 📋 | JIT (Cranelift) for hot predicates/projections | design doc 09; needs a vetted dep |

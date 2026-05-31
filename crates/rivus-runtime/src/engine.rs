@@ -547,23 +547,26 @@ fn try_streaming_parallel(
     path: &str,
     threads: usize,
 ) -> Option<RunResult> {
-    let (projection, prefilter, header, declared, delim) = match &graph.nodes[src_id].op {
-        Op::OpenCsv {
-            projection,
-            prefilter,
-            header,
-            declared,
-            delim,
-            ..
-        } => (
-            projection.clone(),
-            prefilter.clone(),
-            *header,
-            declared.clone(),
-            *delim,
-        ),
-        _ => return None, // only CSV has a streaming-parallel plan for now
-    };
+    let (projection, prefilter, str_prefilter, header, declared, delim) =
+        match &graph.nodes[src_id].op {
+            Op::OpenCsv {
+                projection,
+                prefilter,
+                str_prefilter,
+                header,
+                declared,
+                delim,
+                ..
+            } => (
+                projection.clone(),
+                prefilter.clone(),
+                str_prefilter.clone(),
+                *header,
+                declared.clone(),
+                *delim,
+            ),
+            _ => return None, // only CSV has a streaming-parallel plan for now
+        };
 
     // Each worker streams its byte range to a per-worker *part file* (bounded
     // memory — no output buffering), then the parts are concatenated in source
@@ -591,11 +594,13 @@ fn try_streaming_parallel(
         ranges,
         bad_rows,
         prefilter: pre,
+        str_prefilter: str_pre,
     } = crate::csv::plan_parallel(
         path,
         projection.as_deref(),
         threads,
         &prefilter,
+        &str_prefilter,
         header,
         declared.as_deref(),
         delim,
@@ -615,6 +620,7 @@ fn try_streaming_parallel(
         let dtypes = &dtypes;
         let keep = &keep;
         let pre = &pre;
+        let str_pre = &str_pre;
         let handles: Vec<_> = ranges
             .iter()
             .enumerate()
@@ -630,6 +636,7 @@ fn try_streaming_parallel(
                         b,
                         opts.chunk_size,
                         pre.clone(),
+                        str_pre.clone(),
                         delim,
                     ));
                     let ops: Vec<Box<dyn Operator>> = graph

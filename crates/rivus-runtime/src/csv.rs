@@ -341,6 +341,7 @@ impl CsvChunker {
         end: u64,
         chunk_size: usize,
         prefilter: Vec<PreCmp>,
+        str_prefilter: Vec<String>,
         delim: u8,
     ) -> Result<CsvChunker, String> {
         let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -357,7 +358,7 @@ impl CsvChunker {
             eof: false,
             prefilter,
             inference: Vec::new(),
-            str_prefilter: Vec::new(),
+            str_prefilter,
             pos: start,
             limit: Some(end),
             delim,
@@ -460,6 +461,10 @@ pub struct CsvParallelPlan {
     pub bad_rows: usize,
     /// Compiled pushed-down prefilter (raw col index, op, rhs) for each worker.
     pub prefilter: Vec<PreCmp>,
+    /// Required literal substrings for the raw-line pre-scan (#35): each worker
+    /// skips a raw line lacking one before splitting it (FilterProject stays
+    /// authoritative). Empty = no string pre-scan.
+    pub str_prefilter: Vec<String>,
 }
 
 /// Build a [`CsvParallelPlan`]: read the header, snap `nthreads` byte ranges to
@@ -471,6 +476,7 @@ pub fn plan_parallel(
     allow: Option<&[String]>,
     nthreads: usize,
     prefilter: &[(String, CmpOp, f64)],
+    str_prefilter: &[String],
     header: bool,
     declared: Option<&[(String, Option<DataType>)]>,
     delim: u8,
@@ -533,6 +539,7 @@ pub fn plan_parallel(
         ranges,
         bad_rows: bad,
         prefilter: pre,
+        str_prefilter: str_prefilter.to_vec(),
     })
 }
 

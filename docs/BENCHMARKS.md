@@ -587,7 +587,8 @@ self-describing, e.g.
 > The roadmap listed "single-pass inference (drop the second scan)" as the
 > largest single-thread gap. We prototyped it: read the data region into memory
 > once, infer globally over the buffer, then build columns from the buffer (no
-> second disk scan), gated to files within a RAM budget. It is byte-identical and
+> second disk scan), gated to files within a RAM budget (which is why an earlier
+> draft probed available RAM). It is byte-identical and
 > chunk-size independent — but it was **measured *slower*** than the two-pass
 > reader on a warm cache (4.0 s vs 3.4 s on the file above): holding every line as
 > an owned `String` creates allocation/memory pressure, while the "second scan"
@@ -598,3 +599,38 @@ self-describing, e.g.
 > a single-pass reader swap. (A single-pass reader could still pay off on
 > cold-cache / network filesystems where the second physical read is expensive;
 > it can return behind a measured win for that regime.)
+
+
+### String prefilter on the parallel path (Epic #30 / #35)
+
+The literal-substring prefilter (C4(i)) originally engaged only on the *serial*
+reader: the byte-range parallel workers hard-coded an empty `str_prefilter`, so
+the default `--memory auto` path (which parallelizes files ≥8 MiB — i.e. exactly
+the large-file regime the prefilter targets) never applied it. #35 threads
+`str_prefilter` through `plan_parallel` → `for_range` so every worker runs the
+same raw-line pre-scan, and the per-worker skip counts surface as A1 telemetry
+(one `prefilter skipped N row(s)` Info per worker, summing to total − matching).
+
+Correctness is covered by `string_prefilter_engages_on_parallel_path`: a forced
+streaming-parallel run is **byte-identical** to a forced-serial run of the same
+program, and the workers' skip telemetry sums to the independently-derived
+(total − matching) count.
+
+Honest performance note (171 MiB, 5 M rows, 4 cpus, warm cache, a 0%-selectivity
+`contains(name,"Zzqx")` so parse — not output — dominates; best of 5):
+
+| | prefilter on | prefilter off (`--no-opt`) |
+|---|---:|---:|
+| **parallel** (default) | 0.246 s | 0.246 s |
+| **serial** (`RIVUS_NO_PARALLEL=1`) | 2.218 s | 2.218 s |
+
+Two honest takeaways: (1) the **parallel reader itself is the ~9× win** here
+(0.25 s vs 2.22 s); (2) at this query shape the string-prefilter shows **no
+measurable end-to-end gain on/off**, because the two-pass reader's *pass-1 global
+type inference* scans and splits every row regardless — the prefilter only avoids
+*pass-2 column building*, which is already near-zero at 0% selectivity. The
+prefilter still earns its keep on shapes where pass-2 building dominates (the
+earlier `contains(country,"JP")` serial measurement), and #35's value is making
+it **engage on the default parallel path at all** (previously a silent no-op
+there) with exact, surfaced accounting. Pushing the pre-scan into *pass-1
+inference* — so it can skip the dominant scan too — is a tracked follow-up.

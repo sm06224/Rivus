@@ -374,3 +374,104 @@ fn memory_strategy_is_result_invariant_and_surfaced() {
         assert!(note.is_some(), "a file source must surface a strategy note");
     }
 }
+
+/// #35: the string literal-substring prefilter must also engage on the
+/// **parallel** byte-range path (the default for large files), not just serial.
+/// We force the streaming-parallel reader and assert: (a) the result is
+/// byte-identical to a forced-serial run of the same program, and (b) the
+/// reader's prefilter-skip telemetry is emitted by the workers and sums to the
+/// independently-computed (total − matching) count — so A1 accounting stays
+/// exact across workers.
+#[test]
+fn string_prefilter_engages_on_parallel_path() {
+    // gendata::clean's country column cycles a fixed 5-country alphabet; pick a
+    // needle that lands in some rows so the prescan really skips the rest.
+    let rows = 120_000usize;
+    let seed = 29;
+    let csv = TempCsv(gendata::write_temp(
+        "obs_par_strpf",
+        &gendata::clean(rows, seed),
+    ));
+
+    let mut out = csv.0.clone();
+    out.set_extension("strpf.out.csv");
+    let _oguard = TempCsv(out.clone());
+
+    let prog = |sink: &str| {
+        format!(
+            "F:\n open {}\n |? contains(country, \"US\")\n |> id country\n save {}\n;",
+            csv.0.display(),
+            sink
+        )
+    };
+
+    // --- serial reference (real sink writes the file) ---
+    let mut sout = csv.0.clone();
+    sout.set_extension("strpf.serial.csv");
+    let _sguard = TempCsv(sout.clone());
+    let g = rivus_parser::parse(&prog(&sout.to_string_lossy())).expect("parse");
+    let (g, _r) = rivus_optimizer::optimize(g);
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    run(
+        &g,
+        RunOptions {
+            chunk_size: 8192,
+            ..Default::default()
+        },
+    )
+    .expect("serial run");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    let serial_bytes = std::fs::read(&sout).expect("read serial out");
+
+    // --- forced streaming-parallel run ---
+    let g = rivus_parser::parse(&prog(&out.to_string_lossy())).expect("parse");
+    let (g, _r) = rivus_optimizer::optimize(g);
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let res = run(
+        &g,
+        RunOptions {
+            chunk_size: 8192,
+            ..Default::default()
+        },
+    )
+    .expect("parallel run");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+    let par_bytes = std::fs::read(&out).expect("read parallel out");
+
+    // (a) byte-identical to serial (ordered part-file concat).
+    assert_eq!(
+        par_bytes, serial_bytes,
+        "parallel string-prefilter output must equal serial, byte-for-byte"
+    );
+    assert!(
+        res.workers.len() >= 2,
+        "expected the parallel path (≥2 workers)"
+    );
+
+    // (b) the prefilter-skip telemetry sums to (total − matching) across
+    // workers. Derive "matching" from the serial output (data rows that passed)
+    // rather than replaying the generator — no dependence on gendata internals.
+    let skipped: u64 = res
+        .errors
+        .iter()
+        .filter(|e| e.message.contains("prefilter skipped"))
+        .filter_map(|e| {
+            e.message
+                .split_whitespace()
+                .find_map(|t| t.parse::<u64>().ok())
+        })
+        .sum();
+    // Serial output rows = header + matching data rows.
+    let serial_text = String::from_utf8(serial_bytes.clone()).expect("utf8");
+    let matching = serial_text.lines().count().saturating_sub(1) as u64;
+    assert!(
+        matching > 0 && matching < rows as u64,
+        "test needs a real split (matching={matching})"
+    );
+    assert_eq!(
+        skipped,
+        rows as u64 - matching,
+        "parallel prefilter-skip telemetry must sum to (total − matching)"
+    );
+}

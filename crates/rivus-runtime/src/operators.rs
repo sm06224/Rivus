@@ -155,6 +155,7 @@ pub fn collector() -> Box<dyn Operator> {
 /// (see [`csv::plan_parallel`]); on open error it yields nothing (continue-first
 /// — the worker simply contributes no rows).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn csv_range_source(
     path: &str,
     dtypes: Vec<rivus_core::DataType>,
@@ -165,10 +166,20 @@ pub fn csv_range_source(
     end: u64,
     chunk_size: usize,
     prefilter: Vec<(usize, CmpOp, f64)>,
+    str_prefilter: Vec<String>,
     delim: u8,
 ) -> Box<dyn Operator> {
     match csv::CsvChunker::for_range(
-        path, dtypes, keep, ncols, start, end, chunk_size, prefilter, delim,
+        path,
+        dtypes,
+        keep,
+        ncols,
+        start,
+        end,
+        chunk_size,
+        prefilter,
+        str_prefilter,
+        delim,
     ) {
         Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch)),
         Err(_) => Box::new(MemSource {
