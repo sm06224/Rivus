@@ -12,7 +12,7 @@ use crate::kernel;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
-use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, NodeId, Op};
+use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, FillMethod, NodeId, Op};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -218,10 +218,14 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
         Op::Describe => Box::new(Describe::default()),
         Op::DropNa { cols } => Box::new(DropNa { cols: cols.clone() }),
-        Op::Fill { col, value } => Box::new(Fill {
-            col: col.clone(),
-            value: value.clone(),
-        }),
+        Op::Fill { col, method } => match method {
+            FillMethod::Value(value) => Box::new(Fill {
+                col: col.clone(),
+                value: value.clone(),
+            }),
+            FillMethod::Ffill => Box::new(FillDirectional::ffill(col.clone())),
+            FillMethod::Bfill => Box::new(FillDirectional::bfill(col.clone())),
+        },
         Op::Rename { pairs } => Box::new(Rename {
             pairs: pairs.clone(),
         }),
@@ -1141,6 +1145,138 @@ impl Operator for Fill {
         let mut out = Chunk::new(chunk.meta.id, chunk.schema.clone(), columns);
         out.meta = chunk.meta.clone();
         vec![out]
+    }
+}
+
+/// Replace a text column's blank cells with the nearest non-empty value:
+/// `ffill` carries the last seen value forward, `bfill` the next value back.
+///
+/// `ffill` is streaming — it carries one value across chunks and rewrites each
+/// chunk in flight. `bfill` needs the *next* value, which may live in a later
+/// chunk, so it buffers the stream and emits on `finish` (a pipeline-breaker
+/// like `sort`). Both rewrite only a `Str` column; a numeric column is passed
+/// through unchanged (its blanks already became `0` at parse time). Leading
+/// blanks for `ffill` (and trailing blanks for `bfill`) have no neighbor to
+/// borrow and stay empty.
+struct FillDirectional {
+    col: String,
+    forward: bool,
+    /// `ffill` state: the last non-empty value seen so far (carried across
+    /// chunks). Unused for `bfill`.
+    carry: Option<String>,
+    /// `bfill` buffer: every chunk, replayed in a single backward pass on finish.
+    buf: Vec<Chunk>,
+    warned: bool,
+}
+
+impl FillDirectional {
+    fn ffill(col: String) -> Self {
+        FillDirectional {
+            col,
+            forward: true,
+            carry: None,
+            buf: Vec::new(),
+            warned: false,
+        }
+    }
+    fn bfill(col: String) -> Self {
+        FillDirectional {
+            col,
+            forward: false,
+            carry: None,
+            buf: Vec::new(),
+            warned: false,
+        }
+    }
+
+    /// Warn once if the column is unknown or non-text; returns the column index
+    /// when it's a fillable `Str` column.
+    fn target(&mut self, chunk: &Chunk, ctx: &mut OpCtx) -> Option<usize> {
+        let Some(ci) = chunk.schema.index_of(&self.col) else {
+            if !self.warned {
+                self.warned = true;
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!("fill: unknown column '{}'", self.col),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+            return None;
+        };
+        matches!(chunk.columns[ci], Column::Str(_)).then_some(ci)
+    }
+}
+
+impl Operator for FillDirectional {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if !self.forward {
+            // bfill: buffer; the next non-empty value may be in a later chunk.
+            self.buf.push(chunk);
+            return Vec::new();
+        }
+        let Some(ci) = self.target(&chunk, ctx) else {
+            return vec![chunk];
+        };
+        let Column::Str(s) = &chunk.columns[ci] else {
+            return vec![chunk];
+        };
+        let mut filled = StrColumn::with_capacity(chunk.len, 0);
+        for r in 0..chunk.len {
+            let v = s.get(r);
+            if v.is_empty() {
+                match &self.carry {
+                    Some(c) => filled.push(c),
+                    None => filled.push(""),
+                }
+            } else {
+                filled.push(v);
+                self.carry = Some(v.to_string());
+            }
+        }
+        let mut columns = chunk.columns.clone();
+        columns[ci] = Column::Str(filled);
+        let mut out = Chunk::new(chunk.meta.id, chunk.schema.clone(), columns);
+        out.meta = chunk.meta.clone();
+        vec![out]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.forward || self.buf.is_empty() {
+            return Vec::new();
+        }
+        let chunks = std::mem::take(&mut self.buf);
+        // Resolve the column once against the first chunk (schema is stable).
+        let ci = match self.target(&chunks[0], ctx) {
+            Some(ci) => ci,
+            None => return chunks, // unknown or non-text → pass through unchanged
+        };
+        // One backward pass across all rows, carrying the next non-empty value.
+        let mut next: Option<String> = None;
+        let mut out = chunks;
+        for chunk in out.iter_mut().rev() {
+            let Column::Str(s) = &chunk.columns[ci] else {
+                continue;
+            };
+            let mut vals: Vec<String> = (0..chunk.len).map(|r| s.get(r).to_string()).collect();
+            for v in vals.iter_mut().rev() {
+                if v.is_empty() {
+                    if let Some(n) = &next {
+                        *v = n.clone();
+                    }
+                } else {
+                    next = Some(v.clone());
+                }
+            }
+            let mut filled = StrColumn::with_capacity(chunk.len, 0);
+            for v in &vals {
+                filled.push(v);
+            }
+            chunk.columns[ci] = Column::Str(filled);
+        }
+        out
     }
 }
 

@@ -184,11 +184,17 @@ distinct country region # first row per (country, region)
 ```
 dropna                 # drop rows blank in ANY column
 dropna city region     # drop rows blank in these columns
-fill city "UNKNOWN"    # replace blank cells of `city`
+fill city "UNKNOWN"    # replace blank cells of `city` with a constant
+fill price ffill       # forward-fill: carry the last non-empty value down
+fill price bfill       # backward-fill: carry the next non-empty value up
 ```
 
 A "missing" cell is an empty string. Numeric columns can't hold a blank (it
 parses to 0), so declare a column `:str` if you need to detect/clean its blanks.
+`ffill`/`bfill` carry the nearest neighbour across chunk boundaries (a leading
+blank has nothing to forward-fill from, a trailing blank nothing to back-fill);
+`bfill` buffers the stream to finish (a pipeline-breaker like `sort`), `ffill`
+is fully streaming.
 
 ### `describe` — one-pass column summary
 
@@ -480,7 +486,7 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'sort' IDENT ('asc'|'desc')?
            | 'distinct' IDENT*
            | 'describe'
-           | 'dropna' IDENT* | 'fill' IDENT VALUE
+           | 'dropna' IDENT* | 'fill' IDENT (VALUE | 'ffill' | 'bfill')
            | 'rename' (IDENT IDENT)+ | 'drop' IDENT+
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')

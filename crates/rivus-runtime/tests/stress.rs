@@ -256,6 +256,80 @@ fn dropna_and_fill_chunk_size_independent() {
 }
 
 #[test]
+fn fill_ffill_bfill_chunk_size_independent() {
+    // A column of runs of blanks between a few anchors, plus a leading and a
+    // trailing blank (which ffill/bfill respectively cannot resolve). ffill
+    // carries the previous value forward across chunk boundaries; bfill carries
+    // the next value back across them. Both results must be exact and identical
+    // regardless of chunk_size — the regression guard for the cross-chunk carry.
+    let raw = ["", "", "a", "", "", "b", "", "c", "", "", "", "d", ""];
+    let rows = raw.len();
+    let mut text = String::from("id,tag\n");
+    for (i, v) in raw.iter().enumerate() {
+        text.push_str(&format!("{i},{v}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_fill_dir",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+
+    // Independent oracles.
+    let mut ff = vec![String::new(); rows];
+    let mut last = String::new();
+    for i in 0..rows {
+        if raw[i].is_empty() {
+            ff[i] = last.clone();
+        } else {
+            ff[i] = raw[i].to_string();
+            last = raw[i].to_string();
+        }
+    }
+    let mut bf = vec![String::new(); rows];
+    let mut next = String::new();
+    for i in (0..rows).rev() {
+        if raw[i].is_empty() {
+            bf[i] = next.clone();
+        } else {
+            bf[i] = raw[i].to_string();
+            next = raw[i].to_string();
+        }
+    }
+
+    let collect = |res: &rivus_runtime::RunResult| -> Vec<String> {
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("F"))
+            .unwrap();
+        let mut out = Vec::new();
+        for c in &o.chunks {
+            let ci = c.schema.index_of("tag").unwrap();
+            for r in 0..c.len {
+                out.push(c.value(r, ci).to_string());
+            }
+        }
+        out
+    };
+
+    for cs in [1usize, 2, 3, 5, rows] {
+        let fwd = run_src(
+            &format!("F:\n open {p} (id tag:str)\n fill tag ffill\n;"),
+            cs,
+        );
+        assert_eq!(collect(&fwd), ff, "ffill @cs={cs}");
+        assert!(fwd.errors.is_empty(), "ffill errors @cs={cs}");
+
+        let back = run_src(
+            &format!("F:\n open {p} (id tag:str)\n fill tag bfill\n;"),
+            cs,
+        );
+        assert_eq!(collect(&back), bf, "bfill @cs={cs}");
+        assert!(back.errors.is_empty(), "bfill errors @cs={cs}");
+    }
+}
+
+#[test]
 fn describe_matches_oracle() {
     // One numeric column `v`; `describe` must report count/min/max/mean that
     // match an independent computation, for every chunk size.

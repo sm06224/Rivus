@@ -29,6 +29,17 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Directional missing-value fill: `fill col ffill|bfill` (std-only).**
+  Alongside the existing constant `fill col VALUE`, `ffill` carries the last
+  non-empty value forward over blank cells and `bfill` the next value back —
+  both across chunk boundaries, so the result is chunk-size independent
+  (oracle-tested). `ffill` is fully streaming; `bfill` buffers the stream and
+  emits on finish (a pipeline-breaker like `sort`, and it forces the serial
+  path). A leading blank (`ffill`) / trailing blank (`bfill`) has no neighbour
+  and stays empty. Operates on text columns (declare `:str` to detect a numeric
+  column's blanks). Round-trips through `to_source`. No new dependencies.
+  `fill col mean|median` remains planned — it needs a null-bitmap, since a blank
+  numeric cell currently parses to `0` (missingness is lost at parse time).
 - **`like` / `glob` pattern matching (std-only, no regex dependency).**
   `like(s, "JP-%")` is SQL `LIKE` (`%` any run, `_` any single char);
   `glob(s, "[JD]*-00??")` is shell glob (`*`, `?`, `[abc]`/`[a-z]`/`[!..]`

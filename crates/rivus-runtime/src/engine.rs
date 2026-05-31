@@ -97,6 +97,9 @@ fn must_drain(graph: &PlanGraph) -> bool {
                 | Op::Describe
                 | Op::Join { .. }
                 | Op::StreamRef { .. }
+                // bfill buffers the whole stream and emits on finish (it needs
+                // the next value, possibly in a later chunk) → must drain.
+                | Op::Fill { method: rivus_ir::FillMethod::Bfill, .. }
         )
     })
 }
@@ -665,6 +668,13 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             | Op::Sort { .. }
             | Op::Distinct { .. }
             | Op::Describe => return None,
+            // Directional fill carries state across rows/chunks (forward value,
+            // or a backward buffer) → not partitionable. A constant fill is
+            // stateless and stays eligible.
+            Op::Fill {
+                method: rivus_ir::FillMethod::Ffill | rivus_ir::FillMethod::Bfill,
+                ..
+            } => return None,
             _ => {}
         }
     }

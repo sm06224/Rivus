@@ -27,8 +27,8 @@ mod lexer;
 use lexer::{Lexer, Tok};
 use rivus_core::{DataType, Mode, RivusError, Severity, Value};
 use rivus_ir::{
-    Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, Func, Hook, HookAction,
-    HookEvent, NodeId, Op, PlanGraph,
+    Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, FillMethod, Func, Hook,
+    HookAction, HookEvent, NodeId, Op, PlanGraph,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -343,20 +343,23 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
-                // `fill col VALUE` — fill empty cells of a text column.
+                // `fill col VALUE|ffill|bfill` — fill empty cells of a text
+                // column with a constant, or carry the last/next value over.
                 Tok::Word(w) if w == "fill" => {
                     self.bump();
                     let col = self.word()?;
-                    let value = match self.bump() {
-                        Tok::Str(s) => s,
-                        Tok::Word(s) => s,
-                        Tok::Int(n) => n.to_string(),
-                        Tok::Float(f) => f.to_string(),
+                    let method = match self.bump() {
+                        Tok::Word(s) if s == "ffill" => FillMethod::Ffill,
+                        Tok::Word(s) if s == "bfill" => FillMethod::Bfill,
+                        Tok::Str(s) => FillMethod::Value(s),
+                        Tok::Word(s) => FillMethod::Value(s),
+                        Tok::Int(n) => FillMethod::Value(n.to_string()),
+                        Tok::Float(f) => FillMethod::Value(f.to_string()),
                         other => {
                             return Err(self.err(format!("fill expects a value, found {other:?}")))
                         }
                     };
-                    let n = self.g.add_node(Op::Fill { col, value });
+                    let n = self.g.add_node(Op::Fill { col, method });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -1482,6 +1485,37 @@ Import:
         assert!(s.contains("rename age years"), "got: {s}");
         assert!(s.contains("drop city"), "got: {s}");
         assert_eq!(s, parse(&s).unwrap().to_source());
+    }
+
+    #[test]
+    fn fill_methods_parse_and_round_trip() {
+        use rivus_ir::FillMethod;
+        // `fill col ffill` / `bfill` lower to the directional methods.
+        match nth_op("F:\n open a.csv\n fill tag ffill\n;", 1) {
+            Op::Fill { col, method } => {
+                assert_eq!(col, "tag");
+                assert_eq!(method, FillMethod::Ffill);
+            }
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        match nth_op("F:\n open a.csv\n fill tag bfill\n;", 1) {
+            Op::Fill { method, .. } => assert_eq!(method, FillMethod::Bfill),
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        // A constant value still lowers to FillMethod::Value.
+        match nth_op("F:\n open a.csv\n fill tag \"NA\"\n;", 1) {
+            Op::Fill { method, .. } => assert_eq!(method, FillMethod::Value("NA".to_string())),
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        // Reversible: ffill/bfill/value each survive source -> IR -> source.
+        for prog in [
+            "F:\n open a.csv\n fill tag ffill\n;",
+            "F:\n open a.csv\n fill tag bfill\n;",
+            "F:\n open a.csv\n fill tag \"NA\"\n;",
+        ] {
+            let s = parse(prog).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "round-trip: {s}");
+        }
     }
 
     #[test]

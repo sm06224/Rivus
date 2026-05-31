@@ -20,6 +20,17 @@ pub enum Endian {
     Big,
 }
 
+/// How `fill col …` replaces a column's missing (empty) cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillMethod {
+    /// Substitute a constant value (the column becomes text).
+    Value(String),
+    /// Forward-fill: carry the last non-empty value forward over blanks.
+    Ffill,
+    /// Backward-fill: carry the next non-empty value backward over blanks.
+    Bfill,
+}
+
 /// Aggregate functions for `|# key agg:col` (count is always emitted implicitly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
@@ -240,9 +251,12 @@ pub enum Op {
     /// `dropna [col ...]` — drop rows with a missing (empty) value in any of the
     /// named columns (or any column when none named). Streaming, stateless.
     DropNa { cols: Vec<String> },
-    /// `fill col VALUE` — replace missing (empty) cells of `col` with `VALUE`
-    /// (the column becomes text). Streaming, stateless.
-    Fill { col: String, value: String },
+    /// `fill col VALUE|ffill|bfill` — replace missing (empty) cells of `col`.
+    /// `VALUE` substitutes a constant (the column becomes text); `ffill` carries
+    /// the last non-empty value forward, `bfill` the next non-empty value back.
+    /// A constant fill is streaming/stateless; `ffill`/`bfill` are stateful
+    /// (they carry state across rows and chunks) → serial path.
+    Fill { col: String, method: FillMethod },
     /// `rename OLD NEW [OLD NEW ...]` — rename columns in place, preserving
     /// position, type and values. Unknown `OLD` names are skipped with a warning.
     /// Streaming, stateless.
@@ -463,7 +477,11 @@ impl Op {
                     format!("dropna {}", cols.join(" "))
                 }
             }
-            Op::Fill { col, value } => format!("fill {col} \"{value}\""),
+            Op::Fill { col, method } => match method {
+                FillMethod::Value(v) => format!("fill {col} \"{v}\""),
+                FillMethod::Ffill => format!("fill {col} ffill"),
+                FillMethod::Bfill => format!("fill {col} bfill"),
+            },
             Op::Rename { pairs } => {
                 let parts: Vec<String> = pairs.iter().map(|(f, t)| format!("{f} {t}")).collect();
                 format!("rename {}", parts.join(" "))

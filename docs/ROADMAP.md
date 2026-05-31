@@ -62,7 +62,7 @@ it in small, gated steps.
 |---|---|---|
 | ✅ | filter · project · group(sum/avg/min/max/count) · sort · distinct · take | |
 | ✅ | **Joins (inner hash join)** | hash join: buffer the build side, probe the stream. `A & B on k`. Inner first, then left/right/outer. Memory: build side bounded by its cardinality (document it as a pipeline-breaker like sort). |
-| 🚧 | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅ and `fill col VALUE` ✅ done; `fill col mean\|median\|ffill\|bfill` still planned. |
+| 🚧 | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅, `fill col VALUE` ✅, **`fill col ffill\|bfill`** ✅ done (directional carry across chunks, chunk-size independent; bfill is a pipeline-breaker); `fill col mean\|median` still planned (needs a null-bitmap — a blank numeric cell parses to 0, so numeric missingness is lost at parse time). |
 | ✅ | More aggregates | `std` (sample), `count_distinct`/`nunique`, `first`, `last`, `median`/`pNN` percentiles (linear interp) all done |
 | 🚧 | `rename`, `drop`, `reorder` columns | `rename OLD NEW …` ✅ and `drop COL …` ✅ done (stateless, parallel-safe, reversible); `reorder` via `\|>` today |
 
