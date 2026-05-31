@@ -90,7 +90,7 @@ fn string_prefilter(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
         let needles: Vec<String> = conjuncts
             .into_iter()
             .filter_map(literal_substring_atom)
-            .filter(|s| !s.is_empty())
+            .filter(|s| prescan_safe(s))
             .collect();
         if needles.is_empty() {
             continue;
@@ -149,7 +149,19 @@ fn literal_substring_atom(e: &Expr) -> Option<String> {
     None
 }
 
-/// **Filter pushdown.** Annotate a CSV source with the simple numeric
+/// Whether a literal needle is safe for the reader's **raw-line** byte pre-scan
+/// (issue #37). The pre-scan runs `line.contains(needle)` on the un-decoded CSV
+/// bytes, but a logical field value is stored quote-escaped: an embedded `"` is
+/// written `""`, and `\n`/`\r` inside a quoted field span multiple raw lines.
+/// So a needle containing any of those could fail to match a row that the real
+/// predicate accepts — a **false negative** that would break the superset
+/// guarantee. We simply decline to push such needles; `FilterProject` still
+/// checks every row, so the result stays correct (we only forgo the speedup).
+/// The delimiter itself is safe: a value containing it is quoted, so the needle
+/// still appears verbatim in the raw bytes.
+fn prescan_safe(needle: &str) -> bool {
+    !needle.is_empty() && !needle.contains(['"', '\n', '\r'])
+}
 /// `field <cmp> number` predicates of its single `FilterProject` consumer, so
 /// the reader can skip *building* rows that are definitely out. Conservative
 /// and additive: the `FilterProject` is left untouched (it re-checks every
