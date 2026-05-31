@@ -1073,32 +1073,17 @@ fn like_and_glob_chunk_size_independent() {
         if code.starts_with("JP-") {
             like_jp += 1; // like "JP-%"
         }
-        // glob "[JD]*-??00" → starts J or D, ends with two chars then "00"
-        let cs: Vec<char> = code.chars().collect();
-        let first_ok = cs[0] == 'J' || cs[0] == 'D';
-        let ends_00 = code.ends_with("00");
-        if first_ok && ends_00 {
+        // glob "[JD]*00" → starts with J or D and ends with "00".
+        let first = code.chars().next().unwrap();
+        if (first == 'J' || first == 'D') && code.ends_with("00") {
             glob_cls += 1;
         }
+        text.push_str(&code);
+        text.push('\n');
     }
     let f = TempCsv(gendata::write_temp_bytes(
         "stress_likeglob",
         text.as_bytes(),
-    ));
-    let _ = &f; // header-only file replaced below
-    let mut full = String::from("code\n");
-    {
-        // Regenerate the exact same sequence into the data file.
-        let mut rng = Rng::new(31);
-        for _ in 0..rows {
-            let cc = ["JP", "US", "DE"][rng.below(3) as usize];
-            let n = rng.below(10_000);
-            full.push_str(&format!("{cc}-{n:04}\n"));
-        }
-    }
-    let f = TempCsv(gendata::write_temp_bytes(
-        "stress_likeglob",
-        full.as_bytes(),
     ));
     let p = f.0.display();
     for cs in [1usize, 7, 1024, 8192, rows] {
