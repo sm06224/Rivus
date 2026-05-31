@@ -14,8 +14,18 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Cap on concurrent connection-handler threads. A small bound so a burst of
+/// idle/slow clients can't spawn unbounded threads; excess connections are
+/// dropped immediately (the dashboard is a single local viewer in practice).
+const MAX_CONNS: usize = 64;
+
+/// Per-connection read timeout. A client that opens a socket but never sends a
+/// complete request line must not pin a handler thread forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared observability state the worker publishes into and the HTTP handlers
 /// read from. `seq` increments on every publish so SSE handlers can detect new
@@ -117,11 +127,23 @@ pub fn serve(listener: TcpListener, hub: Arc<Hub>) {
     // Keep serving briefly after `done` so the browser receives the terminal
     // snapshot and a viewer can still poll `/snapshot` (a short grace window).
     let mut grace: u32 = 0;
+    // Bound the number of live handler threads (idle/slow clients can't pile up).
+    let conns = Arc::new(AtomicUsize::new(0));
     loop {
         match listener.accept() {
             Ok((s, _)) => {
+                // Shed load past the cap rather than spawn an unbounded thread.
+                if conns.load(Ordering::Relaxed) >= MAX_CONNS {
+                    drop(s);
+                    continue;
+                }
+                conns.fetch_add(1, Ordering::Relaxed);
                 let hub = Arc::clone(&hub);
-                std::thread::spawn(move || handle(s, hub));
+                let conns = Arc::clone(&conns);
+                std::thread::spawn(move || {
+                    handle(s, hub);
+                    conns.fetch_sub(1, Ordering::Relaxed);
+                });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if hub.read().2 {

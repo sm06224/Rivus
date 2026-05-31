@@ -382,7 +382,8 @@ fn json_summary_exposes_worker_breakdown_on_parallel_runs() {
     for i in 0..20_000u32 {
         body.push_str(&format!("{i},{}\n", i % 90));
     }
-    let csv = tmp_csv("wbreak_src", &body);
+    let csv = std::env::temp_dir().join(format!("rivus_wbreak_{}.csv", std::process::id()));
+    std::fs::write(&csv, &body).unwrap();
     let mut out = csv.clone();
     out.set_extension("wbreak.out.csv");
     let prog = format!(
@@ -410,5 +411,6 @@ fn json_summary_exposes_worker_breakdown_on_parallel_runs() {
         summary.contains("\"worker_breakdown\":[{\"worker\":0,"),
         "parallel summary must expose the per-worker breakdown: {summary}"
     );
+    let _ = std::fs::remove_file(&csv);
     let _ = std::fs::remove_file(&out);
 }

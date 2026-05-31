@@ -155,7 +155,6 @@ pub fn collector() -> Box<dyn Operator> {
 /// (see [`csv::plan_parallel`]); on open error it yields nothing (continue-first
 /// — the worker simply contributes no rows).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn csv_range_source(
     path: &str,
     dtypes: Vec<rivus_core::DataType>,
