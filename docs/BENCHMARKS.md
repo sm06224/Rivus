@@ -482,7 +482,7 @@ Self-generated (`rivus gen clean --rows 5000000`), release (Rivus built
 
 | pattern | ripgrep | DuckDB | Rivus | note |
 |---|---:|---:|---:|---|
-| regex `^aki[0-9]+$` | 0.33 s | **0.34 s** | 2.95 s | `regexp(name,…)` vs `regexp_matches` |
+| regex `^aki[0-9]+$` | 0.33 s | **0.34 s** | 2.28 s | `regexp(name,…)` vs `regexp_matches` (compiled-once) |
 | IN-set `country∈{JP,DE,BR}` | 0.34 s | **0.33 s** | 3.30 s | DuckDB `IN` vs Rivus `or`-chain |
 | numeric `age >= 50` → project | — | **0.34 s** | 1.97 s | grep can't express; Rivus pushdown |
 
