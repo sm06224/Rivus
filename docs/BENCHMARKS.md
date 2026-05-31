@@ -443,3 +443,34 @@ different job. Rivus's value is *typed, semantic* selection (numeric/boolean
 predicates, casts, computed columns, joins, aggregates) over the same data at
 streaming, bounded memory. The two compose: `grep ,JP, data.csv | rivus '|?
 age >= 50 |> name age'` pre-filters bytes with grep, then does the typed work.
+
+### Search-pattern matrix — grep / ripgrep vs Rivus (5 M rows, 171 MiB)
+
+Self-generated (`rivus gen clean --rows 5000000`), release, median of 3, warm
+cache. DuckDB rows omitted — its CLI binary could not be fetched in the sandbox
+(network policy); the script in `bench/search.sh` fills them in where available.
+
+| pattern | grep | ripgrep | Rivus | Rivus expr |
+|---|---:|---:|---:|---:|
+| literal `,JP,` | **0.27 s** | 0.33 s | 3.0 s | `contains(country,"JP")` |
+| prefix `name=aki…` | 0.74 s | **0.34 s** | 2.5 s | `starts_with(name,"aki")` / `like(name,"aki%")` |
+| IN-set `country∈{JP,DE,BR}` | 0.74 s | **0.34 s** | 2.6 s | `country=="JP" or … or …` |
+
+**grep/ripgrep win every literal/anchored/alternation pattern by 4–10×** — and
+that is the right outcome: they scan raw bytes and never parse CSV, infer types,
+build typed columns, or re-serialize. For "which lines match this pattern",
+reach for ripgrep.
+
+Where Rivus is the right tool is the part grep *can't express*: typed, semantic
+predicates over parsed fields — numeric ranges (`age >= 50`), casts, computed
+columns, `case when`, joins, group aggregates — at streaming, bounded memory,
+with the same engine then doing projection / aggregation / output. And the two
+compose: `rg ',JP,' data.csv | rivus '|? age >= 50 |# active avg:score'` lets
+ripgrep pre-filter bytes and Rivus do the typed work on the survivors.
+
+The gap also points at the optimization that would move these numbers: Rivus
+does a **two-pass** streaming read (inference, then build). A pushed-down
+*string* prefilter (today only numeric predicates push into the reader) would
+let a `contains`/`like`/`starts_with` skip building dropped rows — the same
+trick that already took the numeric filter past DuckDB. Tracked in the backlog.
+
