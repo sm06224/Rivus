@@ -351,6 +351,8 @@ impl Parser {
                     let method = match self.bump() {
                         Tok::Word(s) if s == "ffill" => FillMethod::Ffill,
                         Tok::Word(s) if s == "bfill" => FillMethod::Bfill,
+                        Tok::Word(s) if s == "mean" => FillMethod::Mean,
+                        Tok::Word(s) if s == "median" => FillMethod::Median,
                         Tok::Str(s) => FillMethod::Value(s),
                         Tok::Word(s) => FillMethod::Value(s),
                         Tok::Int(n) => FillMethod::Value(n.to_string()),
@@ -1559,10 +1561,21 @@ Import:
             Op::Fill { method, .. } => assert_eq!(method, FillMethod::Value("NA".to_string())),
             o => panic!("expected Fill, got {o:?}"),
         }
-        // Reversible: ffill/bfill/value each survive source -> IR -> source.
+        // mean/median lower to the statistical methods.
+        match nth_op("F:\n open a.csv\n fill score mean\n;", 1) {
+            Op::Fill { method, .. } => assert_eq!(method, FillMethod::Mean),
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        match nth_op("F:\n open a.csv\n fill score median\n;", 1) {
+            Op::Fill { method, .. } => assert_eq!(method, FillMethod::Median),
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        // Reversible: every method survives source -> IR -> source.
         for prog in [
             "F:\n open a.csv\n fill tag ffill\n;",
             "F:\n open a.csv\n fill tag bfill\n;",
+            "F:\n open a.csv\n fill score mean\n;",
+            "F:\n open a.csv\n fill score median\n;",
             "F:\n open a.csv\n fill tag \"NA\"\n;",
         ] {
             let s = parse(prog).unwrap().to_source();

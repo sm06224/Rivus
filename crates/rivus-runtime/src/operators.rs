@@ -225,6 +225,8 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             }),
             FillMethod::Ffill => Box::new(FillDirectional::ffill(col.clone())),
             FillMethod::Bfill => Box::new(FillDirectional::bfill(col.clone())),
+            FillMethod::Mean => Box::new(FillStat::new(col.clone(), false)),
+            FillMethod::Median => Box::new(FillStat::new(col.clone(), true)),
         },
         Op::Rename { pairs } => Box::new(Rename {
             pairs: pairs.clone(),
@@ -1279,6 +1281,148 @@ impl Operator for FillDirectional {
             chunk.columns[ci] = Column::Str(filled);
         }
         out
+    }
+}
+
+/// `fill col mean|median` — replace blank cells of a text column with a
+/// whole-column statistic of its non-empty **numeric** cells. Buffers the entire
+/// stream (a pipeline-breaker like `sort`): the statistic needs every value, so
+/// it can only be known on `finish`. Works on a `Str` column (declare `:str` so
+/// blanks survive parsing); a numeric column has no blank cells (they became `0`
+/// at parse time) and is passed through unchanged. Cells that don't parse as a
+/// number are ignored when computing the statistic but kept as-is in the output.
+struct FillStat {
+    col: String,
+    median: bool,
+    buf: Vec<Chunk>,
+    warned: bool,
+}
+
+impl FillStat {
+    fn new(col: String, median: bool) -> Self {
+        FillStat {
+            col,
+            median,
+            buf: Vec::new(),
+            warned: false,
+        }
+    }
+
+    /// Linear-interpolated median (p50) of a sorted-in-place value set; mirrors
+    /// the percentile aggregate so `fill median` and `|# median:` agree.
+    fn median_of(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if v.is_empty() {
+            return 0.0;
+        }
+        if v.len() == 1 {
+            return v[0];
+        }
+        let rank = 0.5 * (v.len() - 1) as f64;
+        let lo = rank.floor() as usize;
+        let hi = rank.ceil() as usize;
+        let frac = rank - lo as f64;
+        v[lo] + (v[hi] - v[lo]) * frac
+    }
+
+    /// Format the fill value without a trailing `.0` when it is integral, so an
+    /// integer-looking column stays integer-looking after the fill.
+    fn format_stat(x: f64) -> String {
+        if x.fract() == 0.0 && x.abs() < 1e15 {
+            format!("{}", x as i64)
+        } else {
+            format!("{x}")
+        }
+    }
+}
+
+impl Operator for FillStat {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        self.buf.push(chunk);
+        Vec::new() // blocking: needs the whole column to know the statistic
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        let mut chunks = std::mem::take(&mut self.buf);
+        let Some(ci) = chunks[0].schema.index_of(&self.col) else {
+            if !self.warned {
+                self.warned = true;
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!("fill: unknown column '{}'", self.col),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+            return chunks;
+        };
+        // Numeric column → no blanks to fill (parsed to 0 already); pass through.
+        if !matches!(chunks[0].columns[ci], Column::Str(_)) {
+            return chunks;
+        }
+
+        // Pass 1: collect every non-empty cell that parses as a number.
+        let mut nums: Vec<f64> = Vec::new();
+        let mut count = 0f64;
+        let mut sum = 0f64;
+        for c in &chunks {
+            if let Column::Str(s) = &c.columns[ci] {
+                for r in 0..c.len {
+                    let cell = s.get(r).trim();
+                    if cell.is_empty() {
+                        continue;
+                    }
+                    if let Ok(x) = cell.parse::<f64>() {
+                        sum += x;
+                        count += 1.0;
+                        if self.median {
+                            nums.push(x);
+                        }
+                    }
+                }
+            }
+        }
+        // No numeric cell to learn from → leave blanks as-is (warn once).
+        if count == 0.0 {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Warn,
+                    ErrorScope::Chunk,
+                    format!(
+                        "fill {}: no numeric values to compute {}",
+                        self.col,
+                        if self.median { "median" } else { "mean" }
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+            return chunks;
+        }
+        let stat = if self.median {
+            Self::median_of(nums)
+        } else {
+            sum / count
+        };
+        let fill = Self::format_stat(stat);
+
+        // Pass 2: rewrite blank cells with the formatted statistic.
+        for c in chunks.iter_mut() {
+            let Column::Str(s) = &c.columns[ci] else {
+                continue;
+            };
+            let mut filled = StrColumn::with_capacity(c.len, 0);
+            for r in 0..c.len {
+                let v = s.get(r);
+                filled.push(if v.trim().is_empty() { &fill } else { v });
+            }
+            c.columns[ci] = Column::Str(filled);
+        }
+        chunks
     }
 }
 

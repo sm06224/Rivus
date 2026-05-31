@@ -397,6 +397,91 @@ fn fill_ffill_bfill_chunk_size_independent() {
 }
 
 #[test]
+fn fill_mean_median_chunk_size_independent() {
+    // score is blank on every 4th row; the rest are a known numeric sequence.
+    // `fill score mean|median` must replace blanks with the column statistic of
+    // the non-empty cells, keep the non-empty cells unchanged, and be identical
+    // across chunk_size (the statistic is computed over the whole buffered
+    // column, a pipeline-breaker like sort).
+    let rows = 4_000usize;
+    let mut text = String::from("id,score\n");
+    let mut present: Vec<f64> = Vec::new();
+    for i in 0..rows {
+        if i % 4 == 0 {
+            text.push_str(&format!("{i},\n")); // blank score
+        } else {
+            let s = (i % 100) as f64; // deterministic spread 0..99
+            text.push_str(&format!("{i},{s}\n"));
+            present.push(s);
+        }
+    }
+    // Oracle statistics over the present (non-blank) values.
+    let mean = present.iter().sum::<f64>() / present.len() as f64;
+    let mut sorted = present.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let rank = 0.5 * (sorted.len() - 1) as f64;
+    let (lo, hi, frac) = (
+        rank.floor() as usize,
+        rank.ceil() as usize,
+        rank - rank.floor(),
+    );
+    let median = sorted[lo] + (sorted[hi] - sorted[lo]) * frac;
+
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_fillstat",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+
+    // Sum of the filled column = sum(present) + (#blanks * statistic). Checking
+    // the sum (not exact strings) keeps the oracle robust to float formatting.
+    let nblank = (rows / 4) as f64;
+    let present_sum: f64 = present.iter().sum();
+
+    let col_sum = |res: &rivus_runtime::RunResult| -> f64 {
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("F"))
+            .unwrap();
+        let mut sum = 0f64;
+        let mut blanks = 0u64;
+        for c in &o.chunks {
+            let ci = c.schema.index_of("score").unwrap();
+            for r in 0..c.len {
+                let v = c.value(r, ci).to_string();
+                assert!(!v.trim().is_empty(), "blank survived fill");
+                sum += v.parse::<f64>().unwrap();
+                blanks += 0; // (kept for clarity; blanks already replaced)
+            }
+        }
+        let _ = blanks;
+        sum
+    };
+
+    for cs in [1usize, 7, 1024, rows] {
+        let m = run_src(
+            &format!("F:\n open {p} (id score:str)\n fill score mean\n;"),
+            cs,
+        );
+        assert!(
+            (col_sum(&m) - (present_sum + nblank * mean)).abs() < 1e-6,
+            "fill mean sum @cs={cs}"
+        );
+        assert!(m.errors.is_empty(), "mean errors @cs={cs}");
+
+        let md = run_src(
+            &format!("F:\n open {p} (id score:str)\n fill score median\n;"),
+            cs,
+        );
+        assert!(
+            (col_sum(&md) - (present_sum + nblank * median)).abs() < 1e-6,
+            "fill median sum @cs={cs}"
+        );
+    }
+}
+
+#[test]
 fn describe_matches_oracle() {
     // One numeric column `v`; `describe` must report count/min/max/mean that
     // match an independent computation, for every chunk size.

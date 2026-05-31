@@ -37,6 +37,12 @@ pub enum FillMethod {
     Ffill,
     /// Backward-fill: carry the next non-empty value backward over blanks.
     Bfill,
+    /// Fill blanks with the mean of the column's non-empty numeric cells.
+    /// Buffers the whole stream (a pipeline-breaker like `sort`).
+    Mean,
+    /// Fill blanks with the median (p50, linear-interpolated) of the column's
+    /// non-empty numeric cells. Buffers the whole stream (pipeline-breaker).
+    Median,
 }
 
 /// Aggregate functions for `|# key agg:col` (count is always emitted implicitly).
@@ -495,6 +501,8 @@ impl Op {
                 FillMethod::Value(v) => format!("fill {col} \"{v}\""),
                 FillMethod::Ffill => format!("fill {col} ffill"),
                 FillMethod::Bfill => format!("fill {col} bfill"),
+                FillMethod::Mean => format!("fill {col} mean"),
+                FillMethod::Median => format!("fill {col} median"),
             },
             Op::Rename { pairs } => {
                 let parts: Vec<String> = pairs.iter().map(|(f, t)| format!("{f} {t}")).collect();

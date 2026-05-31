@@ -38,6 +38,17 @@ All notable changes to Rivus. Format loosely follows
   `sum(amount)` equals the inner-join sum, with one padded row per never-matched
   left key). Lowers to `Op::Join { kind: Left }`, round-trips through
   `to_source`. No new dependencies. Right/full outer joins remain on the roadmap.
+- **Statistical missing-value fill: `fill col mean|median` (std-only).**
+  Replaces a text column's blank cells with a whole-column statistic of its
+  non-empty numeric cells: `mean` (arithmetic average) or `median` (p50,
+  linear-interpolated, matching the `|# median:` aggregate). Buffers the entire
+  stream (a pipeline-breaker like `sort`, and it forces the serial path), since
+  the statistic needs every value; non-numeric cells are ignored when computing
+  it but kept in the output, and an integral result is formatted without a
+  trailing `.0`. Declare the column `:str` so its blanks survive parsing.
+  Round-trips through `to_source`. Oracle-tested (the filled-column sum equals
+  `sum(present) + blanks × statistic`, chunk-size independent). This completes
+  the imputation roadmap item (D). No new dependencies.
 - **Directional missing-value fill: `fill col ffill|bfill` (std-only).**
   Alongside the existing constant `fill col VALUE`, `ffill` carries the last
   non-empty value forward over blank cells and `bfill` the next value back —

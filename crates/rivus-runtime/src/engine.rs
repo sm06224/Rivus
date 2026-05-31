@@ -97,9 +97,16 @@ fn must_drain(graph: &PlanGraph) -> bool {
                 | Op::Describe
                 | Op::Join { .. }
                 | Op::StreamRef { .. }
-                // bfill buffers the whole stream and emits on finish (it needs
-                // the next value, possibly in a later chunk) → must drain.
-                | Op::Fill { method: rivus_ir::FillMethod::Bfill, .. }
+                // bfill/mean/median buffer the whole stream and emit on finish
+                // (they need a value from a later chunk, or a whole-column
+                // statistic) → must drain.
+                | Op::Fill {
+                    method:
+                        rivus_ir::FillMethod::Bfill
+                        | rivus_ir::FillMethod::Mean
+                        | rivus_ir::FillMethod::Median,
+                    ..
+                }
         )
     })
 }
@@ -668,11 +675,15 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             | Op::Sort { .. }
             | Op::Distinct { .. }
             | Op::Describe => return None,
-            // Directional fill carries state across rows/chunks (forward value,
-            // or a backward buffer) → not partitionable. A constant fill is
-            // stateless and stays eligible.
+            // Directional / statistical fill carries state across rows/chunks
+            // (forward value, backward buffer, or a whole-column statistic) →
+            // not partitionable. A constant fill is stateless and stays eligible.
             Op::Fill {
-                method: rivus_ir::FillMethod::Ffill | rivus_ir::FillMethod::Bfill,
+                method:
+                    rivus_ir::FillMethod::Ffill
+                    | rivus_ir::FillMethod::Bfill
+                    | rivus_ir::FillMethod::Mean
+                    | rivus_ir::FillMethod::Median,
                 ..
             } => return None,
             _ => {}

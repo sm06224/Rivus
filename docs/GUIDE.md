@@ -187,6 +187,8 @@ dropna city region     # drop rows blank in these columns
 fill city "UNKNOWN"    # replace blank cells of `city` with a constant
 fill price ffill       # forward-fill: carry the last non-empty value down
 fill price bfill       # backward-fill: carry the next non-empty value up
+fill score mean        # fill blanks with the column mean (numeric cells)
+fill score median      # fill blanks with the column median
 ```
 
 A "missing" cell is an empty string. Numeric columns can't hold a blank (it
@@ -194,7 +196,10 @@ parses to 0), so declare a column `:str` if you need to detect/clean its blanks.
 `ffill`/`bfill` carry the nearest neighbour across chunk boundaries (a leading
 blank has nothing to forward-fill from, a trailing blank nothing to back-fill);
 `bfill` buffers the stream to finish (a pipeline-breaker like `sort`), `ffill`
-is fully streaming.
+is fully streaming. `mean`/`median` compute a whole-column statistic over the
+non-empty numeric cells and substitute it for the blanks (also pipeline-breakers,
+since the statistic needs every value); an integral result is written without a
+trailing `.0`. All `fill` methods leave non-blank cells untouched.
 
 ### `describe` — one-pass column summary
 
@@ -492,7 +497,7 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'sort' IDENT ('asc'|'desc')?
            | 'distinct' IDENT*
            | 'describe'
-           | 'dropna' IDENT* | 'fill' IDENT (VALUE | 'ffill' | 'bfill')
+           | 'dropna' IDENT* | 'fill' IDENT (VALUE | 'ffill' | 'bfill' | 'mean' | 'median')
            | 'rename' (IDENT IDENT)+ | 'drop' IDENT+
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')
