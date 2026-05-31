@@ -29,6 +29,14 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Prefilter-skip telemetry (Epic #30 / Pillar A — issue #31, A1).** The CSV
+  reader now counts the rows its pushed-down prefilter skips *building* and the
+  source reports it once on exhaustion: `prefilter skipped N row(s) at the
+  reader` (an `Info` event, visible in `explain`/`--json`). Pure accounting —
+  the result is byte-identical (those rows would be dropped by the downstream
+  `FilterProject` anyway), and the count is chunk-size independent. First step of
+  making "what the optimizer skipped" measurable. New
+  `tests/observability.rs`. No new dependencies.
 - **JSON array output: `save out.json` / `save - as json` (std-only).** A
   `.json` path (or `as json`) now writes a single JSON array (`[{…},{…}]`)
   instead of NDJSON; `.jsonl` / `.ndjson` / `as jsonl` stay one-object-per-line,

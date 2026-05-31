@@ -105,6 +105,10 @@ pub struct CsvChunker {
     line: String,
     /// Rows skipped in pass 1 for wrong arity (reported once by the source).
     pub bad_rows: usize,
+    /// Rows the pushed-down prefilter skipped *building* (definitely-out rows).
+    /// Pure accounting for telemetry — the result is unchanged, since the
+    /// downstream `FilterProject` would have dropped exactly these rows anyway.
+    pub rows_prefiltered: u64,
     eof: bool,
     /// Current byte offset and an optional end (for streaming one byte range of
     /// the file in a parallel worker). `limit == None` streams to EOF.
@@ -200,6 +204,7 @@ impl CsvChunker {
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 bad_rows: bad,
+                rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
                 pos: 0,
@@ -276,6 +281,7 @@ impl CsvChunker {
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 bad_rows: bad,
+                rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
                 pos: 0,
@@ -310,6 +316,7 @@ impl CsvChunker {
             chunk_size: chunk_size.max(1),
             line: String::new(),
             bad_rows: 0,
+            rows_prefiltered: 0,
             eof: false,
             prefilter,
             pos: start,
@@ -366,6 +373,7 @@ impl CsvChunker {
                 // out (conservative; the downstream FilterProject is final).
                 if !self.prefilter.is_empty() && !row_passes_prefilter(&self.prefilter, l, &offsets)
                 {
+                    self.rows_prefiltered += 1;
                     continue;
                 }
                 for (k, &ci) in self.keep.iter().enumerate() {

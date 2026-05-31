@@ -510,9 +510,29 @@ impl Operator for SourceCsv {
             self.load(ctx);
         }
         if let Some(chunker) = self.stream.as_mut() {
-            let cols = chunker.next_columns()?;
-            let id = ctx.fresh_id();
-            return Some(Chunk::new(id, self.schema.clone(), cols));
+            match chunker.next_columns() {
+                Some(cols) => {
+                    let id = ctx.fresh_id();
+                    return Some(Chunk::new(id, self.schema.clone(), cols));
+                }
+                None => {
+                    // Source exhausted: report how many rows the pushed-down
+                    // prefilter skipped building (pure accounting — the result is
+                    // unchanged, the downstream FilterProject would drop them).
+                    let skipped = chunker.rows_prefiltered;
+                    if skipped > 0 {
+                        ctx.raise(
+                            ErrorEvent::new(
+                                Severity::Info,
+                                ErrorScope::Item,
+                                format!("prefilter skipped {skipped} row(s) at the reader"),
+                            )
+                            .at_node(ctx.label.clone()),
+                        );
+                    }
+                    return None;
+                }
+            }
         }
         #[cfg(any(feature = "gzip", feature = "zstd"))]
         if let Some(cz) = self.cz_stream.as_mut() {
