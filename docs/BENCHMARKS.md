@@ -405,3 +405,41 @@ delimiter split. Per the project rule ("'faster' is never asserted without a
 measured number"), the change was dropped rather than add a hand-rolled bit
 trick for nothing. Revisit only if a future profile shows the split as hot
 (e.g. after mmap + buffer-reuse remove the IO/alloc overhead).
+
+### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
+
+Data generated self-hosted with `rivus gen clean --rows 5000000` (no awk).
+Release build, 3 runs each, warm cache.
+
+**Task A — select rows where `country == "JP"`** (grep's home turf: a literal
+substring of the raw line, no parsing):
+
+| tool | command | time | rows |
+|---|---|---:|---:|
+| grep | `grep -c ",JP," data.csv` | **0.27 s** | 1 001 296 |
+| Rivus | `open … \|? country == "JP" save -` | 3.1 s | 1 001 296 |
+
+grep is **~11× faster** here, and that is expected and correct: grep scans raw
+bytes and never parses CSV, infers types, builds typed columns, or
+re-serializes — Rivus does all of that (and twice, for streaming type
+inference). For "find lines containing a literal", reach for grep.
+
+**Task B — numeric filter `age >= 50`, project `name age`** (grep *cannot*
+express this: it matches bytes, not numeric ranges — you'd need a hand-built
+alternation over every matching value):
+
+| tool | command | time | rows |
+|---|---|---:|---:|
+| grep | — (not expressible) | — | — |
+| Rivus | `open … \|? age >= 50 \|> name age save -` | **2.0 s** | 2 222 037 |
+
+(Row count matches the `awk 'NR>1&&$3>=50'` oracle.) Note Task B is *faster*
+than Task A despite scanning the same file: filter pushdown skips building the
+dropped rows' columns and projection materializes only `name,age`, so less work
+than the full-row `save -` in Task A.
+
+**Takeaway:** grep wins decisively on literal line-selection — different tool,
+different job. Rivus's value is *typed, semantic* selection (numeric/boolean
+predicates, casts, computed columns, joins, aggregates) over the same data at
+streaming, bounded memory. The two compose: `grep ,JP, data.csv | rivus '|?
+age >= 50 |> name age'` pre-filters bytes with grep, then does the typed work.

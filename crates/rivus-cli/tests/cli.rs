@@ -90,3 +90,43 @@ fn run_inline_to_stdout() {
     assert!(stdout.contains("carol"), "stdout: {stdout}");
     assert!(!stdout.contains("bob"), "filtered row leaked: {stdout}");
 }
+
+/// `gen <shape>` writes deterministic, seeded data to stdout: same seed →
+/// byte-identical output; the `clean` shape is a valid CSV that Rivus can read
+/// back; an unknown shape is a usage error.
+#[test]
+fn gen_is_deterministic_and_self_describing() {
+    let run_gen = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .output()
+            .expect("spawn rivus gen")
+    };
+
+    // Same seed twice → identical bytes.
+    let a = run_gen(&["gen", "clean", "--rows", "500", "--seed", "7"]);
+    let b = run_gen(&["gen", "clean", "--rows", "500", "--seed", "7"]);
+    assert!(a.status.success());
+    assert_eq!(a.stdout, b.stdout, "same seed must be byte-identical");
+
+    // A different seed changes the data.
+    let c = run_gen(&["gen", "clean", "--rows", "500", "--seed", "8"]);
+    assert_ne!(a.stdout, c.stdout, "different seed should differ");
+
+    // `clean` has a header + exactly `rows` data lines.
+    let text = String::from_utf8(a.stdout).unwrap();
+    assert!(text.starts_with("id,name,age,score,country,active\n"));
+    assert_eq!(text.lines().count(), 501, "header + 500 rows");
+
+    // Unknown shape → usage error (exit 2).
+    let bad = run_gen(&["gen", "wat"]);
+    assert_eq!(bad.status.code(), Some(2));
+
+    // jsonl shape emits one object per line.
+    let j = run_gen(&["gen", "jsonl", "--rows", "3", "--seed", "1"]);
+    let jtext = String::from_utf8(j.stdout).unwrap();
+    assert_eq!(jtext.lines().count(), 3);
+    assert!(jtext
+        .lines()
+        .all(|l| l.starts_with('{') && l.ends_with('}')));
+}

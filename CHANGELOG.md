@@ -7,6 +7,11 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **`rivus gen` — self-hosted data generation (dogfooding).** A new CLI
+  subcommand emits deterministic, seeded benchmark/demo data to stdout, so
+  benches and docs need no external awk/python: `rivus gen clean --rows N
+  [--seed S]`, plus `error-heavy` / `mixed` (`--ratio R`) and `jsonl` shapes.
+  Same seed → byte-identical output. Wraps the existing `gendata` generators.
 - **Percentile group aggregates (std-only).** `|#` gains `median` and `pNN`
   (`p50`, `p90`, `p99`, …) — linear-interpolated percentiles (numpy/pandas
   default). They buffer each group's numeric values (bounded by group

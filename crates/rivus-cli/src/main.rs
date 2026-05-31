@@ -16,8 +16,8 @@
 
 mod viz;
 
-use rivus_runtime::{run, RunOptions};
-use std::io::{IsTerminal, Read};
+use rivus_runtime::{gendata, run, RunOptions};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -31,6 +31,12 @@ fn main() -> ExitCode {
     if matches!(cmd, "-h" | "--help" | "help") {
         usage();
         return ExitCode::SUCCESS;
+    }
+
+    // `rivus gen` — self-hosted, deterministic data generation (dogfooding), so
+    // benches and demos need no external awk/python. Writes to stdout.
+    if cmd == "gen" {
+        return run_gen(&args[2..]);
     }
 
     // Bare Unix-filter form: `rivus '|? age >= 20 |> name age'` (no subcommand).
@@ -199,6 +205,75 @@ fn main() -> ExitCode {
     }
 }
 
+/// `rivus gen <shape> [--rows N] [--seed S] [--ratio R]` — write deterministic,
+/// seeded benchmark/demo data to stdout. Self-hosted so dogfooding needs no
+/// external awk/python. Shapes mirror `gendata`:
+///   clean       well-formed `id,name,age,score,country,active` CSV
+///   error-heavy ~`ratio` malformed rows (default 0.1) — continue-first stress
+///   mixed       ~`ratio` type-mixed cells (default 0.1)
+///   jsonl       one flat JSON object per line
+fn run_gen(args: &[String]) -> ExitCode {
+    let mut shape: Option<&str> = None;
+    let mut rows: usize = 1000;
+    let mut seed: u64 = 42;
+    let mut ratio: f64 = 0.1;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rows" | "-n" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse().ok()) {
+                    Some(n) => rows = n,
+                    None => return gen_arg_err("--rows requires a non-negative integer"),
+                }
+            }
+            "--seed" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse().ok()) {
+                    Some(s) => seed = s,
+                    None => return gen_arg_err("--seed requires an integer"),
+                }
+            }
+            "--ratio" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<f64>().ok()) {
+                    Some(r) if (0.0..=1.0).contains(&r) => ratio = r,
+                    _ => return gen_arg_err("--ratio requires a number in 0.0..=1.0"),
+                }
+            }
+            other if shape.is_none() && !other.starts_with('-') => shape = Some(other),
+            other => return gen_arg_err(&format!("unexpected argument '{other}'")),
+        }
+        i += 1;
+    }
+    let bytes: Vec<u8> = match shape {
+        Some("clean") | None => gendata::clean(rows, seed).into_bytes(),
+        Some("error-heavy") => gendata::error_heavy(rows, ratio, seed).into_bytes(),
+        Some("mixed") => gendata::mixed_types(rows, ratio, seed).into_bytes(),
+        Some("jsonl") => gendata::jsonl_clean(rows, seed).into_bytes(),
+        Some(other) => {
+            return gen_arg_err(&format!(
+                "unknown shape '{other}' (clean|error-heavy|mixed|jsonl)"
+            ))
+        }
+    };
+    match std::io::stdout().write_all(&bytes) {
+        Ok(()) => ExitCode::SUCCESS,
+        // A closed downstream pipe (`rivus gen … | head`) is not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("gen: cannot write to stdout: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn gen_arg_err(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}");
+    eprintln!("usage: rivus gen <clean|error-heavy|mixed|jsonl> [--rows N] [--seed S] [--ratio R]");
+    ExitCode::from(2)
+}
+
 /// A transform-only program (no source/scope): starts with a pipe operator or a
 /// transform verb. Such a program is wrapped as a stdin→stdout CSV filter.
 fn is_transform_only(src: &str) -> bool {
@@ -219,7 +294,8 @@ fn usage() {
          USAGE:\n\
          \x20 rivus run     <program> [--chunk-size N] [--no-opt]    run and visualize a flow\n\
          \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
-         \x20 rivus check   <program>                                parse only\n\n\
+         \x20 rivus check   <program>                                parse only\n\
+         \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\
          PROGRAM (any of):\n\
          \x20 <file.riv>                 read the program from a file\n\
          \x20 -c, --command <STRING>     pass the program inline as a string\n\
@@ -232,6 +308,9 @@ fn usage() {
          \x20 RIV\n\n\
          UNIX FILTER (transform-only program → reads CSV from stdin, writes stdout):\n\
          \x20 cat data.csv | rivus '|? age >= 20 |> name age'\n\
-         \x20 cat data.csv | rivus 'describe'\n"
+         \x20 cat data.csv | rivus 'describe'\n\n\
+         DATA GENERATION (deterministic, seeded — for benches/demos, no awk needed):\n\
+         \x20 rivus gen clean --rows 1000000 > data.csv\n\
+         \x20 rivus gen clean --rows 1000000 | rivus '|? age >= 50 |> name age'\n"
     );
 }

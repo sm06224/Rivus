@@ -439,11 +439,23 @@ rivus run -c 'B: open big.csv ;'        # instant head, ~10 MiB RAM
 rivus run     <program> [--chunk-size N] [--no-opt]   run and visualize a flow
 rivus explain <program> [--no-opt]                    show DAG IR + optimizer report
 rivus check   <program>                               parse only
+rivus gen     <shape>   [--rows N --seed S --ratio R] write seeded data to stdout
 
 PROGRAM:
   <file.riv>                 read the program from a file
   -c, --command <STRING>     pass the program inline as a string
   - | stdin                  read the program from stdin (heredoc)
+
+GEN SHAPES (deterministic, seeded — for benches/demos, no awk needed):
+  clean         well-formed id,name,age,score,country,active CSV
+  error-heavy   ~ratio malformed rows (default 0.1) — continue-first stress
+  mixed         ~ratio type-mixed cells (default 0.1)
+  jsonl         one flat JSON object per line
+```
+
+```
+# self-hosted bench: generate, then filter — no external tools
+rivus gen clean --rows 1000000 | rivus '|? age >= 50 |> name age'
 ```
 
 ---
