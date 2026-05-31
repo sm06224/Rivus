@@ -102,3 +102,23 @@ fn fusion_and_pushdown_preserve_results() {
     let names = out.chunks[0].schema.field_names();
     assert_eq!(names, vec!["name", "age"]);
 }
+
+#[test]
+fn pushdown_preserves_computed_columns() {
+    // Projection pushdown must preserve a *computed* column referencing a
+    // non-leading field: restricting the source read-set to {em} must not change
+    // the value of upper(em) / concat(em,…) / split_part(em,…). Guards pushdown
+    // against the string-function projections.
+    let data = "id,em,n\n1,abc,10\n2,xyz,20\n3,pq,30\n".as_bytes();
+    let f = TempCsv(gendata::write_temp_bytes("opt_comp", data));
+    let p = f.0.display();
+
+    for src in [
+        format!("F:\n open {p}\n |> (upper(em)) as u\n;"),
+        format!("F:\n open {p}\n |? n >= 20\n |> (concat(em, \"!\")) as e id\n;"),
+        format!("F:\n open {p}\n |> (split_part(em, \"b\", 1)) as head\n;"),
+    ] {
+        let (raw, opt) = run_both(&src);
+        assert_eq!(fingerprint(&raw), fingerprint(&opt), "mismatch for: {src}");
+    }
+}

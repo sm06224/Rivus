@@ -279,6 +279,60 @@ fn string_functions_chunk_size_independent() {
 }
 
 #[test]
+fn replace_split_concat_chunk_size_independent() {
+    // replace / split_part / concat over a path-like column. Each output row is
+    // checked against an independent oracle, and the result must be chunk-size
+    // independent (these lower to row-wise eval inside a computed projection).
+    let rows = 4_000usize;
+    let mut text = String::from("id,path\n");
+    for i in 0..rows {
+        // paths like "/a/b<i>/c" so split_part(path,"/",3) = "b<i>".
+        text.push_str(&format!("{i},/a/b{i}/c\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_strfn2", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(
+            &format!(
+                "S:\n open {p}\n |> id (replace(path, \"/\", \"-\")) as r (split_part(path, \"/\", 3)) as seg (concat(id, \"@\", path)) as tag\n;"
+            ),
+            cs,
+        );
+        assert_eq!(res.total_rows_out(), rows as u64, "rows @cs={cs}");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("S"))
+            .unwrap();
+        for c in &o.chunks {
+            let ii = c.schema.index_of("id").unwrap();
+            let ri = c.schema.index_of("r").unwrap();
+            let si = c.schema.index_of("seg").unwrap();
+            let ti = c.schema.index_of("tag").unwrap();
+            for r in 0..c.len {
+                let id = c.value(r, ii).to_string();
+                assert_eq!(
+                    c.value(r, ri).to_string(),
+                    format!("-a-b{id}-c"),
+                    "replace @cs={cs}"
+                );
+                assert_eq!(
+                    c.value(r, si).to_string(),
+                    format!("b{id}"),
+                    "split @cs={cs}"
+                );
+                assert_eq!(
+                    c.value(r, ti).to_string(),
+                    format!("{id}@/a/b{id}/c"),
+                    "concat @cs={cs}"
+                );
+            }
+        }
+        assert!(res.errors.is_empty(), "errors @cs={cs}");
+    }
+}
+
+#[test]
 fn dropna_and_fill_chunk_size_independent() {
     // city is blank on every 3rd row. dropna city drops those; fill city
     // replaces them. Both must be exact and chunk-size independent.
