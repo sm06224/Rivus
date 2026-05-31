@@ -368,7 +368,7 @@ fn cast_value(v: Value, ty: DataType) -> Value {
 }
 
 /// Cast a whole column to a target lane (columnar path for computed columns).
-fn cast_column(col: Column, ty: DataType) -> Column {
+pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
     let n = col.len();
     match ty {
         DataType::I64 => Column::I64((0..n).map(|i| to_i64(col.value_at(i))).collect()),

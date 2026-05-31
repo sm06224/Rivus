@@ -29,6 +29,13 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **`cast COL:type [COL:type …]` verb (std-only).** Re-types named columns in
+  place (position and name kept; values re-coerced through the same cast lane as
+  an inline `(col:type)` projection) — e.g. `cast age:int price:f64`. The
+  readable form of the "mid-flow cast" (sugar over a computed projection that
+  keeps the rest). Unknown columns warn and are skipped; round-trips through
+  `to_source` (type names render canonically, `int` → `i64`). Oracle-tested
+  (re-type + dtype check, chunk-size independent). No new dependencies.
 - **Numeric functions `abs` / `round` / `floor` / `ceil` and null-coalesce
   `coalesce` (std-only).** Usable anywhere an expression is. `abs/round/floor/
   ceil` coerce a numeric string (e.g. a `:str`-declared column) by parsing it,

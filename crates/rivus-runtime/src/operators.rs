@@ -242,6 +242,9 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             pairs: pairs.clone(),
         }),
         Op::Drop { cols } => Box::new(Drop { cols: cols.clone() }),
+        Op::Cast { casts } => Box::new(Cast {
+            casts: casts.clone(),
+        }),
         Op::Reorder { cols } => Box::new(Reorder { cols: cols.clone() }),
         Op::ProjectExpr { items } => Box::new(ProjectExpr {
             items: items.clone(),
@@ -1557,6 +1560,47 @@ impl Operator for Drop {
             .map(|&i| chunk.schema.fields[i].clone())
             .collect();
         let columns: Vec<Column> = keep.iter().map(|&i| chunk.columns[i].clone()).collect();
+        let schema = Arc::new(Schema::new(fields));
+        let mut out = Chunk::new(chunk.meta.id, schema, columns);
+        out.meta = chunk.meta.clone();
+        vec![out]
+    }
+}
+
+/// `cast COL:type [COL:type ...]` — re-type named columns in place (position and
+/// name kept; the column's values are re-coerced through the cast lane, exactly
+/// like an inline `(col:type)` projection). Unknown names warn once and are
+/// skipped. Stateless and streaming.
+struct Cast {
+    casts: Vec<(String, DataType)>,
+}
+
+impl Operator for Cast {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let mut fields = chunk.schema.fields.clone();
+        let mut columns = chunk.columns.clone();
+        let mut changed = false;
+        for (name, ty) in &self.casts {
+            match chunk.schema.index_of(name) {
+                Some(i) => {
+                    columns[i] = eval::cast_column(columns[i].clone(), *ty);
+                    fields[i] = Field::new(name.clone(), *ty);
+                    changed = true;
+                }
+                None => ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!("cast: unknown column '{name}'"),
+                    )
+                    .at_node(ctx.label.clone())
+                    .at_chunk(chunk.meta.id),
+                ),
+            }
+        }
+        if !changed {
+            return vec![chunk];
+        }
         let schema = Arc::new(Schema::new(fields));
         let mut out = Chunk::new(chunk.meta.id, schema, columns);
         out.meta = chunk.meta.clone();

@@ -412,6 +412,28 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `cast COL:type [COL:type ...]` — re-type named columns in place.
+                Tok::Word(w) if w == "cast" => {
+                    self.bump();
+                    let mut casts = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump(); // column name
+                        self.expect(&Tok::Colon)?;
+                        let tyword = self.word()?;
+                        let ty = decl_type(&tyword)
+                            .ok_or_else(|| self.err(format!("cast: unknown type '{tyword}'")))?;
+                        casts.push((name, ty));
+                    }
+                    if casts.is_empty() {
+                        return Err(self.err("cast expects at least one COL:type"));
+                    }
+                    let n = self.g.add_node(Op::Cast { casts });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
                 // `reorder COL [COL ...]` — move named columns to the front.
                 Tok::Word(w) if w == "reorder" => {
                     self.bump();
@@ -1161,6 +1183,7 @@ fn is_keyword(w: &str) -> bool {
             | "dropna"
             | "fill"
             | "drop"
+            | "cast"
             | "reorder"
             | "rename"
             | "where"
@@ -1605,6 +1628,30 @@ Import:
         assert_eq!(s, parse(&s).unwrap().to_source());
         // Empty operand list is rejected.
         assert!(parse("F:\n open a.csv\n reorder\n;").is_err());
+    }
+
+    #[test]
+    fn cast_verb_parses_and_round_trips() {
+        match nth_op("F:\n open a.csv\n cast age:int price:f64\n;", 1) {
+            Op::Cast { casts } => assert_eq!(
+                casts,
+                vec![
+                    ("age".to_string(), DataType::I64),
+                    ("price".to_string(), DataType::F64),
+                ]
+            ),
+            o => panic!("expected Cast, got {o:?}"),
+        }
+        // Reversible (types render canonically: int -> i64).
+        let s = parse("F:\n open a.csv\n cast age:int price:f64\n;")
+            .unwrap()
+            .to_source();
+        assert!(s.contains("cast age:i64 price:f64"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+        // Errors: empty list, missing type, unknown type.
+        assert!(parse("F:\n open a.csv\n cast\n;").is_err());
+        assert!(parse("F:\n open a.csv\n cast age\n;").is_err());
+        assert!(parse("F:\n open a.csv\n cast age:wat\n;").is_err());
     }
 
     #[test]

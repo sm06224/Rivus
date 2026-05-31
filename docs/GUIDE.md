@@ -357,7 +357,13 @@ tighter than `+ -`; nest with parens.
 |? age:int >= 20            # compare a *string* column numerically
 |> id (price:f64 * 1.1) as gross
 |> (age:str) as age_text    # the add-property cast (3rd way to type a column)
+cast age:int price:f64      # the `cast` verb: re-type columns in place
 ```
+
+The **`cast COL:type [COL:type …]`** verb is sugar for re-typing named columns
+in place (position and name kept), e.g. `cast age:int price:f64`. Unknown
+columns warn and are skipped; it round-trips through `to_source` (type names
+render canonically, `int` → `i64`).
 
 Numeric arithmetic stays integer when both sides are integers (except `/`,
 which is always float, like SQL/pandas). Strings are parsed best-effort to a
@@ -543,6 +549,7 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'describe'
            | 'dropna' IDENT* | 'fill' IDENT (VALUE | 'ffill' | 'bfill' | 'mean' | 'median')
            | 'rename' (IDENT IDENT)+ | 'drop' IDENT+ | 'reorder' IDENT+
+           | 'cast' (IDENT ':' TYPE)+
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)

@@ -1577,6 +1577,50 @@ fn reorder_is_chunk_size_independent() {
 }
 
 #[test]
+fn cast_verb_retypes_columns_chunk_size_independent() {
+    // `code` is declared str (keeps leading zeros); `cast code:int` re-types it,
+    // dropping the zeros. The cast result and the column dtype must be exact and
+    // chunk-size independent.
+    let rows = 5_000usize;
+    let mut text = String::from("id,code\n");
+    for i in 0..rows {
+        text.push_str(&format!("{i},0{i:04}\n")); // leading-zero code
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_cast_verb",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(
+            &format!("C:\n open {p} (id code:str)\n cast code:int\n;"),
+            cs,
+        );
+        let out = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("C"))
+            .unwrap();
+        // The `code` column is now i64, value == id (leading zeros stripped).
+        assert_eq!(
+            out.chunks[0].schema.fields[out.chunks[0].schema.index_of("code").unwrap()].dtype,
+            rivus_core::DataType::I64,
+            "code dtype @cs={cs}"
+        );
+        let mut got = Vec::with_capacity(rows);
+        for c in &out.chunks {
+            let ci = c.schema.index_of("code").unwrap();
+            for r in 0..c.len {
+                got.push(c.value(r, ci).as_f64().unwrap() as i64);
+            }
+        }
+        let want: Vec<i64> = (0..rows as i64).collect();
+        assert_eq!(got, want, "cast values @cs={cs}");
+        assert!(res.errors.is_empty(), "errors @cs={cs}");
+    }
+}
+
+#[test]
 fn case_when_is_chunk_size_independent() {
     // `case when … then … else … end` computed column buckets each row by its
     // age band, identically across chunk sizes.

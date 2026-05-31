@@ -50,9 +50,9 @@ it in small, gated steps.
 | ✅ | Computed columns `\|> (age*12) as months` (add-property style) | arithmetic `+ - * / %`, `as` alias |
 | ✅ | **Readable filter** | `\|?` is terse; add a comma-separated form where `,` means AND, e.g. `where age >= 20, country == "JP"`. Keep `\|?` as an alias. |
 | ✅ | **Inline type casts** | `age:int`, `price:f64`, `flag:bool`, `id:str` usable in predicates and projections, e.g. `where age:int >= 20` and `\|> (amount:f64 * 1.1) as gross` |
-| 📋 | **Three ways to give types** (write them distinctly): | |
-| ✅ | • at the source | `open f.csv (id:int name:str)` — declared schema (done) |
-| ✅ | • mid-flow cast | `\|> (age:int) as age` — cast via a computed column (a `cast` verb is sugar, 1.x) |
+| ✅ | **Three ways to give types** (written distinctly): | all done |
+| ✅ | • at the source | `open f.csv (id:int name:str)` — declared schema |
+| ✅ | • mid-flow cast | `\|> (age:int) as age` (computed column) **and** the `cast age:int price:f64` verb (re-types columns in place) |
 | ✅ | • derive/add property | `\|> (expr) as name` computed columns (done) |
 | ✅ | String / numeric functions, `case when … then … else` | `upper/lower/trim/len/substr/contains/replace/split_part/concat`, `starts_with/ends_with/like/glob/regexp`, numeric `abs/round/floor/ceil`, null-coalesce `coalesce`, and `case when … then … [else …] end` all done |
 
@@ -79,7 +79,7 @@ read-throughput, in priority order:
 | ✅ | Optimizer: dedup · fuse · projection pushdown · **filter pushdown** | |
 | ✅ | Allocation-free field split, 256 KiB IO buffers | |
 | ✅ | **Parallel reads incl. stdout sinks** | `save -` now assembles ordered parts to stdout; 363 MiB filter 5.2 s → 1.8 s (2.8×). Env knobs `RIVUS_PARALLEL_MIN_BYTES` / `RIVUS_NO_PARALLEL` |
-| 📋 | **Auto-tune / lower the parallel threshold** | 256 MiB is conservative; mid-size files (e.g. 171 MiB) still run serial — measure the crossover and lower it |
+| ✅ | **Lower the parallel threshold (8 MiB)** | was 256 MiB (mid-size files ran serial); measured crossover and wired `parallel_min_bytes()` into the engine. 171 MiB filter: serial 1.6 s → parallel 0.4–0.7 s. `RIVUS_PARALLEL_MIN_BYTES`-overridable |
 | 📋 | **Single-pass inference** (sample + adaptive widen) | drop the second full scan that streaming type-inference costs |
 | 📋 | **SIMD CSV scan** (`std::arch`, no deps) | find `,`/`\n` with SSE2/AVX2; bench-gated (SWAR tried, no win at current bottleneck — revisit after the above) |
 | 📋 | **Vectorized / SIMD predicate kernels** for more shapes | extend `kernel.rs` beyond numeric conjunctions |
