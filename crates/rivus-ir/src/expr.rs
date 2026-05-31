@@ -118,6 +118,9 @@ impl Func {
             Func::Like => "like",
             Func::Glob => "glob",
             Func::Regexp => "regexp",
+            Func::Replace => "replace",
+            Func::SplitPart => "split_part",
+            Func::Concat => "concat",
         }
     }
 }
