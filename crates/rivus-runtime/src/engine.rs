@@ -12,7 +12,7 @@
 //! accumulates on the error stream and the flow keeps running.
 
 use crate::operators::{self, OpCtx, Operator};
-use crate::telemetry::NodeTelemetry;
+use crate::telemetry::{NodeTelemetry, WorkerTelemetry};
 use rivus_core::{Chunk, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
 use rivus_ir::{HookAction, HookEvent, NodeId, Op, PlanGraph};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -56,6 +56,9 @@ pub struct RunResult {
     pub errors: Vec<ErrorEvent>,
     pub final_mode: Mode,
     pub outputs: Vec<Output>,
+    /// Per-worker breakdown for a parallel run (empty on the serial path). Lets
+    /// callers see parallel skew that the node-aggregate `telemetry` hides.
+    pub workers: Vec<WorkerTelemetry>,
 }
 
 impl RunResult {
@@ -320,6 +323,7 @@ fn drive(
         errors,
         final_mode: mode,
         outputs,
+        workers: Vec::new(),
     }
 }
 
@@ -847,11 +851,36 @@ fn merge_results(
     let mut errors: Vec<ErrorEvent> = src_errors;
     let mut mode = Mode::Normal;
     let mut by_node: BTreeMap<NodeId, Vec<Chunk>> = BTreeMap::new();
+    // Per-worker breakdown (one entry per input RunResult, in source order).
+    let mut workers: Vec<WorkerTelemetry> = Vec::with_capacity(results.len());
 
-    for res in results {
+    for (worker, res) in results.into_iter().enumerate() {
         if mode_rank(res.final_mode) > mode_rank(mode) {
             mode = res.final_mode;
         }
+        // This worker's contribution: the rows that reached its sink/leaf nodes
+        // (a sink's `rows_in`), plus any rows captured as un-sinked output.
+        // Captured before the per-node sums fold it away. In the streaming-
+        // parallel path the sink is a collector writing a part file, so its
+        // `rows_in` is the right "rows this worker produced".
+        let mut w_rows: u64 = 0;
+        for (i, t) in res.telemetry.iter().enumerate() {
+            if matches!(
+                graph.nodes[i].op,
+                Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. } | Op::SinkPrint
+            ) {
+                w_rows += t.rows_in;
+            }
+        }
+        for o in &res.outputs {
+            w_rows += o.chunks.iter().map(|c| c.len as u64).sum::<u64>();
+        }
+        let w_busy = res.telemetry.iter().map(|t| t.busy).sum();
+        workers.push(WorkerTelemetry {
+            worker,
+            rows_out: w_rows,
+            busy: w_busy,
+        });
         errors.extend(res.errors);
         for (i, t) in res.telemetry.into_iter().enumerate() {
             telemetry[i].chunks_in += t.chunks_in;
@@ -900,6 +929,7 @@ fn merge_results(
         errors,
         final_mode: mode,
         outputs,
+        workers,
     }
 }
 

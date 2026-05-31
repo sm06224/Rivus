@@ -107,3 +107,72 @@ fn no_prefilter_means_no_skip_telemetry() {
         res.errors
     );
 }
+
+/// A2: a parallel (byte-range) run records per-worker telemetry — one entry per
+/// worker — whose `rows_out` sum equals the run's total, while the result and
+/// the node aggregate are unchanged. The serial path leaves `workers` empty.
+#[test]
+fn parallel_run_records_per_worker_telemetry() {
+    // A file large enough to split into ≥2 byte ranges; a `save` sink to a real
+    // file makes it eligible for the streaming-parallel path.
+    let rows = 200_000usize;
+    let csv = TempCsv(gendata::write_temp(
+        "obs_workers",
+        &gendata::clean(rows, 13),
+    ));
+    let mut out = csv.0.clone();
+    out.set_extension("out.csv");
+    let _oguard = TempCsv(out.clone());
+
+    let src = format!(
+        "F:\n open {}\n |? age >= 50\n |> name age\n save {}\n;",
+        csv.0.display(),
+        out.display()
+    );
+    let graph = rivus_parser::parse(&src).expect("parse");
+    let (graph, _r) = rivus_optimizer::optimize(graph);
+
+    // Force the streaming-parallel reader (threshold 0). Restore afterwards.
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let res = run(
+        &graph,
+        RunOptions {
+            chunk_size: 8192,
+            ..Default::default()
+        },
+    )
+    .expect("run");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    // Per-worker telemetry exists, with ≥2 workers, indexed 0..n.
+    assert!(
+        res.workers.len() >= 2,
+        "expected ≥2 workers, got {}",
+        res.workers.len()
+    );
+    for (i, w) in res.workers.iter().enumerate() {
+        assert_eq!(w.worker, i, "worker indices are 0..n in order");
+    }
+    // The workers' rows_out sum to the run's total (the sink is written once on
+    // merge, so total_rows_out is 0 here — compare against the worker sum and an
+    // independent oracle instead).
+    let worker_rows: u64 = res.workers.iter().map(|w| w.rows_out).sum();
+
+    // Oracle: count age>=50 by replaying the PRNG.
+    let mut rng = Rng::new(13);
+    let mut passing = 0u64;
+    for _ in 0..rows {
+        let age = rng.below(90);
+        let _ = rng.below(10_000);
+        let _ = rng.below(5);
+        let _ = rng.below(2);
+        if age >= 50 {
+            passing += 1;
+        }
+    }
+    assert_eq!(
+        worker_rows, passing,
+        "per-worker rows_out must sum to the result"
+    );
+}

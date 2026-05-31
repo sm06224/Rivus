@@ -58,3 +58,17 @@ impl NodeTelemetry {
         }
     }
 }
+
+/// Per-worker telemetry for a parallel (byte-range) run — one entry per worker,
+/// so parallel skew (uneven rows / busy time across workers) is observable
+/// instead of being collapsed into the node aggregate. Empty on the serial path,
+/// so it's purely additive and never changes existing fields.
+#[derive(Debug, Clone)]
+pub struct WorkerTelemetry {
+    /// Worker index (0-based), in source order over the byte ranges.
+    pub worker: usize,
+    /// Rows this worker emitted from its byte range (sum over its output leaves).
+    pub rows_out: u64,
+    /// Total busy time across this worker's sub-DAG.
+    pub busy: Duration,
+}

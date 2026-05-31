@@ -17,7 +17,7 @@ mod telemetry;
 pub mod gendata;
 
 pub use engine::{run, Output, RunOptions, RunResult};
-pub use telemetry::NodeTelemetry;
+pub use telemetry::{NodeTelemetry, WorkerTelemetry};
 
 #[cfg(test)]
 mod tests {

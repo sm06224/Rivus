@@ -29,6 +29,13 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Per-worker telemetry (Epic #30 / Pillar A — issue #31, A2).** A parallel
+  (byte-range) run now records a `WorkerTelemetry { worker, rows_out, busy }` per
+  worker in `RunResult.workers`, so parallel skew (uneven rows / busy time across
+  workers) is observable instead of being collapsed into the node aggregate. The
+  serial path leaves it empty — purely additive, results and the existing
+  node-aggregate `telemetry` unchanged. Oracle-tested (workers indexed 0..n,
+  `rows_out` sums to the result). No new dependencies.
 - **Prefilter-skip telemetry (Epic #30 / Pillar A — issue #31, A1).** The CSV
   reader now counts the rows its pushed-down prefilter skips *building* and the
   source reports it once on exhaustion: `prefilter skipped N row(s) at the
