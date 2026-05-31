@@ -72,6 +72,10 @@ pub enum Func {
     /// Shell glob: `*` = any run, `?` = any single char, `[abc]`/`[a-z]`/`[!..]`
     /// character classes.
     Glob,
+    /// Full regular expression (unanchored partial match). The IR always knows
+    /// it (parse/`to_source` are std-only); evaluating it needs the runtime's
+    /// off-by-default `regex` feature, else it raises a recoverable error.
+    Regexp,
 }
 
 impl Func {
@@ -87,6 +91,7 @@ impl Func {
             "ends_with" => Func::EndsWith,
             "like" => Func::Like,
             "glob" => Func::Glob,
+            "regexp" | "regex" | "matches" => Func::Regexp,
             _ => return None,
         })
     }
@@ -102,6 +107,7 @@ impl Func {
             Func::EndsWith => "ends_with",
             Func::Like => "like",
             Func::Glob => "glob",
+            Func::Regexp => "regexp",
         }
     }
 }

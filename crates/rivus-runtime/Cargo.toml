@@ -8,6 +8,14 @@ description = "Rivus runtime: single-thread chunk execution engine, telemetry, m
 [dependencies]
 rivus-core.workspace = true
 rivus-ir.workspace = true
+# Off-by-default: full-regex `regexp()` predicate. The default build stays
+# zero-dependency; opt in with `--features regex`. rust-lang/regex is pure-Rust,
+# linear-time (no catastrophic backtracking), MIT/Apache-2.0. See SUPPLY-CHAIN.md.
+regex = { version = "1", optional = true }
+
+[features]
+default = []
+regex = ["dep:regex"]
 
 [dev-dependencies]
 rivus-parser.workspace = true

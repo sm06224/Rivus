@@ -63,7 +63,68 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             let pat = arg(1).to_string();
             Value::Bool(glob_match(&hay, &pat))
         }
+        Func::Regexp => {
+            // Row-wise fallback (the columnar path in `eval_column` compiles the
+            // pattern once). With the feature off this is always false.
+            let hay = arg(0).to_string();
+            let pat = arg(1).to_string();
+            Value::Bool(regexp_match(&hay, &pat))
+        }
     }
+}
+
+/// Does `text` contain a match for `pat` (unanchored)? Behind the off-by-default
+/// `regex` feature; without it, always `false` (the engine raises a recoverable
+/// error once per run via `regexp_available`).
+#[cfg(feature = "regex")]
+fn regexp_match(text: &str, pat: &str) -> bool {
+    match regex::Regex::new(pat) {
+        Ok(re) => re.is_match(text),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(feature = "regex"))]
+fn regexp_match(_text: &str, _pat: &str) -> bool {
+    false
+}
+
+/// Whether `regexp()` is usable in this build (the `regex` feature is on).
+/// The engine checks this once and raises a recoverable error if a flow uses
+/// `regexp` in a default (feature-off) build, so the failure is explicit.
+pub fn regexp_available() -> bool {
+    cfg!(feature = "regex")
+}
+
+/// The literal pattern of `regexp(col, "lit")`, if arg 1 is a string literal
+/// (the common case) — lets the columnar path compile the regex exactly once.
+fn regex_literal(args: &[Expr]) -> Option<&str> {
+    match args.get(1) {
+        Some(Expr::Literal(Value::Str(s))) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Columnar `regexp` with a literal pattern: compile once, test every row.
+#[cfg(feature = "regex")]
+fn regexp_column(args: &[Expr], chunk: &Chunk) -> Column {
+    let pat = regex_literal(args).unwrap_or("");
+    let col = eval_column(&args[0], chunk);
+    match regex::Regex::new(pat) {
+        Ok(re) => Column::Bool(
+            (0..chunk.len)
+                .map(|r| re.is_match(&col.value_at(r).to_string()))
+                .collect(),
+        ),
+        // Invalid pattern → all-false (a parse-time check would be better, but
+        // this keeps continue-first semantics: the run doesn't panic).
+        Err(_) => Column::Bool(vec![false; chunk.len]),
+    }
+}
+
+#[cfg(not(feature = "regex"))]
+fn regexp_column(_args: &[Expr], chunk: &Chunk) -> Column {
+    Column::Bool(vec![false; chunk.len])
 }
 
 /// SQL `LIKE`: `%` matches any run (including empty), `_` matches exactly one
@@ -579,8 +640,7 @@ mod match_tests {
         assert!(like_match("abc", "abc")); // literal
         assert!(!like_match("JP-1234", "US-%"));
         assert!(!like_match("ab", "abc"));
-        assert!(!like_match("abc", "ab_")); // _ needs exactly one → "abc" ok? c→_ yes
-                                            // (so this should match) — fix below
+        assert!(like_match("abc", "ab_")); // `_` matches exactly the trailing c
     }
 
     #[test]
@@ -612,5 +672,20 @@ mod match_tests {
         let text = "a".repeat(64);
         let pat = "%".repeat(50) + "b"; // never matches (no 'b')
         assert!(!like_match(&text, &pat));
+    }
+}
+
+#[cfg(all(test, feature = "regex"))]
+mod regex_tests {
+    use super::regexp_match;
+
+    #[test]
+    fn regexp_partial_and_anchored() {
+        assert!(regexp_match("JP-1234", r"^JP-\d{4}$"));
+        assert!(regexp_match("xx JP-9 yy", r"JP-\d")); // unanchored partial
+        assert!(!regexp_match("US-1234", r"^JP-\d{4}$"));
+        assert!(regexp_match("abc", r"[a-c]+"));
+        // Invalid pattern → false (continue-first, no panic).
+        assert!(!regexp_match("abc", r"([unclosed"));
     }
 }

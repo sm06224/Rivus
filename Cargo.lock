@@ -306,6 +306,7 @@ name = "rivus-runtime"
 version = "1.0.0"
 dependencies = [
  "criterion",
+ "regex",
  "rivus-core",
  "rivus-ir",
  "rivus-optimizer",
