@@ -29,6 +29,69 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Live observability: `rivus run … --tui` and `--serve [ADDR]` (Epic #30 /
+  Pillar B — issue #32, std-only).** Built on Pillar A's `RuntimeSnapshot`.
+  `--tui` repaints an ANSI dashboard on stderr each tick (rows/s, per-node bars,
+  state). `--serve` launches a **std-only HTTP/1.1 + SSE** server (a
+  `TcpListener`, hand-written request parsing, no third-party crates): `GET /`
+  serves an embedded HTML/JS/SVG dashboard, `GET /snapshot` the latest snapshot
+  JSON, `GET /events` a live `text/event-stream`. Heavy rendering lives in the
+  browser; Rust ships only JSON snapshots. The flow runs on a worker thread that
+  publishes to a shared `Hub`; stdout stays clean (a `save -` sink still pipes).
+  A bind failure falls back to a normal run. **Zero new dependencies**
+  (`cargo deny --all-features` green). CLI-tested over loopback (HTML + SSE
+  frame + clean stdout).
+- **Inference-decision telemetry (Epic #30 / Pillar A — issue #31, A4).** A CSV
+  source now records its per-column inference outcome `(name, type, widened)` in
+  `RunResult.inference`; the `--json` summary lists `widened_columns` (columns an
+  int candidate was knocked down to float). Surfaced **off the error stream**
+  (summary-only), so the JSONL `node`/`error` contract and "clean data → no
+  errors" semantics are untouched. Pure accounting, result-invariant. Completes
+  Pillar A's measurement core. No new dependencies.
+- **String prefilter pushdown (Epic #30 / Pillar C, C4(i)).** `filter_pushdown`
+  now also lifts **literal-substring** predicates (`contains` / `starts_with` /
+  `ends_with` / `==` / the literal run of a `like` pattern) into the CSV reader
+  as a ripgrep-style raw-line byte pre-scan: a line lacking the needle is skipped
+  *before* it's split into fields. It's a **superset** filter — the downstream
+  `FilterProject` re-checks every survivor, so the result is byte-identical (a
+  substring landing in the wrong column is still rejected) — and it costs no
+  extra memory. Measured **~2.0×** on `contains(country,"JP")` over 171 MiB
+  serial (3.45 s → 1.70 s); the skipped-row count shows up as A1 telemetry.
+  Equivalence-gated (`optimizer_equiv`), result unchanged. No new dependencies.
+  (The byte-range parallel reader doesn't apply it yet — tracked for later.)
+- **Streaming runtime snapshots (Epic #30 / Pillar A — issue #31, A5).** New
+  `RuntimeSnapshot` / `NodeSnapshot` (a cheap point-in-time view: elapsed,
+  rows_seen, mode, per-node counters) and `run_with_progress(graph, opts, hook)`
+  — the engine calls an optional `ProgressHook` (`&mut dyn FnMut(&RuntimeSnapshot)`)
+  every few source chunks and once at the end. The base for live TUI / HTTP
+  dashboards (Pillar B / §14.4 `RuntimeHandle::subscribe`). `run` is unchanged
+  (calls it with no hook); with no subscriber nothing is built, so the cost is
+  ~0. A subscriber forces the serial path for a coherent live stream; results
+  are identical. Oracle-tested (≥1 snapshot, monotonic rows_seen, final snapshot
+  sees every row, result invariant). No new dependencies.
+- **First-row latency & parse phase in `--json` summary (Epic #30 / Pillar A —
+  issue #31, A3).** `RunResult` gains `first_row_latency: Option<Duration>` (wall
+  to the first produced chunk; min across workers in parallel), and the JSONL
+  `summary` line gains `first_row_latency_ms` and `parse_busy_ms` (source busy)
+  — surfacing the previously-collected-but-unrendered `Chunk.meta.created_at`
+  signal. **Summary-only**: the `node` / `error` line keys are byte-stable
+  (existing JSONL contract unchanged). Pure accounting, result-invariant. No new
+  dependencies.
+- **Per-worker telemetry (Epic #30 / Pillar A — issue #31, A2).** A parallel
+  (byte-range) run now records a `WorkerTelemetry { worker, rows_out, busy }` per
+  worker in `RunResult.workers`, so parallel skew (uneven rows / busy time across
+  workers) is observable instead of being collapsed into the node aggregate. The
+  serial path leaves it empty — purely additive, results and the existing
+  node-aggregate `telemetry` unchanged. Oracle-tested (workers indexed 0..n,
+  `rows_out` sums to the result). No new dependencies.
+- **Prefilter-skip telemetry (Epic #30 / Pillar A — issue #31, A1).** The CSV
+  reader now counts the rows its pushed-down prefilter skips *building* and the
+  source reports it once on exhaustion: `prefilter skipped N row(s) at the
+  reader` (an `Info` event, visible in `explain`/`--json`). Pure accounting —
+  the result is byte-identical (those rows would be dropped by the downstream
+  `FilterProject` anyway), and the count is chunk-size independent. First step of
+  making "what the optimizer skipped" measurable. New
+  `tests/observability.rs`. No new dependencies.
 - **JSON array output: `save out.json` / `save - as json` (std-only).** A
   `.json` path (or `as json`) now writes a single JSON array (`[{…},{…}]`)
   instead of NDJSON; `.jsonl` / `.ndjson` / `as jsonl` stay one-object-per-line,

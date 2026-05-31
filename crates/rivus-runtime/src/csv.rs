@@ -105,6 +105,10 @@ pub struct CsvChunker {
     line: String,
     /// Rows skipped in pass 1 for wrong arity (reported once by the source).
     pub bad_rows: usize,
+    /// Rows the pushed-down prefilter skipped *building* (definitely-out rows).
+    /// Pure accounting for telemetry — the result is unchanged, since the
+    /// downstream `FilterProject` would have dropped exactly these rows anyway.
+    pub rows_prefiltered: u64,
     eof: bool,
     /// Current byte offset and an optional end (for streaming one byte range of
     /// the file in a parallel worker). `limit == None` streams to EOF.
@@ -112,8 +116,23 @@ pub struct CsvChunker {
     limit: Option<u64>,
     /// Compiled pushed-down numeric predicates (skip building failing rows).
     prefilter: Vec<PreCmp>,
+    /// Required literal substrings: a raw line lacking any of them is skipped
+    /// before splitting (a ripgrep-style superset pre-scan; FilterProject is
+    /// still authoritative downstream). Empty = no string pre-scan.
+    str_prefilter: Vec<String>,
+    /// Per-kept-column inference `(name, type, widened)` for telemetry (A4).
+    /// Empty when the schema was declared or sample-inferred.
+    inference: Vec<(String, DataType, bool)>,
     /// Field delimiter byte (`b','` for CSV, `b'\t'` for TSV).
     delim: u8,
+}
+
+impl CsvChunker {
+    /// The per-column inference outcome (A4 telemetry); empty for declared or
+    /// sample-inferred schemas.
+    pub fn inference(&self) -> &[(String, DataType, bool)] {
+        &self.inference
+    }
 }
 
 impl CsvChunker {
@@ -132,12 +151,22 @@ impl CsvChunker {
         chunk_size: usize,
         preview: bool,
         prefilter: &[(String, CmpOp, f64)],
+        str_prefilter: &[String],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
         delim: u8,
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
-            return Self::open_preview(path, allow, chunk_size, prefilter, header, declared, delim);
+            return Self::open_preview(
+                path,
+                allow,
+                chunk_size,
+                prefilter,
+                str_prefilter,
+                header,
+                declared,
+                delim,
+            );
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -174,6 +203,13 @@ impl CsvChunker {
             }
         }
         let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        // Inference outcome (A4 telemetry) — captured before declared types
+        // override, so `widened` reflects what the data forced.
+        let inference: Vec<(String, DataType, bool)> = keep
+            .iter()
+            .enumerate()
+            .map(|(k, &ci)| (names[ci].clone(), dtypes[k], flags[k].widened()))
+            .collect();
         apply_declared_types(&mut dtypes, &keep, declared);
 
         let mut fields = Vec::with_capacity(keep.len());
@@ -200,8 +236,11 @@ impl CsvChunker {
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 bad_rows: bad,
+                rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
+                inference,
+                str_prefilter: str_prefilter.to_vec(),
                 pos: 0,
                 limit: None,
                 delim,
@@ -217,6 +256,7 @@ impl CsvChunker {
         allow: Option<&[String]>,
         chunk_size: usize,
         prefilter: &[(String, CmpOp, f64)],
+        str_prefilter: &[String],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
         delim: u8,
@@ -276,8 +316,11 @@ impl CsvChunker {
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 bad_rows: bad,
+                rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
+                inference: Vec::new(),
+                str_prefilter: str_prefilter.to_vec(),
                 pos: 0,
                 limit: None,
                 delim,
@@ -310,8 +353,11 @@ impl CsvChunker {
             chunk_size: chunk_size.max(1),
             line: String::new(),
             bad_rows: 0,
+            rows_prefiltered: 0,
             eof: false,
             prefilter,
+            inference: Vec::new(),
+            str_prefilter: Vec::new(),
             pos: start,
             limit: Some(end),
             delim,
@@ -358,6 +404,15 @@ impl CsvChunker {
             if l.trim().is_empty() {
                 continue;
             }
+            // String prefilter: a required literal substring is missing from the
+            // raw line, so no field can satisfy the predicate — skip before
+            // splitting (ripgrep-style; FilterProject stays authoritative).
+            if !self.str_prefilter.is_empty()
+                && !self.str_prefilter.iter().all(|n| l.contains(n.as_str()))
+            {
+                self.rows_prefiltered += 1;
+                continue;
+            }
             if split_offsets(l, &mut offsets, self.delim) {
                 if offsets.len() != self.ncols {
                     continue;
@@ -366,6 +421,7 @@ impl CsvChunker {
                 // out (conservative; the downstream FilterProject is final).
                 if !self.prefilter.is_empty() && !row_passes_prefilter(&self.prefilter, l, &offsets)
                 {
+                    self.rows_prefiltered += 1;
                     continue;
                 }
                 for (k, &ci) in self.keep.iter().enumerate() {
@@ -918,6 +974,14 @@ impl Flags {
         } else {
             DataType::Str
         }
+    }
+
+    /// Did inference "widen" a numeric column? True only for the genuinely
+    /// interesting case: all-float but not all-int — i.e. it looked integer
+    /// until a later cell forced F64. A purely textual column is not "widened",
+    /// it's just `Str`. Pure observation (telemetry); does not affect `resolve`.
+    fn widened(&self) -> bool {
+        self.any && self.all_float && !self.all_int
     }
 }
 

@@ -95,6 +95,12 @@ pub trait Operator {
     fn finish(&mut self, _ctx: &mut OpCtx) -> Vec<Chunk> {
         Vec::new()
     }
+    /// Per-column type-inference outcome `(name, type, widened)` for a source
+    /// that inferred its schema, surfaced as telemetry (A4). Empty for non-source
+    /// operators and for declared/sample-inferred schemas. Read after the run.
+    fn inference(&self) -> Vec<(String, DataType, bool)> {
+        Vec::new()
+    }
 }
 
 /// Read a text source: the `-` sentinel reads stdin, otherwise a file.
@@ -195,6 +201,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             path,
             projection,
             prefilter,
+            str_prefilter,
             header,
             declared,
             delim,
@@ -204,6 +211,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             chunk_size,
             preview,
             prefilter.clone(),
+            str_prefilter.clone(),
             *header,
             declared.clone(),
             *delim,
@@ -302,6 +310,9 @@ struct SourceCsv {
     /// reader uses them to skip *building* rows that definitely fail (the
     /// downstream FilterProject remains authoritative).
     prefilter: Vec<(String, CmpOp, f64)>,
+    /// Required literal substrings pushed down by the optimizer; the reader skips
+    /// any raw line lacking one before splitting it (a superset pre-scan).
+    str_prefilter: Vec<String>,
     header: bool,
     declared: Option<Vec<(String, Option<DataType>)>>,
     /// Field delimiter byte (`b','` CSV, `b'\t'` TSV).
@@ -326,6 +337,7 @@ impl SourceCsv {
         chunk_size: usize,
         preview: bool,
         prefilter: Vec<(String, CmpOp, f64)>,
+        str_prefilter: Vec<String>,
         header: bool,
         declared: Option<Vec<(String, Option<DataType>)>>,
         delim: u8,
@@ -337,6 +349,7 @@ impl SourceCsv {
             loaded: false,
             preview,
             prefilter,
+            str_prefilter,
             header,
             declared,
             delim,
@@ -360,6 +373,7 @@ impl SourceCsv {
             loaded: true,
             preview: false,
             prefilter: Vec::new(),
+            str_prefilter: Vec::new(),
             header: true,
             declared: None,
             delim: b',',
@@ -386,6 +400,7 @@ impl SourceCsv {
                 self.chunk_size,
                 self.preview,
                 &self.prefilter,
+                &self.str_prefilter,
                 self.header,
                 self.declared.as_deref(),
                 self.delim,
@@ -505,14 +520,41 @@ impl Operator for SourceCsv {
         true
     }
 
+    fn inference(&self) -> Vec<(String, DataType, bool)> {
+        self.stream
+            .as_ref()
+            .map(|c| c.inference().to_vec())
+            .unwrap_or_default()
+    }
+
     fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
         if !self.loaded {
             self.load(ctx);
         }
         if let Some(chunker) = self.stream.as_mut() {
-            let cols = chunker.next_columns()?;
-            let id = ctx.fresh_id();
-            return Some(Chunk::new(id, self.schema.clone(), cols));
+            match chunker.next_columns() {
+                Some(cols) => {
+                    let id = ctx.fresh_id();
+                    return Some(Chunk::new(id, self.schema.clone(), cols));
+                }
+                None => {
+                    // Source exhausted: report how many rows the pushed-down
+                    // prefilter skipped building (pure accounting — the result is
+                    // unchanged, the downstream FilterProject would drop them).
+                    let skipped = chunker.rows_prefiltered;
+                    if skipped > 0 {
+                        ctx.raise(
+                            ErrorEvent::new(
+                                Severity::Info,
+                                ErrorScope::Item,
+                                format!("prefilter skipped {skipped} row(s) at the reader"),
+                            )
+                            .at_node(ctx.label.clone()),
+                        );
+                    }
+                    return None;
+                }
+            }
         }
         #[cfg(any(feature = "gzip", feature = "zstd"))]
         if let Some(cz) = self.cz_stream.as_mut() {

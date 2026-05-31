@@ -148,3 +148,32 @@ fn optimizer_preserves_computed_columns() {
         assert_eq!(raw, opt, "optimized != unoptimized for: {src}");
     }
 }
+
+#[test]
+fn string_prefilter_is_a_superset_and_preserves_results() {
+    // The string prefilter is a raw-line substring pre-scan: a row whose
+    // substring appears in the WRONG column must still be excluded by the
+    // authoritative FilterProject. Optimized must equal unoptimized for every
+    // string predicate shape that pushes a needle down.
+    let data = concat!(
+        "id,country,name\n",
+        "1,US,JPman\n", // "JP" only in name → must NOT match contains(country,"JP")
+        "2,JP,bob\n",   // genuine match
+        "3,US,carol\n",
+        "4,US,upJPper\n", // "JP" mid-name → must NOT match
+        "5,JP,JPse\n",    // genuine match (and "JP" in name too)
+    )
+    .as_bytes();
+    let f = TempCsv(gendata::write_temp_bytes("opt_strpf", data));
+    let p = f.0.display();
+
+    for src in [
+        format!("F:\n open {p}\n |? contains(country, \"JP\")\n |> id country name\n;"),
+        format!("F:\n open {p}\n |? country == \"JP\"\n |> id country\n;"),
+        format!("F:\n open {p}\n |? starts_with(country, \"J\")\n |> id\n;"),
+        format!("F:\n open {p}\n |? like(country, \"JP%\")\n |> id\n;"),
+    ] {
+        let (raw, opt) = fingerprints_both(&src);
+        assert_eq!(raw, opt, "string prefilter changed results for: {src}");
+    }
+}

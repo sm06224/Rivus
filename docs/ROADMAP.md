@@ -80,10 +80,11 @@ read-throughput, in priority order:
 | ✅ | Allocation-free field split, 256 KiB IO buffers | |
 | ✅ | **Parallel reads incl. stdout sinks** | `save -` now assembles ordered parts to stdout; 363 MiB filter 5.2 s → 1.8 s (2.8×). Env knobs `RIVUS_PARALLEL_MIN_BYTES` / `RIVUS_NO_PARALLEL` |
 | ✅ | **Lower the parallel threshold (8 MiB)** | was 256 MiB (mid-size files ran serial); measured crossover and wired `parallel_min_bytes()` into the engine. 171 MiB filter: serial 1.6 s → parallel 0.4–0.7 s. `RIVUS_PARALLEL_MIN_BYTES`-overridable |
-| 📋 | **Single-pass inference** (sample + adaptive widen) | drop the second full scan that streaming type-inference costs |
+| ❌ | ~~**Single-pass retain-buffer reader**~~ (evaluated, dropped) | prototyped to drop the second scan; **measured *slower*** than two-pass on warm cache (4.0 s vs 3.4 s on 288 MB) — holding all lines in memory costs more than the page-cached re-read saves. Not shipped (faster needs a measured number). May return for cold-cache/network FS. See `BENCHMARKS.md` |
+| ✅ | **Adaptive execution strategy** (Epic #30 / Pillar C, #33) | std-only host probe (`Analytics`: cpus + `/proc/meminfo`) → autotuner picks **serial vs parallel** and surfaces the decision (`RunResult.strategy`, `--json` `"strategy"`). `--memory low\|auto\|fast`; default `auto` parallelizes ≥8 MiB on multicore. 288 MB filter: serial 3.53 s → parallel **1.13 s** (3.1×), byte-identical |
 | 📋 | **SIMD CSV scan** (`std::arch`, no deps) | find `,`/`\n` with SSE2/AVX2; bench-gated (SWAR tried, no win at current bottleneck — revisit after the above) |
 | 📋 | **Vectorized / SIMD predicate kernels** for more shapes | extend `kernel.rs` beyond numeric conjunctions |
-| 📋 | Push computed-column / string predicates into the reader | extend prefilter |
+| 🚧 | Push computed-column / string predicates into the reader | **string literal-substring prefilter ✅** (`contains`/`starts_with`/`ends_with`/`==`/`like`-literal → ripgrep-style raw-line pre-scan, ~2× serial on `contains`, result-invariant superset; Epic #30 C4(i)). Computed-column predicates + the parallel byte-range path still planned |
 | 📋 | mmap the source; overlap decode with IO | |
 | 📋 | Re-use buffers across chunks; arena-per-chunk recycling | |
 | 📋 | JIT (Cranelift) for hot predicates/projections | design doc 09; needs a vetted dep |
@@ -94,6 +95,7 @@ read-throughput, in priority order:
 |---|---|---|
 | ✅ | Live progress, execution-graph viz, error stream | |
 | ✅ | Structured telemetry stream (JSONL on stderr/socket) | **done** — `rivus run … --json` emits one JSON object per node (counters: chunks/rows in·out, busy_ms, rows/s, selectivity, mode) + per error event + a summary; stdout stays clean. `--telemetry-addr HOST:PORT` streams the same JSONL to a TCP socket (a live feed for an external viewer), falling back to stderr on a connection error. std-only (no serde, `std::net`). |
+| ✅ | Live dashboard (TUI + browser) | **done** (Epic #30 Pillar B) — `rivus run … --tui` repaints an ANSI dashboard on stderr; `--serve [ADDR]` runs a std-only HTTP/1.1 + SSE server (embedded HTML/JS/SVG at `GET /`, `GET /snapshot`, live `GET /events`). Browser does the drawing; Rust ships JSON snapshots from `RuntimeSnapshot`. Zero new deps. |
 | 📋 | `\| view` interactive grid (Out-GridView), live analytics GUI | design doc 19; streaming, never full-materialize |
 | 📋 | Shell completion from IR/schema; nushell value interop | design doc 19 |
 

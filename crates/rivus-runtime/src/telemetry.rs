@@ -58,3 +58,47 @@ impl NodeTelemetry {
         }
     }
 }
+
+/// Per-worker telemetry for a parallel (byte-range) run — one entry per worker,
+/// so parallel skew (uneven rows / busy time across workers) is observable
+/// instead of being collapsed into the node aggregate. Empty on the serial path,
+/// so it's purely additive and never changes existing fields.
+#[derive(Debug, Clone)]
+pub struct WorkerTelemetry {
+    /// Worker index (0-based), in source order over the byte ranges.
+    pub worker: usize,
+    /// Rows this worker emitted from its byte range (sum over its output leaves).
+    pub rows_out: u64,
+    /// Total busy time across this worker's sub-DAG.
+    pub busy: Duration,
+}
+
+/// A cheap, cloneable point-in-time view of one node, for a live snapshot.
+#[derive(Debug, Clone)]
+pub struct NodeSnapshot {
+    pub node_id: usize,
+    pub label: String,
+    pub kind: String,
+    pub rows_in: u64,
+    pub rows_out: u64,
+    pub errors: u64,
+    pub mode: Mode,
+    pub finished: bool,
+}
+
+/// A consistent snapshot of a run in progress (Observability spec §14.4): the
+/// elapsed wall time, rows seen so far, and a per-node view. Published by the
+/// engine's optional progress hook so a live TUI / HTTP dashboard (Pillar B) can
+/// render the run as it streams, instead of only seeing the final `RunResult`.
+/// Building one is O(nodes) and only happens when a subscriber is attached.
+#[derive(Debug, Clone)]
+pub struct RuntimeSnapshot {
+    /// Wall time since the run started.
+    pub elapsed: Duration,
+    /// Total rows pulled from sources so far.
+    pub rows_seen: u64,
+    /// Current runtime mode (escalated by error hooks).
+    pub mode: Mode,
+    /// Per-node view, in node-id order.
+    pub nodes: Vec<NodeSnapshot>,
+}
