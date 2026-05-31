@@ -12,7 +12,7 @@ use crate::kernel;
 use rivus_core::{
     Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
 };
-use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, FillMethod, NodeId, Op};
+use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, FillMethod, JoinKind, NodeId, Op};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -246,9 +246,11 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Join {
             left_key,
             right_key,
+            kind,
         } => Box::new(Join::new(
             left_key.clone(),
             right_key.clone(),
+            *kind,
             inputs.first().copied().unwrap_or(usize::MAX),
         )),
         Op::SinkPrint => Box::new(SinkPrint),
@@ -1767,16 +1769,18 @@ impl Operator for Merge {
 struct Join {
     left_key: String,
     right_key: String,
+    kind: JoinKind,
     left_id: NodeId,
     left_buf: Vec<Chunk>,
     right_buf: Vec<Chunk>,
 }
 
 impl Join {
-    fn new(left_key: String, right_key: String, left_id: NodeId) -> Self {
+    fn new(left_key: String, right_key: String, kind: JoinKind, left_id: NodeId) -> Self {
         Join {
             left_key,
             right_key,
+            kind,
             left_id,
             left_buf: Vec::new(),
             right_buf: Vec::new(),
@@ -1809,11 +1813,20 @@ impl Operator for Join {
     }
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let (Some(left), Some(right)) = (
-            concat_chunks(std::mem::take(&mut self.left_buf)),
-            concat_chunks(std::mem::take(&mut self.right_buf)),
-        ) else {
-            return Vec::new(); // one side empty → inner join is empty
+        let left = concat_chunks(std::mem::take(&mut self.left_buf));
+        let right = concat_chunks(std::mem::take(&mut self.right_buf));
+        let Some(left) = left else {
+            return Vec::new(); // no left rows → nothing to emit (both kinds)
+        };
+        // An empty right side: inner join is empty; a left join keeps every
+        // left row but has no right schema to pad with, so it emits left-only.
+        let Some(right) = right else {
+            if self.kind == JoinKind::Left {
+                let idx: Vec<usize> = (0..left.len).collect();
+                let cols: Vec<Column> = left.columns.iter().map(|c| c.gather(&idx)).collect();
+                return vec![Chunk::new(ctx.fresh_id(), left.schema.clone(), cols)];
+            }
+            return Vec::new();
         };
 
         let warn = |ctx: &mut OpCtx, side: &str, key: &str| {
@@ -1836,6 +1849,9 @@ impl Operator for Join {
         };
 
         // Build the hash table on the right side, then probe with the left.
+        // `ridx` is `Option<usize>`: `None` marks a left row that matched no
+        // right row (only produced for a left join), which pads the right
+        // columns with type defaults.
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for ri in 0..right.len {
             table
@@ -1843,14 +1859,22 @@ impl Operator for Join {
                 .or_default()
                 .push(ri);
         }
+        let left_join = self.kind == JoinKind::Left;
         let mut lidx = Vec::new();
-        let mut ridx = Vec::new();
+        let mut ridx: Vec<Option<usize>> = Vec::new();
         for li in 0..left.len {
-            if let Some(rs) = table.get(&left.value(li, lk).to_string()) {
-                for &ri in rs {
-                    lidx.push(li);
-                    ridx.push(ri);
+            match table.get(&left.value(li, lk).to_string()) {
+                Some(rs) => {
+                    for &ri in rs {
+                        lidx.push(li);
+                        ridx.push(Some(ri));
+                    }
                 }
+                None if left_join => {
+                    lidx.push(li);
+                    ridx.push(None);
+                }
+                None => {}
             }
         }
 
@@ -1873,7 +1897,7 @@ impl Operator for Join {
 
         let mut out: Vec<Column> = left.columns.iter().map(|c| c.gather(&lidx)).collect();
         for &ci in &right_cols {
-            out.push(right.columns[ci].gather(&ridx));
+            out.push(right.columns[ci].gather_opt(&ridx));
         }
         vec![Chunk::new(
             ctx.fresh_id(),

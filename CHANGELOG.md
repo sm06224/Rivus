@@ -29,6 +29,15 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Left outer join: `A &left B on key` (std-only).** Alongside the inner join
+  (`A & B`), `&left` keeps every left row; an unmatched left row is emitted once
+  with the right columns padded to type defaults (`0` / `0.0` / `false` / empty
+  string). Same hash-join machinery (build the right side, probe the left) and
+  same blocking/serial semantics as the inner join; row order is the left order,
+  and the result is chunk-size independent (oracle-tested: the left-join
+  `sum(amount)` equals the inner-join sum, with one padded row per never-matched
+  left key). Lowers to `Op::Join { kind: Left }`, round-trips through
+  `to_source`. No new dependencies. Right/full outer joins remain on the roadmap.
 - **Directional missing-value fill: `fill col ffill|bfill` (std-only).**
   Alongside the existing constant `fill col VALUE`, `ffill` carries the last
   non-empty value forward over blank cells and `bfill` the next value back —

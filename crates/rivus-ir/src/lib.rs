@@ -10,7 +10,7 @@ pub mod graph;
 pub use expr::{Access, ArithOp, CmpOp, Expr, Func};
 pub use graph::{
     delim_for_path, delim_modifier_for, AggFunc, BinType, Edge, EdgeKind, Endian, FillMethod, Hook,
-    HookAction, HookEvent, Node, NodeId, Op, PlanGraph, COMMA,
+    HookAction, HookEvent, JoinKind, Node, NodeId, Op, PlanGraph, COMMA,
 };
 
 #[cfg(test)]

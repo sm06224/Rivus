@@ -175,6 +175,73 @@ fn inner_hash_join_matches_oracle() {
 }
 
 #[test]
+fn left_join_keeps_unmatched_left_rows() {
+    // Left: users 0..users. Right: orders whose id is in [0, users*2), so only
+    // some users have a matching order. A LEFT join must emit:
+    //   (matched pairs) + (one padded row per user with no order at all),
+    // and be chunk-size independent. The padded rows carry amount = 0 (i64
+    // default), so summing `amount` over the left join equals summing over the
+    // inner join — an independent oracle that also checks the default padding.
+    let users = 1_500usize;
+    let mut u = String::from("id,name\n");
+    for i in 0..users {
+        u.push_str(&format!("{i},user{i}\n"));
+    }
+    let orders = 4_000usize;
+    let mut o = String::from("id,amount\n");
+    let mut rng = Rng::new(9);
+    let mut matched_pairs = 0u64;
+    let mut matched_users = vec![false; users];
+    for _ in 0..orders {
+        let id = rng.below((users * 2) as u64);
+        o.push_str(&format!("{id},10\n"));
+        if (id as usize) < users {
+            matched_pairs += 1;
+            matched_users[id as usize] = true;
+        }
+    }
+    let unmatched_users = matched_users.iter().filter(|m| !**m).count() as u64;
+    // LEFT join rows = matched pairs + one padded row per never-matched user.
+    let expected_rows = matched_pairs + unmatched_users;
+
+    let uf = TempCsv(gendata::write_temp_bytes("ljoin_u", u.as_bytes()));
+    let of = TempCsv(gendata::write_temp_bytes("ljoin_o", o.as_bytes()));
+    let (up, op) = (uf.0.display(), of.0.display());
+
+    for cs in [1, 7, 1024, orders] {
+        let src = format!("U: open {up} ;\nO: open {op} ;\nJ: U &left O on id |> name amount\n;");
+        let res = run_src(&src, cs);
+        assert_eq!(
+            res.total_rows_out(),
+            expected_rows,
+            "left join rows @cs={cs}"
+        );
+
+        // Sum of amount = 10 per matched pair, 0 for padded rows.
+        let o_out = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("J"))
+            .unwrap();
+        let mut sum = 0i64;
+        let mut padded = 0u64;
+        for c in &o_out.chunks {
+            let ai = c.schema.index_of("amount").unwrap();
+            for r in 0..c.len {
+                let v = c.value(r, ai).to_string().parse::<i64>().unwrap_or(0);
+                sum += v;
+                if v == 0 {
+                    padded += 1;
+                }
+            }
+        }
+        assert_eq!(sum, matched_pairs as i64 * 10, "amount sum @cs={cs}");
+        assert_eq!(padded, unmatched_users, "padded (amount=0) rows @cs={cs}");
+        assert!(res.errors.is_empty(), "left join errors @cs={cs}");
+    }
+}
+
+#[test]
 fn string_functions_chunk_size_independent() {
     // contains(city, "y") filter + upper(name) projection must match an oracle.
     let rows = 6_000usize;

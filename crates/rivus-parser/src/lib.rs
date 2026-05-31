@@ -28,7 +28,7 @@ use lexer::{Lexer, Tok};
 use rivus_core::{DataType, Mode, RivusError, Severity, Value};
 use rivus_ir::{
     Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, FillMethod, Func, Hook,
-    HookAction, HookEvent, NodeId, Op, PlanGraph,
+    HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -574,6 +574,14 @@ impl Parser {
                     }
                     Ok(merge)
                 } else if self.eat(&Tok::Amp) {
+                    // `&` is an inner join; `&left` is a left outer join (the
+                    // `left` qualifier lexes as a bare word right after `&`).
+                    let kind = if self.peek_is_word("left") {
+                        self.bump();
+                        JoinKind::Left
+                    } else {
+                        JoinKind::Inner
+                    };
                     let rhs = self.word()?;
                     let rid = *self
                         .g
@@ -594,6 +602,7 @@ impl Parser {
                     let join = self.g.add_node(Op::Join {
                         left_key,
                         right_key,
+                        kind,
                     });
                     self.g.add_edge(first, join, EdgeKind::Stream);
                     self.g.add_edge(rid, join, EdgeKind::Stream);
@@ -1485,6 +1494,49 @@ Import:
         assert!(s.contains("rename age years"), "got: {s}");
         assert!(s.contains("drop city"), "got: {s}");
         assert_eq!(s, parse(&s).unwrap().to_source());
+    }
+
+    #[test]
+    fn join_kinds_parse_and_round_trip() {
+        // `&` is inner, `&left` is a left outer join; `on lk:rk` sets distinct keys.
+        let g = parse("U: open u.csv ;\nO: open o.csv ;\nJ: U & O on id ;").unwrap();
+        let inner = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::Join { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .expect("a join node");
+        assert_eq!(inner, JoinKind::Inner);
+
+        let g = parse("U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on uid:oid ;").unwrap();
+        match g.nodes.iter().find_map(|n| match &n.op {
+            Op::Join {
+                kind,
+                left_key,
+                right_key,
+            } => Some((*kind, left_key.clone(), right_key.clone())),
+            _ => None,
+        }) {
+            Some((kind, lk, rk)) => {
+                assert_eq!(kind, JoinKind::Left);
+                assert_eq!(lk, "uid");
+                assert_eq!(rk, "oid");
+            }
+            None => panic!("expected a join node"),
+        }
+
+        // Reversible: inner, left, and distinct-key joins each survive a
+        // source -> IR -> source round-trip.
+        for prog in [
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U & O on id ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on id ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on uid:oid ;",
+        ] {
+            let s = parse(prog).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "round-trip: {s}");
+        }
     }
 
     #[test]

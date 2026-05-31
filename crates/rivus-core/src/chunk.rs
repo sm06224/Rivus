@@ -204,6 +204,28 @@ impl Column {
         }
     }
 
+    /// Gather a new column from optional row indices: `Some(i)` takes row `i`,
+    /// `None` writes the type's default (`false` / `0` / `0.0` / `""`). Used by
+    /// outer joins, where an unmatched side contributes a null-like default.
+    pub fn gather_opt(&self, indices: &[Option<usize>]) -> Column {
+        match self {
+            Column::Bool(v) => {
+                Column::Bool(indices.iter().map(|o| o.is_some_and(|i| v[i])).collect())
+            }
+            Column::I64(v) => Column::I64(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect()),
+            Column::F64(v) => {
+                Column::F64(indices.iter().map(|o| o.map_or(0.0, |i| v[i])).collect())
+            }
+            Column::Str(v) => {
+                let mut out = StrColumn::with_capacity(indices.len(), 0);
+                for o in indices {
+                    out.push(o.map_or("", |i| v.get(i)));
+                }
+                Column::Str(out)
+            }
+        }
+    }
+
     /// Gather a new column from selected row indices (used by filter/join).
     pub fn gather(&self, indices: &[usize]) -> Column {
         match self {

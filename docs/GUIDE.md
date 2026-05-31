@@ -245,12 +245,18 @@ Merged:
 - `A & B on key` — **inner join** on a key (use `on lkey:rkey` when the two
   sides name the key differently). Output = left columns + right columns (minus
   the join key; a name clashing with a left column is suffixed `_r`).
+- `A &left B on key` — **left outer join**: every left row is kept; when no
+  right row matches, the right columns are padded with type defaults (`0` /
+  `0.0` / `false` / empty string).
 
 ```
 # inner join two CSVs on `id`
 Users:  open users.csv ;
 Orders: open orders.csv ;
 Joined: Users & Orders on id  |> name amount  save out.csv ;
+
+# left join: keep every user, even those with no order (amount → 0)
+AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 ```
 
 Reference scopes by the names you gave them. The CLI prints the whole graph.

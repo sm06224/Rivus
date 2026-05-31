@@ -20,6 +20,14 @@ pub enum Endian {
     Big,
 }
 
+/// Which rows a join keeps. `Inner` emits only matched pairs; `Left` keeps
+/// every left row, padding the right columns with defaults when unmatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
 /// How `fill col …` replaces a column's missing (empty) cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FillMethod {
@@ -284,8 +292,14 @@ pub enum Op {
     Branch,
     /// `+` merge: union of all incoming streams.
     Merge,
-    /// `&` synchronized join on keys.
-    Join { left_key: String, right_key: String },
+    /// `&` synchronized join on keys. `kind` selects inner (`&`) vs left outer
+    /// (`&left`): a left join keeps every left row, filling the right columns
+    /// with type defaults when no right row matches.
+    Join {
+        left_key: String,
+        right_key: String,
+        kind: JoinKind,
+    },
     /// `print` / default leaf sink.
     SinkPrint,
     /// `save path.csv` — `delim` selects the field separator (`b','` for CSV,
@@ -506,7 +520,14 @@ impl Op {
             Op::Join {
                 left_key,
                 right_key,
-            } => format!("& on {left_key} = {right_key}"),
+                kind,
+            } => {
+                let amp = match kind {
+                    JoinKind::Inner => "&",
+                    JoinKind::Left => "&left",
+                };
+                format!("{amp} on {left_key} = {right_key}")
+            }
             Op::SinkPrint => "print".to_string(),
             Op::SinkCsv { path, delim } => match delim_modifier_for(path, *delim) {
                 Some(m) => format!("save {path} {m}"),
@@ -728,12 +749,19 @@ impl PlanGraph {
                 Op::Join {
                     left_key,
                     right_key,
+                    kind,
                 } => {
-                    let names = self.input_labels(&inputs).join(" & ");
-                    let _ = writeln!(
-                        out,
-                        "{label}:\n    {names}    # on {left_key} = {right_key}\n;"
-                    );
+                    let sep = match kind {
+                        JoinKind::Inner => " & ",
+                        JoinKind::Left => " &left ",
+                    };
+                    let names = self.input_labels(&inputs).join(sep);
+                    let on = if left_key == right_key {
+                        format!("on {left_key}")
+                    } else {
+                        format!("on {left_key}:{right_key}")
+                    };
+                    let _ = writeln!(out, "{label}:\n    {names} {on}\n;");
                     continue;
                 }
                 _ => {}
