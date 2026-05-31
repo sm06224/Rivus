@@ -232,3 +232,57 @@ fn telemetry_json_emits_jsonl_to_stderr() {
     assert!(saw_summary, "missing summary line in: {stderr}");
     assert!(saw_node, "missing node line in: {stderr}");
 }
+
+/// `--telemetry-addr HOST:PORT` streams the JSONL telemetry to a TCP socket
+/// instead of stderr. A listener thread captures it; stdout stays clean data.
+#[test]
+fn telemetry_addr_streams_jsonl_over_tcp() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_teleaddr_{}.csv", std::process::id()));
+    std::fs::write(&csv, "id,age\n1,30\n2,55\n3,72\n").unwrap();
+
+    // Bind to an ephemeral port and hand the address to the CLI.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = String::new();
+        conn.read_to_string(&mut buf).unwrap();
+        buf
+    });
+
+    let prog = format!("F: open {} |? age >= 50 |> id age save - ;", csv.display());
+    let out = Command::new(BIN)
+        .args(["run", "-c", &prog, "--telemetry-addr", &addr])
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&csv);
+    assert!(out.status.success());
+
+    // stdout stays clean data.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout, "id,age\n2,55\n3,72\n");
+
+    // The socket received valid JSONL with a summary line.
+    let received = handle.join().unwrap();
+    let mut saw_summary = false;
+    for line in received.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "bad line: {line}"
+        );
+        if line.contains("\"event\":\"summary\"") {
+            saw_summary = true;
+        }
+    }
+    assert!(saw_summary, "no summary over socket: {received}");
+    // Telemetry went to the socket, so stderr carries no JSONL.
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        !stderr.contains("\"event\""),
+        "stderr leaked telemetry: {stderr}"
+    );
+}

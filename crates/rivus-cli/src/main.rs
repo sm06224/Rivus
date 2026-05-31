@@ -51,6 +51,7 @@ fn main() -> ExitCode {
     let mut chunk_size = RunOptions::default().chunk_size;
     let mut optimize = true;
     let mut telemetry_json = false;
+    let mut telemetry_addr: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -65,6 +66,21 @@ fn main() -> ExitCode {
                     Some("ascii") | None => {}
                     Some(other) => {
                         eprintln!("error: --telemetry expects 'json' or 'ascii', got '{other}'");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            // Stream the JSONL telemetry to a TCP socket (HOST:PORT) instead of
+            // stderr — a live feed for an external viewer/GUI. Implies --json.
+            "--telemetry-addr" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => {
+                        telemetry_addr = Some(a.clone());
+                        telemetry_json = true;
+                    }
+                    None => {
+                        eprintln!("error: --telemetry-addr requires a HOST:PORT");
                         return ExitCode::from(2);
                     }
                 }
@@ -205,7 +221,19 @@ fn main() -> ExitCode {
             ) {
                 Ok(res) => {
                     if telemetry_json {
-                        eprint!("{}", viz::render_telemetry_jsonl(&graph, &res));
+                        let jsonl = viz::render_telemetry_jsonl(&graph, &res);
+                        if let Some(addr) = &telemetry_addr {
+                            // Stream to the socket; fall back to stderr on a
+                            // connection error so telemetry is never silently lost.
+                            if let Err(e) = send_telemetry(addr, &jsonl) {
+                                eprintln!(
+                                    "warning: telemetry to '{addr}' failed ({e}); writing to stderr"
+                                );
+                                eprint!("{jsonl}");
+                            }
+                        } else {
+                            eprint!("{jsonl}");
+                        }
                     } else {
                         eprint!("{}", viz::render_run(&graph, &res));
                     }
@@ -227,6 +255,17 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Send the rendered JSONL telemetry to a TCP `HOST:PORT` (std-only,
+/// `std::net`). Connects, writes the whole buffer, and closes — a one-shot feed
+/// for a live viewer. Errors propagate so the caller can fall back to stderr.
+fn send_telemetry(addr: &str, jsonl: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(addr)?;
+    stream.write_all(jsonl.as_bytes())?;
+    stream.flush()
 }
 
 /// `rivus gen <shape> [--rows N] [--seed S] [--ratio R]` — write deterministic,
@@ -316,7 +355,7 @@ fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
-         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--json]  run a flow\n\
+         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--json|--telemetry-addr HOST:PORT]  run a flow\n\
          \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
          \x20 rivus check   <program>                                parse only\n\
          \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\

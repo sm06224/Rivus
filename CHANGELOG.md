@@ -37,8 +37,10 @@ All notable changes to Rivus. Format loosely follows
   `{"event":"summary",…}`. stdout stays clean data, so a `save -` sink still
   pipes downstream while a tool reads telemetry from stderr (the base for an
   editor/GUI integration, Observability spec §19). `--telemetry json` is an
-  alias; in JSON mode the ASCII banner, optimizer report and live progress are
-  suppressed. A tiny hand-rolled JSON writer — no serde, no new dependencies.
+  alias; `--telemetry-addr HOST:PORT` streams the same JSONL to a **TCP socket**
+  (a live feed for an external viewer; falls back to stderr on a connection
+  error). In JSON mode the ASCII banner, optimizer report and live progress are
+  suppressed. A tiny hand-rolled JSON writer + `std::net` — no serde, no deps.
 - **zstd input: `open data.csv.zst` (opt-in `--features zstd`).** Reads
   zstd-compressed CSV/TSV (`.zst` / `.zstd`) through the **pure-Rust `ruzstd`
   decoder** (no C toolchain). Same serial single-pass, sample-inference path as

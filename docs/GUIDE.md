@@ -51,7 +51,9 @@ Flags: `--chunk-size N` (rows per chunk, default 4096), `--no-opt` (disable the
 optimizer), `--json` (emit machine-readable **JSONL telemetry** to stderr
 instead of the ASCII view — one object per node + per error + a summary; stdout
 stays clean data, so `rivus run flow.riv --json 2>telemetry.jsonl >out.csv`
-splits data and metrics cleanly).
+splits data and metrics cleanly), `--telemetry-addr HOST:PORT` (stream that same
+JSONL to a TCP socket for a live external viewer; falls back to stderr if the
+connection fails).
 
 **stdout vs stderr.** The execution graph, telemetry and error stream go to
 **stderr**; a `save stdout` sink writes clean data to **stdout**. So Rivus drops
