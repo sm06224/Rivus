@@ -68,11 +68,19 @@ it in small, gated steps.
 
 ## E. Performance — keep beating DuckDB
 
+The wall (see [`BENCHMARKS.md`](BENCHMARKS.md) "high wall"): on stdout queries
+over 5 M rows DuckDB lands ~0.33 s on *every* shape (regex, IN-set, numeric)
+while Rivus is 2–3 s. The gap is the **CSV read path** (serial, two-pass
+streaming inference), not the predicate engine. So the top perf levers now are
+read-throughput, in priority order:
+
 | | item | note |
 |---|---|---|
 | ✅ | Optimizer: dedup · fuse · projection pushdown · **filter pushdown** | |
 | ✅ | Allocation-free field split, 256 KiB IO buffers | |
-| 📋 | **SIMD CSV scan** (`std::arch`, no deps) | find `,`/`\n` with SSE2/AVX2; bench-gated |
+| 📋 | **Parallel-by-default reads** (incl. stdout sinks) | today byte-range parallel only fires for file sinks > 256 MiB; biggest single win vs DuckDB |
+| 📋 | **Single-pass inference** (sample + adaptive widen) | drop the second full scan that streaming type-inference costs |
+| 📋 | **SIMD CSV scan** (`std::arch`, no deps) | find `,`/`\n` with SSE2/AVX2; bench-gated (SWAR tried, no win at current bottleneck — revisit after the above) |
 | 📋 | **Vectorized / SIMD predicate kernels** for more shapes | extend `kernel.rs` beyond numeric conjunctions |
 | 📋 | Push computed-column / string predicates into the reader | extend prefilter |
 | 📋 | mmap the source; overlap decode with IO | |
