@@ -90,3 +90,199 @@ fn run_inline_to_stdout() {
     assert!(stdout.contains("carol"), "stdout: {stdout}");
     assert!(!stdout.contains("bob"), "filtered row leaked: {stdout}");
 }
+
+/// `gen <shape>` writes deterministic, seeded data to stdout: same seed →
+/// byte-identical output; the `clean` shape is a valid CSV that Rivus can read
+/// back; an unknown shape is a usage error.
+#[test]
+fn gen_is_deterministic_and_self_describing() {
+    let run_gen = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .output()
+            .expect("spawn rivus gen")
+    };
+
+    // Same seed twice → identical bytes.
+    let a = run_gen(&["gen", "clean", "--rows", "500", "--seed", "7"]);
+    let b = run_gen(&["gen", "clean", "--rows", "500", "--seed", "7"]);
+    assert!(a.status.success());
+    assert_eq!(a.stdout, b.stdout, "same seed must be byte-identical");
+
+    // A different seed changes the data.
+    let c = run_gen(&["gen", "clean", "--rows", "500", "--seed", "8"]);
+    assert_ne!(a.stdout, c.stdout, "different seed should differ");
+
+    // `clean` has a header + exactly `rows` data lines.
+    let text = String::from_utf8(a.stdout).unwrap();
+    assert!(text.starts_with("id,name,age,score,country,active\n"));
+    assert_eq!(text.lines().count(), 501, "header + 500 rows");
+
+    // Unknown shape → usage error (exit 2).
+    let bad = run_gen(&["gen", "wat"]);
+    assert_eq!(bad.status.code(), Some(2));
+
+    // jsonl shape emits one object per line.
+    let j = run_gen(&["gen", "jsonl", "--rows", "3", "--seed", "1"]);
+    let jtext = String::from_utf8(j.stdout).unwrap();
+    assert_eq!(jtext.lines().count(), 3);
+    assert!(jtext
+        .lines()
+        .all(|l| l.starts_with('{') && l.ends_with('}')));
+}
+
+/// The parallel byte-range reader must produce the *same* stdout — same rows,
+/// same order — as the serial path, including for a `save -` (stdout) sink.
+/// `RIVUS_PARALLEL_MIN_BYTES=0` forces the parallel path on a small file;
+/// `RIVUS_NO_PARALLEL=1` forces serial. The two outputs must be byte-identical.
+#[test]
+fn parallel_stdout_matches_serial() {
+    // Build a CSV big enough to split into several byte ranges.
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_par_{}.csv", std::process::id()));
+    let mut text = String::from("id,name,age\n");
+    for i in 0..50_000 {
+        text.push_str(&format!("{i},user{i},{}\n", 18 + (i % 70)));
+    }
+    std::fs::write(&csv, &text).unwrap();
+
+    let prog = format!(
+        "F: open {} |? age >= 50 |> id name age save - ;",
+        csv.display()
+    );
+    let run = |force_serial: bool| {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["run", "-c", &prog]);
+        if force_serial {
+            cmd.env("RIVUS_NO_PARALLEL", "1");
+        } else {
+            cmd.env("RIVUS_PARALLEL_MIN_BYTES", "0"); // force parallel
+        }
+        let out = cmd.output().expect("spawn rivus");
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+
+    let serial = run(true);
+    let parallel = run(false);
+    let _ = std::fs::remove_file(&csv);
+
+    assert_eq!(
+        serial, parallel,
+        "parallel stdout differs from serial (rows/order must match)"
+    );
+    // Sanity: header + at least one data row survived the filter.
+    let s = String::from_utf8(serial).unwrap();
+    assert!(s.starts_with("id,name,age\n"));
+    assert!(s.lines().count() > 1);
+}
+
+/// `--json` emits machine-readable JSONL telemetry to stderr, while stdout
+/// stays clean data. Every stderr line must be a valid JSON object, including a
+/// final `summary`, and the data on stdout must be unaffected by the flag.
+#[test]
+fn telemetry_json_emits_jsonl_to_stderr() {
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_tele_{}.csv", std::process::id()));
+    std::fs::write(&csv, "id,age\n1,30\n2,55\n3,72\n").unwrap();
+
+    let prog = format!("F: open {} |? age >= 50 |> id age save - ;", csv.display());
+    let out = Command::new(BIN)
+        .args(["run", "-c", &prog, "--json"])
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&csv);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout: clean CSV (header + the two matching rows), no telemetry noise.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout, "id,age\n2,55\n3,72\n",
+        "stdout must stay clean data"
+    );
+
+    // stderr: every non-empty line is a JSON object; a `summary` line exists;
+    // at least one `node` line carries the expected counter keys.
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let mut saw_summary = false;
+    let mut saw_node = false;
+    for line in stderr.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "not a JSON object: {line}"
+        );
+        if line.contains("\"event\":\"summary\"") {
+            saw_summary = true;
+            assert!(line.contains("\"final_mode\":\"normal\""));
+        }
+        if line.contains("\"event\":\"node\"") {
+            saw_node = true;
+            assert!(line.contains("\"rows_out\":"));
+            assert!(line.contains("\"kind\":"));
+        }
+    }
+    assert!(saw_summary, "missing summary line in: {stderr}");
+    assert!(saw_node, "missing node line in: {stderr}");
+}
+
+/// `--telemetry-addr HOST:PORT` streams the JSONL telemetry to a TCP socket
+/// instead of stderr. A listener thread captures it; stdout stays clean data.
+#[test]
+fn telemetry_addr_streams_jsonl_over_tcp() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_teleaddr_{}.csv", std::process::id()));
+    std::fs::write(&csv, "id,age\n1,30\n2,55\n3,72\n").unwrap();
+
+    // Bind to an ephemeral port and hand the address to the CLI.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = String::new();
+        conn.read_to_string(&mut buf).unwrap();
+        buf
+    });
+
+    let prog = format!("F: open {} |? age >= 50 |> id age save - ;", csv.display());
+    let out = Command::new(BIN)
+        .args(["run", "-c", &prog, "--telemetry-addr", &addr])
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&csv);
+    assert!(out.status.success());
+
+    // stdout stays clean data.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout, "id,age\n2,55\n3,72\n");
+
+    // The socket received valid JSONL with a summary line.
+    let received = handle.join().unwrap();
+    let mut saw_summary = false;
+    for line in received.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "bad line: {line}"
+        );
+        if line.contains("\"event\":\"summary\"") {
+            saw_summary = true;
+        }
+    }
+    assert!(saw_summary, "no summary over socket: {received}");
+    // Telemetry went to the socket, so stderr carries no JSONL.
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        !stderr.contains("\"event\""),
+        "stderr leaked telemetry: {stderr}"
+    );
+}

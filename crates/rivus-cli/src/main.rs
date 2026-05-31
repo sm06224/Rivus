@@ -16,8 +16,8 @@
 
 mod viz;
 
-use rivus_runtime::{run, RunOptions};
-use std::io::{IsTerminal, Read};
+use rivus_runtime::{gendata, run, RunOptions};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -33,6 +33,12 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // `rivus gen` — self-hosted, deterministic data generation (dogfooding), so
+    // benches and demos need no external awk/python. Writes to stdout.
+    if cmd == "gen" {
+        return run_gen(&args[2..]);
+    }
+
     // Bare Unix-filter form: `rivus '|? age >= 20 |> name age'` (no subcommand).
     // If arg 1 is a transform-only program rather than a known subcommand, run
     // it as a stdin→stdout filter. Flags still parse from arg 2.
@@ -44,10 +50,41 @@ fn main() -> ExitCode {
     }
     let mut chunk_size = RunOptions::default().chunk_size;
     let mut optimize = true;
+    let mut telemetry_json = false;
+    let mut telemetry_addr: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--no-opt" => optimize = false,
+            // Emit machine-readable JSONL telemetry to stderr (Observability
+            // spec §19: base for editor/GUI). `--telemetry json` or `--json`.
+            "--json" => telemetry_json = true,
+            "--telemetry" => {
+                i += 1;
+                match args.get(i).map(|s| s.as_str()) {
+                    Some("json") => telemetry_json = true,
+                    Some("ascii") | None => {}
+                    Some(other) => {
+                        eprintln!("error: --telemetry expects 'json' or 'ascii', got '{other}'");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            // Stream the JSONL telemetry to a TCP socket (HOST:PORT) instead of
+            // stderr — a live feed for an external viewer/GUI. Implies --json.
+            "--telemetry-addr" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => {
+                        telemetry_addr = Some(a.clone());
+                        telemetry_json = true;
+                    }
+                    None => {
+                        eprintln!("error: --telemetry-addr requires a HOST:PORT");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--chunk-size" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
@@ -153,19 +190,24 @@ fn main() -> ExitCode {
         "run" => {
             // Human-facing visualization goes to STDERR so that a `save stdout`
             // sink leaves STDOUT as clean data for shell pipes (`… | rivus run
-            // flow.riv | …`). Interactive terminals still show stderr.
-            eprintln!("\u{2550}\u{2550} Rivus \u{2550}\u{2550}  flow: {label}\n");
+            // flow.riv | …`). Interactive terminals still show stderr. With
+            // `--json`, stderr is machine-readable JSONL instead — so the banner,
+            // opt-report and live progress are suppressed to keep it clean.
+            if !telemetry_json {
+                eprintln!("\u{2550}\u{2550} Rivus \u{2550}\u{2550}  flow: {label}\n");
+            }
             let (graph, report) = if optimize {
                 rivus_optimizer::optimize(parsed)
             } else {
                 (parsed, rivus_optimizer::OptReport::default())
             };
-            if !report.is_empty() {
+            if !telemetry_json && !report.is_empty() {
                 eprint!("{}", viz::render_opt_report(&report));
                 eprintln!();
             }
-            // Live progress only when stderr is a terminal (keep logs/pipes clean).
-            let progress = std::io::stderr().is_terminal();
+            // Live progress only when stderr is a terminal (keep logs/pipes
+            // clean) and not in JSONL mode.
+            let progress = !telemetry_json && std::io::stderr().is_terminal();
             // Sink-less flows are previews: cap captured rows so `rivus run
             // 'open big.csv'` shows the head instantly in bounded memory. A
             // `save` sink overrides this and writes every row.
@@ -178,7 +220,23 @@ fn main() -> ExitCode {
                 },
             ) {
                 Ok(res) => {
-                    eprint!("{}", viz::render_run(&graph, &res));
+                    if telemetry_json {
+                        let jsonl = viz::render_telemetry_jsonl(&graph, &res);
+                        if let Some(addr) = &telemetry_addr {
+                            // Stream to the socket; fall back to stderr on a
+                            // connection error so telemetry is never silently lost.
+                            if let Err(e) = send_telemetry(addr, &jsonl) {
+                                eprintln!(
+                                    "warning: telemetry to '{addr}' failed ({e}); writing to stderr"
+                                );
+                                eprint!("{jsonl}");
+                            }
+                        } else {
+                            eprint!("{jsonl}");
+                        }
+                    } else {
+                        eprint!("{}", viz::render_run(&graph, &res));
+                    }
                     // A fatal error on the stream means the graph halted.
                     if res.final_mode == rivus_core::Mode::Halted {
                         return ExitCode::FAILURE;
@@ -199,6 +257,86 @@ fn main() -> ExitCode {
     }
 }
 
+/// Send the rendered JSONL telemetry to a TCP `HOST:PORT` (std-only,
+/// `std::net`). Connects, writes the whole buffer, and closes — a one-shot feed
+/// for a live viewer. Errors propagate so the caller can fall back to stderr.
+fn send_telemetry(addr: &str, jsonl: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(addr)?;
+    stream.write_all(jsonl.as_bytes())?;
+    stream.flush()
+}
+
+/// `rivus gen <shape> [--rows N] [--seed S] [--ratio R]` — write deterministic,
+/// seeded benchmark/demo data to stdout. Self-hosted so dogfooding needs no
+/// external awk/python. Shapes mirror `gendata`:
+///   clean       well-formed `id,name,age,score,country,active` CSV
+///   error-heavy ~`ratio` malformed rows (default 0.1) — continue-first stress
+///   mixed       ~`ratio` type-mixed cells (default 0.1)
+///   jsonl       one flat JSON object per line
+fn run_gen(args: &[String]) -> ExitCode {
+    let mut shape: Option<&str> = None;
+    let mut rows: usize = 1000;
+    let mut seed: u64 = 42;
+    let mut ratio: f64 = 0.1;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--rows" | "-n" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse().ok()) {
+                    Some(n) => rows = n,
+                    None => return gen_arg_err("--rows requires a non-negative integer"),
+                }
+            }
+            "--seed" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse().ok()) {
+                    Some(s) => seed = s,
+                    None => return gen_arg_err("--seed requires an integer"),
+                }
+            }
+            "--ratio" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<f64>().ok()) {
+                    Some(r) if (0.0..=1.0).contains(&r) => ratio = r,
+                    _ => return gen_arg_err("--ratio requires a number in 0.0..=1.0"),
+                }
+            }
+            other if shape.is_none() && !other.starts_with('-') => shape = Some(other),
+            other => return gen_arg_err(&format!("unexpected argument '{other}'")),
+        }
+        i += 1;
+    }
+    let bytes: Vec<u8> = match shape {
+        Some("clean") | None => gendata::clean(rows, seed).into_bytes(),
+        Some("error-heavy") => gendata::error_heavy(rows, ratio, seed).into_bytes(),
+        Some("mixed") => gendata::mixed_types(rows, ratio, seed).into_bytes(),
+        Some("jsonl") => gendata::jsonl_clean(rows, seed).into_bytes(),
+        Some(other) => {
+            return gen_arg_err(&format!(
+                "unknown shape '{other}' (clean|error-heavy|mixed|jsonl)"
+            ))
+        }
+    };
+    match std::io::stdout().write_all(&bytes) {
+        Ok(()) => ExitCode::SUCCESS,
+        // A closed downstream pipe (`rivus gen … | head`) is not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("gen: cannot write to stdout: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn gen_arg_err(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}");
+    eprintln!("usage: rivus gen <clean|error-heavy|mixed|jsonl> [--rows N] [--seed S] [--ratio R]");
+    ExitCode::from(2)
+}
+
 /// A transform-only program (no source/scope): starts with a pipe operator or a
 /// transform verb. Such a program is wrapped as a stdin→stdout CSV filter.
 fn is_transform_only(src: &str) -> bool {
@@ -209,7 +347,7 @@ fn is_transform_only(src: &str) -> bool {
     let first = s.split_whitespace().next().unwrap_or("");
     matches!(
         first,
-        "where" | "take" | "limit" | "head" | "sort" | "distinct" | "describe"
+        "where" | "take" | "limit" | "head" | "sort" | "distinct" | "describe" | "dropna" | "fill"
     )
 }
 
@@ -217,9 +355,10 @@ fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
-         \x20 rivus run     <program> [--chunk-size N] [--no-opt]    run and visualize a flow\n\
+         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--json|--telemetry-addr HOST:PORT]  run a flow\n\
          \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
-         \x20 rivus check   <program>                                parse only\n\n\
+         \x20 rivus check   <program>                                parse only\n\
+         \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\
          PROGRAM (any of):\n\
          \x20 <file.riv>                 read the program from a file\n\
          \x20 -c, --command <STRING>     pass the program inline as a string\n\
@@ -232,6 +371,9 @@ fn usage() {
          \x20 RIV\n\n\
          UNIX FILTER (transform-only program → reads CSV from stdin, writes stdout):\n\
          \x20 cat data.csv | rivus '|? age >= 20 |> name age'\n\
-         \x20 cat data.csv | rivus 'describe'\n"
+         \x20 cat data.csv | rivus 'describe'\n\n\
+         DATA GENERATION (deterministic, seeded — for benches/demos, no awk needed):\n\
+         \x20 rivus gen clean --rows 1000000 > data.csv\n\
+         \x20 rivus gen clean --rows 1000000 | rivus '|? age >= 50 |> name age'\n"
     );
 }

@@ -387,3 +387,140 @@ optimizer lifts `age>=50` onto the CSV source, so the reader skips *building*
 the `name` column for the ~half of rows the predicate drops (4.1 s → 3.0 s).
 The downstream FilterProject stays authoritative, so output is byte-identical
 (gated by `tests/optimizer_equiv.rs`).
+
+### Negative result — SWAR delimiter scan (not landed)
+
+Tried replacing the per-byte delimiter loop in `split_offsets` with a
+dependency-free SWAR (SIMD-within-a-register) word-at-a-time scan (8 bytes/step,
+the `(x-0x01..)&!x&0x80..` zero-byte trick, no `unsafe`). Measured on a 92 MiB /
+3 M-row CSV (`filter age>=50`, project `name age`, write), release, 3 runs each:
+
+| scan | time |
+|---|---:|
+| scalar byte loop | 1.13 s |
+| SWAR 8-byte | 1.14 s |
+
+**No measurable win** — IO and typed column-building dominate this path, not the
+delimiter split. Per the project rule ("'faster' is never asserted without a
+measured number"), the change was dropped rather than add a hand-rolled bit
+trick for nothing. Revisit only if a future profile shows the split as hot
+(e.g. after mmap + buffer-reuse remove the IO/alloc overhead).
+
+### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
+
+Data generated self-hosted with `rivus gen clean --rows 5000000` (no awk).
+Release build, 3 runs each, warm cache.
+
+**Task A — select rows where `country == "JP"`** (grep's home turf: a literal
+substring of the raw line, no parsing):
+
+| tool | command | time | rows |
+|---|---|---:|---:|
+| grep | `grep -c ",JP," data.csv` | **0.27 s** | 1 001 296 |
+| Rivus | `open … \|? country == "JP" save -` | 3.1 s | 1 001 296 |
+
+grep is **~11× faster** here, and that is expected and correct: grep scans raw
+bytes and never parses CSV, infers types, builds typed columns, or
+re-serializes — Rivus does all of that (and twice, for streaming type
+inference). For "find lines containing a literal", reach for grep.
+
+**Task B — numeric filter `age >= 50`, project `name age`** (grep *cannot*
+express this: it matches bytes, not numeric ranges — you'd need a hand-built
+alternation over every matching value):
+
+| tool | command | time | rows |
+|---|---|---:|---:|
+| grep | — (not expressible) | — | — |
+| Rivus | `open … \|? age >= 50 \|> name age save -` | **2.0 s** | 2 222 037 |
+
+(Row count matches the `awk 'NR>1&&$3>=50'` oracle.) Note Task B is *faster*
+than Task A despite scanning the same file: filter pushdown skips building the
+dropped rows' columns and projection materializes only `name,age`, so less work
+than the full-row `save -` in Task A.
+
+**Takeaway:** grep wins decisively on literal line-selection — different tool,
+different job. Rivus's value is *typed, semantic* selection (numeric/boolean
+predicates, casts, computed columns, joins, aggregates) over the same data at
+streaming, bounded memory. The two compose: `grep ,JP, data.csv | rivus '|?
+age >= 50 |> name age'` pre-filters bytes with grep, then does the typed work.
+
+### Search-pattern matrix — grep / ripgrep vs Rivus (5 M rows, 171 MiB)
+
+Self-generated (`rivus gen clean --rows 5000000`), release, median of 3, warm
+cache. DuckDB rows omitted — its CLI binary could not be fetched in the sandbox
+(network policy); the script in `bench/search.sh` fills them in where available.
+
+| pattern | grep | ripgrep | Rivus | Rivus expr |
+|---|---:|---:|---:|---:|
+| literal `,JP,` | **0.27 s** | 0.33 s | 3.0 s | `contains(country,"JP")` |
+| prefix `name=aki…` | 0.74 s | **0.34 s** | 2.5 s | `starts_with(name,"aki")` / `like(name,"aki%")` |
+| IN-set `country∈{JP,DE,BR}` | 0.74 s | **0.34 s** | 2.6 s | `country=="JP" or … or …` |
+
+**grep/ripgrep win every literal/anchored/alternation pattern by 4–10×** — and
+that is the right outcome: they scan raw bytes and never parse CSV, infer types,
+build typed columns, or re-serialize. For "which lines match this pattern",
+reach for ripgrep.
+
+Where Rivus is the right tool is the part grep *can't express*: typed, semantic
+predicates over parsed fields — numeric ranges (`age >= 50`), casts, computed
+columns, `case when`, joins, group aggregates — at streaming, bounded memory,
+with the same engine then doing projection / aggregation / output. And the two
+compose: `rg ',JP,' data.csv | rivus '|? age >= 50 |# active avg:score'` lets
+ripgrep pre-filter bytes and Rivus do the typed work on the survivors.
+
+The gap also points at the optimization that would move these numbers: Rivus
+does a **two-pass** streaming read (inference, then build). A pushed-down
+*string* prefilter (today only numeric predicates push into the reader) would
+let a `contains`/`like`/`starts_with` skip building dropped rows — the same
+trick that already took the numeric filter past DuckDB. Tracked in the backlog.
+
+
+### Regex + DuckDB — the high wall (5 M rows, 171 MiB)
+
+Self-generated (`rivus gen clean --rows 5000000`), release (Rivus built
+`--features regex`), median of 3, warm cache, **both writing the full projected
+result to stdout** (`COPY … TO '/dev/stdout'` for DuckDB). DuckDB 1.1.3 CLI.
+
+With the 8 MiB threshold now wired into the engine (this file is 171 MiB, so it
+takes the byte-range streaming-parallel reader; re-measured 2026-05-31, best of 3):
+
+| pattern | DuckDB | Rivus (serial) | Rivus (parallel) | note |
+|---|---:|---:|---:|---|
+| regex `^aki[0-9]+$` | **0.34 s** | 2.02 s | 0.54 s | `regexp(name,…)` vs `regexp_matches`, compiled-once |
+| IN-set `country∈{JP,DE,BR}` | **0.41 s** | 2.08 s | 0.66 s | DuckDB `IN` vs Rivus `or`-chain |
+| numeric `age >= 50` → project | **0.36 s** | 1.59 s | 0.43 s | grep can't express; Rivus filter-pushdown |
+
+**The wall is now ~1.2–1.6×, down from 6–10×.** The byte-range streaming reader
+gives a clean ~3× over serial here (171 MiB: numeric 1.59 s → 0.43 s, regex
+2.02 s → 0.54 s, IN-set 2.08 s → 0.66 s), byte-identical to the serial path
+(`RIVUS_NO_PARALLEL=1`). Numeric is now within ~1.2× of DuckDB; the string-set /
+regex shapes ~1.6×. The remaining difference is the **CSV read path**, not the
+predicate engine (rust-lang regex matches at DuckDB's RE2-class speed): Rivus
+does a *two-pass* streaming read (infer types, then build typed columns) where
+DuckDB reads once into vectors. (On a 380 MiB file the same numeric query is
+0.91 s parallel vs 3.33 s serial — the win grows with file size.)
+
+> **Note (2026-05-31):** the parallel speedup above only materialized once the
+> 8 MiB threshold was *actually wired into the engine*. The earlier "lower to
+> 8 MiB" change edited only the docs — the engine const stayed at 256 MiB, so
+> 8–256 MiB files silently used the in-memory chunk-partition path, which
+> materialized the whole file and ran *slower than serial* (171 MiB numeric:
+> 1.7 s in-memory vs 1.5 s serial). `try_parallel` now reads the threshold from
+> `parallel_min_bytes()` (default 8 MiB, `RIVUS_PARALLEL_MIN_BYTES`-overridable).
+
+Read-throughput levers, by remaining impact:
+1. ✅ **Parallel reads for stdout sinks** — done. The byte-range reader used to
+   bail to serial on a `save -` sink; it now assembles ordered parts to stdout.
+2. ✅ **Lower the parallel threshold to 8 MiB — *and wire it into the engine*** —
+   done. Mid-size files (8–256 MiB) now take the streaming-parallel reader
+   instead of the slower in-memory path. `RIVUS_PARALLEL_MIN_BYTES`-overridable
+   (default 8 MiB); `RIVUS_NO_PARALLEL=1` forces serial.
+3. 📋 **Single-pass inference** (sample + adaptive widen) to drop the second
+   scan — the largest remaining single-thread gap.
+4. 📋 **mmap + overlap decode with IO**; reuse per-chunk buffers.
+
+DuckDB still buffers (~400 MiB RSS on the 1.1 GB set earlier) where Rivus
+streams at ~10 MiB, so the honest framing stays "Rivus trades some speed for
+bounded memory and a zero-dependency default" — and the roadmap goal is to close
+the read-throughput gap until that trade is near-free. ripgrep remains the right
+tool for "match lines in a file"; Rivus composes with it (`rg … | rivus …`).

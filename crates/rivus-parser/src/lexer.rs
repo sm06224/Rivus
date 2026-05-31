@@ -201,6 +201,13 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     Tok::Minus
                 }
+                // A lone `-` outside parens is the stdin/stdout sentinel word
+                // (`open -`, `save -`). `->` and expression `-` are handled
+                // above, so this only fires for a dash not followed by `>`.
+                b'-' => {
+                    self.bump();
+                    Tok::Word("-".to_string())
+                }
                 b'*' if self.depth > 0 => {
                     self.bump();
                     Tok::Star

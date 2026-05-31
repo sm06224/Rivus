@@ -20,6 +20,53 @@ pub enum Endian {
     Big,
 }
 
+/// Which rows a join keeps. `Inner` emits only matched pairs; `Left` keeps
+/// every left row, padding the right columns with defaults when unmatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+impl JoinKind {
+    /// The `&`-operator spelling used in source (`&`, `&left`, `&right`, `&full`).
+    pub fn amp(&self) -> &'static str {
+        match self {
+            JoinKind::Inner => "&",
+            JoinKind::Left => "&left",
+            JoinKind::Right => "&right",
+            JoinKind::Full => "&full",
+        }
+    }
+    /// Keep left rows that matched nothing (left / full outer).
+    pub fn keeps_left(&self) -> bool {
+        matches!(self, JoinKind::Left | JoinKind::Full)
+    }
+    /// Keep right rows that matched nothing (right / full outer).
+    pub fn keeps_right(&self) -> bool {
+        matches!(self, JoinKind::Right | JoinKind::Full)
+    }
+}
+
+/// How `fill col …` replaces a column's missing (empty) cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillMethod {
+    /// Substitute a constant value (the column becomes text).
+    Value(String),
+    /// Forward-fill: carry the last non-empty value forward over blanks.
+    Ffill,
+    /// Backward-fill: carry the next non-empty value backward over blanks.
+    Bfill,
+    /// Fill blanks with the mean of the column's non-empty numeric cells.
+    /// Buffers the whole stream (a pipeline-breaker like `sort`).
+    Mean,
+    /// Fill blanks with the median (p50, linear-interpolated) of the column's
+    /// non-empty numeric cells. Buffers the whole stream (pipeline-breaker).
+    Median,
+}
+
 /// Aggregate functions for `|# key agg:col` (count is always emitted implicitly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
@@ -27,6 +74,19 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// Sample standard deviation (ddof=1; `0` for fewer than two values).
+    Std,
+    /// Number of distinct non-empty values (`nunique` is an accepted alias).
+    CountDistinct,
+    /// First non-empty value seen in the group (source order).
+    First,
+    /// Last non-empty value seen in the group (source order).
+    Last,
+    /// Percentile of the numeric values in the group (linear interpolation,
+    /// like numpy/pandas default). The `u8` is the percentile in 0..=100;
+    /// `median` is p50. These buffer every numeric value per group, so — like
+    /// `sort`/`join` — they are pipeline-breakers bounded by group cardinality.
+    Pct(u8),
 }
 
 impl AggFunc {
@@ -36,16 +96,46 @@ impl AggFunc {
             "avg" => AggFunc::Avg,
             "min" => AggFunc::Min,
             "max" => AggFunc::Max,
-            _ => return None,
+            "std" => AggFunc::Std,
+            "count_distinct" | "nunique" => AggFunc::CountDistinct,
+            "first" => AggFunc::First,
+            "last" => AggFunc::Last,
+            "median" => AggFunc::Pct(50),
+            // `pN` / `pNN` percentile, N in 0..=100 (e.g. `p50`, `p90`, `p99`).
+            other => {
+                let n = other.strip_prefix('p')?;
+                let pct: u8 = n.parse().ok()?;
+                if pct > 100 {
+                    return None;
+                }
+                AggFunc::Pct(pct)
+            }
         })
     }
 
+    /// A heap-allocated label (most variants are static; `Pct` is `pNN`, and
+    /// p50 renders as `median` to round-trip the `median` alias).
+    pub fn label(&self) -> String {
+        match self {
+            AggFunc::Pct(50) => "median".to_string(),
+            AggFunc::Pct(n) => format!("p{n}"),
+            other => other.as_str().to_string(),
+        }
+    }
+
+    /// Static name for the non-percentile variants (used in column headers and
+    /// `to_source`). Percentiles have no static name — use [`AggFunc::label`].
     pub fn as_str(&self) -> &'static str {
         match self {
             AggFunc::Sum => "sum",
             AggFunc::Avg => "avg",
             AggFunc::Min => "min",
             AggFunc::Max => "max",
+            AggFunc::Std => "std",
+            AggFunc::CountDistinct => "count_distinct",
+            AggFunc::First => "first",
+            AggFunc::Last => "last",
+            AggFunc::Pct(_) => "pct",
         }
     }
 }
@@ -149,6 +239,10 @@ pub enum Op {
         /// columns positionally (overriding the header / `c0…`) and, where a
         /// type is given, fixes that column's lane instead of inferring it.
         declared: Option<Vec<(String, Option<DataType>)>>,
+        /// Field delimiter byte. `b','` for CSV (the default); `b'\t'` for a
+        /// `.tsv`/`.tab` file or `open f.x as tsv`. Std-only — the reader just
+        /// splits on a different byte.
+        delim: u8,
     },
     /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
     /// binary records (a C struct dump). `endian` selects byte order;
@@ -180,7 +274,10 @@ pub enum Op {
     /// blocking operator (buffers every row, emits on finish); the sort is
     /// stable, so equal keys keep source order and the result is chunk-size
     /// independent. Pipeline-breaker for the parallel executor.
-    Sort { key: String, desc: bool },
+    /// `sort KEY [asc|desc] [KEY [asc|desc] ...]` — order the whole stream by
+    /// one or more keys, each with its own direction (default ascending).
+    /// Blocking (buffers all rows) → serial path.
+    Sort { keys: Vec<(String, bool)> },
     /// `distinct [KEY ...]` — drop duplicate rows, keeping the first occurrence.
     /// With no keys, the whole row is the dedup key; otherwise only the named
     /// columns. Streaming (emits as it goes) but stateful (a global seen-set),
@@ -190,10 +287,38 @@ pub enum Op {
     /// (column, type, count, min, max, mean). A streaming, single-pass
     /// accumulator that emits on finish; stateful → serial path.
     Describe,
-    /// `|# key [agg:col ...]` — group by key. Always emits a `count`; each
-    /// `(func, col)` adds an aggregate column (e.g. `sum:score`, `avg:age`).
+    /// `dropna [col ...]` — drop rows with a missing (empty) value in any of the
+    /// named columns (or any column when none named). Streaming, stateless.
+    DropNa { cols: Vec<String> },
+    /// `fill col VALUE|ffill|bfill` — replace missing (empty) cells of `col`.
+    /// `VALUE` substitutes a constant (the column becomes text); `ffill` carries
+    /// the last non-empty value forward, `bfill` the next non-empty value back.
+    /// A constant fill is streaming/stateless; `ffill`/`bfill` are stateful
+    /// (they carry state across rows and chunks) → serial path.
+    Fill { col: String, method: FillMethod },
+    /// `rename OLD NEW [OLD NEW ...]` — rename columns in place, preserving
+    /// position, type and values. Unknown `OLD` names are skipped with a warning.
+    /// Streaming, stateless.
+    Rename { pairs: Vec<(String, String)> },
+    /// `drop COL [COL ...]` — remove the named columns, keeping the rest in
+    /// order. Unknown names are ignored. Streaming, stateless. (Sugar over
+    /// projection, but resolved against the live schema since `drop` names the
+    /// columns to remove rather than the ones to keep.)
+    Drop { cols: Vec<String> },
+    /// `cast COL:type [COL:type ...]` — change the type of named columns in
+    /// place (position and name kept; values re-coerced via the cast lane).
+    /// Sugar for a computed `(col:type) as col` projection that keeps the rest.
+    /// Unknown names are skipped with a warning. Streaming, stateless.
+    Cast { casts: Vec<(String, DataType)> },
+    /// `reorder COL [COL ...]` — move the named columns to the front in the
+    /// given order; all other columns follow in their original order. Unknown
+    /// names are ignored. Streaming, stateless, type/value preserving.
+    Reorder { cols: Vec<String> },
+    /// `|# key [key ...] [agg:col ...]` — group by one or more keys. Always
+    /// emits a `count`; each `(func, col)` adds an aggregate column (e.g.
+    /// `sum:score`, `avg:age`). Each key becomes a column in the output.
     GroupBy {
-        key: String,
+        keys: Vec<String>,
         aggs: Vec<(AggFunc, String)>,
     },
     /// Fused linear chain of filters and an optional trailing projection,
@@ -208,14 +333,90 @@ pub enum Op {
     Branch,
     /// `+` merge: union of all incoming streams.
     Merge,
-    /// `&` synchronized join on keys.
-    Join { left_key: String, right_key: String },
+    /// `&` synchronized join on one or more key pairs. `kind` selects inner
+    /// (`&`) vs left/right/full outer. `left_keys[i]` joins `right_keys[i]`; the
+    /// two vectors have equal length (≥1). An outer join keeps unmatched rows on
+    /// the kept side, filling the other side's columns with type defaults.
+    Join {
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
+        kind: JoinKind,
+    },
     /// `print` / default leaf sink.
     SinkPrint,
-    /// `save path.csv`
-    SinkCsv { path: String },
+    /// `save path.csv` — `delim` selects the field separator (`b','` for CSV,
+    /// `b'\t'` for a `.tsv`/`.tab` path or `save out.x as tsv`).
+    SinkCsv { path: String, delim: u8 },
     /// `save path.jsonl` — write JSON Lines (one object per row).
     SinkJsonl { path: String },
+}
+
+/// The default CSV field delimiter.
+pub const COMMA: u8 = b',';
+
+/// Render a join's `on` clause faithfully for `to_source`: one token per key
+/// pair, `lk` when the two names are equal else `lk:rk`, space-separated. So
+/// `on id`, `on uid:oid`, and `on a b c` all round-trip, as does a mixed
+/// `on a x:y`.
+pub fn join_on_clause(left_keys: &[String], right_keys: &[String]) -> String {
+    let parts: Vec<String> = left_keys
+        .iter()
+        .zip(right_keys.iter())
+        .map(|(l, r)| {
+            if l == r {
+                l.clone()
+            } else {
+                format!("{l}:{r}")
+            }
+        })
+        .collect();
+    format!("on {}", parts.join(" "))
+}
+
+/// Pick the field delimiter for a path by extension: `.tsv`/`.tab` use a tab,
+/// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
+/// feature — `open f.tsv` and `save out.tsv` just work.
+pub fn delim_for_path(path: &str) -> u8 {
+    let mut lower = path.to_ascii_lowercase();
+    // A compression suffix doesn't change the field delimiter: `.tsv.gz` is
+    // still tab-delimited. Strip it before checking the data extension.
+    for suf in [".gz", ".zst", ".zstd"] {
+        if let Some(stripped) = lower.strip_suffix(suf) {
+            lower = stripped.to_string();
+            break;
+        }
+    }
+    if lower.ends_with(".tsv") || lower.ends_with(".tab") {
+        b'\t'
+    } else {
+        COMMA
+    }
+}
+
+/// Render the `as …` modifier needed so `path` re-parses with `delim`, for
+/// `to_source` reversibility. Returns `None` when the path extension already
+/// implies `delim` (e.g. `.tsv` → tab, `.csv` → comma) so the rendered source
+/// stays clean; otherwise the explicit `as tsv` / `as csv` (or `delim "…"`).
+pub fn delim_modifier_for(path: &str, delim: u8) -> Option<String> {
+    if delim == delim_for_path(path) {
+        return None;
+    }
+    Some(match delim {
+        COMMA => "as csv".to_string(),
+        b'\t' => "as tsv".to_string(),
+        other => format!("delim \"{}\"", escape_delim(other)),
+    })
+}
+
+/// Render a delimiter byte for display inside a quoted `delim "…"` modifier.
+fn escape_delim(b: u8) -> String {
+    match b {
+        b'\t' => "\\t".to_string(),
+        b'\n' => "\\n".to_string(),
+        b'\r' => "\\r".to_string(),
+        0x20..=0x7e => (b as char).to_string(),
+        other => format!("\\x{other:02x}"),
+    }
 }
 
 impl Op {
@@ -232,6 +433,12 @@ impl Op {
             Op::Sort { .. } => "sort",
             Op::Distinct { .. } => "distinct",
             Op::Describe => "describe",
+            Op::DropNa { .. } => "dropna",
+            Op::Fill { .. } => "fill",
+            Op::Rename { .. } => "rename",
+            Op::Drop { .. } => "drop",
+            Op::Cast { .. } => "cast",
+            Op::Reorder { .. } => "reorder",
             Op::FilterProject { .. } => "fused",
             Op::GroupBy { .. } => "group",
             Op::Branch => "branch",
@@ -252,10 +459,15 @@ impl Op {
                 prefilter,
                 header,
                 declared,
+                delim,
             } => {
                 let mut s = format!("open {path}");
                 if !header {
                     s.push_str(" noheader");
+                }
+                if let Some(m) = delim_modifier_for(path, *delim) {
+                    s.push(' ');
+                    s.push_str(&m);
                 }
                 if let Some(cols) = declared {
                     let parts: Vec<String> = cols
@@ -310,18 +522,36 @@ impl Op {
                             name,
                             access: Access::Fast,
                         } if name == alias => name.clone(),
-                        _ => format!("{e} as {alias}"),
+                        // The parser's computed-column rule is `(expr) as alias`,
+                        // so a computed item must render parenthesized to
+                        // re-parse. `Arith` already self-parenthesizes; wrap
+                        // anything that doesn't start with `(` (e.g. `case`,
+                        // field renames, functions).
+                        _ => {
+                            let s = e.to_string();
+                            if s.starts_with('(') {
+                                format!("{s} as {alias}")
+                            } else {
+                                format!("({s}) as {alias}")
+                            }
+                        }
                     })
                     .collect();
                 format!("|> {}", parts.join(" "))
             }
             Op::Take { n } => format!("take {n}"),
-            Op::Sort { key, desc } => {
-                if *desc {
-                    format!("sort {key} desc")
-                } else {
-                    format!("sort {key}")
-                }
+            Op::Sort { keys } => {
+                let parts: Vec<String> = keys
+                    .iter()
+                    .map(|(k, desc)| {
+                        if *desc {
+                            format!("{k} desc")
+                        } else {
+                            k.clone()
+                        }
+                    })
+                    .collect();
+                format!("sort {}", parts.join(" "))
             }
             Op::Distinct { keys } => {
                 if keys.is_empty() {
@@ -331,6 +561,30 @@ impl Op {
                 }
             }
             Op::Describe => "describe".to_string(),
+            Op::DropNa { cols } => {
+                if cols.is_empty() {
+                    "dropna".to_string()
+                } else {
+                    format!("dropna {}", cols.join(" "))
+                }
+            }
+            Op::Fill { col, method } => match method {
+                FillMethod::Value(v) => format!("fill {col} \"{v}\""),
+                FillMethod::Ffill => format!("fill {col} ffill"),
+                FillMethod::Bfill => format!("fill {col} bfill"),
+                FillMethod::Mean => format!("fill {col} mean"),
+                FillMethod::Median => format!("fill {col} median"),
+            },
+            Op::Rename { pairs } => {
+                let parts: Vec<String> = pairs.iter().map(|(f, t)| format!("{f} {t}")).collect();
+                format!("rename {}", parts.join(" "))
+            }
+            Op::Drop { cols } => format!("drop {}", cols.join(" ")),
+            Op::Cast { casts } => {
+                let parts: Vec<String> = casts.iter().map(|(c, t)| format!("{c}:{t}")).collect();
+                format!("cast {}", parts.join(" "))
+            }
+            Op::Reorder { cols } => format!("reorder {}", cols.join(" ")),
             Op::FilterProject { preds, fields } => {
                 let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
                 if let Some(f) = fields {
@@ -338,21 +592,25 @@ impl Op {
                 }
                 s.trim_end().to_string()
             }
-            Op::GroupBy { key, aggs } => {
-                let mut s = format!("|# {key}");
+            Op::GroupBy { keys, aggs } => {
+                let mut s = format!("|# {}", keys.join(" "));
                 for (f, c) in aggs {
-                    s.push_str(&format!(" {}:{c}", f.as_str()));
+                    s.push_str(&format!(" {}:{c}", f.label()));
                 }
                 s
             }
             Op::Branch => "-> branch".to_string(),
             Op::Merge => "+ merge".to_string(),
             Op::Join {
-                left_key,
-                right_key,
-            } => format!("& on {left_key} = {right_key}"),
+                left_keys,
+                right_keys,
+                kind,
+            } => format!("{} {}", kind.amp(), join_on_clause(left_keys, right_keys)),
             Op::SinkPrint => "print".to_string(),
-            Op::SinkCsv { path } => format!("save {path}"),
+            Op::SinkCsv { path, delim } => match delim_modifier_for(path, *delim) {
+                Some(m) => format!("save {path} {m}"),
+                None => format!("save {path}"),
+            },
             Op::SinkJsonl { path } => format!("save {path}  # as jsonl"),
         }
     }
@@ -567,14 +825,14 @@ impl PlanGraph {
                     continue;
                 }
                 Op::Join {
-                    left_key,
-                    right_key,
+                    left_keys,
+                    right_keys,
+                    kind,
                 } => {
-                    let names = self.input_labels(&inputs).join(" & ");
-                    let _ = writeln!(
-                        out,
-                        "{label}:\n    {names}    # on {left_key} = {right_key}\n;"
-                    );
+                    let sep = format!(" {} ", kind.amp());
+                    let names = self.input_labels(&inputs).join(&sep);
+                    let on = join_on_clause(left_keys, right_keys);
+                    let _ = writeln!(out, "{label}:\n    {names} {on}\n;");
                     continue;
                 }
                 _ => {}

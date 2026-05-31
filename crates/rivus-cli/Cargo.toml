@@ -15,3 +15,11 @@ rivus-ir.workspace = true
 rivus-parser.workspace = true
 rivus-optimizer.workspace = true
 rivus-runtime.workspace = true
+
+# Off-by-default: enable full-regex `regexp()` by forwarding to the runtime's
+# `regex` feature. Default `rivus` stays zero-dependency. See SUPPLY-CHAIN.md.
+[features]
+default = []
+regex = ["rivus-runtime/regex"]
+gzip = ["rivus-runtime/gzip"]
+zstd = ["rivus-runtime/zstd"]

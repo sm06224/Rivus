@@ -48,7 +48,12 @@ rivus check   <program>     # parse only (report syntax errors)
 | stdin (`-`, heredoc) | `rivus run - <<'RIV' … RIV` |
 
 Flags: `--chunk-size N` (rows per chunk, default 4096), `--no-opt` (disable the
-optimizer).
+optimizer), `--json` (emit machine-readable **JSONL telemetry** to stderr
+instead of the ASCII view — one object per node + per error + a summary; stdout
+stays clean data, so `rivus run flow.riv --json 2>telemetry.jsonl >out.csv`
+splits data and metrics cleanly), `--telemetry-addr HOST:PORT` (stream that same
+JSONL to a TCP socket for a live external viewer; falls back to stderr if the
+connection fails).
 
 **stdout vs stderr.** The execution graph, telemetry and error stream go to
 **stderr**; a `save stdout` sink writes clean data to **stdout**. So Rivus drops
@@ -65,13 +70,15 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | syntax | reads |
 |---|---|
 | `open PATH` | format from the extension (`.csv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSON) |
-| `open PATH as FMT` | force the format (`FMT` = `csv` \| `json` \| `jsonl` \| `ndjson`) |
+| `open PATH as FMT` | force the format (`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
+| `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
+| `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`. e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |
-| `open stdin` | read CSV (or `as FMT`) from standard input |
+| `open stdin` / `open -` | read CSV (or `as FMT`) from standard input |
 | `stream NAME` | replay a named flow (MVP: reference) |
 
 Format detection deliberately **does not over-trust the extension**: use
@@ -130,15 +137,26 @@ Select columns, rename them, or compute new ones. Each item is one of:
 
 ### `|#` — group by
 
-Partition by a key column and aggregate. A `count` column is always emitted;
-each `func:col` adds one aggregate. Functions: `sum avg min max`.
+Partition by one or more key columns and aggregate. A `count` column is always
+emitted; each `func:col` adds one aggregate. Functions:
+
+- numeric: `sum avg min max std` (std is sample, ddof=1)
+- percentiles: `median` and `pNN` (`p50 p90 p99 …`, linear interpolation)
+- distinct count: `count_distinct` (alias `nunique`)
+- positional: `first last` (first/last non-empty value in source order)
 
 ```
-|# country                        # → country, count
-|# country sum:score avg:age      # → country, count, sum_score, avg_age
+|# country                          # → country, count
+|# country region sum:score         # multi-key: → country, region, count, sum_score
+|# country sum:score avg:age        # → country, count, sum_score, avg_age
+|# country median:score p90:score   # → country, count, median_score, p90_score
+|# country count_distinct:city      # → country, count, count_distinct_city
 ```
 
-Output columns are named `count` and `<func>_<col>` (e.g. `sum_score`).
+Multiple keys partition by the column *tuple* (each key becomes its own output
+column, before `count`). Output columns are named `count` and `<func>_<col>` (e.g. `sum_score`,
+`p90_score`). `std`/percentiles buffer each group's values (a pipeline-breaker
+like `sort`); the rest stream in O(1) memory per group.
 
 ### `take` / `limit` / `head` — cap rows
 
@@ -148,14 +166,16 @@ limit 100       # alias
 head 100        # alias
 ```
 
-### `sort` — order by a key
+### `sort` — order by one or more keys
 
 A stable sort over the whole stream (a blocking step). Ties keep source order.
+Multiple keys sort by each in turn, each with its own direction.
 
 ```
-sort age            # ascending (default)
+sort age              # ascending (default)
 sort age asc
 sort score desc
+sort team score desc  # team ascending, then score descending within a team
 ```
 
 ### `distinct` — drop duplicates
@@ -169,6 +189,28 @@ distinct user_id        # first row per user_id
 distinct country region # first row per (country, region)
 ```
 
+### `dropna` / `fill` — missing values
+
+```
+dropna                 # drop rows blank in ANY column
+dropna city region     # drop rows blank in these columns
+fill city "UNKNOWN"    # replace blank cells of `city` with a constant
+fill price ffill       # forward-fill: carry the last non-empty value down
+fill price bfill       # backward-fill: carry the next non-empty value up
+fill score mean        # fill blanks with the column mean (numeric cells)
+fill score median      # fill blanks with the column median
+```
+
+A "missing" cell is an empty string. Numeric columns can't hold a blank (it
+parses to 0), so declare a column `:str` if you need to detect/clean its blanks.
+`ffill`/`bfill` carry the nearest neighbour across chunk boundaries (a leading
+blank has nothing to forward-fill from, a trailing blank nothing to back-fill);
+`bfill` buffers the stream to finish (a pipeline-breaker like `sort`), `ffill`
+is fully streaming. `mean`/`median` compute a whole-column statistic over the
+non-empty numeric cells and substitute it for the blanks (also pipeline-breakers,
+since the statistic needs every value); an integral result is written without a
+trailing `.0`. All `fill` methods leave non-blank cells untouched.
+
 ### `describe` — one-pass column summary
 
 Replace the stream with a per-column summary (like pandas `.describe()` / SQL
@@ -181,6 +223,21 @@ open data.csv describe save stdout as csv
 # id,i64,1000,1,1000,500.5
 # name,str,1000,,,
 ```
+
+### `rename` / `drop` / `reorder` — column shape
+
+Stateless, streaming column operations (no `|>` needed):
+
+```
+rename age years city loc   # rename in place: age→years, city→loc
+drop zip notes              # remove columns, keep the rest in order
+reorder name id             # move name,id to the front; rest follow in order
+```
+
+`rename` keeps each column's position, type and values (unknown names warn);
+`drop` removes the named columns (unknown names are ignored); `reorder` is a
+pure permutation that floats the named columns to the front (unknown names
+ignored, duplicates deduped). All three round-trip through `to_source`.
 
 ### Composing them
 
@@ -218,12 +275,26 @@ Merged:
 - `A & B on key` — **inner join** on a key (use `on lkey:rkey` when the two
   sides name the key differently). Output = left columns + right columns (minus
   the join key; a name clashing with a left column is suffixed `_r`).
+- **Composite keys:** `on k1 k2 …` joins on the column *tuple* — e.g.
+  `A & B on country region` matches rows agreeing on both. Each key may be
+  `lk:rk` for differing names (`on a x:y`). Works for every join kind below.
+- `A &left B on key` — **left outer join**: every left row is kept; when no
+  right row matches, the right columns are padded with type defaults (`0` /
+  `0.0` / `false` / empty string).
+- `A &right B on key` — **right outer join**: every right row is kept (the left
+  columns padded with defaults). The join-key column keeps the right key, so an
+  orphan right row never loses its key.
+- `A &full B on key` — **full outer join**: every row from both sides; unmatched
+  rows are padded on the missing side.
 
 ```
 # inner join two CSVs on `id`
 Users:  open users.csv ;
 Orders: open orders.csv ;
 Joined: Users & Orders on id  |> name amount  save out.csv ;
+
+# left join: keep every user, even those with no order (amount → 0)
+AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 ```
 
 Reference scopes by the names you gave them. The CLI prints the whole graph.
@@ -246,6 +317,25 @@ Used in `|?` predicates and `(…)` computed columns.
 | deep / dynamic field | `$_..age` (recursive), `item("age")` (dynamic) |
 | parent scope field | `$_:1.country` (`$_:0` = current, `$_:1` = parent …) |
 
+**Functions**
+
+- *string* — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
+  `substr(s, start, len)`, `replace(s, from, to)`, `split_part(s, sep, n)`
+  (1-based field), `concat(a, b, …)`.
+- *predicates* (→ bool) — `contains(s, sub)`, `starts_with(s, p)`,
+  `ends_with(s, p)`, `like(s, pat)`, `glob(s, pat)`, and (with `--features
+  regex`) `regexp(s, re)`.
+- *numeric* — `abs(x)`, `round(x)` (ties away from zero), `floor(x)`, `ceil(x)`;
+  each returns an integer when the result is whole, else a float.
+- *null-coalesce* — `coalesce(a, b, …)`: the first argument whose text is
+  non-empty (the SQL/pandas null-coalesce).
+
+```
+|? contains(email, "@gmail")
+|> (upper(name)) as NAME (len(name)) as nlen (substr(zip, 0, 3)) as area
+|> (round(price * 1.1)) as gross (coalesce(nick, name)) as display
+```
+
 **Comparison** — `==  !=  <  <=  >  >=`
 **Logic** — `and`, `or`
 **Arithmetic** (inside parentheses) — `+  -  *  /  %`, with `* / %` binding
@@ -267,7 +357,13 @@ tighter than `+ -`; nest with parens.
 |? age:int >= 20            # compare a *string* column numerically
 |> id (price:f64 * 1.1) as gross
 |> (age:str) as age_text    # the add-property cast (3rd way to type a column)
+cast age:int price:f64      # the `cast` verb: re-type columns in place
 ```
+
+The **`cast COL:type [COL:type …]`** verb is sugar for re-typing named columns
+in place (position and name kept), e.g. `cast age:int price:f64`. Unknown
+columns warn and are skipped; it round-trips through `to_source` (type names
+render canonically, `int` → `i64`).
 
 Numeric arithmetic stays integer when both sides are integers (except `/`,
 which is always float, like SQL/pandas). Strings are parsed best-effort to a
@@ -280,10 +376,10 @@ than crashing (continue-first).
 
 | syntax | writes |
 |---|---|
-| `save PATH` | format from the extension (mirrors the sources) |
-| `save PATH as FMT` | force the format (`csv` \| `json` \| `jsonl` \| `ndjson`) |
+| `save PATH` | format from the extension (mirrors the sources; `.tsv`/`.tab` → tab-delimited) |
+| `save PATH as FMT` | force the format (`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
 | `writecsv PATH` / `writejson PATH` | explicit verbs |
-| `save stdout` | write to standard output |
+| `save stdout` / `save -` | write to standard output |
 | `print` | capture for the on-screen preview |
 
 ```
@@ -407,14 +503,26 @@ rivus run -c 'B: open big.csv ;'        # instant head, ~10 MiB RAM
 ## 11. Full CLI reference
 
 ```
-rivus run     <program> [--chunk-size N] [--no-opt]   run and visualize a flow
+rivus run     <program> [--chunk-size N] [--no-opt] [--json]  run a flow
 rivus explain <program> [--no-opt]                    show DAG IR + optimizer report
 rivus check   <program>                               parse only
+rivus gen     <shape>   [--rows N --seed S --ratio R] write seeded data to stdout
 
 PROGRAM:
   <file.riv>                 read the program from a file
   -c, --command <STRING>     pass the program inline as a string
   - | stdin                  read the program from stdin (heredoc)
+
+GEN SHAPES (deterministic, seeded — for benches/demos, no awk needed):
+  clean         well-formed id,name,age,score,country,active CSV
+  error-heavy   ~ratio malformed rows (default 0.1) — continue-first stress
+  mixed         ~ratio type-mixed cells (default 0.1)
+  jsonl         one flat JSON object per line
+```
+
+```
+# self-hosted bench: generate, then filter — no external tools
+rivus gen clean --rows 1000000 | rivus '|? age >= 50 |> name age'
 ```
 
 ---
@@ -430,15 +538,18 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | 'readcsv' PATH | 'readjson' PATH
            | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
            | 'stream' IDENT
-           | IDENT (('+' IDENT)+ | ('&' IDENT))? ;            (merge / join over scopes)
+           | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
            | '|>' proj+                                       (project / compute)
-           | '|#' IDENT (('sum'|'avg'|'min'|'max') ':' IDENT)*  (group)
+           | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
            | ('take'|'limit'|'head') INT
-           | 'sort' IDENT ('asc'|'desc')?
+           | 'sort' (IDENT ('asc'|'desc')?)+
            | 'distinct' IDENT*
            | 'describe'
+           | 'dropna' IDENT* | 'fill' IDENT (VALUE | 'ffill' | 'bfill' | 'mean' | 'median')
+           | 'rename' (IDENT IDENT)+ | 'drop' IDENT+ | 'reorder' IDENT+
+           | 'cast' (IDENT ':' TYPE)+
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)
@@ -447,8 +558,13 @@ proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;
 expr       = or ; or = and ('or' and)* ; and = cmp ('and' cmp)* ;
 cmp        = add (CMP add)? ; add = mul (('+'|'-') mul)* ; mul = primary (('*'|'/'|'%') primary)* ;
 primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
-           | IDENT | '$_' field-tail | '$_:'N field-tail | 'item' '(' STRING ')' ;
-FMT        = 'csv' | 'json' | 'jsonl' | 'ndjson' ;
+           | IDENT | '$_' field-tail | '$_:'N field-tail | 'item' '(' STRING ')'
+           | FUNC '(' expr (',' expr)* ')'
+           | 'case' ('when' expr 'then' expr)+ ('else' expr)? 'end' ;
+FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
+AGG        = 'sum' | 'avg' | 'min' | 'max' | 'std'
+           | 'count_distinct' | 'nunique' | 'first' | 'last'
+           | 'median' | 'p' DIGITS ;   (percentile, 0..=100)
 CMP        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
 ```
 

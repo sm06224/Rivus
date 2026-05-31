@@ -112,6 +112,8 @@ pub struct CsvChunker {
     limit: Option<u64>,
     /// Compiled pushed-down numeric predicates (skip building failing rows).
     prefilter: Vec<PreCmp>,
+    /// Field delimiter byte (`b','` for CSV, `b'\t'` for TSV).
+    delim: u8,
 }
 
 impl CsvChunker {
@@ -132,16 +134,17 @@ impl CsvChunker {
         prefilter: &[(String, CmpOp, f64)],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
+        delim: u8,
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
-            return Self::open_preview(path, allow, chunk_size, prefilter, header, declared);
+            return Self::open_preview(path, allow, chunk_size, prefilter, header, declared, delim);
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut r = BufReader::with_capacity(READ_BUF, f);
         // `r` is left positioned at the first data row (after the header, or at
         // byte 0 for a header-less file).
-        let (names, data_start) = read_header(&mut r, header, declared)?;
+        let (names, data_start) = read_header(&mut r, header, declared, delim)?;
         let ncols = names.len();
         if ncols == 0 {
             return Err("CSV has no columns".to_string());
@@ -166,7 +169,7 @@ impl CsvChunker {
             if l.trim().is_empty() {
                 continue;
             }
-            if !observe_line(l, ncols, &keep, &mut flags, &mut offsets) {
+            if !observe_line(l, ncols, &keep, &mut flags, &mut offsets, delim) {
                 bad += 1;
             }
         }
@@ -201,6 +204,7 @@ impl CsvChunker {
                 prefilter: pre,
                 pos: 0,
                 limit: None,
+                delim,
             },
         ))
     }
@@ -215,10 +219,11 @@ impl CsvChunker {
         prefilter: &[(String, CmpOp, f64)],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
+        delim: u8,
     ) -> Result<(Schema, CsvChunker), String> {
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let mut reader = BufReader::with_capacity(READ_BUF, f);
-        let (names, data_start) = read_header(&mut reader, header, declared)?;
+        let (names, data_start) = read_header(&mut reader, header, declared, delim)?;
         let ncols = names.len();
         if ncols == 0 {
             return Err("CSV has no columns".to_string());
@@ -243,7 +248,7 @@ impl CsvChunker {
             if l.trim().is_empty() {
                 continue;
             }
-            if !observe_line(l, ncols, &keep, &mut flags, &mut offsets) {
+            if !observe_line(l, ncols, &keep, &mut flags, &mut offsets, delim) {
                 bad += 1;
             }
         }
@@ -275,6 +280,7 @@ impl CsvChunker {
                 prefilter: pre,
                 pos: 0,
                 limit: None,
+                delim,
             },
         ))
     }
@@ -292,6 +298,7 @@ impl CsvChunker {
         end: u64,
         chunk_size: usize,
         prefilter: Vec<PreCmp>,
+        delim: u8,
     ) -> Result<CsvChunker, String> {
         let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
@@ -307,6 +314,7 @@ impl CsvChunker {
             prefilter,
             pos: start,
             limit: Some(end),
+            delim,
         })
     }
 
@@ -350,7 +358,7 @@ impl CsvChunker {
             if l.trim().is_empty() {
                 continue;
             }
-            if split_offsets(l, &mut offsets) {
+            if split_offsets(l, &mut offsets, self.delim) {
                 if offsets.len() != self.ncols {
                     continue;
                 }
@@ -367,7 +375,7 @@ impl CsvChunker {
             } else {
                 // Quoted records take the owned slow path and skip the prefilter
                 // (rare; FilterProject still filters them downstream).
-                let fields = split_record(l);
+                let fields = split_record(l, self.delim);
                 if fields.len() != self.ncols {
                     continue;
                 }
@@ -409,6 +417,7 @@ pub fn plan_parallel(
     prefilter: &[(String, CmpOp, f64)],
     header: bool,
     declared: Option<&[(String, Option<DataType>)]>,
+    delim: u8,
 ) -> Result<CsvParallelPlan, String> {
     let file_len = std::fs::metadata(path)
         .map_err(|e| format!("cannot stat '{path}': {e}"))?
@@ -417,7 +426,7 @@ pub fn plan_parallel(
     // Header → column names, kept indices, and the first data byte offset.
     let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
     let mut r = BufReader::with_capacity(READ_BUF, f);
-    let (names, data_start) = read_header(&mut r, header, declared)?;
+    let (names, data_start) = read_header(&mut r, header, declared, delim)?;
     let ncols = names.len();
     if ncols == 0 {
         return Err("CSV has no columns".to_string());
@@ -438,7 +447,7 @@ pub fn plan_parallel(
             .iter()
             .map(|&(a, b)| {
                 let kref = &kept;
-                s.spawn(move || infer_range(path, kref, ncols, a, b))
+                s.spawn(move || infer_range(path, kref, ncols, a, b, delim))
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -506,6 +515,7 @@ fn infer_range(
     ncols: usize,
     start: u64,
     end: u64,
+    delim: u8,
 ) -> (Vec<Flags>, usize) {
     let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
     let mut bad = 0usize;
@@ -531,7 +541,7 @@ fn infer_range(
         if l.trim().is_empty() {
             continue;
         }
-        if !observe_line(l, ncols, keep, &mut flags, &mut offsets) {
+        if !observe_line(l, ncols, keep, &mut flags, &mut offsets, delim) {
             bad += 1;
         }
     }
@@ -547,6 +557,7 @@ fn read_header(
     r: &mut BufReader<File>,
     header: bool,
     declared: Option<&[(String, Option<DataType>)]>,
+    delim: u8,
 ) -> Result<(Vec<String>, u64), String> {
     let mut first = String::new();
     let n = r.read_line(&mut first).map_err(|e| e.to_string())?;
@@ -562,9 +573,9 @@ fn read_header(
             Ok((names, 0)) // header-less: first line is data
         }
     } else if header {
-        Ok((split_owned(trim_eol(&first)), n as u64))
+        Ok((split_owned(trim_eol(&first), delim), n as u64))
     } else {
-        let ncols = split_owned(trim_eol(&first)).len();
+        let ncols = split_owned(trim_eol(&first), delim).len();
         let names = (0..ncols).map(|i| format!("c{i}")).collect();
         r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         Ok((names, 0))
@@ -607,13 +618,13 @@ pub struct CsvData {
 /// Columns not in `allow` are still split past (so record boundaries and arity
 /// checks are unaffected) but are never inferred, parsed, or allocated — the
 /// projection-pushdown fast path. `allow = None` keeps every column.
-pub fn parse_projected(text: &str, allow: Option<&[String]>) -> Result<CsvData, String> {
+pub fn parse_projected(text: &str, allow: Option<&[String]>, delim: u8) -> Result<CsvData, String> {
     let mut lines = text.lines();
     let header = match lines.next() {
         Some(h) => h,
         None => return Err("empty CSV".to_string()),
     };
-    let names: Vec<String> = split_owned(header);
+    let names: Vec<String> = split_owned(header, delim);
     let ncols = names.len();
     if ncols == 0 {
         return Err("CSV header has no columns".to_string());
@@ -633,8 +644,8 @@ pub fn parse_projected(text: &str, allow: Option<&[String]>) -> Result<CsvData, 
     // Both paths produce byte-identical results (row order is preserved); the
     // parallel path is exercised by the stress tests (20k–50k rows).
     let (dtypes, columns, bad_rows) = match choose_threads(body.len()) {
-        1 => parse_serial(body, ncols, &keep),
-        n => parse_parallel(body, ncols, &keep, n),
+        1 => parse_serial(body, ncols, &keep, delim),
+        n => parse_parallel(body, ncols, &keep, n, delim),
     };
 
     let mut fields = Vec::with_capacity(keep.len());
@@ -670,10 +681,15 @@ struct Inferred {
     bad: usize,
 }
 
-fn parse_serial(body: &str, ncols: usize, keep: &[usize]) -> (Vec<DataType>, Vec<Column>, usize) {
-    let inf = infer_slice(body, ncols, keep);
+fn parse_serial(
+    body: &str,
+    ncols: usize,
+    keep: &[usize],
+    delim: u8,
+) -> (Vec<DataType>, Vec<Column>, usize) {
+    let inf = infer_slice(body, ncols, keep, delim);
     let dtypes: Vec<DataType> = inf.flags.iter().map(Flags::resolve).collect();
-    let columns = build_slice(body, ncols, keep, &dtypes, inf.nrows);
+    let columns = build_slice(body, ncols, keep, &dtypes, inf.nrows, delim);
     (dtypes, columns, inf.bad)
 }
 
@@ -682,17 +698,18 @@ fn parse_parallel(
     ncols: usize,
     keep: &[usize],
     nthreads: usize,
+    delim: u8,
 ) -> (Vec<DataType>, Vec<Column>, usize) {
     let slices = split_lines(body, nthreads);
     if slices.len() <= 1 {
-        return parse_serial(body, ncols, keep);
+        return parse_serial(body, ncols, keep, delim);
     }
 
     // Phase 1: infer types per slice, in parallel.
     let infers: Vec<Inferred> = std::thread::scope(|s| {
         let handles: Vec<_> = slices
             .iter()
-            .map(|&sl| s.spawn(move || infer_slice(sl, ncols, keep)))
+            .map(|&sl| s.spawn(move || infer_slice(sl, ncols, keep, delim)))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -714,7 +731,9 @@ fn parse_parallel(
         let handles: Vec<_> = slices
             .iter()
             .zip(&infers)
-            .map(|(&sl, inf)| s.spawn(move || build_slice(sl, ncols, keep, dtypes, inf.nrows)))
+            .map(|(&sl, inf)| {
+                s.spawn(move || build_slice(sl, ncols, keep, dtypes, inf.nrows, delim))
+            })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -733,7 +752,7 @@ fn parse_parallel(
 }
 
 /// Infer column types (for kept columns) and count valid / bad rows in a slice.
-fn infer_slice(slice: &str, ncols: usize, keep: &[usize]) -> Inferred {
+fn infer_slice(slice: &str, ncols: usize, keep: &[usize], delim: u8) -> Inferred {
     let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
     let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
     let mut nrows = 0usize;
@@ -743,7 +762,7 @@ fn infer_slice(slice: &str, ncols: usize, keep: &[usize]) -> Inferred {
             continue;
         }
         scratch.clear();
-        split_into(line, &mut scratch);
+        split_into(line, &mut scratch, delim);
         if scratch.len() != ncols {
             bad += 1;
             continue;
@@ -763,6 +782,7 @@ fn build_slice(
     keep: &[usize],
     dtypes: &[DataType],
     cap: usize,
+    delim: u8,
 ) -> Vec<Column> {
     let mut builders: Vec<ColBuilder> = dtypes
         .iter()
@@ -774,7 +794,7 @@ fn build_slice(
             continue;
         }
         scratch.clear();
-        split_into(line, &mut scratch);
+        split_into(line, &mut scratch, delim);
         if scratch.len() != ncols {
             continue; // identical skip rule as inference
         }
@@ -943,7 +963,7 @@ impl ColBuilder {
 /// Split an unquoted record into field byte-ranges `(start, end)` into `out`
 /// (cleared first), allocating nothing — `out` is reused across rows. Returns
 /// `false` when the line contains a `"` (the caller takes the owned slow path).
-fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>) -> bool {
+fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
     out.clear();
     let bytes = line.as_bytes();
     if bytes.contains(&b'"') {
@@ -951,7 +971,7 @@ fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>) -> bool {
     }
     let mut start = 0usize;
     for (i, &b) in bytes.iter().enumerate() {
-        if b == b',' {
+        if b == delim {
             out.push((start, i));
             start = i + 1;
         }
@@ -969,8 +989,9 @@ fn observe_line(
     keep: &[usize],
     flags: &mut [Flags],
     offsets: &mut Vec<(usize, usize)>,
+    delim: u8,
 ) -> bool {
-    if split_offsets(line, offsets) {
+    if split_offsets(line, offsets, delim) {
         if offsets.len() != ncols {
             return false;
         }
@@ -979,7 +1000,7 @@ fn observe_line(
             flags[k].observe(&line[s..e]);
         }
     } else {
-        let fields = split_record(line);
+        let fields = split_record(line, delim);
         if fields.len() != ncols {
             return false;
         }
@@ -993,29 +1014,30 @@ fn observe_line(
 /// Split a record into fields. Fast path: records without `"` split into
 /// borrowed slices with zero allocation. Slow path: quote/escape-aware owned
 /// split. Results are appended to `out` (reused across rows).
-fn split_into<'a>(line: &'a str, out: &mut Vec<Cow<'a, str>>) {
+fn split_into<'a>(line: &'a str, out: &mut Vec<Cow<'a, str>>, delim: u8) {
     if !line.as_bytes().contains(&b'"') {
-        for f in line.split(',') {
+        for f in line.split(delim as char) {
             out.push(Cow::Borrowed(f));
         }
     } else {
-        for f in split_record(line) {
+        for f in split_record(line, delim) {
             out.push(Cow::Owned(f));
         }
     }
 }
 
 /// Owned split for the header (rare, runs once).
-fn split_owned(line: &str) -> Vec<String> {
+fn split_owned(line: &str, delim: u8) -> Vec<String> {
     if !line.as_bytes().contains(&b'"') {
-        line.split(',').map(|s| s.to_string()).collect()
+        line.split(delim as char).map(|s| s.to_string()).collect()
     } else {
-        split_record(line)
+        split_record(line, delim)
     }
 }
 
-/// Split a CSV record on commas, honoring `"..."` quoting with `""` escapes.
-fn split_record(line: &str) -> Vec<String> {
+/// Split a record on `delim`, honoring `"..."` quoting with `""` escapes.
+fn split_record(line: &str, delim: u8) -> Vec<String> {
+    let sep = delim as char;
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
@@ -1031,7 +1053,7 @@ fn split_record(line: &str) -> Vec<String> {
                 }
             }
             '"' => in_quotes = true,
-            ',' if !in_quotes => {
+            c if c == sep && !in_quotes => {
                 out.push(std::mem::take(&mut cur));
             }
             _ => cur.push(c),
@@ -1041,13 +1063,246 @@ fn split_record(line: &str) -> Vec<String> {
     out
 }
 
+// ----------------------------------------------------------- compressed input
+
+/// Streaming CSV reader for a **compressed** file (gzip `.gz` with feature
+/// `gzip`, zstd `.zst` with feature `zstd`).
+///
+/// A compressed stream can't be seeked, so the two-pass / byte-range readers
+/// don't apply. Instead this does a single forward pass with *sample inference*:
+/// it reads and buffers the first `chunk_size` data rows, infers the schema from
+/// them (exactly like `open_preview`), then yields the whole file — buffered
+/// sample first, then the rest decoded on the fly. Bounded memory (one chunk of
+/// buffered rows + the decode buffer), serial, no parallelism. Inference is over
+/// a sample, so on a column whose type only "widens" after the sample (e.g. an
+/// int column that turns float/text deep in the file) it can mis-type — the
+/// documented trade-off for not being able to re-read a compressed stream.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+pub struct CompressedCsvReader {
+    reader: Box<dyn BufRead + Send>,
+    ncols: usize,
+    keep: Vec<usize>,
+    dtypes: Vec<DataType>,
+    chunk_size: usize,
+    delim: u8,
+    /// Sample rows buffered during inference, emitted before streaming the rest.
+    pending: Vec<String>,
+    pending_pos: usize,
+    line: String,
+    eof: bool,
+    pub bad_rows: usize,
+}
+
+/// Wrap `path`'s file in the right streaming decoder for its extension. `.gz`
+/// needs feature `gzip`, `.zst`/`.zstd` need feature `zstd`; an unsupported
+/// (or feature-disabled) extension returns an actionable error.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+fn open_decoder(path: &str) -> Result<Box<dyn BufRead + Send>, String> {
+    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".gz") {
+        #[cfg(feature = "gzip")]
+        {
+            return Ok(Box::new(BufReader::with_capacity(
+                READ_BUF,
+                flate2::read::MultiGzDecoder::new(f),
+            )));
+        }
+        #[cfg(not(feature = "gzip"))]
+        return Err(format!(
+            "'{path}' is gzip-compressed; rebuild with `--features gzip`"
+        ));
+    }
+    if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+        #[cfg(feature = "zstd")]
+        {
+            let dec = ruzstd::decoding::StreamingDecoder::new(f)
+                .map_err(|e| format!("cannot read zstd '{path}': {e}"))?;
+            return Ok(Box::new(BufReader::with_capacity(READ_BUF, dec)));
+        }
+        #[cfg(not(feature = "zstd"))]
+        return Err(format!(
+            "'{path}' is zstd-compressed; rebuild with `--features zstd`"
+        ));
+    }
+    Err(format!("'{path}' has no supported compression extension"))
+}
+
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+impl CompressedCsvReader {
+    /// Open `path`, wrap it in the right decoder, read the CSV header + a sample
+    /// to infer the schema, and return the reader positioned to yield every row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        path: &str,
+        allow: Option<&[String]>,
+        chunk_size: usize,
+        header: bool,
+        declared: Option<&[(String, Option<DataType>)]>,
+        delim: u8,
+    ) -> Result<(Schema, CompressedCsvReader), String> {
+        let mut reader = open_decoder(path)?;
+
+        // Column names: a declared schema, else the header line, else c0,c1,….
+        // A header line is consumed when `header` even if `declared` overrides.
+        let mut first = String::new();
+        if reader.read_line(&mut first).map_err(|e| e.to_string())? == 0 {
+            return Err("empty compressed CSV".to_string());
+        }
+        let mut pending: Vec<String> = Vec::new();
+        let names: Vec<String> = if let Some(d) = declared {
+            if !header {
+                pending.push(trim_eol(&first).to_string()); // first line is data
+            }
+            d.iter().map(|(nm, _)| nm.clone()).collect()
+        } else if header {
+            split_owned(trim_eol(&first), delim)
+        } else {
+            let n = split_owned(trim_eol(&first), delim).len();
+            pending.push(trim_eol(&first).to_string());
+            (0..n).map(|i| format!("c{i}")).collect()
+        };
+        let ncols = names.len();
+        if ncols == 0 {
+            return Err("compressed CSV has no columns".to_string());
+        }
+        let keep: Vec<usize> = match allow {
+            None => (0..ncols).collect(),
+            Some(a) => (0..ncols)
+                .filter(|&i| a.iter().any(|n| n == &names[i]))
+                .collect(),
+        };
+
+        // Sample up to `chunk_size` data rows, buffering them and inferring types.
+        let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
+        let mut bad = 0usize;
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
+        while pending.len() < chunk_size.max(1) {
+            let mut l = String::new();
+            if reader.read_line(&mut l).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            let t = trim_eol(&l);
+            if t.trim().is_empty() {
+                continue;
+            }
+            if !observe_line(t, ncols, &keep, &mut flags, &mut offsets, delim) {
+                bad += 1;
+                continue;
+            }
+            pending.push(t.to_string());
+        }
+        let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        apply_declared_types(&mut dtypes, &keep, declared);
+
+        let mut fields = Vec::with_capacity(keep.len());
+        for (k, &ci) in keep.iter().enumerate() {
+            fields.push(Field::new(names[ci].clone(), dtypes[k]));
+        }
+        let schema = Schema::new(fields);
+
+        Ok((
+            schema,
+            CompressedCsvReader {
+                reader,
+                ncols,
+                keep,
+                dtypes,
+                chunk_size: chunk_size.max(1),
+                delim,
+                pending,
+                pending_pos: 0,
+                line: String::new(),
+                eof: false,
+                bad_rows: bad,
+            },
+        ))
+    }
+
+    /// Push one record's kept cells into the per-column builders, honoring the
+    /// quoted slow path. Returns `false` for a wrong-arity record (skipped).
+    fn push_record(&self, builders: &mut [ColBuilder], line: &str) -> bool {
+        let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(self.ncols);
+        if split_offsets(line, &mut offsets, self.delim) {
+            if offsets.len() != self.ncols {
+                return false;
+            }
+            for (k, &ci) in self.keep.iter().enumerate() {
+                let (s, e) = offsets[ci];
+                builders[k].push(&line[s..e]);
+            }
+        } else {
+            let fields = split_record(line, self.delim);
+            if fields.len() != self.ncols {
+                return false;
+            }
+            for (k, &ci) in self.keep.iter().enumerate() {
+                builders[k].push(&fields[ci]);
+            }
+        }
+        true
+    }
+
+    /// Yield the next chunk of up to `chunk_size` typed rows, or `None` at EOF.
+    pub fn next_columns(&mut self) -> Option<Vec<Column>> {
+        if self.eof && self.pending_pos >= self.pending.len() {
+            return None;
+        }
+        let mut builders: Vec<ColBuilder> = self
+            .dtypes
+            .iter()
+            .map(|d| ColBuilder::with_capacity(*d, self.chunk_size))
+            .collect();
+        let mut got = 0usize;
+
+        // Drain the buffered sample rows first (already arity-checked).
+        while got < self.chunk_size && self.pending_pos < self.pending.len() {
+            let idx = self.pending_pos;
+            self.pending_pos += 1;
+            // Borrow-safe: clone the small line out before the &mut builders call.
+            let line = std::mem::take(&mut self.pending[idx]);
+            if self.push_record(&mut builders, &line) {
+                got += 1;
+            }
+        }
+        // Then stream the rest of the file.
+        while got < self.chunk_size && !self.eof {
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.eof = true;
+                    break;
+                }
+            }
+            let t = trim_eol(&self.line).to_string();
+            if t.trim().is_empty() {
+                continue;
+            }
+            if self.push_record(&mut builders, &t) {
+                got += 1;
+            } else {
+                self.bad_rows += 1;
+            }
+        }
+        if got == 0 {
+            return None;
+        }
+        Some(builders.iter_mut().map(ColBuilder::finish).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn infers_and_parses_types() {
-        let data = parse_projected("a,b,c,d\n1,1.5,true,x\n2,2.0,false,y\n", None).unwrap();
+        let data = parse_projected("a,b,c,d\n1,1.5,true,x\n2,2.0,false,y\n", None, b',').unwrap();
         assert_eq!(data.schema.fields[0].dtype, DataType::I64);
         assert_eq!(data.schema.fields[1].dtype, DataType::F64);
         assert_eq!(data.schema.fields[2].dtype, DataType::Bool);
@@ -1061,7 +1316,7 @@ mod tests {
 
     #[test]
     fn skips_malformed_rows() {
-        let data = parse_projected("a,b\n1,2\nonly_one_field\n3,4\n", None).unwrap();
+        let data = parse_projected("a,b\n1,2\nonly_one_field\n3,4\n", None, b',').unwrap();
         assert_eq!(data.bad_rows, 1);
         match &data.columns[0] {
             Column::I64(v) => assert_eq!(v, &[1, 3]),
@@ -1071,7 +1326,8 @@ mod tests {
 
     #[test]
     fn handles_quoted_fields_with_commas() {
-        let data = parse_projected("name,note\n\"a,b\",\"he said \"\"hi\"\"\"\n", None).unwrap();
+        let data =
+            parse_projected("name,note\n\"a,b\",\"he said \"\"hi\"\"\"\n", None, b',').unwrap();
         match &data.columns[0] {
             Column::Str(v) => assert_eq!(v.get(0), "a,b"),
             _ => panic!("expected str"),
@@ -1084,7 +1340,7 @@ mod tests {
 
     #[test]
     fn mixed_column_falls_back_to_str() {
-        let data = parse_projected("v\n1\n2\nN/A\n", None).unwrap();
+        let data = parse_projected("v\n1\n2\nN/A\n", None, b',').unwrap();
         assert_eq!(data.schema.fields[0].dtype, DataType::Str);
     }
 }

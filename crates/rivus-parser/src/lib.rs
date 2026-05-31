@@ -27,8 +27,8 @@ mod lexer;
 use lexer::{Lexer, Tok};
 use rivus_core::{DataType, Mode, RivusError, Severity, Value};
 use rivus_ir::{
-    Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, Hook, HookAction, HookEvent,
-    NodeId, Op, PlanGraph,
+    Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, FillMethod, Func, Hook,
+    HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -94,6 +94,17 @@ impl Parser {
         match self.bump() {
             Tok::Word(w) => Ok(w),
             other => Err(self.err(format!("expected identifier, found {other:?}"))),
+        }
+    }
+
+    /// Read a source/sink path token. Like [`word`], but also accepts a bare
+    /// `-` (which the lexer tokenizes as `Minus`) as the stdin/stdout sentinel,
+    /// so `open -` / `save -` work like `open stdin` / `save stdout`.
+    fn path_word(&mut self) -> Result<String, RivusError> {
+        match self.bump() {
+            Tok::Word(w) => Ok(w),
+            Tok::Minus => Ok("-".to_string()),
+            other => Err(self.err(format!("expected a path, found {other:?}"))),
         }
     }
 
@@ -182,9 +193,26 @@ impl Parser {
                 }
                 Tok::PipeGroup => {
                     self.bump();
-                    let key = self.word()?;
-                    // Optional aggregates: `sum:col avg:col ...` (a func word
-                    // followed by `:`); anything else ends the group clause.
+                    // One or more group keys, then optional aggregates. A word is
+                    // an aggregate (not a key) when it's a known func immediately
+                    // followed by `:` (e.g. `sum:score`); every other leading
+                    // word is a key. At least one key is required.
+                    let is_agg = |p: &Self| {
+                        matches!(p.tok(), Tok::Word(w)
+                            if AggFunc::parse(w).is_some()
+                                && p.toks[p.pos + 1].0 == Tok::Colon)
+                    };
+                    let mut keys = Vec::new();
+                    while let Tok::Word(_) = self.tok() {
+                        if is_agg(self) {
+                            break;
+                        }
+                        keys.push(self.word()?);
+                    }
+                    if keys.is_empty() {
+                        return Err(self.err("group `|#` requires at least one key"));
+                    }
+                    // Aggregates: `func:col` repeated.
                     let mut aggs = Vec::new();
                     while let Tok::Word(w) = self.tok().clone() {
                         match AggFunc::parse(&w) {
@@ -197,7 +225,7 @@ impl Parser {
                             _ => break,
                         }
                     }
-                    let n = self.g.add_node(Op::GroupBy { key, aggs });
+                    let n = self.g.add_node(Op::GroupBy { keys, aggs });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -228,24 +256,28 @@ impl Parser {
                 // sink mirrors the source format set (write what you can read).
                 Tok::Word(w) if w == "save" => {
                     self.bump();
-                    let path = norm_path(self.word()?);
+                    let path = norm_path(self.path_word()?);
                     let explicit = if self.peek_is_word("as") {
                         self.bump();
                         Some(self.word()?)
                     } else {
                         None
                     };
+                    let delim = resolve_delim(&path, explicit.as_deref());
                     let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                         self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                     })?;
-                    let n = self.g.add_node(fmt.into_sink_op(path));
+                    let n = self.g.add_node(fmt.into_sink_op(path, delim));
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
                 Tok::Word(w) if w == "writecsv" => {
                     self.bump();
                     let path = self.word()?;
-                    let n = self.g.add_node(Op::SinkCsv { path });
+                    let n = self.g.add_node(Op::SinkCsv {
+                        delim: rivus_ir::delim_for_path(&path),
+                        path,
+                    });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -273,20 +305,32 @@ impl Parser {
                     self.g.add_edge(current, node, EdgeKind::Stream);
                     current = node;
                 }
-                // `sort KEY [asc|desc]` — order the whole stream by one column.
+                // `sort KEY [asc|desc] [KEY [asc|desc] ...]` — order by one or
+                // more keys, each with its own direction (default ascending).
                 Tok::Word(w) if w == "sort" => {
                     self.bump();
-                    let key = self.word()?;
-                    let desc = if self.peek_is_word("desc") {
-                        self.bump();
-                        true
-                    } else if self.peek_is_word("asc") {
-                        self.bump();
-                        false
-                    } else {
-                        false
-                    };
-                    let n = self.g.add_node(Op::Sort { key, desc });
+                    let mut keys = Vec::new();
+                    while let Tok::Word(k) = self.tok().clone() {
+                        if is_keyword(&k) {
+                            break;
+                        }
+                        self.bump(); // key
+                                     // `asc`/`desc` apply to the key just read; absence = asc.
+                        let desc = if self.peek_is_word("desc") {
+                            self.bump();
+                            true
+                        } else if self.peek_is_word("asc") {
+                            self.bump();
+                            false
+                        } else {
+                            false
+                        };
+                        keys.push((k, desc));
+                    }
+                    if keys.is_empty() {
+                        return Err(self.err("sort expects at least one key"));
+                    }
+                    let n = self.g.add_node(Op::Sort { keys });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -310,6 +354,120 @@ impl Parser {
                 Tok::Word(w) if w == "describe" => {
                     self.bump();
                     let n = self.g.add_node(Op::Describe);
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `dropna [col ...]` — drop rows with empty values.
+                Tok::Word(w) if w == "dropna" => {
+                    self.bump();
+                    let mut cols = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump();
+                        cols.push(name);
+                    }
+                    let n = self.g.add_node(Op::DropNa { cols });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `fill col VALUE|ffill|bfill` — fill empty cells of a text
+                // column with a constant, or carry the last/next value over.
+                Tok::Word(w) if w == "fill" => {
+                    self.bump();
+                    let col = self.word()?;
+                    let method = match self.bump() {
+                        Tok::Word(s) if s == "ffill" => FillMethod::Ffill,
+                        Tok::Word(s) if s == "bfill" => FillMethod::Bfill,
+                        Tok::Word(s) if s == "mean" => FillMethod::Mean,
+                        Tok::Word(s) if s == "median" => FillMethod::Median,
+                        Tok::Str(s) => FillMethod::Value(s),
+                        Tok::Word(s) => FillMethod::Value(s),
+                        Tok::Int(n) => FillMethod::Value(n.to_string()),
+                        Tok::Float(f) => FillMethod::Value(f.to_string()),
+                        other => {
+                            return Err(self.err(format!("fill expects a value, found {other:?}")))
+                        }
+                    };
+                    let n = self.g.add_node(Op::Fill { col, method });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `drop COL [COL ...]` — remove the named columns.
+                Tok::Word(w) if w == "drop" => {
+                    self.bump();
+                    let mut cols = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump();
+                        cols.push(name);
+                    }
+                    if cols.is_empty() {
+                        return Err(self.err("drop expects at least one column name"));
+                    }
+                    let n = self.g.add_node(Op::Drop { cols });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `cast COL:type [COL:type ...]` — re-type named columns in place.
+                Tok::Word(w) if w == "cast" => {
+                    self.bump();
+                    let mut casts = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump(); // column name
+                        self.expect(&Tok::Colon)?;
+                        let tyword = self.word()?;
+                        let ty = decl_type(&tyword)
+                            .ok_or_else(|| self.err(format!("cast: unknown type '{tyword}'")))?;
+                        casts.push((name, ty));
+                    }
+                    if casts.is_empty() {
+                        return Err(self.err("cast expects at least one COL:type"));
+                    }
+                    let n = self.g.add_node(Op::Cast { casts });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `reorder COL [COL ...]` — move named columns to the front.
+                Tok::Word(w) if w == "reorder" => {
+                    self.bump();
+                    let mut cols = Vec::new();
+                    while let Tok::Word(name) = self.tok().clone() {
+                        if is_keyword(&name) {
+                            break;
+                        }
+                        self.bump();
+                        cols.push(name);
+                    }
+                    if cols.is_empty() {
+                        return Err(self.err("reorder expects at least one column name"));
+                    }
+                    let n = self.g.add_node(Op::Reorder { cols });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `rename OLD NEW [OLD NEW ...]` — rename columns in place.
+                Tok::Word(w) if w == "rename" => {
+                    self.bump();
+                    let mut pairs = Vec::new();
+                    while let Tok::Word(from) = self.tok().clone() {
+                        if is_keyword(&from) {
+                            break;
+                        }
+                        self.bump();
+                        let to = self.word()?;
+                        pairs.push((from, to));
+                    }
+                    if pairs.is_empty() {
+                        return Err(self.err("rename expects `OLD NEW` column pairs"));
+                    }
+                    let n = self.g.add_node(Op::Rename { pairs });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -365,7 +523,7 @@ impl Parser {
             // equivalent explicit aliases (lower cognitive load, fewer surprises).
             Tok::Word(w) if w == "open" => {
                 self.bump();
-                let path = norm_path(self.word()?);
+                let path = norm_path(self.path_word()?);
                 let explicit = if self.peek_is_word("as") {
                     self.bump();
                     Some(self.word()?)
@@ -383,10 +541,11 @@ impl Parser {
                 } else {
                     None
                 };
+                let delim = resolve_delim(&path, explicit.as_deref());
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                 })?;
-                let mut op = fmt.into_op(path);
+                let mut op = fmt.into_op(path, delim);
                 if let Op::OpenCsv {
                     header, declared, ..
                 } = &mut op
@@ -400,8 +559,9 @@ impl Parser {
             }
             Tok::Word(w) if w == "readcsv" => {
                 self.bump();
-                let path = norm_path(self.word()?);
+                let path = norm_path(self.path_word()?);
                 Ok(self.g.add_node(Op::OpenCsv {
+                    delim: rivus_ir::delim_for_path(&path),
                     path,
                     projection: None,
                     prefilter: Vec::new(),
@@ -411,7 +571,7 @@ impl Parser {
             }
             Tok::Word(w) if w == "readjson" => {
                 self.bump();
-                let path = norm_path(self.word()?);
+                let path = norm_path(self.path_word()?);
                 Ok(self.g.add_node(Op::OpenJsonl { path }))
             }
             Tok::Word(w) if w == "stream" => {
@@ -485,26 +645,54 @@ impl Parser {
                     }
                     Ok(merge)
                 } else if self.eat(&Tok::Amp) {
+                    // `&` is an inner join; `&left`/`&right`/`&full` are outer
+                    // joins (the qualifier lexes as a bare word right after `&`).
+                    let kind = if self.peek_is_word("left") {
+                        self.bump();
+                        JoinKind::Left
+                    } else if self.peek_is_word("right") {
+                        self.bump();
+                        JoinKind::Right
+                    } else if self.peek_is_word("full") {
+                        self.bump();
+                        JoinKind::Full
+                    } else {
+                        JoinKind::Inner
+                    };
                     let rhs = self.word()?;
                     let rid = *self
                         .g
                         .labels
                         .get(&rhs)
                         .ok_or_else(|| self.err(format!("unknown flow '{rhs}'")))?;
-                    // `on key` (same name both sides) or `on lkey:rkey`.
+                    // `on k [k ...]` — each key is `lkey` (same name both sides)
+                    // or `lkey:rkey`. One or more pairs form a composite key.
                     if !self.peek_is_word("on") {
                         return Err(self.err("join `A & B` requires `on <key>` (or `on lk:rk`)"));
                     }
                     self.bump(); // `on`
-                    let left_key = self.word()?;
-                    let right_key = if self.eat(&Tok::Colon) {
-                        self.word()?
-                    } else {
-                        left_key.clone()
-                    };
+                    let mut left_keys = Vec::new();
+                    let mut right_keys = Vec::new();
+                    while let Tok::Word(w) = self.tok().clone() {
+                        if is_keyword(&w) {
+                            break;
+                        }
+                        let lk = self.word()?;
+                        let rk = if self.eat(&Tok::Colon) {
+                            self.word()?
+                        } else {
+                            lk.clone()
+                        };
+                        left_keys.push(lk);
+                        right_keys.push(rk);
+                    }
+                    if left_keys.is_empty() {
+                        return Err(self.err("join `on` requires at least one key"));
+                    }
                     let join = self.g.add_node(Op::Join {
-                        left_key,
-                        right_key,
+                        left_keys,
+                        right_keys,
+                        kind,
                     });
                     self.g.add_edge(first, join, EdgeKind::Stream);
                     self.g.add_edge(rid, join, EdgeKind::Stream);
@@ -806,6 +994,29 @@ impl Parser {
                     access: Access::Dynamic,
                 })
             }
+            // Scalar function call `func(args…)` — e.g. `upper(name)`,
+            // `substr(name, 0, 3)`, `contains(city, "NY")`.
+            Tok::Word(ref w)
+                if Func::parse(w).is_some() && self.toks[self.pos + 1].0 == Tok::LParen =>
+            {
+                let func = Func::parse(w).unwrap();
+                self.bump(); // func name
+                self.expect(&Tok::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&Tok::RParen) {
+                    args.push(self.parse_expr()?);
+                    while self.eat(&Tok::Comma) {
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                Ok(Expr::Func { func, args })
+            }
+            // `case when COND then VAL [when …] [else VAL] end` conditional.
+            Tok::Word(ref w) if w == "case" => {
+                self.bump(); // case
+                self.parse_case()
+            }
             // Bare field of the current object: `age`.
             Tok::Word(name) => {
                 self.bump();
@@ -816,6 +1027,37 @@ impl Parser {
             }
             other => Err(self.err(format!("unexpected token in expression: {other:?}"))),
         }
+    }
+
+    /// Parse the tail of `case when COND then VAL [when COND then VAL ...]
+    /// [else VAL] end` (the `case` keyword is already consumed). At least one
+    /// `when` branch is required; `else` is optional (defaults to "" at eval).
+    fn parse_case(&mut self) -> Result<Expr, RivusError> {
+        let mut branches = Vec::new();
+        while self.peek_is_word("when") {
+            self.bump(); // when
+            let cond = self.parse_expr()?;
+            if !self.peek_is_word("then") {
+                return Err(self.err("case: expected `then` after a `when` condition"));
+            }
+            self.bump(); // then
+            let val = self.parse_expr()?;
+            branches.push((cond, val));
+        }
+        if branches.is_empty() {
+            return Err(self.err("case: expected at least one `when … then …` branch"));
+        }
+        let default = if self.peek_is_word("else") {
+            self.bump();
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        if !self.peek_is_word("end") {
+            return Err(self.err("case: expected `end` to close the expression"));
+        }
+        self.bump(); // end
+        Ok(Expr::Case { branches, default })
     }
 
     /// After consuming `$_` / `$_:N`, read the field accessor tail.
@@ -866,7 +1108,7 @@ enum Format {
 }
 
 impl Format {
-    fn into_op(self, path: String) -> Op {
+    fn into_op(self, path: String, delim: u8) -> Op {
         match self {
             Format::Csv => Op::OpenCsv {
                 path,
@@ -874,16 +1116,28 @@ impl Format {
                 prefilter: Vec::new(),
                 header: true,
                 declared: None,
+                delim,
             },
             Format::Jsonl => Op::OpenJsonl { path },
         }
     }
 
-    fn into_sink_op(self, path: String) -> Op {
+    fn into_sink_op(self, path: String, delim: u8) -> Op {
         match self {
-            Format::Csv => Op::SinkCsv { path },
+            Format::Csv => Op::SinkCsv { path, delim },
             Format::Jsonl => Op::SinkJsonl { path },
         }
+    }
+}
+
+/// Resolve the field delimiter for `open`/`save`: an explicit `as csv|tsv` wins
+/// (`tsv` → tab, `csv` → comma); otherwise it follows the path extension
+/// (`.tsv`/`.tab` → tab, else comma). JSON formats ignore this.
+fn resolve_delim(path: &str, explicit: Option<&str>) -> u8 {
+    match explicit.map(|f| f.to_ascii_lowercase()).as_deref() {
+        Some("tsv") => b'\t',
+        Some("csv") => rivus_ir::COMMA,
+        _ => rivus_ir::delim_for_path(path),
     }
 }
 
@@ -926,6 +1180,12 @@ fn is_keyword(w: &str) -> bool {
             | "sort"
             | "distinct"
             | "describe"
+            | "dropna"
+            | "fill"
+            | "drop"
+            | "cast"
+            | "reorder"
+            | "rename"
             | "where"
             | "on"
             | "map"
@@ -1028,6 +1288,31 @@ mod tests {
     }
 
     #[test]
+    fn scalar_funcs_parse_and_round_trip() {
+        use rivus_ir::Func;
+        // Each name maps to its Func variant.
+        for (name, want) in [
+            ("replace", Func::Replace),
+            ("split_part", Func::SplitPart),
+            ("concat", Func::Concat),
+            ("abs", Func::Abs),
+            ("round", Func::Round),
+            ("floor", Func::Floor),
+            ("ceil", Func::Ceil),
+            ("coalesce", Func::Coalesce),
+        ] {
+            assert_eq!(Func::parse(name), Some(want), "parse {name}");
+        }
+        // String + numeric + coalesce funcs survive source -> IR -> source.
+        let src = "F:\n open a.csv\n |> (abs(v)) as a (round(v)) as r (floor(v)) as fl (ceil(v)) as c (coalesce(name, \"NA\")) as nm (replace(p, \"/\", \"-\")) as rp\n;";
+        let s = parse(src).unwrap().to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        for needle in ["abs(", "round(", "floor(", "ceil(", "coalesce(", "replace("] {
+            assert!(s.contains(needle), "missing {needle} in {s}");
+        }
+    }
+
+    #[test]
     fn stdio_paths_normalize() {
         // `stdin`/`stdout` (and `-`) map to the "-" sentinel for source & sink.
         let g = parse("F:\n open stdin\n save stdout\n;").unwrap();
@@ -1039,7 +1324,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::SinkCsv { path } => Some(path.clone()),
+                Op::SinkCsv { path, .. } => Some(path.clone()),
                 _ => None,
             })
             .unwrap();
@@ -1049,6 +1334,28 @@ mod tests {
             &parse("F:\n open stdin as json\n;").unwrap().nodes[0].op,
             Op::OpenJsonl { path } if path == "-"
         ));
+    }
+
+    #[test]
+    fn bare_dash_is_stdio_sentinel() {
+        // `open -` / `save -` lex the lone dash as the stdin/stdout sentinel
+        // (distinct from `->` branch and expression `-`), mapping to "-".
+        let g = parse("F:\n open -\n |> name\n save -\n;").unwrap();
+        match &g.nodes[0].op {
+            Op::OpenCsv { path, .. } => assert_eq!(path, "-"),
+            o => panic!("expected OpenCsv, got {o:?}"),
+        }
+        let sink = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::SinkCsv { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(sink, "-");
+        // `->` branch must still tokenize as a branch, not a dash word.
+        assert!(parse("F:\n open a.csv\n -> Kids:\n |? age < 18\n ;\n;").is_ok());
     }
 
     #[test]
@@ -1159,5 +1466,373 @@ Import:
         let g = parse(src).unwrap();
         let n = g.labels["Import"];
         assert!(!g.nodes[n].hooks.is_empty());
+    }
+
+    #[test]
+    fn tsv_extension_sets_tab_delim() {
+        // `.tsv`/`.tab` open as tab-delimited without an explicit `as tsv`.
+        assert!(matches!(
+            first_op("F:\n open d.tsv\n;"),
+            Op::OpenCsv { delim: b'\t', .. }
+        ));
+        assert!(matches!(
+            first_op("F:\n open d.tab\n;"),
+            Op::OpenCsv { delim: b'\t', .. }
+        ));
+        // A plain `.csv` stays comma.
+        assert!(matches!(
+            first_op("F:\n open d.csv\n;"),
+            Op::OpenCsv { delim: b',', .. }
+        ));
+    }
+
+    #[test]
+    fn as_tsv_overrides_extension() {
+        // `as tsv` forces a tab on any path; `as csv` forces a comma back.
+        assert!(matches!(
+            first_op("F:\n open d.txt as tsv\n;"),
+            Op::OpenCsv { delim: b'\t', .. }
+        ));
+        assert!(matches!(
+            first_op("F:\n open d.tsv as csv\n;"),
+            Op::OpenCsv { delim: b',', .. }
+        ));
+    }
+
+    #[test]
+    fn tsv_sink_delim_from_extension_and_override() {
+        // Sinks pick up the delimiter the same way sources do.
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.tsv\n;", 1),
+            Op::SinkCsv { delim: b'\t', .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.csv as tsv\n;", 1),
+            Op::SinkCsv { delim: b'\t', .. }
+        ));
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save o.csv\n;", 1),
+            Op::SinkCsv { delim: b',', .. }
+        ));
+    }
+
+    #[test]
+    fn tsv_round_trips_cleanly() {
+        // A `.tsv` source/sink needs no modifier (extension implies tab), so the
+        // regenerated source is clean and re-parses identically.
+        let g = parse("F:\n open a.tsv\n |> name age\n save out.tsv\n;").unwrap();
+        let src = g.to_source();
+        assert!(src.contains("open a.tsv"), "got: {src}");
+        assert!(src.contains("save out.tsv"), "got: {src}");
+        assert!(!src.contains("as tsv"), "redundant modifier in: {src}");
+        assert_eq!(src, parse(&src).unwrap().to_source());
+    }
+
+    #[test]
+    fn explicit_tsv_modifier_round_trips() {
+        // When the delimiter disagrees with the extension, `as tsv`/`as csv` is
+        // emitted so the round-trip stays faithful.
+        let g = parse("F:\n open a.txt as tsv\n save out.dat as tsv\n;").unwrap();
+        let src = g.to_source();
+        assert!(src.contains("open a.txt as tsv"), "got: {src}");
+        assert!(src.contains("save out.dat as tsv"), "got: {src}");
+        assert_eq!(src, parse(&src).unwrap().to_source());
+    }
+
+    #[test]
+    fn group_parses_extended_aggregates() {
+        // std / count_distinct / nunique / first / last all parse into GroupBy.
+        use rivus_ir::AggFunc;
+        let op = nth_op(
+            "G:\n open a.csv\n |# team std:score count_distinct:p nunique:p first:p last:p\n;",
+            1,
+        );
+        let Op::GroupBy { aggs, .. } = op else {
+            panic!("expected GroupBy, got {op:?}");
+        };
+        let funcs: Vec<AggFunc> = aggs.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            funcs,
+            vec![
+                AggFunc::Std,
+                AggFunc::CountDistinct,
+                AggFunc::CountDistinct, // nunique is an alias
+                AggFunc::First,
+                AggFunc::Last,
+            ]
+        );
+    }
+
+    #[test]
+    fn group_parses_percentiles_and_round_trips() {
+        // `median` is p50; `pNN` parses to Pct(NN); out-of-range / bad names fail.
+        use rivus_ir::AggFunc;
+        let op = nth_op("G:\n open a.csv\n |# t median:s p90:s p99:s\n;", 1);
+        let Op::GroupBy { aggs, .. } = op else {
+            panic!("expected GroupBy, got {op:?}");
+        };
+        let funcs: Vec<AggFunc> = aggs.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            funcs,
+            vec![AggFunc::Pct(50), AggFunc::Pct(90), AggFunc::Pct(99)]
+        );
+        // Reversible: median stays `median`, others render `pNN`.
+        let g = parse("G:\n open a.csv\n |# t median:s p90:s\n;").unwrap();
+        let s = g.to_source();
+        assert!(s.contains("median:s"), "got: {s}");
+        assert!(s.contains("p90:s"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+        // `p101` is out of range → not an aggregate; the leftover `p101:s`
+        // tokens are then invalid flow, so the whole program fails to parse.
+        assert!(parse("G:\n open a.csv\n |# t p101:s\n;").is_err());
+    }
+
+    #[test]
+    fn rename_and_drop_parse_and_round_trip() {
+        // `rename OLD NEW ...` lowers to Op::Rename with ordered pairs.
+        match nth_op("F:\n open a.csv\n rename age years city loc\n;", 1) {
+            Op::Rename { pairs } => assert_eq!(
+                pairs,
+                vec![
+                    ("age".to_string(), "years".to_string()),
+                    ("city".to_string(), "loc".to_string()),
+                ]
+            ),
+            o => panic!("expected Rename, got {o:?}"),
+        }
+        // `drop COL ...` lowers to Op::Drop.
+        match nth_op("F:\n open a.csv\n drop city zip\n;", 1) {
+            Op::Drop { cols } => assert_eq!(cols, vec!["city".to_string(), "zip".to_string()]),
+            o => panic!("expected Drop, got {o:?}"),
+        }
+        // Reversible: source -> IR -> source re-parses identically.
+        let g = parse("F:\n open a.csv\n rename age years\n drop city\n;").unwrap();
+        let s = g.to_source();
+        assert!(s.contains("rename age years"), "got: {s}");
+        assert!(s.contains("drop city"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+    }
+
+    #[test]
+    fn reorder_parses_and_round_trips() {
+        match nth_op("F:\n open a.csv\n reorder city age\n;", 1) {
+            Op::Reorder { cols } => {
+                assert_eq!(cols, vec!["city".to_string(), "age".to_string()])
+            }
+            o => panic!("expected Reorder, got {o:?}"),
+        }
+        let s = parse("F:\n open a.csv\n reorder city age\n;")
+            .unwrap()
+            .to_source();
+        assert!(s.contains("reorder city age"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+        // Empty operand list is rejected.
+        assert!(parse("F:\n open a.csv\n reorder\n;").is_err());
+    }
+
+    #[test]
+    fn cast_verb_parses_and_round_trips() {
+        match nth_op("F:\n open a.csv\n cast age:int price:f64\n;", 1) {
+            Op::Cast { casts } => assert_eq!(
+                casts,
+                vec![
+                    ("age".to_string(), DataType::I64),
+                    ("price".to_string(), DataType::F64),
+                ]
+            ),
+            o => panic!("expected Cast, got {o:?}"),
+        }
+        // Reversible (types render canonically: int -> i64).
+        let s = parse("F:\n open a.csv\n cast age:int price:f64\n;")
+            .unwrap()
+            .to_source();
+        assert!(s.contains("cast age:i64 price:f64"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+        // Errors: empty list, missing type, unknown type.
+        assert!(parse("F:\n open a.csv\n cast\n;").is_err());
+        assert!(parse("F:\n open a.csv\n cast age\n;").is_err());
+        assert!(parse("F:\n open a.csv\n cast age:wat\n;").is_err());
+    }
+
+    #[test]
+    fn join_kinds_parse_and_round_trip() {
+        // `&` is inner, `&left` is a left outer join; `on lk:rk` sets distinct keys.
+        let g = parse("U: open u.csv ;\nO: open o.csv ;\nJ: U & O on id ;").unwrap();
+        let inner = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::Join { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .expect("a join node");
+        assert_eq!(inner, JoinKind::Inner);
+
+        let g = parse("U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on uid:oid ;").unwrap();
+        match g.nodes.iter().find_map(|n| match &n.op {
+            Op::Join {
+                kind,
+                left_keys,
+                right_keys,
+            } => Some((*kind, left_keys.clone(), right_keys.clone())),
+            _ => None,
+        }) {
+            Some((kind, lk, rk)) => {
+                assert_eq!(kind, JoinKind::Left);
+                assert_eq!(lk, vec!["uid".to_string()]);
+                assert_eq!(rk, vec!["oid".to_string()]);
+            }
+            None => panic!("expected a join node"),
+        }
+
+        // Multi-key: `on a b` joins on the (a, b) tuple, same name both sides.
+        let g = parse("U: open u.csv ;\nO: open o.csv ;\nJ: U & O on country region ;").unwrap();
+        let (lk, rk) = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::Join {
+                    left_keys,
+                    right_keys,
+                    ..
+                } => Some((left_keys.clone(), right_keys.clone())),
+                _ => None,
+            })
+            .expect("a join node");
+        assert_eq!(lk, vec!["country".to_string(), "region".to_string()]);
+        assert_eq!(rk, vec!["country".to_string(), "region".to_string()]);
+
+        // right/full lower to their kinds.
+        match parse("U: open u.csv ;\nO: open o.csv ;\nJ: U &right O on id ;")
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::Join { kind, .. } => Some(*kind),
+                _ => None,
+            }) {
+            Some(k) => assert_eq!(k, JoinKind::Right),
+            None => panic!("expected join"),
+        }
+
+        // Reversible: every join kind (and a distinct-key join) survives a
+        // source -> IR -> source round-trip.
+        for prog in [
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U & O on id ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on id ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &right O on id ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &full O on id ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on uid:oid ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U & O on country region ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &full O on a x:y ;",
+        ] {
+            let s = parse(prog).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "round-trip: {s}");
+        }
+    }
+
+    #[test]
+    fn fill_methods_parse_and_round_trip() {
+        use rivus_ir::FillMethod;
+        // `fill col ffill` / `bfill` lower to the directional methods.
+        match nth_op("F:\n open a.csv\n fill tag ffill\n;", 1) {
+            Op::Fill { col, method } => {
+                assert_eq!(col, "tag");
+                assert_eq!(method, FillMethod::Ffill);
+            }
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        match nth_op("F:\n open a.csv\n fill tag bfill\n;", 1) {
+            Op::Fill { method, .. } => assert_eq!(method, FillMethod::Bfill),
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        // A constant value still lowers to FillMethod::Value.
+        match nth_op("F:\n open a.csv\n fill tag \"NA\"\n;", 1) {
+            Op::Fill { method, .. } => assert_eq!(method, FillMethod::Value("NA".to_string())),
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        // mean/median lower to the statistical methods.
+        match nth_op("F:\n open a.csv\n fill score mean\n;", 1) {
+            Op::Fill { method, .. } => assert_eq!(method, FillMethod::Mean),
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        match nth_op("F:\n open a.csv\n fill score median\n;", 1) {
+            Op::Fill { method, .. } => assert_eq!(method, FillMethod::Median),
+            o => panic!("expected Fill, got {o:?}"),
+        }
+        // Reversible: every method survives source -> IR -> source.
+        for prog in [
+            "F:\n open a.csv\n fill tag ffill\n;",
+            "F:\n open a.csv\n fill tag bfill\n;",
+            "F:\n open a.csv\n fill score mean\n;",
+            "F:\n open a.csv\n fill score median\n;",
+            "F:\n open a.csv\n fill tag \"NA\"\n;",
+        ] {
+            let s = parse(prog).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "round-trip: {s}");
+        }
+    }
+
+    #[test]
+    fn rename_and_drop_reject_empty() {
+        // Both verbs require at least one operand.
+        assert!(parse("F:\n open a.csv\n rename\n;").is_err());
+        assert!(parse("F:\n open a.csv\n drop\n;").is_err());
+    }
+
+    #[test]
+    fn case_when_parses_and_round_trips() {
+        // `case when … then … [else …] end` lowers to Expr::Case and survives a
+        // source -> IR -> source round-trip (re-parses identically).
+        let src = "F:\n open a.csv\n |> (case when age >= 60 then \"senior\" else \"other\" end) as bucket\n;";
+        let g = parse(src).unwrap();
+        match &g.nodes[1].op {
+            Op::ProjectExpr { items } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].1, "bucket");
+                match &items[0].0 {
+                    Expr::Case { branches, default } => {
+                        assert_eq!(branches.len(), 1);
+                        assert!(default.is_some());
+                    }
+                    other => panic!("expected Case, got {other:?}"),
+                }
+            }
+            other => panic!("expected ProjectExpr, got {other:?}"),
+        }
+        let s1 = g.to_source();
+        assert!(s1.contains("(case when"), "got: {s1}");
+        assert!(s1.contains("then \"senior\""), "got: {s1}");
+        assert!(s1.contains("else \"other\" end)"), "got: {s1}");
+        assert_eq!(s1, parse(&s1).unwrap().to_source(), "case not reversible");
+    }
+
+    #[test]
+    fn case_without_else_and_errors() {
+        // `else` is optional.
+        let g =
+            parse("F:\n open a.csv\n |> (case when age >= 60 then \"old\" end) as b\n;").unwrap();
+        assert!(matches!(&g.nodes[1].op, Op::ProjectExpr { .. }));
+        // A `case` with no branch, or missing `then`/`end`, is a parse error.
+        assert!(parse("F:\n open a.csv\n |> (case end) as b\n;").is_err());
+        assert!(parse("F:\n open a.csv\n |> (case when age >= 1 \"x\" end) as b\n;").is_err());
+        assert!(parse("F:\n open a.csv\n |> (case when age >= 1 then \"x\") as b\n;").is_err());
+    }
+
+    #[test]
+    fn bare_dash_is_stdin_stdout_sentinel() {
+        // `open -` / `save -` map to the "-" sentinel, like `open stdin` /
+        // `save stdout` (the bare dash lexes as Minus; path_word accepts it).
+        let g = parse("F:\n open -\n |> name\n save -\n;").unwrap();
+        assert!(matches!(&g.nodes[0].op, Op::OpenCsv { path, .. } if path == "-"));
+        let sink = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::SinkCsv { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(sink, "-");
     }
 }

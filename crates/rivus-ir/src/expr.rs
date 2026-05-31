@@ -56,6 +56,96 @@ impl ArithOp {
     }
 }
 
+/// Scalar functions callable in expressions: `upper(x)`, `substr(s, 0, 3)`, …
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Func {
+    Upper,
+    Lower,
+    Len,
+    Trim,
+    Substr,
+    Contains,
+    StartsWith,
+    EndsWith,
+    /// SQL `LIKE` pattern: `%` = any run, `_` = any single char (case-sensitive).
+    Like,
+    /// Shell glob: `*` = any run, `?` = any single char, `[abc]`/`[a-z]`/`[!..]`
+    /// character classes.
+    Glob,
+    /// Full regular expression (unanchored partial match). The IR always knows
+    /// it (parse/`to_source` are std-only); evaluating it needs the runtime's
+    /// off-by-default `regex` feature, else it raises a recoverable error.
+    Regexp,
+    /// `replace(s, from, to)` — replace every occurrence of a literal substring.
+    Replace,
+    /// `split_part(s, sep, n)` — the `n`-th field (1-based) after splitting `s`
+    /// on the literal separator `sep`; empty string when out of range.
+    SplitPart,
+    /// `concat(a, b, …)` — concatenate all arguments as text (any arity).
+    Concat,
+    /// `abs(x)` — absolute value (numeric).
+    Abs,
+    /// `round(x)` — round to the nearest integer (ties away from zero).
+    Round,
+    /// `floor(x)` — largest integer ≤ x.
+    Floor,
+    /// `ceil(x)` — smallest integer ≥ x.
+    Ceil,
+    /// `coalesce(a, b, …)` — the first argument whose text is non-empty (any
+    /// arity); empty string if all are empty. The SQL/pandas null-coalesce.
+    Coalesce,
+}
+
+impl Func {
+    pub fn parse(s: &str) -> Option<Func> {
+        Some(match s {
+            "upper" => Func::Upper,
+            "lower" => Func::Lower,
+            "len" => Func::Len,
+            "trim" => Func::Trim,
+            "substr" => Func::Substr,
+            "contains" => Func::Contains,
+            "starts_with" => Func::StartsWith,
+            "ends_with" => Func::EndsWith,
+            "like" => Func::Like,
+            "glob" => Func::Glob,
+            "regexp" | "regex" | "matches" => Func::Regexp,
+            "replace" => Func::Replace,
+            "split_part" => Func::SplitPart,
+            "concat" => Func::Concat,
+            "abs" => Func::Abs,
+            "round" => Func::Round,
+            "floor" => Func::Floor,
+            "ceil" => Func::Ceil,
+            "coalesce" => Func::Coalesce,
+            _ => return None,
+        })
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Func::Upper => "upper",
+            Func::Lower => "lower",
+            Func::Len => "len",
+            Func::Substr => "substr",
+            Func::Trim => "trim",
+            Func::Contains => "contains",
+            Func::StartsWith => "starts_with",
+            Func::EndsWith => "ends_with",
+            Func::Like => "like",
+            Func::Glob => "glob",
+            Func::Regexp => "regexp",
+            Func::Replace => "replace",
+            Func::SplitPart => "split_part",
+            Func::Concat => "concat",
+            Func::Abs => "abs",
+            Func::Round => "round",
+            Func::Floor => "floor",
+            Func::Ceil => "ceil",
+            Func::Coalesce => "coalesce",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     /// `$_.field` — direct structural lookup.
@@ -95,6 +185,18 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: DataType,
     },
+    /// Scalar function call `func(args…)` (string/util functions).
+    Func {
+        func: Func,
+        args: Vec<Expr>,
+    },
+    /// `case when COND then VAL [when COND then VAL ...] [else VAL] end`. The
+    /// first branch whose condition is truthy yields its value; if none match,
+    /// `default` (the `else`) is used, or an empty string when absent. Row-wise.
+    Case {
+        branches: Vec<(Expr, Expr)>,
+        default: Option<Box<Expr>>,
+    },
 }
 
 impl Expr {
@@ -130,6 +232,20 @@ impl fmt::Display for Expr {
             // the same structure regardless of precedence.
             Expr::Arith { left, op, right } => write!(f, "({left} {} {right})", op.as_str()),
             Expr::Cast { expr, ty } => write!(f, "{expr}:{ty}"),
+            Expr::Func { func, args } => {
+                let a: Vec<String> = args.iter().map(|e| e.to_string()).collect();
+                write!(f, "{}({})", func.as_str(), a.join(", "))
+            }
+            Expr::Case { branches, default } => {
+                write!(f, "case")?;
+                for (cond, val) in branches {
+                    write!(f, " when {cond} then {val}")?;
+                }
+                if let Some(d) = default {
+                    write!(f, " else {d}")?;
+                }
+                write!(f, " end")
+            }
         }
     }
 }

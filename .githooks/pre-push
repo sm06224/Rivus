@@ -1,0 +1,40 @@
+#!/bin/sh
+# Rivus pre-push gate (CLAUDE.md: guarantee green locally before every push).
+# Enable once per clone with:  git config core.hooksPath .githooks
+#
+# Runs the same checks CI does, including the off-by-default feature sets so a
+# non-exhaustive match or feature-gated breakage (cf. issue #28) is caught
+# before it ever reaches the branch. Set RIVUS_SKIP_HOOK=1 to bypass in a pinch.
+set -e
+
+if [ -n "$RIVUS_SKIP_HOOK" ]; then
+    echo "pre-push: skipped (RIVUS_SKIP_HOOK set)"
+    exit 0
+fi
+
+echo "pre-push: cargo fmt --all -- --check"
+cargo fmt --all -- --check
+
+echo "pre-push: cargo clippy --workspace --all-targets"
+cargo clippy --workspace --all-targets
+
+echo "pre-push: cargo clippy --all-features --workspace --all-targets"
+cargo clippy --all-features --workspace --all-targets
+
+echo "pre-push: cargo test --workspace"
+cargo test --workspace
+
+echo "pre-push: cargo test --all-features --workspace"
+cargo test --all-features --workspace
+
+echo "pre-push: cargo deny check bans sources licenses"
+cargo deny check bans sources licenses
+
+echo "pre-push: gitleaks detect --no-git"
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks detect --no-git --source .
+else
+    echo "pre-push: gitleaks not installed — skipping (CI still runs it)"
+fi
+
+echo "pre-push: all checks passed"

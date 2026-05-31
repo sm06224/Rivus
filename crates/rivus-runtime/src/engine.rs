@@ -97,6 +97,16 @@ fn must_drain(graph: &PlanGraph) -> bool {
                 | Op::Describe
                 | Op::Join { .. }
                 | Op::StreamRef { .. }
+                // bfill/mean/median buffer the whole stream and emit on finish
+                // (they need a value from a later chunk, or a whole-column
+                // statistic) → must drain.
+                | Op::Fill {
+                    method:
+                        rivus_ir::FillMethod::Bfill
+                        | rivus_ir::FillMethod::Mean
+                        | rivus_ir::FillMethod::Median,
+                    ..
+                }
         )
     })
 }
@@ -393,36 +403,39 @@ fn try_streaming_parallel(
     path: &str,
     threads: usize,
 ) -> Option<RunResult> {
-    let (projection, prefilter, header, declared) = match &graph.nodes[src_id].op {
+    let (projection, prefilter, header, declared, delim) = match &graph.nodes[src_id].op {
         Op::OpenCsv {
             projection,
             prefilter,
             header,
             declared,
+            delim,
             ..
         } => (
             projection.clone(),
             prefilter.clone(),
             *header,
             declared.clone(),
+            *delim,
         ),
         _ => return None, // only CSV has a streaming-parallel plan for now
     };
 
     // Each worker streams its byte range to a per-worker *part file* (bounded
     // memory — no output buffering), then the parts are concatenated in source
-    // order. Map every file sink to its final path; bail to serial if any sink
-    // writes stdout (can't split an ordered stream across workers) or if there
-    // is no file sink (nothing to write in parallel without buffering).
-    let mut sinks: Vec<(NodeId, String, bool)> = Vec::new();
+    // order into the final destination. A `-` sink assembles to stdout (so the
+    // Unix-filter form is parallel too). Bail only when there is no file/stdout
+    // sink (a preview/print flow has nothing to write in parallel without
+    // buffering — that stays on the serial path).
+    let mut sinks: Vec<(NodeId, String, bool, u8)> = Vec::new();
     for nd in &graph.nodes {
         match &nd.op {
-            Op::SinkCsv { path } => sinks.push((nd.id, path.clone(), false)),
-            Op::SinkJsonl { path } => sinks.push((nd.id, path.clone(), true)),
+            Op::SinkCsv { path, delim } => sinks.push((nd.id, path.clone(), false, *delim)),
+            Op::SinkJsonl { path } => sinks.push((nd.id, path.clone(), true, b',')),
             _ => {}
         }
     }
-    if sinks.is_empty() || sinks.iter().any(|(_, p, _)| p == "-") {
+    if sinks.is_empty() {
         return None;
     }
 
@@ -441,6 +454,7 @@ fn try_streaming_parallel(
         &prefilter,
         header,
         declared.as_deref(),
+        delim,
     )
     .ok()?;
     let nparts = ranges.len();
@@ -472,6 +486,7 @@ fn try_streaming_parallel(
                         b,
                         opts.chunk_size,
                         pre.clone(),
+                        delim,
                     ));
                     let ops: Vec<Box<dyn Operator>> = graph
                         .nodes
@@ -479,14 +494,14 @@ fn try_streaming_parallel(
                         .map(|node| {
                             if node.id == src_id {
                                 src.take().expect("one source")
-                            } else if let Some((_, fp, jsonl)) =
-                                sinks.iter().find(|(id, _, _)| *id == node.id)
+                            } else if let Some((_, fp, jsonl, sdelim)) =
+                                sinks.iter().find(|(id, _, _, _)| *id == node.id)
                             {
                                 let pp = part_path(fp, i);
                                 if *jsonl {
                                     operators::jsonl_sink(pp)
                                 } else {
-                                    operators::csv_sink(pp)
+                                    operators::csv_sink(pp, *sdelim)
                                 }
                             } else {
                                 operators::build(
@@ -519,7 +534,7 @@ fn try_streaming_parallel(
     let mut res = merge_results(graph, results, src_errors, false);
 
     // Concatenate each sink's part files in source order into its final path.
-    for (_, final_path, jsonl) in &sinks {
+    for (_, final_path, jsonl, _) in &sinks {
         let parts: Vec<String> = (0..nparts).map(|i| part_path(final_path, i)).collect();
         if let Err(e) = concat_parts(final_path, &parts, *jsonl) {
             res.errors.push(ErrorEvent::new(
@@ -537,7 +552,14 @@ fn try_streaming_parallel(
 /// Streams part-by-part (bounded memory) and removes the parts when done.
 fn concat_parts(final_path: &str, parts: &[String], jsonl: bool) -> std::io::Result<()> {
     use std::io::{BufRead, Write};
-    let mut out = std::io::BufWriter::new(std::fs::File::create(final_path)?);
+    // `-` writes the assembled stream to stdout (keeps the Unix-filter contract
+    // working under the parallel path); any other path is a real output file.
+    let sink: Box<dyn Write> = if final_path == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(std::fs::File::create(final_path)?)
+    };
+    let mut out = std::io::BufWriter::new(sink);
     let mut header_done = jsonl;
     for part in parts {
         let f = match std::fs::File::open(part) {
@@ -575,6 +597,17 @@ fn source_path(op: &Op) -> Option<&str> {
     }
 }
 
+/// Is this source path compressed (`.gz`/`.zst`/`.zstd`)? Such sources are read
+/// serially in a single pass (a compressed stream can't be seeked for
+/// byte-range parallelism).
+fn is_compressed_source(path: &str) -> bool {
+    if path == "-" {
+        return false;
+    }
+    let l = path.to_ascii_lowercase();
+    l.ends_with(".gz") || l.ends_with(".zst") || l.ends_with(".zstd")
+}
+
 /// Rank for escalating runtime modes when merging parallel partitions.
 fn mode_rank(m: Mode) -> u8 {
     match m {
@@ -604,6 +637,17 @@ fn partition(all: Vec<Chunk>, n: usize) -> Vec<Vec<Chunk>> {
     out
 }
 
+/// Minimum CSV file size (bytes) for the byte-range streaming-parallel reader.
+/// Below it, the in-memory chunk-partition path handles the file (or the serial
+/// reader, for tiny inputs). Override with `RIVUS_PARALLEL_MIN_BYTES` (e.g. `0`
+/// to always stream-parallel a file source); default 8 MiB.
+fn parallel_min_bytes() -> u64 {
+    std::env::var("RIVUS_PARALLEL_MIN_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(8 * 1024 * 1024)
+}
+
 /// Attempt data-parallel execution. Eligible flows have exactly one file source
 /// and no stateful operators (group/join/stream). The source is parsed once
 /// (its parse is already internally parallel), then contiguous chunk partitions
@@ -614,6 +658,11 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
         .map(|t| t.get())
         .unwrap_or(1);
     if threads < 2 {
+        return None;
+    }
+    // Escape hatch: force the serial streaming path. A true single-thread
+    // baseline for benchmarking, and a safety valve on constrained hosts.
+    if std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
         return None;
     }
 
@@ -637,6 +686,17 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             | Op::Sort { .. }
             | Op::Distinct { .. }
             | Op::Describe => return None,
+            // Directional / statistical fill carries state across rows/chunks
+            // (forward value, backward buffer, or a whole-column statistic) →
+            // not partitionable. A constant fill is stateless and stays eligible.
+            Op::Fill {
+                method:
+                    rivus_ir::FillMethod::Ffill
+                    | rivus_ir::FillMethod::Bfill
+                    | rivus_ir::FillMethod::Mean
+                    | rivus_ir::FillMethod::Median,
+                ..
+            } => return None,
             _ => {}
         }
     }
@@ -648,14 +708,22 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
         return None;
     }
 
+    // A compressed source can't be seeked (so no byte-range parallel or
+    // two-pass) and its on-disk size is the *compressed* size — force the
+    // serial, single-pass streaming reader (bounded memory), which `run()`
+    // falls through to.
+    if source_path(&graph.nodes[src_id].op).is_some_and(is_compressed_source) {
+        return None;
+    }
+
     // The chunk-partition path materializes the whole input to split it. For a
     // large file, stream it in parallel instead (byte ranges, no buffering);
     // non-CSV large sources fall back to the serial streaming reader.
-    const PARALLEL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+    let min_bytes = parallel_min_bytes();
     if let Some(path) = source_path(&graph.nodes[src_id].op) {
         if path != "-" {
             if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > PARALLEL_MAX_BYTES {
+                if meta.len() >= min_bytes {
                     return try_streaming_parallel(graph, opts, src_id, path, threads);
                 }
             }
@@ -743,7 +811,9 @@ fn flush_parallel_sinks(graph: &PlanGraph, res: &mut RunResult) {
 /// If `op` is a file sink, write `chunks` to it once and return (path, result).
 fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Result<()>)> {
     match op {
-        Op::SinkCsv { path } => Some((path, operators::write_csv_file(path, chunks))),
+        Op::SinkCsv { path, delim } => {
+            Some((path, operators::write_csv_file(path, chunks, *delim)))
+        }
         Op::SinkJsonl { path } => Some((path, operators::write_jsonl_file(path, chunks))),
         _ => None,
     }

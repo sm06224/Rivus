@@ -13,8 +13,311 @@
 //! results are identical.
 
 use rivus_core::{Chunk, Column, DataType, StrColumn, Value};
-use rivus_ir::{Access, ArithOp, CmpOp, Expr};
+use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func};
 use std::cmp::Ordering;
+
+/// Apply a scalar function to argument values for one row.
+fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
+    let arg = |i: usize| {
+        args.get(i)
+            .map(|e| eval(e, chunk, row))
+            .unwrap_or(Value::Null)
+    };
+    match func {
+        Func::Upper => Value::Str(arg(0).to_string().to_uppercase()),
+        Func::Lower => Value::Str(arg(0).to_string().to_lowercase()),
+        Func::Trim => Value::Str(arg(0).to_string().trim().to_string()),
+        Func::Len => Value::I64(arg(0).to_string().chars().count() as i64),
+        Func::Contains => {
+            let hay = arg(0).to_string();
+            let needle = arg(1).to_string();
+            Value::Bool(hay.contains(&needle))
+        }
+        Func::StartsWith => {
+            let hay = arg(0).to_string();
+            let prefix = arg(1).to_string();
+            Value::Bool(hay.starts_with(&prefix))
+        }
+        Func::EndsWith => {
+            let hay = arg(0).to_string();
+            let suffix = arg(1).to_string();
+            Value::Bool(hay.ends_with(&suffix))
+        }
+        Func::Substr => {
+            let s = arg(0).to_string();
+            let start = arg(1).as_f64().unwrap_or(0.0) as usize;
+            let take = args
+                .get(2)
+                .map(|e| eval(e, chunk, row).as_f64().unwrap_or(0.0) as usize)
+                .unwrap_or(usize::MAX);
+            let out: String = s.chars().skip(start).take(take).collect();
+            Value::Str(out)
+        }
+        Func::Like => {
+            let hay = arg(0).to_string();
+            let pat = arg(1).to_string();
+            Value::Bool(like_match(&hay, &pat))
+        }
+        Func::Glob => {
+            let hay = arg(0).to_string();
+            let pat = arg(1).to_string();
+            Value::Bool(glob_match(&hay, &pat))
+        }
+        Func::Regexp => {
+            // Row-wise fallback (the columnar path in `eval_column` compiles the
+            // pattern once). With the feature off this is always false.
+            let hay = arg(0).to_string();
+            let pat = arg(1).to_string();
+            Value::Bool(regexp_match(&hay, &pat))
+        }
+        Func::Replace => {
+            let s = arg(0).to_string();
+            let from = arg(1).to_string();
+            let to = arg(2).to_string();
+            // An empty `from` would loop in `str::replace`'s sense of "between
+            // every char"; keep it a no-op so the result is well-defined.
+            let out = if from.is_empty() {
+                s
+            } else {
+                s.replace(&from, &to)
+            };
+            Value::Str(out)
+        }
+        Func::SplitPart => {
+            let s = arg(0).to_string();
+            let sep = arg(1).to_string();
+            // 1-based field index (DuckDB/awk convention); 0 or out-of-range → "".
+            let n = arg(2).as_f64().unwrap_or(0.0) as i64;
+            let out = if sep.is_empty() || n < 1 {
+                String::new()
+            } else {
+                s.split(sep.as_str())
+                    .nth((n - 1) as usize)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            Value::Str(out)
+        }
+        Func::Concat => {
+            let mut out = String::new();
+            for i in 0..args.len() {
+                out.push_str(&arg(i).to_string());
+            }
+            Value::Str(out)
+        }
+        Func::Abs => num_value(arg(0), f64::abs),
+        Func::Round => num_value(arg(0), f64::round),
+        Func::Floor => num_value(arg(0), f64::floor),
+        Func::Ceil => num_value(arg(0), f64::ceil),
+        Func::Coalesce => {
+            // First argument whose text form is non-empty, kept as-is (preserves
+            // its lane). Empty string if every argument is empty/null.
+            for i in 0..args.len() {
+                let v = arg(i);
+                if !v.to_string().is_empty() {
+                    return v;
+                }
+            }
+            Value::Str(String::new())
+        }
+    }
+}
+
+/// Apply a unary numeric function to a value, coercing a numeric *string* (e.g.
+/// from a `:str`-declared column) by parsing it. A non-numeric value yields
+/// `Null` (continue-first). An integral result is returned as `I64` so an
+/// integer-looking column stays integer-looking; otherwise `F64`.
+fn num_value(v: Value, f: impl Fn(f64) -> f64) -> Value {
+    let x = match v.as_f64() {
+        Some(x) => x,
+        None => match v {
+            Value::Str(s) => match s.trim().parse::<f64>() {
+                Ok(x) => x,
+                Err(_) => return Value::Null,
+            },
+            _ => return Value::Null,
+        },
+    };
+    let r = f(x);
+    if r.is_finite() && r.fract() == 0.0 && r.abs() < 9.007_199_254_740_992e15 {
+        Value::I64(r as i64)
+    } else {
+        Value::F64(r)
+    }
+}
+
+/// Run `f` with the compiled regex for `pat`, caching it per thread so a
+/// row-wise predicate (`|? regexp(col, "…")`) compiles the pattern once, not
+/// once per row. An invalid pattern is cached as `None` (→ no match), keeping
+/// continue-first semantics. The cache is keyed by the pattern string; flows
+/// use a tiny number of distinct patterns, so it never grows unbounded in
+/// practice.
+#[cfg(feature = "regex")]
+fn with_regex<R>(pat: &str, f: impl FnOnce(Option<&regex::Regex>) -> R) -> R {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Option<regex::Regex>>> =
+            RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        let entry = m
+            .entry(pat.to_string())
+            .or_insert_with(|| regex::Regex::new(pat).ok());
+        f(entry.as_ref())
+    })
+}
+
+/// Does `text` contain a match for `pat` (unanchored)? Behind the off-by-default
+/// `regex` feature; without it, always `false`. Uses the per-thread compiled-
+/// regex cache so repeated calls with the same pattern don't recompile.
+#[cfg(feature = "regex")]
+fn regexp_match(text: &str, pat: &str) -> bool {
+    with_regex(pat, |re| re.map(|r| r.is_match(text)).unwrap_or(false))
+}
+
+#[cfg(not(feature = "regex"))]
+fn regexp_match(_text: &str, _pat: &str) -> bool {
+    false
+}
+
+/// The literal pattern of `regexp(col, "lit")`, if arg 1 is a string literal
+/// (the common case) — lets the columnar path compile the regex exactly once.
+fn regex_literal(args: &[Expr]) -> Option<&str> {
+    match args.get(1) {
+        Some(Expr::Literal(Value::Str(s))) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Columnar `regexp` with a literal pattern: compile once, test every row.
+#[cfg(feature = "regex")]
+fn regexp_column(args: &[Expr], chunk: &Chunk) -> Column {
+    let pat = regex_literal(args).unwrap_or("");
+    let col = eval_column(&args[0], chunk);
+    with_regex(pat, |re| match re {
+        Some(re) => Column::Bool(
+            (0..chunk.len)
+                .map(|r| re.is_match(&col.value_at(r).to_string()))
+                .collect(),
+        ),
+        // Invalid pattern → all-false (continue-first: the run doesn't panic).
+        None => Column::Bool(vec![false; chunk.len]),
+    })
+}
+
+#[cfg(not(feature = "regex"))]
+fn regexp_column(_args: &[Expr], chunk: &Chunk) -> Column {
+    Column::Bool(vec![false; chunk.len])
+}
+
+/// SQL `LIKE`: `%` matches any run (including empty), `_` matches exactly one
+/// char. Case-sensitive, no escape char (MVP). Linear-time backtracking with a
+/// single restart pointer (the classic two-pointer wildcard match), so a
+/// pathological pattern can't blow up.
+fn like_match(text: &str, pat: &str) -> bool {
+    wildcard_match(text, pat, '%', '_')
+}
+
+/// Shell glob over a single string: `*` any run, `?` any single char, plus
+/// `[abc]` / `[a-z]` / `[!abc]` character classes. Case-sensitive.
+fn glob_match(text: &str, pat: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pat.chars().collect();
+    glob_rec(&t, 0, &p, 0)
+}
+
+/// Two-pointer wildcard match where `star` is the any-run wildcard and `one`
+/// the any-single wildcard. O(n·m) worst case but no recursion/backtracking
+/// explosion: on a mismatch it backtracks only to just-after the last `star`,
+/// advancing how much that star consumed by one (the canonical greedy algo).
+fn wildcard_match(text: &str, pat: &str, star: char, one: char) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pat.chars().collect();
+    let (mut ti, mut pi) = (0usize, 0usize);
+    // `last_star` = pattern index of the most recent `star`; `consumed` = how
+    // many text chars it currently absorbs (grows by one on each backtrack).
+    let mut last_star: Option<usize> = None;
+    let mut consumed = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == one || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == star {
+            last_star = Some(pi);
+            consumed = ti;
+            pi += 1;
+        } else if let Some(ls) = last_star {
+            pi = ls + 1;
+            consumed += 1;
+            ti = consumed;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == star {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Recursive glob with `[...]` classes (rare enough that recursion is fine; `*`
+/// still bounded because each `*` advances `ti` monotonically per call chain).
+fn glob_rec(t: &[char], ti: usize, p: &[char], pi: usize) -> bool {
+    if pi == p.len() {
+        return ti == t.len();
+    }
+    match p[pi] {
+        '*' => {
+            // Match zero-or-more: try consuming none, then one more each step.
+            for k in ti..=t.len() {
+                if glob_rec(t, k, p, pi + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        '?' => ti < t.len() && glob_rec(t, ti + 1, p, pi + 1),
+        '[' => {
+            if ti >= t.len() {
+                return false;
+            }
+            // Parse the class `[...]`: optional leading `!` negates.
+            let mut j = pi + 1;
+            let negate = j < p.len() && p[j] == '!';
+            if negate {
+                j += 1;
+            }
+            let mut matched = false;
+            let class_start = j;
+            while j < p.len() && (p[j] != ']' || j == class_start) {
+                // Range `a-z` when a `-` sits between two chars inside the class.
+                if j + 2 < p.len() && p[j + 1] == '-' && p[j + 2] != ']' {
+                    if t[ti] >= p[j] && t[ti] <= p[j + 2] {
+                        matched = true;
+                    }
+                    j += 3;
+                } else {
+                    if t[ti] == p[j] {
+                        matched = true;
+                    }
+                    j += 1;
+                }
+            }
+            // `j` is at the closing `]` (or end if malformed → no match).
+            if j >= p.len() {
+                return false;
+            }
+            if matched != negate {
+                glob_rec(t, ti + 1, p, j + 1)
+            } else {
+                false
+            }
+        }
+        c => ti < t.len() && t[ti] == c && glob_rec(t, ti + 1, p, pi + 1),
+    }
+}
 
 /// Coerce a value to an integer (truncating floats; parsing strings; bool→0/1).
 fn to_i64(v: Value) -> i64 {
@@ -65,7 +368,7 @@ fn cast_value(v: Value, ty: DataType) -> Value {
 }
 
 /// Cast a whole column to a target lane (columnar path for computed columns).
-fn cast_column(col: Column, ty: DataType) -> Column {
+pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
     let n = col.len();
     match ty {
         DataType::I64 => Column::I64((0..n).map(|i| to_i64(col.value_at(i))).collect()),
@@ -96,6 +399,51 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
         Expr::Literal(v) => const_column(v, chunk.len),
         Expr::Cast { expr, ty } => cast_column(eval_column(expr, chunk), *ty),
         Expr::Arith { left, op, right } => eval_arith(left, *op, right, chunk),
+        Expr::Func { func, args } => {
+            let n = chunk.len;
+            match func {
+                Func::Len => Column::I64(
+                    (0..n)
+                        .map(|r| to_i64(call_func(*func, args, chunk, r)))
+                        .collect(),
+                ),
+                // `regexp(col, "literal")` compiles the pattern once for the
+                // whole chunk (per-row compilation is catastrophic — ~10× slower).
+                Func::Regexp if regex_literal(args).is_some() => regexp_column(args, chunk),
+                Func::Contains
+                | Func::StartsWith
+                | Func::EndsWith
+                | Func::Like
+                | Func::Glob
+                | Func::Regexp => Column::Bool(
+                    (0..n)
+                        .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
+                        .collect(),
+                ),
+                // Numeric / coalesce funcs produce a value whose lane depends on
+                // the data (e.g. `round` is integral, `coalesce` may be text),
+                // so pick the narrowest fitting lane per chunk.
+                Func::Abs | Func::Round | Func::Floor | Func::Ceil | Func::Coalesce => {
+                    let vals: Vec<Value> =
+                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    column_from_values(vals)
+                }
+                _ => {
+                    let mut s = StrColumn::with_capacity(n, n * 8);
+                    for r in 0..n {
+                        s.push(&call_func(*func, args, chunk, r).to_string());
+                    }
+                    Column::Str(s)
+                }
+            }
+        }
+        // `case … end` is row-wise; evaluate each row and pick a column lane
+        // from the resulting values (all-int → I64, all-numeric → F64,
+        // all-bool → Bool, otherwise Str — mirroring schema inference).
+        Expr::Case { .. } => {
+            let vals: Vec<Value> = (0..chunk.len).map(|r| eval(expr, chunk, r)).collect();
+            column_from_values(vals)
+        }
         // Compare / And / Or are predicates → a boolean column.
         _ => {
             let v: Vec<bool> = (0..chunk.len)
@@ -103,6 +451,40 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 .collect();
             Column::Bool(v)
         }
+    }
+}
+
+/// Build a typed column from row values, choosing the narrowest lane that fits
+/// (all-int → I64, all-numeric → F64, all-bool → Bool, else Str). Used by
+/// row-wise expressions like `case` that don't have a native columnar form.
+pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
+    let all_int = vals
+        .iter()
+        .all(|v| matches!(v, Value::I64(_) | Value::Bool(_)));
+    let all_num = vals
+        .iter()
+        .all(|v| matches!(v, Value::I64(_) | Value::F64(_) | Value::Bool(_)));
+    let all_bool = !vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Bool(_)));
+    if all_bool {
+        Column::Bool(
+            vals.iter()
+                .map(|v| matches!(v, Value::Bool(true)))
+                .collect(),
+        )
+    } else if all_int {
+        Column::I64(
+            vals.iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as i64)
+                .collect(),
+        )
+    } else if all_num {
+        Column::F64(vals.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect())
+    } else {
+        let mut s = StrColumn::with_capacity(vals.len(), vals.len() * 8);
+        for v in &vals {
+            s.push(&v.to_string());
+        }
+        Column::Str(s)
     }
 }
 
@@ -209,6 +591,18 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
         }
         Expr::Arith { left, op, right } => arith_value(left, *op, right, chunk, row),
         Expr::Cast { expr, ty } => cast_value(eval(expr, chunk, row), *ty),
+        Expr::Func { func, args } => call_func(*func, args, chunk, row),
+        Expr::Case { branches, default } => {
+            for (cond, val) in branches {
+                if eval_predicate(cond, chunk, row) {
+                    return eval(val, chunk, row);
+                }
+            }
+            match default {
+                Some(d) => eval(d, chunk, row),
+                None => Value::Str(String::new()),
+            }
+        }
     }
 }
 
@@ -328,4 +722,69 @@ fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
         },
     };
     cmp_ord(ord, op)
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::{glob_match, like_match};
+
+    #[test]
+    fn like_wildcards() {
+        assert!(like_match("JP-1234", "JP-%"));
+        assert!(like_match("JP-1234", "%234"));
+        assert!(like_match("JP-1234", "%-%"));
+        assert!(like_match("JP-1234", "__-____")); // 2 + dash + 4
+        assert!(like_match("abc", "%")); // % matches everything
+        assert!(like_match("", "%")); // including empty
+        assert!(like_match("abc", "abc")); // literal
+        assert!(!like_match("JP-1234", "US-%"));
+        assert!(!like_match("ab", "abc"));
+        assert!(like_match("abc", "ab_")); // `_` matches exactly the trailing c
+    }
+
+    #[test]
+    fn like_underscore_is_exactly_one() {
+        assert!(like_match("abc", "ab_"));
+        assert!(!like_match("ab", "ab_")); // nothing for the _
+        assert!(!like_match("abcd", "ab_")); // trailing d unmatched
+    }
+
+    #[test]
+    fn glob_wildcards_and_classes() {
+        assert!(glob_match("JP-0042", "[JD]*-00??"));
+        assert!(glob_match("DE-0099", "[JD]*-00??"));
+        assert!(!glob_match("US-0007", "[JD]*-00??")); // U not in [JD]
+        assert!(glob_match("abc", "a?c"));
+        assert!(glob_match("abc", "a*"));
+        assert!(glob_match("a-z", "[a-z]-[a-z]"));
+        assert!(!glob_match("A-z", "[a-z]-[a-z]")); // case-sensitive
+        assert!(glob_match("x", "[!abc]")); // negated class
+        assert!(!glob_match("a", "[!abc]"));
+        assert!(glob_match("anything", "*"));
+        assert!(glob_match("", "*"));
+    }
+
+    #[test]
+    fn no_catastrophic_backtracking() {
+        // A pathological LIKE that a naive recursive matcher chokes on must
+        // still resolve quickly with the two-pointer algorithm.
+        let text = "a".repeat(64);
+        let pat = "%".repeat(50) + "b"; // never matches (no 'b')
+        assert!(!like_match(&text, &pat));
+    }
+}
+
+#[cfg(all(test, feature = "regex"))]
+mod regex_tests {
+    use super::regexp_match;
+
+    #[test]
+    fn regexp_partial_and_anchored() {
+        assert!(regexp_match("JP-1234", r"^JP-\d{4}$"));
+        assert!(regexp_match("xx JP-9 yy", r"JP-\d")); // unanchored partial
+        assert!(!regexp_match("US-1234", r"^JP-\d{4}$"));
+        assert!(regexp_match("abc", r"[a-c]+"));
+        // Invalid pattern → false (continue-first, no panic).
+        assert!(!regexp_match("abc", r"([unclosed"));
+    }
 }

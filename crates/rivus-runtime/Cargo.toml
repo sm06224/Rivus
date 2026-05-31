@@ -8,11 +8,33 @@ description = "Rivus runtime: single-thread chunk execution engine, telemetry, m
 [dependencies]
 rivus-core.workspace = true
 rivus-ir.workspace = true
+# Off-by-default: full-regex `regexp()` predicate. The default build stays
+# zero-dependency; opt in with `--features regex`. rust-lang/regex is pure-Rust,
+# linear-time (no catastrophic backtracking), MIT/Apache-2.0. See SUPPLY-CHAIN.md.
+regex = { version = "1", optional = true }
+# Off-by-default: gzip (`.gz`) input. `flate2` with its pure-Rust `miniz_oxide`
+# backend (no C toolchain), MIT/Apache-2.0, de-facto standard. See SUPPLY-CHAIN.md.
+flate2 = { version = "1", optional = true, default-features = false, features = [
+    "rust_backend",
+] }
+# Off-by-default: zstd (`.zst`) input. `ruzstd` is a pure-Rust zstd *decoder*
+# (no C), MIT. Decode-only is all a reader needs; default features (std + the
+# pure-Rust `twox-hash` checksum) are all pure-Rust. See SUPPLY-CHAIN.md.
+ruzstd = { version = "0.8", optional = true }
+
+[features]
+default = []
+regex = ["dep:regex"]
+gzip = ["dep:flate2"]
+zstd = ["dep:ruzstd"]
 
 [dev-dependencies]
 rivus-parser.workspace = true
 rivus-optimizer.workspace = true
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Test-only: write `.zst` fixtures for the zstd-decode oracle. Encode-side only,
+# never shipped (dev-dependency). The runtime decodes with pure-Rust `ruzstd`.
+zstd = "0.13"
 
 [[bench]]
 name = "pipeline"

@@ -101,6 +101,142 @@ pub fn render_errors(res: &RunResult) -> String {
     s
 }
 
+/// Render the run as **JSON Lines** (one object per line) for machine consumers
+/// — editors, a GUI, or `jq`. Emitted to stderr so stdout stays clean data.
+/// Each line is one of: `{"event":"node",…}` per flow node (telemetry counters),
+/// `{"event":"error",…}` per error-stream event, and a final
+/// `{"event":"summary",…}`. std-only: a tiny hand-rolled JSON writer (no serde).
+pub fn render_telemetry_jsonl(graph: &PlanGraph, res: &RunResult) -> String {
+    let mut s = String::new();
+    for t in &res.telemetry {
+        let mut o = JsonObj::new();
+        o.str("event", "node");
+        o.num("node_id", t.node_id as f64);
+        o.str("label", &t.label);
+        o.str("kind", &t.kind);
+        o.num("chunks_in", t.chunks_in as f64);
+        o.num("chunks_out", t.chunks_out as f64);
+        o.num("rows_in", t.rows_in as f64);
+        o.num("rows_out", t.rows_out as f64);
+        o.num("errors", t.errors as f64);
+        o.num("busy_ms", t.busy.as_secs_f64() * 1000.0);
+        o.num("rows_per_sec", t.throughput_rows_per_sec());
+        o.num("selectivity", t.selectivity());
+        o.str("mode", &t.mode.to_string());
+        o.boolean("finished", t.finished);
+        s.push_str(&o.finish());
+        s.push('\n');
+    }
+    for e in &res.errors {
+        let mut o = JsonObj::new();
+        o.str("event", "error");
+        o.str("severity", &e.severity.to_string());
+        o.str("scope", error_scope_str(&e.scope));
+        o.str("message", &e.message);
+        match &e.node {
+            Some(n) => o.str("node", n),
+            None => o.null("node"),
+        }
+        match e.chunk_id {
+            Some(id) => o.num("chunk_id", id as f64),
+            None => o.null("chunk_id"),
+        }
+        s.push_str(&o.finish());
+        s.push('\n');
+    }
+    let mut o = JsonObj::new();
+    o.str("event", "summary");
+    o.num("nodes", graph.nodes.len() as f64);
+    o.num("rows_out", res.total_rows_out() as f64);
+    o.num("errors", res.errors.len() as f64);
+    o.str("final_mode", &res.final_mode.to_string());
+    s.push_str(&o.finish());
+    s.push('\n');
+    s
+}
+
+fn error_scope_str(scope: &rivus_core::ErrorScope) -> &'static str {
+    use rivus_core::ErrorScope::*;
+    match scope {
+        Item => "item",
+        Chunk => "chunk",
+        Branch => "branch",
+        Graph => "graph",
+    }
+}
+
+/// A minimal JSON object writer (std-only). Keys are known-safe identifiers;
+/// string *values* are escaped. Integral numbers print without a `.0`.
+struct JsonObj {
+    buf: String,
+    first: bool,
+}
+
+impl JsonObj {
+    fn new() -> Self {
+        JsonObj {
+            buf: String::from("{"),
+            first: true,
+        }
+    }
+    fn sep(&mut self) {
+        if self.first {
+            self.first = false;
+        } else {
+            self.buf.push(',');
+        }
+    }
+    fn key(&mut self, k: &str) {
+        self.sep();
+        self.buf.push('"');
+        self.buf.push_str(k);
+        self.buf.push_str("\":");
+    }
+    fn str(&mut self, k: &str, v: &str) {
+        self.key(k);
+        json_escape_into(&mut self.buf, v);
+    }
+    fn num(&mut self, k: &str, v: f64) {
+        self.key(k);
+        if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15 {
+            self.buf.push_str(&format!("{}", v as i64));
+        } else if v.is_finite() {
+            self.buf.push_str(&format!("{v}"));
+        } else {
+            self.buf.push_str("null"); // JSON has no NaN/Inf
+        }
+    }
+    fn boolean(&mut self, k: &str, v: bool) {
+        self.key(k);
+        self.buf.push_str(if v { "true" } else { "false" });
+    }
+    fn null(&mut self, k: &str) {
+        self.key(k);
+        self.buf.push_str("null");
+    }
+    fn finish(mut self) -> String {
+        self.buf.push('}');
+        self.buf
+    }
+}
+
+/// Append `v` as a quoted, escaped JSON string.
+fn json_escape_into(out: &mut String, v: &str) {
+    out.push('"');
+    for c in v.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 pub fn render_outputs(outputs: &[Output]) -> String {
     if outputs.is_empty() {
         return "\u{2592} outputs           (none captured)\n".to_string();

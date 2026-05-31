@@ -74,8 +74,8 @@ a committed `Cargo.lock` + `cargo deny check --all-features`):
 
 | need | crate | feature | why it clears the bar |
 |---|---|---|---|
-| **gzip / DEFLATE** | [`flate2`](https://crates.io/crates/flate2) (pure-Rust `miniz_oxide` backend) | `gzip` | de-facto standard, ~100M+ downloads, rust-lang-adjacent maintenance, MIT/Apache-2.0, stable 1.x; pure-Rust backend avoids a C toolchain |
-| **zstd (decode)** | [`ruzstd`](https://crates.io/crates/ruzstd) | `zstd` | pure-Rust decoder, no C; *or* [`zstd`](https://crates.io/crates/zstd) (gyscos, mature C bindings) if encode/throughput needed — decide at integration |
+| **gzip / DEFLATE** ✅ *integrated* | [`flate2`](https://crates.io/crates/flate2) (pure-Rust `miniz_oxide` backend) | `gzip` | de-facto standard, ~100M+ downloads, rust-lang-adjacent maintenance, MIT/Apache-2.0, stable 1.x; pure-Rust backend avoids a C toolchain. **Adopted**: `default-features = false, features = ["rust_backend"]`, behind the source trait (`open *.gz`). Transitive tree (all pure-Rust, permissive): `crc32fast`→`cfg-if`, `miniz_oxide`→`adler2` (added `0BSD` to the license allow-list), `simd-adler32`. `cargo deny check --all-features` green. |
+| **zstd (decode)** ✅ *integrated* | [`ruzstd`](https://crates.io/crates/ruzstd) | `zstd` | **pure-Rust decoder, no C**, MIT, established. **Adopted** for `.zst` input behind the source trait (`open *.zst`). Runtime tree (all pure-Rust, permissive): `ruzstd`→`twox-hash` (MIT). The encode-side [`zstd`](https://crates.io/crates/zstd) crate (C bindings, `zstd-sys`) is used **only as a `[dev-dependency]`** to write `.zst` test fixtures — it never ships in any build. `cargo deny check --all-features` green; default `cargo tree -p rivus-cli` stays rivus-only. |
 | **Parquet / Arrow** | [`parquet`](https://crates.io/crates/parquet) + [`arrow`](https://crates.io/crates/arrow) (apache/arrow-rs) | `parquet` | official Apache project, the standard, actively released; heavy transitive tree → strictly feature-gated and isolated |
 | **Python pickle** | [`serde-pickle`](https://crates.io/crates/serde-pickle) | `pickle` | the established pickle crate, maintained, MIT/Apache-2.0 |
 
