@@ -8,6 +8,8 @@ This guide is the practical reference: the full syntax, every operator, and a
 gallery of copy-pasteable one-liners. For the design rationale see
 [`docs/design/`](design/README.md); for install see the [README](../README.md).
 
+> 🇯🇵 日本語版は [**`docs/GUIDE.ja.md`**](GUIDE.ja.md) を参照してください。
+
 ---
 
 ## 1. The 10-second mental model
@@ -376,20 +378,25 @@ than crashing (continue-first).
 
 | syntax | writes |
 |---|---|
-| `save PATH` | format from the extension (mirrors the sources; `.tsv`/`.tab` → tab-delimited) |
+| `save PATH` | format from the extension (mirrors the sources; `.tsv`/`.tab` → tab-delimited; `.json` → JSON array; `.jsonl`/`.ndjson` → NDJSON) |
 | `save PATH as FMT` | force the format (`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
-| `writecsv PATH` / `writejson PATH` | explicit verbs |
+| `writecsv PATH` / `writejson PATH` | explicit verbs (`writejson` = NDJSON) |
 | `save stdout` / `save -` | write to standard output |
 | `print` | capture for the on-screen preview |
 
 ```
 … save out.csv
-… save out.jsonl as jsonl
-… save stdout as csv          # pipe-friendly
+… save out.json              # a single JSON array: [{…},{…}]
+… save out.jsonl             # NDJSON: one object per line
+… save - as json             # JSON array to stdout (pipe-friendly)
+… save out.tsv               # tab-delimited
 ```
 
-A flow can read and write the same format ("write what you can read"): CSV and
-JSON Lines are symmetric.
+A flow can read and write the same format ("write what you can read"): CSV/TSV,
+JSON array and JSON Lines are all symmetric. **`as json` is a single bracketed
+array**; **`as jsonl`/`.jsonl`** is one object per line (and what `writejson`
+emits). Both stream in bounded memory; an empty result is `[]` (json) or no
+lines (jsonl).
 
 ---
 
@@ -425,8 +432,11 @@ Rivus is built to be used like `awk`/`jq` — inline, in a pipe, or as a heredoc
 # filter + project a CSV to stdout
 rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;'
 
-# CSV → JSONL conversion
+# CSV → JSONL conversion (one object per line)
 rivus run -c 'U: open users.csv save stdout as jsonl ;' > users.jsonl
+
+# CSV → JSON array (a single [{…},{…}], pipe straight into jq)
+rivus run -c 'U: open users.csv |? age >= 20 save - as json ;' | jq '.[].name'
 
 # top-5 by a computed column
 rivus run -c 'S: open sales.csv |> product (qty * price) as total sort total desc take 5 save stdout as csv ;'
@@ -483,20 +493,105 @@ rivus run -c 'B: open big.csv ;'        # instant head, ~10 MiB RAM
 
 ---
 
+## 9b. Worked examples (the harder stuff)
+
+Real pipelines that exercise the DAG, joins, grouping and cleaning together.
+Each is a complete program — save it to a `.riv` file or pass it with `-c`.
+
+**Enrich orders with customers, then revenue per (country, tier).** A composite
+join feeding a multi-key group with several aggregates and a percentile:
+
+```
+Customers: open customers.csv ;        # id, country, tier
+Orders:    open orders.csv ;           # cust_id, amount, status
+
+Revenue:
+    Orders &left Customers on cust_id:id   # keep every order; fill missing cust
+    |? status == "paid"
+    |> country tier (amount:f64) as amount
+    |# country tier sum:amount avg:amount p90:amount count_distinct:cust_id
+    sort sum_amount desc
+    save revenue.csv
+;
+```
+
+**Clean a messy export, then bucket and summarize.** Declared types, imputation,
+a `case` bucket and a group — the kind of thing you'd reach to pandas for:
+
+```
+Clean:
+    open raw.csv (id age:str score:str region:str)
+    cast age:int score:f64                 # re-type the string columns
+    fill region ffill                      # carry the last region over blanks
+    fill score mean                        # impute missing scores with the mean
+    |> id age region score
+       (case when age >= 65 then "senior"
+             when age >= 18 then "adult"
+             else "minor" end) as band
+    |# region band avg:score median:score std:score
+    save out.json                          # a single JSON array
+;
+```
+
+**Sessionize a log and rank within each user.** Branch a source, compute on each
+side, and emit JSON for a dashboard — with live telemetry to a socket:
+
+```
+Events:
+    open events.csv.gz                     # gzip input (needs --features gzip)
+    |? status == "ok"
+    |> user ts (bytes / 1048576.0) as mib
+    sort user mib desc                      # user asc, mib desc within user
+    |> user (round(mib)) as mib (concat(user, "@", ts)) as event_id
+    save - as json
+;
+```
+```sh
+rivus run sessions.riv --telemetry-addr 127.0.0.1:9000   # stream metrics live
+```
+
+**Find IDs that match a pattern and normalize them.** `regexp` (feature-gated),
+`replace`, `split_part`, `coalesce`:
+
+```
+Ids:
+    open access.csv
+    |? regexp(path, "^/api/v[0-9]+/")       # only versioned API routes
+    |> (split_part(path, "/", 3)) as version
+       (replace(path, "//", "/")) as norm_path
+       (coalesce(user, "anon")) as who
+    |# version who
+    save stdout as csv
+;
+```
+
+---
+
 ## 10. Performance notes
 
-- **Streaming, bounded memory.** CSV sources and sinks stream; a 1.1 GB file
-  through `open |? … |> … save out.csv` runs in **~10 MiB** of RAM (it does not
-  load the file). On a real ETL this matches DuckDB's wall time at ~40× less
-  memory — see [`docs/BENCHMARKS.md`](BENCHMARKS.md).
-- **Parallel.** Large files (> 256 MiB) with a `save` sink are streamed across
-  CPU cores automatically (byte-range workers → ordered output), still in
-  bounded memory.
+- **Streaming, bounded memory.** CSV sources and sinks stream; a 1.1 GB / 48 M-row
+  file through `open |? age>=50 |> name age save out.csv` runs in **~10 MiB** of
+  RAM (it does not load the file) at **~1.45× faster than DuckDB and ~40× less
+  memory** (3.0 s vs 4.4 s / 407 MiB), ~3.8× faster than awk, ~10× faster than
+  Python — see [`docs/BENCHMARKS.md`](BENCHMARKS.md).
+- **Parallel by default.** A single-CSV file ≥ **8 MiB** with a `save` sink (incl.
+  `save -`) is streamed across CPU cores automatically (newline-aligned
+  byte-range workers → ordered output), still in bounded memory. On a 171 MiB
+  filter that's ~1.6 s serial → **~0.4 s** parallel. Tune with
+  `RIVUS_PARALLEL_MIN_BYTES` (bytes; `0` = always) or force serial with
+  `RIVUS_NO_PARALLEL=1`. Compressed (`.gz`/`.zst`) sources can't be seeked, so
+  they read serially.
 - **Live progress.** An interactive `rivus run` prints a `… N rows  T s  R
   rows/s` line on stderr while a long job streams.
+- **Machine-readable telemetry.** `rivus run … --json` emits per-node JSONL
+  (rows in/out, busy_ms, rows/s, selectivity, mode) + errors + a summary to
+  stderr (stdout stays clean data); `--telemetry-addr HOST:PORT` streams it to a
+  TCP socket for a live viewer.
 - **The optimizer runs by default** (dedup sources, fuse filter+project,
-  projection pushdown). `rivus explain` shows exactly what it did and
-  regenerates the source from the optimized IR. `--no-opt` turns it off.
+  projection pushdown, filter pushdown into the reader). `rivus explain` shows
+  exactly what it did and regenerates the source from the optimized IR.
+  `--no-opt` turns it off; correctness is gated byte-for-byte by the
+  `optimizer_equiv` tests.
 
 ---
 

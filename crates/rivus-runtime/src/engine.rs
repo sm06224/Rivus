@@ -91,6 +91,7 @@ fn must_drain(graph: &PlanGraph) -> bool {
             nd.op,
             Op::SinkCsv { .. }
                 | Op::SinkJsonl { .. }
+                | Op::SinkJson { .. }
                 | Op::GroupBy { .. }
                 | Op::Sort { .. }
                 | Op::Distinct { .. }
@@ -132,7 +133,10 @@ fn build_ops(
             if Some(node.id) == ov_id {
                 ov_op.take().expect("source override used once")
             } else if ov_id.is_some()
-                && matches!(node.op, Op::SinkCsv { .. } | Op::SinkJsonl { .. })
+                && matches!(
+                    node.op,
+                    Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. }
+                )
             {
                 operators::collector()
             } else {
@@ -815,6 +819,7 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
             Some((path, operators::write_csv_file(path, chunks, *delim)))
         }
         Op::SinkJsonl { path } => Some((path, operators::write_jsonl_file(path, chunks))),
+        Op::SinkJson { path } => Some((path, operators::write_json_file(path, chunks))),
         _ => None,
     }
 }

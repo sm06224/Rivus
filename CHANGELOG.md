@@ -29,6 +29,14 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **JSON array output: `save out.json` / `save - as json` (std-only).** A
+  `.json` path (or `as json`) now writes a single JSON array (`[{…},{…}]`)
+  instead of NDJSON; `.jsonl` / `.ndjson` / `as jsonl` stay one-object-per-line,
+  and `writejson` is unchanged (NDJSON). The array sink streams incrementally
+  (open `[`, comma-separate rows across chunks, close `]`) so it stays
+  bounded-memory; an empty result is `[]`. Output is valid JSON (round-trips
+  back through `open`), and byte-identical on the serial and parallel paths.
+  No new dependencies.
 - **`cast COL:type [COL:type …]` verb (std-only).** Re-types named columns in
   place (position and name kept; values re-coerced through the same cast lane as
   an inline `(col:type)` projection) — e.g. `cast age:int price:f64`. The
