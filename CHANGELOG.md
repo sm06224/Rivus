@@ -29,6 +29,13 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Inference-decision telemetry (Epic #30 / Pillar A — issue #31, A4).** A CSV
+  source now records its per-column inference outcome `(name, type, widened)` in
+  `RunResult.inference`; the `--json` summary lists `widened_columns` (columns an
+  int candidate was knocked down to float). Surfaced **off the error stream**
+  (summary-only), so the JSONL `node`/`error` contract and "clean data → no
+  errors" semantics are untouched. Pure accounting, result-invariant. Completes
+  Pillar A's measurement core. No new dependencies.
 - **String prefilter pushdown (Epic #30 / Pillar C, C4(i)).** `filter_pushdown`
   now also lifts **literal-substring** predicates (`contains` / `starts_with` /
   `ends_with` / `==` / the literal run of a `like` pattern) into the CSV reader

@@ -268,3 +268,46 @@ fn progress_hook_publishes_live_snapshots() {
         "final snapshot must have seen every row"
     );
 }
+
+/// A4: a CSV source whose column widens int→float surfaces it in
+/// `RunResult.inference`; a clean column does not. Result-invariant (the column
+/// still resolves to F64), and it never touches the error stream.
+#[test]
+fn inference_widening_is_surfaced_off_the_error_stream() {
+    let mut text = String::from("id,v\n");
+    for i in 1..=3_000u64 {
+        text.push_str(&format!("{i},{i}\n"));
+    }
+    text.push_str("3001,3.5\n"); // forces v: int -> float
+    let csv = TempCsv(gendata::write_temp_bytes("obs_widen", text.as_bytes()));
+    let res = run_src(&format!("F:\n open {}\n |> id v\n;", csv.0.display()), 4096);
+
+    assert_eq!(res.total_rows_out(), 3001);
+    // Widened column is reported in inference, NOT on the error stream.
+    let widened: Vec<&str> = res
+        .inference
+        .iter()
+        .filter(|(_, _, w)| *w)
+        .map(|(n, _, _)| n.as_str())
+        .collect();
+    assert_eq!(widened, vec!["v"], "v should be reported widened");
+    assert!(
+        res.errors.is_empty(),
+        "inference telemetry must not pollute the error stream: {:?}",
+        res.errors
+    );
+
+    // Clean all-int column: nothing widened.
+    let clean = TempCsv(gendata::write_temp_bytes(
+        "obs_nowiden",
+        b"id,v\n1,10\n2,20\n",
+    ));
+    let res = run_src(
+        &format!("F:\n open {}\n |> id v\n;", clean.0.display()),
+        4096,
+    );
+    assert!(
+        !res.inference.iter().any(|(_, _, w)| *w),
+        "clean column must not be widened"
+    );
+}

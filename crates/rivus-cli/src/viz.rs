@@ -165,6 +165,17 @@ pub fn render_telemetry_jsonl(graph: &PlanGraph, res: &RunResult) -> String {
     if !res.workers.is_empty() {
         o.num("workers", res.workers.len() as f64);
     }
+    // A4: columns whose inferred type widened (int→float). Summary-only; the
+    // node/error line contract stays byte-stable.
+    let widened: Vec<&str> = res
+        .inference
+        .iter()
+        .filter(|(_, _, w)| *w)
+        .map(|(n, _, _)| n.as_str())
+        .collect();
+    if !widened.is_empty() {
+        o.str("widened_columns", &widened.join(","));
+    }
     s.push_str(&o.finish());
     s.push('\n');
     s

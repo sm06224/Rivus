@@ -120,8 +120,19 @@ pub struct CsvChunker {
     /// before splitting (a ripgrep-style superset pre-scan; FilterProject is
     /// still authoritative downstream). Empty = no string pre-scan.
     str_prefilter: Vec<String>,
+    /// Per-kept-column inference `(name, type, widened)` for telemetry (A4).
+    /// Empty when the schema was declared or sample-inferred.
+    inference: Vec<(String, DataType, bool)>,
     /// Field delimiter byte (`b','` for CSV, `b'\t'` for TSV).
     delim: u8,
+}
+
+impl CsvChunker {
+    /// The per-column inference outcome (A4 telemetry); empty for declared or
+    /// sample-inferred schemas.
+    pub fn inference(&self) -> &[(String, DataType, bool)] {
+        &self.inference
+    }
 }
 
 impl CsvChunker {
@@ -192,6 +203,13 @@ impl CsvChunker {
             }
         }
         let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        // Inference outcome (A4 telemetry) — captured before declared types
+        // override, so `widened` reflects what the data forced.
+        let inference: Vec<(String, DataType, bool)> = keep
+            .iter()
+            .enumerate()
+            .map(|(k, &ci)| (names[ci].clone(), dtypes[k], flags[k].widened()))
+            .collect();
         apply_declared_types(&mut dtypes, &keep, declared);
 
         let mut fields = Vec::with_capacity(keep.len());
@@ -221,6 +239,7 @@ impl CsvChunker {
                 rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
+                inference,
                 str_prefilter: str_prefilter.to_vec(),
                 pos: 0,
                 limit: None,
@@ -300,6 +319,7 @@ impl CsvChunker {
                 rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
+                inference: Vec::new(),
                 str_prefilter: str_prefilter.to_vec(),
                 pos: 0,
                 limit: None,
@@ -336,6 +356,7 @@ impl CsvChunker {
             rows_prefiltered: 0,
             eof: false,
             prefilter,
+            inference: Vec::new(),
             str_prefilter: Vec::new(),
             pos: start,
             limit: Some(end),
@@ -953,6 +974,14 @@ impl Flags {
         } else {
             DataType::Str
         }
+    }
+
+    /// Did inference "widen" a numeric column? True only for the genuinely
+    /// interesting case: all-float but not all-int — i.e. it looked integer
+    /// until a later cell forced F64. A purely textual column is not "widened",
+    /// it's just `Str`. Pure observation (telemetry); does not affect `resolve`.
+    fn widened(&self) -> bool {
+        self.any && self.all_float && !self.all_int
     }
 }
 

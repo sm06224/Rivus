@@ -95,6 +95,12 @@ pub trait Operator {
     fn finish(&mut self, _ctx: &mut OpCtx) -> Vec<Chunk> {
         Vec::new()
     }
+    /// Per-column type-inference outcome `(name, type, widened)` for a source
+    /// that inferred its schema, surfaced as telemetry (A4). Empty for non-source
+    /// operators and for declared/sample-inferred schemas. Read after the run.
+    fn inference(&self) -> Vec<(String, DataType, bool)> {
+        Vec::new()
+    }
 }
 
 /// Read a text source: the `-` sentinel reads stdin, otherwise a file.
@@ -512,6 +518,13 @@ impl SourceCsv {
 impl Operator for SourceCsv {
     fn is_source(&self) -> bool {
         true
+    }
+
+    fn inference(&self) -> Vec<(String, DataType, bool)> {
+        self.stream
+            .as_ref()
+            .map(|c| c.inference().to_vec())
+            .unwrap_or_default()
     }
 
     fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {

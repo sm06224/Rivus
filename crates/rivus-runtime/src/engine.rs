@@ -13,7 +13,7 @@
 
 use crate::operators::{self, OpCtx, Operator};
 use crate::telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
-use rivus_core::{Chunk, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
+use rivus_core::{Chunk, DataType, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
 use rivus_ir::{HookAction, HookEvent, NodeId, Op, PlanGraph};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -62,6 +62,10 @@ pub struct RunResult {
     /// Wall time from run start to the first chunk a source produced — the
     /// "time to first row". `None` if no row was ever produced.
     pub first_row_latency: Option<Duration>,
+    /// Per-column type-inference outcomes `(name, type, widened)` from CSV
+    /// sources that inferred a schema (A4 telemetry). Empty for declared/sample
+    /// schemas and non-CSV sources.
+    pub inference: Vec<(String, DataType, bool)>,
 }
 
 impl RunResult {
@@ -373,6 +377,11 @@ fn drive(
 
     prog.finish(rows_seen);
 
+    // A4: gather per-column inference outcomes from any source that inferred a
+    // schema (telemetry; empty otherwise). Cheap, runs once at the end.
+    let inference: Vec<(String, DataType, bool)> =
+        ops.iter().flat_map(|op| op.inference()).collect();
+
     // A5: a final snapshot so a subscriber always observes the terminal state.
     if let Some(h) = hook.as_mut() {
         h(&build_snapshot(
@@ -412,6 +421,7 @@ fn drive(
         outputs,
         workers: Vec::new(),
         first_row_latency,
+        inference,
     }
 }
 
@@ -1024,6 +1034,9 @@ fn merge_results(
         outputs,
         workers,
         first_row_latency,
+        // Per-worker byte-range readers infer globally; the merged view doesn't
+        // surface their inference (empty — telemetry, not a contract).
+        inference: Vec::new(),
     }
 }
 
