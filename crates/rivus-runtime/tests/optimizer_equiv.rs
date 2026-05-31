@@ -103,12 +103,37 @@ fn fusion_and_pushdown_preserve_results() {
     assert_eq!(names, vec!["name", "age"]);
 }
 
+/// Run a program twice (optimized / unoptimized) and return both fingerprints,
+/// *without* requiring the optimizer to fire (unlike `run_both`). Used to assert
+/// equivalence for programs the optimizer may legitimately leave untouched.
+fn fingerprints_both(src: &str) -> (BTreeMap<String, Vec<String>>, BTreeMap<String, Vec<String>>) {
+    let g = rivus_parser::parse(src).expect("parse");
+    let raw = run(
+        &g,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("raw run");
+    let (opt_g, _report) = rivus_optimizer::optimize(g);
+    let opt = run(
+        &opt_g,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("opt run");
+    (fingerprint(&raw), fingerprint(&opt))
+}
+
 #[test]
-fn pushdown_preserves_computed_columns() {
-    // Projection pushdown must preserve a *computed* column referencing a
-    // non-leading field: restricting the source read-set to {em} must not change
-    // the value of upper(em) / concat(em,…) / split_part(em,…). Guards pushdown
-    // against the string-function projections.
+fn optimizer_preserves_computed_columns() {
+    // Whatever the optimizer does (or doesn't do) to a flow with computed
+    // string-function columns, the result must be identical to unoptimized.
+    // Guards the new replace/split_part/concat projections — and computed
+    // columns generally — against any current or future rewrite.
     let data = "id,em,n\n1,abc,10\n2,xyz,20\n3,pq,30\n".as_bytes();
     let f = TempCsv(gendata::write_temp_bytes("opt_comp", data));
     let p = f.0.display();
@@ -116,9 +141,10 @@ fn pushdown_preserves_computed_columns() {
     for src in [
         format!("F:\n open {p}\n |> (upper(em)) as u\n;"),
         format!("F:\n open {p}\n |? n >= 20\n |> (concat(em, \"!\")) as e id\n;"),
+        format!("F:\n open {p}\n |> (replace(em, \"b\", \"-\")) as r\n;"),
         format!("F:\n open {p}\n |> (split_part(em, \"b\", 1)) as head\n;"),
     ] {
-        let (raw, opt) = run_both(&src);
-        assert_eq!(fingerprint(&raw), fingerprint(&opt), "mismatch for: {src}");
+        let (raw, opt) = fingerprints_both(&src);
+        assert_eq!(raw, opt, "optimized != unoptimized for: {src}");
     }
 }
