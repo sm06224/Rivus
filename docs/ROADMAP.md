@@ -83,7 +83,7 @@ read-throughput, in priority order:
 | 📋 | **Single-pass inference** (sample + adaptive widen) | drop the second full scan that streaming type-inference costs |
 | 📋 | **SIMD CSV scan** (`std::arch`, no deps) | find `,`/`\n` with SSE2/AVX2; bench-gated (SWAR tried, no win at current bottleneck — revisit after the above) |
 | 📋 | **Vectorized / SIMD predicate kernels** for more shapes | extend `kernel.rs` beyond numeric conjunctions |
-| 📋 | Push computed-column / string predicates into the reader | extend prefilter |
+| 🚧 | Push computed-column / string predicates into the reader | **string literal-substring prefilter ✅** (`contains`/`starts_with`/`ends_with`/`==`/`like`-literal → ripgrep-style raw-line pre-scan, ~2× serial on `contains`, result-invariant superset; Epic #30 C4(i)). Computed-column predicates + the parallel byte-range path still planned |
 | 📋 | mmap the source; overlap decode with IO | |
 | 📋 | Re-use buffers across chunks; arena-per-chunk recycling | |
 | 📋 | JIT (Cranelift) for hot predicates/projections | design doc 09; needs a vetted dep |

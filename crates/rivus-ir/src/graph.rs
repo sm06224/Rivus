@@ -227,10 +227,15 @@ pub enum Op {
     /// `filter_pushdown`, lets the reader skip *building* rows whose numeric
     /// `(column, op, rhs)` conjunction is definitely false — a conservative
     /// pre-pass; the downstream `FilterProject` remains authoritative.
+    /// `str_prefilter` carries required literal substrings (from `contains` /
+    /// `starts_with` / `ends_with` / `==` / `like`-literal predicates): the
+    /// reader skips any *raw line* lacking the substring before splitting it
+    /// (a ripgrep-style superset filter, so the result is unchanged).
     OpenCsv {
         path: String,
         projection: Option<Vec<String>>,
         prefilter: Vec<(String, CmpOp, f64)>,
+        str_prefilter: Vec<String>,
         /// Whether the first line is a header. `false` (`open f.csv noheader`)
         /// treats every line as data and names columns `c0, c1, …`.
         header: bool,
@@ -463,6 +468,7 @@ impl Op {
                 path,
                 projection,
                 prefilter,
+                str_prefilter,
                 header,
                 declared,
                 delim,
@@ -494,6 +500,9 @@ impl Op {
                         .map(|(c, op, v)| format!("{c}{}{v}", op.as_str()))
                         .collect();
                     s.push_str(&format!("  # pre-filter: {}", preds.join(" and ")));
+                }
+                if !str_prefilter.is_empty() {
+                    s.push_str(&format!("  # str-prefilter: {:?}", str_prefilter));
                 }
                 s
             }

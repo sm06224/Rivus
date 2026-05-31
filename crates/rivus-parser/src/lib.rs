@@ -565,6 +565,7 @@ impl Parser {
                     path,
                     projection: None,
                     prefilter: Vec::new(),
+                    str_prefilter: Vec::new(),
                     header: true,
                     declared: None,
                 }))
@@ -1117,6 +1118,7 @@ impl Format {
                 path,
                 projection: None,
                 prefilter: Vec::new(),
+                str_prefilter: Vec::new(),
                 header: true,
                 declared: None,
                 delim,

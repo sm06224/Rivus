@@ -524,3 +524,28 @@ streams at ~10 MiB, so the honest framing stays "Rivus trades some speed for
 bounded memory and a zero-dependency default" — and the roadmap goal is to close
 the read-throughput gap until that trade is near-free. ripgrep remains the right
 tool for "match lines in a file"; Rivus composes with it (`rg … | rivus …`).
+
+### String prefilter pushdown (Epic #30 / Pillar C C4(i), 5 M rows, 171 MiB)
+
+`filter_pushdown` now also lifts **literal-substring** predicates
+(`contains` / `starts_with` / `ends_with` / `==` / the literal run of `like`)
+into the reader as a ripgrep-style raw-line byte pre-scan: a line lacking the
+needle is skipped *before* it's split into fields. It's a **superset** filter
+(the downstream `FilterProject` re-checks every survivor, so the result is
+byte-identical — a substring landing in the wrong column is still rejected), and
+it costs no extra memory.
+
+Measured: `… |? contains(country, "JP") |> id name age save -`, serial
+(best of 3, 171 MiB, ~1 M matching rows):
+
+| | wall | rows out |
+|---|---:|---:|
+| without prefilter (`--no-opt`) | 3.45 s | 1,001,313 |
+| with string prefilter | **1.70 s** | 1,001,313 |
+
+**~2.0× on the serial path** — the win is skipping the split+build of the ~80%
+of rows that can't match. Result is identical (count matches DuckDB's
+`country LIKE '%JP%'`). The skipped-row count is surfaced as A1 telemetry
+(`prefilter skipped N row(s) at the reader`). The byte-range *parallel* reader
+doesn't apply the string pre-scan yet (it stays on the numeric prefilter); that
+extension is tracked for a later slice.

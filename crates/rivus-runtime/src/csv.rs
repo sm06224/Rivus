@@ -116,6 +116,10 @@ pub struct CsvChunker {
     limit: Option<u64>,
     /// Compiled pushed-down numeric predicates (skip building failing rows).
     prefilter: Vec<PreCmp>,
+    /// Required literal substrings: a raw line lacking any of them is skipped
+    /// before splitting (a ripgrep-style superset pre-scan; FilterProject is
+    /// still authoritative downstream). Empty = no string pre-scan.
+    str_prefilter: Vec<String>,
     /// Field delimiter byte (`b','` for CSV, `b'\t'` for TSV).
     delim: u8,
 }
@@ -136,12 +140,22 @@ impl CsvChunker {
         chunk_size: usize,
         preview: bool,
         prefilter: &[(String, CmpOp, f64)],
+        str_prefilter: &[String],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
         delim: u8,
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
-            return Self::open_preview(path, allow, chunk_size, prefilter, header, declared, delim);
+            return Self::open_preview(
+                path,
+                allow,
+                chunk_size,
+                prefilter,
+                str_prefilter,
+                header,
+                declared,
+                delim,
+            );
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -207,6 +221,7 @@ impl CsvChunker {
                 rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
+                str_prefilter: str_prefilter.to_vec(),
                 pos: 0,
                 limit: None,
                 delim,
@@ -222,6 +237,7 @@ impl CsvChunker {
         allow: Option<&[String]>,
         chunk_size: usize,
         prefilter: &[(String, CmpOp, f64)],
+        str_prefilter: &[String],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
         delim: u8,
@@ -284,6 +300,7 @@ impl CsvChunker {
                 rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
+                str_prefilter: str_prefilter.to_vec(),
                 pos: 0,
                 limit: None,
                 delim,
@@ -319,6 +336,7 @@ impl CsvChunker {
             rows_prefiltered: 0,
             eof: false,
             prefilter,
+            str_prefilter: Vec::new(),
             pos: start,
             limit: Some(end),
             delim,
@@ -363,6 +381,15 @@ impl CsvChunker {
             self.pos += n as u64;
             let l = trim_eol(&self.line);
             if l.trim().is_empty() {
+                continue;
+            }
+            // String prefilter: a required literal substring is missing from the
+            // raw line, so no field can satisfy the predicate — skip before
+            // splitting (ripgrep-style; FilterProject stays authoritative).
+            if !self.str_prefilter.is_empty()
+                && !self.str_prefilter.iter().all(|n| l.contains(n.as_str()))
+            {
+                self.rows_prefiltered += 1;
                 continue;
             }
             if split_offsets(l, &mut offsets, self.delim) {

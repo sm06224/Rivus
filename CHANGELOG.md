@@ -29,6 +29,17 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **String prefilter pushdown (Epic #30 / Pillar C, C4(i)).** `filter_pushdown`
+  now also lifts **literal-substring** predicates (`contains` / `starts_with` /
+  `ends_with` / `==` / the literal run of a `like` pattern) into the CSV reader
+  as a ripgrep-style raw-line byte pre-scan: a line lacking the needle is skipped
+  *before* it's split into fields. It's a **superset** filter — the downstream
+  `FilterProject` re-checks every survivor, so the result is byte-identical (a
+  substring landing in the wrong column is still rejected) — and it costs no
+  extra memory. Measured **~2.0×** on `contains(country,"JP")` over 171 MiB
+  serial (3.45 s → 1.70 s); the skipped-row count shows up as A1 telemetry.
+  Equivalence-gated (`optimizer_equiv`), result unchanged. No new dependencies.
+  (The byte-range parallel reader doesn't apply it yet — tracked for later.)
 - **Streaming runtime snapshots (Epic #30 / Pillar A — issue #31, A5).** New
   `RuntimeSnapshot` / `NodeSnapshot` (a cheap point-in-time view: elapsed,
   rows_seen, mode, per-node counters) and `run_with_progress(graph, opts, hook)`
