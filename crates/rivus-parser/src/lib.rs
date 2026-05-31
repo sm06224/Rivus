@@ -97,6 +97,17 @@ impl Parser {
         }
     }
 
+    /// Read a source/sink path token. Like [`word`], but also accepts a bare
+    /// `-` (which the lexer tokenizes as `Minus`) as the stdin/stdout sentinel,
+    /// so `open -` / `save -` work like `open stdin` / `save stdout`.
+    fn path_word(&mut self) -> Result<String, RivusError> {
+        match self.bump() {
+            Tok::Word(w) => Ok(w),
+            Tok::Minus => Ok("-".to_string()),
+            other => Err(self.err(format!("expected a path, found {other:?}"))),
+        }
+    }
+
     fn peek_is_word(&self, w: &str) -> bool {
         matches!(self.tok(), Tok::Word(x) if x == w)
     }
@@ -228,7 +239,7 @@ impl Parser {
                 // sink mirrors the source format set (write what you can read).
                 Tok::Word(w) if w == "save" => {
                     self.bump();
-                    let path = norm_path(self.word()?);
+                    let path = norm_path(self.path_word()?);
                     let explicit = if self.peek_is_word("as") {
                         self.bump();
                         Some(self.word()?)
@@ -438,7 +449,7 @@ impl Parser {
             // equivalent explicit aliases (lower cognitive load, fewer surprises).
             Tok::Word(w) if w == "open" => {
                 self.bump();
-                let path = norm_path(self.word()?);
+                let path = norm_path(self.path_word()?);
                 let explicit = if self.peek_is_word("as") {
                     self.bump();
                     Some(self.word()?)
@@ -474,7 +485,7 @@ impl Parser {
             }
             Tok::Word(w) if w == "readcsv" => {
                 self.bump();
-                let path = norm_path(self.word()?);
+                let path = norm_path(self.path_word()?);
                 Ok(self.g.add_node(Op::OpenCsv {
                     delim: rivus_ir::delim_for_path(&path),
                     path,
@@ -486,7 +497,7 @@ impl Parser {
             }
             Tok::Word(w) if w == "readjson" => {
                 self.bump();
-                let path = norm_path(self.word()?);
+                let path = norm_path(self.path_word()?);
                 Ok(self.g.add_node(Op::OpenJsonl { path }))
             }
             Tok::Word(w) if w == "stream" => {
@@ -1197,6 +1208,28 @@ mod tests {
     }
 
     #[test]
+    fn bare_dash_is_stdio_sentinel() {
+        // `open -` / `save -` lex the lone dash as the stdin/stdout sentinel
+        // (distinct from `->` branch and expression `-`), mapping to "-".
+        let g = parse("F:\n open -\n |> name\n save -\n;").unwrap();
+        match &g.nodes[0].op {
+            Op::OpenCsv { path, .. } => assert_eq!(path, "-"),
+            o => panic!("expected OpenCsv, got {o:?}"),
+        }
+        let sink = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::SinkCsv { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(sink, "-");
+        // `->` branch must still tokenize as a branch, not a dash word.
+        assert!(parse("F:\n open a.csv\n -> Kids:\n |? age < 18\n ;\n;").is_ok());
+    }
+
+    #[test]
     fn sink_format_selection() {
         // The sink mirrors the source format set: extension default + `as` + aliases.
         assert!(matches!(
@@ -1471,5 +1504,22 @@ Import:
         assert!(parse("F:\n open a.csv\n |> (case end) as b\n;").is_err());
         assert!(parse("F:\n open a.csv\n |> (case when age >= 1 \"x\" end) as b\n;").is_err());
         assert!(parse("F:\n open a.csv\n |> (case when age >= 1 then \"x\") as b\n;").is_err());
+    }
+
+    #[test]
+    fn bare_dash_is_stdin_stdout_sentinel() {
+        // `open -` / `save -` map to the "-" sentinel, like `open stdin` /
+        // `save stdout` (the bare dash lexes as Minus; path_word accepts it).
+        let g = parse("F:\n open -\n |> name\n save -\n;").unwrap();
+        assert!(matches!(&g.nodes[0].op, Op::OpenCsv { path, .. } if path == "-"));
+        let sink = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::SinkCsv { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(sink, "-");
     }
 }

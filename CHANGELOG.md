@@ -7,6 +7,9 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **`-` sentinel for `open`/`save`.** `open -` reads stdin and `save -` writes
+  stdout, alongside the existing `stdin`/`stdout` keywords — so a Rivus flow
+  drops into a Unix pipe the conventional way (`… | rivus -c '… open - … save -'`).
 - **`case when … then … [else …] end` expression (std-only).** A row-wise
   conditional usable anywhere an expression is (computed columns, filters).
   The first truthy `when` branch yields its value; with no match the `else`

@@ -72,7 +72,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |
-| `open stdin` | read CSV (or `as FMT`) from standard input |
+| `open stdin` / `open -` | read CSV (or `as FMT`) from standard input |
 | `stream NAME` | replay a named flow (MVP: reference) |
 
 Format detection deliberately **does not over-trust the extension**: use
@@ -303,7 +303,7 @@ than crashing (continue-first).
 | `save PATH` | format from the extension (mirrors the sources; `.tsv`/`.tab` → tab-delimited) |
 | `save PATH as FMT` | force the format (`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
 | `writecsv PATH` / `writejson PATH` | explicit verbs |
-| `save stdout` | write to standard output |
+| `save stdout` / `save -` | write to standard output |
 | `print` | capture for the on-screen preview |
 
 ```

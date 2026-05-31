@@ -37,7 +37,7 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | Inline `-c`, stdin heredoc, `open stdin` / `save stdout` | |
 | ✅ | stdout = clean data, stderr = visualization | pipe-friendly today |
 | ✅ | **First-class stdin→process→stdout** | make `cat x.csv \| rivus '<transforms>'` ergonomic: a default source (stdin) and sink (stdout) so a bare transform chain works as a Unix filter |
-| 📋 | `-` sentinel for `open`/`save` | the bare dash isn't lexable yet (only `stdin`/`stdout`) |
+| ✅ | `-` sentinel for `open`/`save` | `open -` / `save -` map to stdin/stdout (alongside `stdin`/`stdout`) |
 | ✅ | **`describe`** | `rivus describe <source>` / a `describe` verb: per-column type, count, nulls, min/max/mean — a streaming one-pass summary (pandas `.describe()` / SQL `DESCRIBE`) |
 
 ## C. Language: a more readable, typed flow syntax
