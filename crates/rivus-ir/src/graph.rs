@@ -396,7 +396,19 @@ impl Op {
                             name,
                             access: Access::Fast,
                         } if name == alias => name.clone(),
-                        _ => format!("{e} as {alias}"),
+                        // The parser's computed-column rule is `(expr) as alias`,
+                        // so a computed item must render parenthesized to
+                        // re-parse. `Arith` already self-parenthesizes; wrap
+                        // anything that doesn't start with `(` (e.g. `case`,
+                        // field renames, functions).
+                        _ => {
+                            let s = e.to_string();
+                            if s.starts_with('(') {
+                                format!("{s} as {alias}")
+                            } else {
+                                format!("({s}) as {alias}")
+                            }
+                        }
                     })
                     .collect();
                 format!("|> {}", parts.join(" "))
