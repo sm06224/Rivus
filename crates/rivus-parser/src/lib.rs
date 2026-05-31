@@ -631,20 +631,33 @@ impl Parser {
                         .labels
                         .get(&rhs)
                         .ok_or_else(|| self.err(format!("unknown flow '{rhs}'")))?;
-                    // `on key` (same name both sides) or `on lkey:rkey`.
+                    // `on k [k ...]` — each key is `lkey` (same name both sides)
+                    // or `lkey:rkey`. One or more pairs form a composite key.
                     if !self.peek_is_word("on") {
                         return Err(self.err("join `A & B` requires `on <key>` (or `on lk:rk`)"));
                     }
                     self.bump(); // `on`
-                    let left_key = self.word()?;
-                    let right_key = if self.eat(&Tok::Colon) {
-                        self.word()?
-                    } else {
-                        left_key.clone()
-                    };
+                    let mut left_keys = Vec::new();
+                    let mut right_keys = Vec::new();
+                    while let Tok::Word(w) = self.tok().clone() {
+                        if is_keyword(&w) {
+                            break;
+                        }
+                        let lk = self.word()?;
+                        let rk = if self.eat(&Tok::Colon) {
+                            self.word()?
+                        } else {
+                            lk.clone()
+                        };
+                        left_keys.push(lk);
+                        right_keys.push(rk);
+                    }
+                    if left_keys.is_empty() {
+                        return Err(self.err("join `on` requires at least one key"));
+                    }
                     let join = self.g.add_node(Op::Join {
-                        left_key,
-                        right_key,
+                        left_keys,
+                        right_keys,
                         kind,
                     });
                     self.g.add_edge(first, join, EdgeKind::Stream);
@@ -1575,18 +1588,35 @@ Import:
         match g.nodes.iter().find_map(|n| match &n.op {
             Op::Join {
                 kind,
-                left_key,
-                right_key,
-            } => Some((*kind, left_key.clone(), right_key.clone())),
+                left_keys,
+                right_keys,
+            } => Some((*kind, left_keys.clone(), right_keys.clone())),
             _ => None,
         }) {
             Some((kind, lk, rk)) => {
                 assert_eq!(kind, JoinKind::Left);
-                assert_eq!(lk, "uid");
-                assert_eq!(rk, "oid");
+                assert_eq!(lk, vec!["uid".to_string()]);
+                assert_eq!(rk, vec!["oid".to_string()]);
             }
             None => panic!("expected a join node"),
         }
+
+        // Multi-key: `on a b` joins on the (a, b) tuple, same name both sides.
+        let g = parse("U: open u.csv ;\nO: open o.csv ;\nJ: U & O on country region ;").unwrap();
+        let (lk, rk) = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::Join {
+                    left_keys,
+                    right_keys,
+                    ..
+                } => Some((left_keys.clone(), right_keys.clone())),
+                _ => None,
+            })
+            .expect("a join node");
+        assert_eq!(lk, vec!["country".to_string(), "region".to_string()]);
+        assert_eq!(rk, vec!["country".to_string(), "region".to_string()]);
 
         // right/full lower to their kinds.
         match parse("U: open u.csv ;\nO: open o.csv ;\nJ: U &right O on id ;")
@@ -1609,6 +1639,8 @@ Import:
             "U: open u.csv ;\nO: open o.csv ;\nJ: U &right O on id ;",
             "U: open u.csv ;\nO: open o.csv ;\nJ: U &full O on id ;",
             "U: open u.csv ;\nO: open o.csv ;\nJ: U &left O on uid:oid ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U & O on country region ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U &full O on a x:y ;",
         ] {
             let s = parse(prog).unwrap().to_source();
             assert_eq!(s, parse(&s).unwrap().to_source(), "round-trip: {s}");

@@ -257,12 +257,12 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Merge => Box::new(Merge),
         Op::Branch => Box::new(Merge), // identity forwarder; fan-out is structural
         Op::Join {
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             kind,
         } => Box::new(Join::new(
-            left_key.clone(),
-            right_key.clone(),
+            left_keys.clone(),
+            right_keys.clone(),
             *kind,
             inputs.first().copied().unwrap_or(usize::MAX),
         )),
@@ -2061,8 +2061,8 @@ impl Operator for Merge {
 /// collides with a left column is suffixed `_r`. Keys compare by string value,
 /// so `30` (i64) and `"30"` (str) match — convenient for loosely-typed CSV.
 struct Join {
-    left_key: String,
-    right_key: String,
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
     kind: JoinKind,
     left_id: NodeId,
     left_buf: Vec<Chunk>,
@@ -2070,16 +2070,35 @@ struct Join {
 }
 
 impl Join {
-    fn new(left_key: String, right_key: String, kind: JoinKind, left_id: NodeId) -> Self {
+    fn new(
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
+        kind: JoinKind,
+        left_id: NodeId,
+    ) -> Self {
         Join {
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             kind,
             left_id,
             left_buf: Vec::new(),
             right_buf: Vec::new(),
         }
     }
+}
+
+/// A row's composite join key: the values at `idxs` joined by the ASCII unit
+/// separator (`0x1F`, which can't appear in a parsed CSV field), so distinct key
+/// tuples never collide.
+fn join_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> String {
+    let mut s = String::new();
+    for (n, &ci) in idxs.iter().enumerate() {
+        if n > 0 {
+            s.push('\u{1f}');
+        }
+        s.push_str(&chunk.value(row, ci).to_string());
+    }
+    s
 }
 
 /// Concatenate buffered chunks (sharing a schema) into one.
@@ -2151,25 +2170,38 @@ impl Operator for Join {
                 .at_node(ctx.label.clone()),
             );
         };
-        let Some(lk) = left.schema.index_of(&self.left_key) else {
-            warn(ctx, "left", &self.left_key);
-            return Vec::new();
-        };
-        let Some(rk) = right.schema.index_of(&self.right_key) else {
-            warn(ctx, "right", &self.right_key);
-            return Vec::new();
-        };
+        // Resolve each key column on both sides (composite key, in key order).
+        let mut lk = Vec::with_capacity(self.left_keys.len());
+        for k in &self.left_keys {
+            match left.schema.index_of(k) {
+                Some(i) => lk.push(i),
+                None => {
+                    warn(ctx, "left", k);
+                    return Vec::new();
+                }
+            }
+        }
+        let mut rk = Vec::with_capacity(self.right_keys.len());
+        for k in &self.right_keys {
+            match right.schema.index_of(k) {
+                Some(i) => rk.push(i),
+                None => {
+                    warn(ctx, "right", k);
+                    return Vec::new();
+                }
+            }
+        }
 
         // Build the hash table on the right side, then probe with the left.
         // Each output row is a `(Option<left>, Option<right>)` pair: an unmatched
         // left row (left/full) has `None` on the right and pads the right columns
         // with defaults; an unmatched right row (right/full) has `None` on the
-        // left and pads the left columns — except the join-key column, which
-        // takes the right key so the key is never lost.
+        // left and pads the left columns — except the join-key columns, which
+        // take the right key so the key is never lost.
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for ri in 0..right.len {
             table
-                .entry(right.value(ri, rk).to_string())
+                .entry(join_key_at(&right, &rk, ri))
                 .or_default()
                 .push(ri);
         }
@@ -2177,7 +2209,7 @@ impl Operator for Join {
         let mut lidx: Vec<Option<usize>> = Vec::new();
         let mut ridx: Vec<Option<usize>> = Vec::new();
         for li in 0..left.len {
-            match table.get(&left.value(li, lk).to_string()) {
+            match table.get(&join_key_at(&left, &lk, li)) {
                 Some(rs) => {
                     for &ri in rs {
                         right_matched[ri] = true;
@@ -2202,12 +2234,13 @@ impl Operator for Join {
             }
         }
 
-        // Output schema: left fields, then right fields except the join key
-        // (collisions suffixed `_r`).
+        // Output schema: left fields, then right fields except the join keys
+        // (collisions suffixed `_r`). The right key columns are dropped (the
+        // left key column carries the value).
         let mut fields = left.schema.fields.clone();
         let mut right_cols = Vec::new();
         for (ci, f) in right.schema.fields.iter().enumerate() {
-            if ci == rk {
+            if rk.contains(&ci) {
                 continue;
             }
             let name = if left.schema.index_of(&f.name).is_some() {
@@ -2219,15 +2252,16 @@ impl Operator for Join {
             right_cols.push(ci);
         }
 
-        // Left columns: gather by `lidx`, but the join-key column borrows the
+        // Left columns: gather by `lidx`. A join-key column borrows the matching
         // right key when the left side is absent (key-preservation for
-        // right/full joins). Other left columns pad with the type default.
+        // right/full joins); a non-key left column pads with the type default.
         let mut out: Vec<Column> = Vec::with_capacity(fields.len());
         for (ci, col) in left.columns.iter().enumerate() {
-            if ci == lk {
-                out.push(join_key_column(col, &lidx, &ridx, &right.columns[rk]));
-            } else {
-                out.push(col.gather_opt(&lidx));
+            match lk.iter().position(|&k| k == ci) {
+                Some(kpos) => {
+                    out.push(join_key_column(col, &lidx, &ridx, &right.columns[rk[kpos]]))
+                }
+                None => out.push(col.gather_opt(&lidx)),
             }
         }
         for &ci in &right_cols {

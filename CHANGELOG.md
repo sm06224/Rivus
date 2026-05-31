@@ -29,6 +29,16 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Composite-key joins: `A & B on k1 k2 …` (std-only).** Every join kind
+  (`&`/`&left`/`&right`/`&full`) now joins on one *or more* key columns — e.g.
+  `A & B on country region` matches rows agreeing on the (country, region)
+  tuple. Each key may be `lk:rk` when the sides name it differently (`on a x:y`),
+  and the forms mix (`on a x:y`). Rows are keyed on the key values joined by the
+  ASCII unit separator (`0x1F`), so tuples never collide; outer joins drop the
+  right key columns and preserve every left key value (right/full carry the right
+  key into the output). Round-trips through `to_source`; oracle-tested (a
+  same-country / different-region pair must *not* match), chunk-size independent.
+  No new dependencies.
 - **Multi-key grouping: `|# key1 key2 … [func:col …]` (std-only).** `|#` now
   accepts more than one group key — e.g. `|# country region sum:score` groups by
   the (country, region) tuple. Each key becomes its own output column (in key

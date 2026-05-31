@@ -175,6 +175,84 @@ fn inner_hash_join_matches_oracle() {
 }
 
 #[test]
+fn multi_key_inner_join_matches_oracle() {
+    // Join on a (country, region) tuple. Left rows whose tuple matches a right
+    // row join; a left row with the same country but a different region must NOT
+    // match (the composite key matters). Row count and the joined `sales` value
+    // are checked against an independent oracle, chunk-size independent.
+    use std::collections::HashMap;
+    // Left: one row per (country, region) with a name.
+    let lefts = [
+        ("JP", "east", "a"),
+        ("JP", "west", "b"),
+        ("US", "east", "c"),
+        ("US", "south", "d"), // no right match (region differs)
+    ];
+    // Right: (country, region) -> sales. JP/east and US/east match; JP/north is
+    // an orphan; US/south is absent.
+    let rights = [
+        ("JP", "east", 100i64),
+        ("US", "east", 200),
+        ("JP", "north", 9),
+    ];
+    let mut l = String::from("country,region,name\n");
+    for (c, r, n) in lefts {
+        l.push_str(&format!("{c},{r},{n}\n"));
+    }
+    let mut o = String::from("country,region,sales\n");
+    for (c, r, s) in rights {
+        o.push_str(&format!("{c},{r},{s}\n"));
+    }
+    // Oracle: inner join on (country, region).
+    let mut rmap: HashMap<(&str, &str), i64> = HashMap::new();
+    for (c, r, s) in rights {
+        rmap.insert((c, r), s);
+    }
+    let mut expected: Vec<(String, String, String, i64)> = Vec::new();
+    for (c, r, n) in lefts {
+        if let Some(&s) = rmap.get(&(c, r)) {
+            expected.push((c.into(), r.into(), n.into(), s));
+        }
+    }
+    expected.sort();
+
+    let lf = TempCsv(gendata::write_temp_bytes("mkjoin_l", l.as_bytes()));
+    let of = TempCsv(gendata::write_temp_bytes("mkjoin_o", o.as_bytes()));
+    let (lp, op) = (lf.0.display(), of.0.display());
+
+    for cs in [1usize, 2, 1024] {
+        let src = format!(
+            "L: open {lp} ;\nO: open {op} ;\nJ: L & O on country region |> country region name sales\n;"
+        );
+        let res = run_src(&src, cs);
+        let out = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("J"))
+            .unwrap();
+        let mut got: Vec<(String, String, String, i64)> = Vec::new();
+        for c in &out.chunks {
+            let (ci, ri, ni, si) = (
+                c.schema.index_of("country").unwrap(),
+                c.schema.index_of("region").unwrap(),
+                c.schema.index_of("name").unwrap(),
+                c.schema.index_of("sales").unwrap(),
+            );
+            for r in 0..c.len {
+                got.push((
+                    c.value(r, ci).to_string(),
+                    c.value(r, ri).to_string(),
+                    c.value(r, ni).to_string(),
+                    c.value(r, si).as_f64().unwrap() as i64,
+                ));
+            }
+        }
+        got.sort();
+        assert_eq!(got, expected, "multi-key inner join @cs={cs}");
+    }
+}
+
+#[test]
 fn left_join_keeps_unmatched_left_rows() {
     // Left: users 0..users. Right: orders whose id is in [0, users*2), so only
     // some users have a matching order. A LEFT join must emit:

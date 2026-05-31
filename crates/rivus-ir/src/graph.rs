@@ -325,12 +325,13 @@ pub enum Op {
     Branch,
     /// `+` merge: union of all incoming streams.
     Merge,
-    /// `&` synchronized join on keys. `kind` selects inner (`&`) vs left outer
-    /// (`&left`): a left join keeps every left row, filling the right columns
-    /// with type defaults when no right row matches.
+    /// `&` synchronized join on one or more key pairs. `kind` selects inner
+    /// (`&`) vs left/right/full outer. `left_keys[i]` joins `right_keys[i]`; the
+    /// two vectors have equal length (≥1). An outer join keeps unmatched rows on
+    /// the kept side, filling the other side's columns with type defaults.
     Join {
-        left_key: String,
-        right_key: String,
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
         kind: JoinKind,
     },
     /// `print` / default leaf sink.
@@ -344,6 +345,25 @@ pub enum Op {
 
 /// The default CSV field delimiter.
 pub const COMMA: u8 = b',';
+
+/// Render a join's `on` clause faithfully for `to_source`: one token per key
+/// pair, `lk` when the two names are equal else `lk:rk`, space-separated. So
+/// `on id`, `on uid:oid`, and `on a b c` all round-trip, as does a mixed
+/// `on a x:y`.
+pub fn join_on_clause(left_keys: &[String], right_keys: &[String]) -> String {
+    let parts: Vec<String> = left_keys
+        .iter()
+        .zip(right_keys.iter())
+        .map(|(l, r)| {
+            if l == r {
+                l.clone()
+            } else {
+                format!("{l}:{r}")
+            }
+        })
+        .collect();
+    format!("on {}", parts.join(" "))
+}
 
 /// Pick the field delimiter for a path by extension: `.tsv`/`.tab` use a tab,
 /// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
@@ -563,10 +583,10 @@ impl Op {
             Op::Branch => "-> branch".to_string(),
             Op::Merge => "+ merge".to_string(),
             Op::Join {
-                left_key,
-                right_key,
+                left_keys,
+                right_keys,
                 kind,
-            } => format!("{} on {left_key} = {right_key}", kind.amp()),
+            } => format!("{} {}", kind.amp(), join_on_clause(left_keys, right_keys)),
             Op::SinkPrint => "print".to_string(),
             Op::SinkCsv { path, delim } => match delim_modifier_for(path, *delim) {
                 Some(m) => format!("save {path} {m}"),
@@ -786,17 +806,13 @@ impl PlanGraph {
                     continue;
                 }
                 Op::Join {
-                    left_key,
-                    right_key,
+                    left_keys,
+                    right_keys,
                     kind,
                 } => {
                     let sep = format!(" {} ", kind.amp());
                     let names = self.input_labels(&inputs).join(&sep);
-                    let on = if left_key == right_key {
-                        format!("on {left_key}")
-                    } else {
-                        format!("on {left_key}:{right_key}")
-                    };
+                    let on = join_on_clause(left_keys, right_keys);
                     let _ = writeln!(out, "{label}:\n    {names} {on}\n;");
                     continue;
                 }

@@ -273,6 +273,9 @@ Merged:
 - `A & B on key` — **inner join** on a key (use `on lkey:rkey` when the two
   sides name the key differently). Output = left columns + right columns (minus
   the join key; a name clashing with a left column is suffixed `_r`).
+- **Composite keys:** `on k1 k2 …` joins on the column *tuple* — e.g.
+  `A & B on country region` matches rows agreeing on both. Each key may be
+  `lk:rk` for differing names (`on a x:y`). Works for every join kind below.
 - `A &left B on key` — **left outer join**: every left row is kept; when no
   right row matches, the right columns are padded with type defaults (`0` /
   `0.0` / `false` / empty string).
@@ -516,7 +519,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | 'readcsv' PATH | 'readjson' PATH
            | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
            | 'stream' IDENT
-           | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY))? ;  (merge / join)
+           | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
            | '|>' proj+                                       (project / compute)
