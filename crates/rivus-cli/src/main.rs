@@ -17,7 +17,7 @@
 mod serve;
 mod viz;
 
-use rivus_runtime::{gendata, run, run_with_progress, RunOptions, RuntimeSnapshot};
+use rivus_runtime::{gendata, run, run_with_progress, MemoryPref, RunOptions, RuntimeSnapshot};
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
@@ -58,6 +58,8 @@ fn main() -> ExitCode {
     let mut serve_addr: Option<String> = None;
     // `--tui`: repaint a live ANSI dashboard on stderr as the run streams.
     let mut tui = false;
+    // `--memory low|auto|fast` (Pillar C): reader memory/speed strategy.
+    let mut memory = MemoryPref::default();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -95,6 +97,16 @@ fn main() -> ExitCode {
             // `--serve HOST:PORT`. The next arg is the address only if it isn't
             // another flag.
             "--tui" => tui = true,
+            "--memory" => {
+                i += 1;
+                match args.get(i).and_then(|s| MemoryPref::parse(s)) {
+                    Some(m) => memory = m,
+                    None => {
+                        eprintln!("error: --memory expects low|auto|fast");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--serve" => {
                 let addr = match args.get(i + 1) {
                     Some(a) if !a.starts_with("--") => {
@@ -246,6 +258,7 @@ fn main() -> ExitCode {
                     chunk_size,
                     progress,
                     max_capture: Some(1000),
+                    memory,
                 },
             ) {
                 Ok(res) => {
@@ -311,6 +324,7 @@ fn run_served(graph: &rivus_ir::PlanGraph, addr: &str, chunk_size: usize) -> Exi
                     chunk_size,
                     progress: false,
                     max_capture: Some(1000),
+                    memory: MemoryPref::Low,
                 },
             ) {
                 Ok(res) if res.final_mode == rivus_core::Mode::Halted => ExitCode::FAILURE,
@@ -336,6 +350,7 @@ fn run_served(graph: &rivus_ir::PlanGraph, addr: &str, chunk_size: usize) -> Exi
                 chunk_size,
                 progress: false,
                 max_capture: Some(1000),
+                memory: MemoryPref::Low,
             },
             Some(&mut hook),
         );
@@ -376,6 +391,7 @@ fn run_tui(graph: &rivus_ir::PlanGraph, chunk_size: usize) -> ExitCode {
             chunk_size,
             progress: false,
             max_capture: Some(1000),
+            memory: MemoryPref::Low,
         },
         Some(&mut hook),
     ) {
@@ -475,7 +491,7 @@ fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
-         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--json|--telemetry-addr HOST:PORT|--tui|--serve [ADDR]]  run a flow\n\
+         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--memory low|auto|fast] [--json|--telemetry-addr HOST:PORT|--tui|--serve [ADDR]]  run a flow\n\
          \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
          \x20 rivus check   <program>                                parse only\n\
          \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\

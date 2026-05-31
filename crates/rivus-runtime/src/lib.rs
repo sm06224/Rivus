@@ -5,6 +5,7 @@
 //! the full error stream, the final runtime mode and per-node telemetry. See
 //! `docs/design/02-execution-model.md` and `05-scheduler.md`.
 
+mod analytics;
 mod csv;
 mod engine;
 mod eval;
@@ -16,6 +17,7 @@ mod telemetry;
 #[doc(hidden)]
 pub mod gendata;
 
+pub use analytics::{choose_strategy, Analytics, MemoryPref, Strategy};
 pub use engine::{run, run_with_progress, Output, ProgressHook, RunOptions, RunResult};
 pub use telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
 

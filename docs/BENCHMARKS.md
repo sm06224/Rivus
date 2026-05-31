@@ -515,8 +515,9 @@ Read-throughput levers, by remaining impact:
    done. Mid-size files (8–256 MiB) now take the streaming-parallel reader
    instead of the slower in-memory path. `RIVUS_PARALLEL_MIN_BYTES`-overridable
    (default 8 MiB); `RIVUS_NO_PARALLEL=1` forces serial.
-3. 📋 **Single-pass inference** (sample + adaptive widen) to drop the second
-   scan — the largest remaining single-thread gap.
+3. ❌ **Single-pass retain-buffer reader** — *evaluated and dropped*: measured
+   slower than two-pass on a warm cache (see the Pillar C section below). The
+   real single-thread→multi-thread win is the byte-range parallel reader.
 4. 📋 **mmap + overlap decode with IO**; reuse per-chunk buffers.
 
 DuckDB still buffers (~400 MiB RSS on the 1.1 GB set earlier) where Rivus
@@ -549,3 +550,51 @@ of rows that can't match. Result is identical (count matches DuckDB's
 (`prefilter skipped N row(s) at the reader`). The byte-range *parallel* reader
 doesn't apply the string pre-scan yet (it stays on the numeric prefilter); that
 extension is tracked for a later slice.
+
+### Adaptive execution strategy (Epic #30 / Pillar C, #33) — and a dropped idea
+
+Pillar C closes the "両立ループ" (visibility → strategy → speed): a std-only host
+probe (`rivus_runtime::analytics::Analytics::probe` — logical CPUs, available
+RAM from `/proc/meminfo`; both overridable with `RIVUS_CPUS` / `RIVUS_RAM_BYTES`
+for deterministic tests) feeds an autotuner (`choose_strategy`) that picks the
+execution strategy and **surfaces the decision** on `RunResult.strategy` (shown
+in the `--json` summary as `"strategy"`). The user knob is
+`--memory low|auto|fast`:
+
+- `low` — force the single-thread bounded reader (lowest resource use).
+- `auto` (default) — parallelize when ≥2 CPUs **and** the input clears the
+  byte-range threshold (8 MiB); small inputs stay serial.
+- `fast` — same, with a more aggressive threshold (1 MiB).
+
+All three return **byte-identical** results (guaranteed by
+`streaming_parallel_matches_serial` and the new
+`memory_strategy_is_result_invariant_and_surfaced` test).
+
+Measured (288 MB clean CSV, `|? age >= 20 |> name age save out.csv`, 4 cpus,
+warm cache, best of 4):
+
+| `--memory` | strategy chosen | wall | rows out |
+|---|---|---:|---:|
+| `low` | forced serial (two-pass) | 3.53 s | 6,223,068 |
+| `auto` (default) | byte-range parallel | **1.13 s** | 6,223,068 |
+| `fast` | byte-range parallel | 1.13 s | 6,223,068 |
+
+**~3.1× faster on the default path, byte-identical output.** The decision is
+self-describing, e.g.
+`"memory=auto: 288130173 B ≥ 8388608 B, 4 cpus → parallel"`.
+
+> **Dropped idea — single-pass retain-buffer reader (honest negative result).**
+> The roadmap listed "single-pass inference (drop the second scan)" as the
+> largest single-thread gap. We prototyped it: read the data region into memory
+> once, infer globally over the buffer, then build columns from the buffer (no
+> second disk scan), gated to files within a RAM budget. It is byte-identical and
+> chunk-size independent — but it was **measured *slower*** than the two-pass
+> reader on a warm cache (4.0 s vs 3.4 s on the file above): holding every line as
+> an owned `String` creates allocation/memory pressure, while the "second scan"
+> it eliminates is a nearly-free re-read from the OS page cache. Per the project
+> law ("faster is never asserted without a measured number"), we did **not** ship
+> it. The genuinely measured single-thread→multi-thread win is the byte-range
+> parallel reader, so Pillar C's adaptive decision is **serial vs parallel**, not
+> a single-pass reader swap. (A single-pass reader could still pay off on
+> cold-cache / network filesystems where the second physical read is expensive;
+> it can return behind a measured win for that regime.)

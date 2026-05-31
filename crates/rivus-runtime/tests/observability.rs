@@ -311,3 +311,66 @@ fn inference_widening_is_surfaced_off_the_error_stream() {
         "clean column must not be widened"
     );
 }
+
+/// Pillar C (#33): the `--memory` strategy is **result-invariant** — `Low`
+/// (forced serial), `Auto` and `Fast` produce byte-identical output — and the
+/// chosen strategy is surfaced on `RunResult.strategy` (Observability §13).
+/// `Low` must always report a serial decision.
+#[test]
+fn memory_strategy_is_result_invariant_and_surfaced() {
+    use rivus_runtime::MemoryPref;
+
+    let csv = TempCsv(gendata::write_temp(
+        "obs_strategy",
+        &gendata::clean(20_000, 7),
+    ));
+    let p = csv.0.display();
+    let src = format!("F:\n open {p}\n |? age >= 30\n |> name age\n;");
+
+    let run_pref = |pref: MemoryPref, min_bytes: &str| -> (Vec<String>, Option<String>) {
+        let g = rivus_parser::parse(&src).unwrap();
+        let (g, _) = rivus_optimizer::optimize(g);
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", min_bytes);
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 1024,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("F"))
+            .unwrap();
+        let mut rows = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let row: Vec<String> = (0..c.columns.len())
+                    .map(|i| c.value(r, i).to_string())
+                    .collect();
+                rows.push(row.join(","));
+            }
+        }
+        (rows, res.strategy)
+    };
+
+    // Baseline: forced serial. Its decision must say so.
+    let (baseline, low_note) = run_pref(MemoryPref::Low, "8388608");
+    assert!(!baseline.is_empty());
+    assert!(
+        low_note.as_deref().unwrap_or("").contains("serial"),
+        "memory=low must report a serial decision, got {low_note:?}"
+    );
+
+    // Auto and Fast must match byte-for-byte, with a threshold low enough that
+    // the autotuner would pick parallel on a multicore host.
+    for pref in [MemoryPref::Auto, MemoryPref::Fast] {
+        let (rows, note) = run_pref(pref, "0");
+        assert_eq!(rows, baseline, "memory={pref:?} changed the result");
+        assert!(note.is_some(), "a file source must surface a strategy note");
+    }
+}

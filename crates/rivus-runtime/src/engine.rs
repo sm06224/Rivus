@@ -30,6 +30,11 @@ pub struct RunOptions {
     /// `open big.csv` previews instantly in bounded memory instead of
     /// materializing the whole file. A file sink (`save`) always drains in full.
     pub max_capture: Option<usize>,
+    /// Execution-strategy preference (Pillar C). `Auto` (default) autotunes
+    /// serial-vs-parallel from CPU count + input size; `Low` forces the
+    /// single-thread bounded reader; `Fast` prefers the byte-range parallel
+    /// reader more aggressively. All produce byte-identical results.
+    pub memory: crate::analytics::MemoryPref,
 }
 
 impl Default for RunOptions {
@@ -38,6 +43,7 @@ impl Default for RunOptions {
             chunk_size: 4096,
             progress: false,
             max_capture: None,
+            memory: crate::analytics::MemoryPref::Auto,
         }
     }
 }
@@ -66,6 +72,9 @@ pub struct RunResult {
     /// sources that inferred a schema (A4 telemetry). Empty for declared/sample
     /// schemas and non-CSV sources.
     pub inference: Vec<(String, DataType, bool)>,
+    /// The autotuner's chosen-strategy rationale (Pillar C): serial-vs-parallel
+    /// and why. `None` when there is no file source to decide on.
+    pub strategy: Option<String>,
 }
 
 impl RunResult {
@@ -97,18 +106,44 @@ pub fn run_with_progress(
     if graph.topo_order().is_none() {
         return Err(RivusError::Build("flow graph contains a cycle".into()));
     }
-    // Data-parallel fast path for stateless, single-source flows; else serial.
-    // (A subscriber forces the serial path so it sees a coherent live stream.)
-    if hook.is_none() {
-        if let Some(res) = try_parallel(graph, &opts) {
+    // Pillar C autotuner: decide serial-vs-parallel from the host probe + input
+    // size, and surface the rationale (Observability §13). The decision is
+    // *measured* — the byte-range parallel reader is both faster and
+    // bounded-memory (see `analytics`), so `Auto`/`Fast` attempt it and `Low`
+    // forces single-thread. A live hook always forces serial (coherent stream).
+    let env = crate::analytics::Analytics::probe();
+    let src_size = single_file_source_size(graph);
+    let min_parallel = parallel_min_bytes_for(opts.memory);
+    let (strat, note) =
+        crate::analytics::choose_strategy(opts.memory, &env, src_size, min_parallel);
+    // Only a real file source has a strategy worth reporting.
+    let has_file_source = single_file_source(graph).is_some();
+    // Sink-less, non-blocking flows with a capture cap are previews: let the
+    // CSV source sample-infer its schema so it starts instantly (and never
+    // materialize for the parallel path).
+    let preview = opts.max_capture.is_some() && !must_drain(graph);
+
+    if hook.is_none() && strat == crate::analytics::Strategy::Parallel {
+        if let Some(mut res) = try_parallel(graph, &opts, min_parallel) {
+            res.strategy = has_file_source.then(|| note.clone());
             return Ok(res);
         }
+        // Parallel was chosen but didn't run: a preview (latency-first, stays
+        // serial) or a non-partitionable flow (stateful op, multiple sources).
+        let ops = build_ops(graph, &opts, None, preview);
+        let mut res = drive(graph, ops, 0, opts.progress, opts.max_capture, hook);
+        let why = if preview {
+            "preview → serial"
+        } else {
+            "not partitionable → serial"
+        };
+        res.strategy = has_file_source.then(|| format!("{note}; {why}"));
+        return Ok(res);
     }
-    // Sink-less, non-blocking flows with a capture cap are previews: let the
-    // CSV source sample-infer its schema so it starts instantly.
-    let preview = opts.max_capture.is_some() && !must_drain(graph);
     let ops = build_ops(graph, &opts, None, preview);
-    Ok(drive(graph, ops, 0, opts.progress, opts.max_capture, hook))
+    let mut res = drive(graph, ops, 0, opts.progress, opts.max_capture, hook);
+    res.strategy = has_file_source.then(|| note.clone());
+    Ok(res)
 }
 
 /// Build a cheap point-in-time [`RuntimeSnapshot`] from the live node telemetry.
@@ -422,6 +457,9 @@ fn drive(
         workers: Vec::new(),
         first_row_latency,
         inference,
+        // The autotuner's rationale is set by `run_with_progress` (it owns the
+        // serial-vs-parallel decision); drive itself doesn't decide.
+        strategy: None,
     }
 }
 
@@ -754,12 +792,53 @@ fn parallel_min_bytes() -> u64 {
         .unwrap_or(8 * 1024 * 1024)
 }
 
+/// The byte-range threshold the autotuner uses for a given preference. `Low`
+/// never parallelizes (`u64::MAX`); `Auto` uses [`parallel_min_bytes`]; `Fast`
+/// is more aggressive (1 MiB, still env-overridable to a smaller floor).
+fn parallel_min_bytes_for(pref: crate::analytics::MemoryPref) -> u64 {
+    use crate::analytics::MemoryPref::*;
+    match pref {
+        Low => u64::MAX,
+        Auto => parallel_min_bytes(),
+        Fast => parallel_min_bytes().min(1024 * 1024),
+    }
+}
+
+/// The single file-source node id, if the flow has exactly one and it's a real
+/// file (not stdin `-`). Used to decide whether a strategy is worth reporting.
+fn single_file_source(graph: &PlanGraph) -> Option<NodeId> {
+    let mut found: Option<NodeId> = None;
+    for node in &graph.nodes {
+        if matches!(
+            node.op,
+            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. }
+        ) {
+            if found.is_some() {
+                return None; // multiple sources
+            }
+            found = Some(node.id);
+        }
+    }
+    let id = found?;
+    match source_path(&graph.nodes[id].op) {
+        Some(p) if p != "-" => Some(id),
+        _ => None,
+    }
+}
+
+/// On-disk size of the single file source, for the autotuner's size threshold.
+fn single_file_source_size(graph: &PlanGraph) -> Option<u64> {
+    let id = single_file_source(graph)?;
+    let path = source_path(&graph.nodes[id].op)?;
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
 /// Attempt data-parallel execution. Eligible flows have exactly one file source
 /// and no stateful operators (group/join/stream). The source is parsed once
 /// (its parse is already internally parallel), then contiguous chunk partitions
 /// are run through identical stateless sub-DAGs on worker threads and merged in
 /// source order. Returns `None` (→ serial) when ineligible or too small.
-fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
+fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<RunResult> {
     let threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1);
@@ -824,8 +903,9 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
 
     // The chunk-partition path materializes the whole input to split it. For a
     // large file, stream it in parallel instead (byte ranges, no buffering);
-    // non-CSV large sources fall back to the serial streaming reader.
-    let min_bytes = parallel_min_bytes();
+    // non-CSV large sources fall back to the serial streaming reader. The
+    // threshold is the autotuner's (`min_bytes`), so the decision and the reader
+    // agree exactly.
     if let Some(path) = source_path(&graph.nodes[src_id].op) {
         if path != "-" {
             if let Ok(meta) = std::fs::metadata(path) {
@@ -1037,6 +1117,9 @@ fn merge_results(
         // Per-worker byte-range readers infer globally; the merged view doesn't
         // surface their inference (empty — telemetry, not a contract).
         inference: Vec::new(),
+        // `run_with_progress` stamps the parallel rationale onto the returned
+        // result; merge_results itself doesn't decide.
+        strategy: None,
     }
 }
 

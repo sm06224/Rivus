@@ -288,6 +288,10 @@ pub fn render_telemetry_jsonl(graph: &PlanGraph, res: &RunResult) -> String {
     if !widened.is_empty() {
         o.str("widened_columns", &widened.join(","));
     }
+    // C3: the autotuner's strategy decision (Pillar C). Summary-only.
+    if let Some(st) = &res.strategy {
+        o.str("strategy", st);
+    }
     s.push_str(&o.finish());
     s.push('\n');
     s
