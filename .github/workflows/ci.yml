@@ -78,6 +78,13 @@ jobs:
       - name: Test (gzip feature)
         run: cargo test -p rivus-runtime --features gzip
 
+      # Exercise the off-by-default `zstd` feature (ruzstd, pure-Rust decoder).
+      - name: Clippy (zstd feature)
+        run: cargo clippy -p rivus-runtime -p rivus-cli --features rivus-cli/zstd --all-targets
+
+      - name: Test (zstd feature)
+        run: cargo test -p rivus-runtime --features zstd
+
       - name: Build release
         run: cargo build --workspace --release
 

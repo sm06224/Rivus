@@ -24,7 +24,7 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | JSON / JSON Lines / NDJSON, fixed-width binary | |
 | ✅ | **Header-less CSV** | `open f.csv noheader` → columns `c0,c1,…`; first line is data |
 | ✅ | **Typed / named columns at `open`** | `open f.csv (id:int, name:str, age:int)` — give a schema instead of inferring; also names a header-less file |
-| 🚧 | **Compressed inputs** | **`.gz` ✅ done** — feature `gzip` via `flate2` (pure-Rust `miniz_oxide` backend), serial single-pass with sample inference (compressed streams can't seek → no byte-range parallel); default build stays dep-free. Next: `.zst` (`ruzstd`), `.zip`/tar. Vetting log in `SUPPLY-CHAIN.md`. |
+| 🚧 | **Compressed inputs** | **`.gz` ✅** (feature `gzip`, `flate2`/`miniz_oxide`) and **`.zst` ✅** (feature `zstd`, pure-Rust `ruzstd` decoder) done — serial single-pass with sample inference (compressed streams can't seek → no byte-range parallel); default build stays dep-free. Next: `.zip`/tar. Vetting log in `SUPPLY-CHAIN.md`. |
 | ✅ | **TSV / custom delimiter** (real) | `delim: u8` threaded through `OpenCsv`/`SinkCsv` (std-only). `.tsv`/`.tab` paths split on a tab automatically; `as tsv`/`as csv` overrides the extension. Reader, parallel reader, and sinks all honor it; `to_source` stays faithful. |
 | 📋 | **Parquet / Arrow** | feature `parquet` via apache **`arrow`/`parquet`** (isolated behind the source/sink trait) |
 | 📋 | **Python pickle**, YAML/TOML/INI/XML/HTML | `pickle` via `serde-pickle`; text formats likely std-only or a small vetted dep |
@@ -108,8 +108,8 @@ read-throughput, in priority order:
 5. ~~Inline type casts + comma filter~~ ✅ done (`age:int`, `where a, b`).
 6. ~~Joins~~ ✅ inner + left hash join done; ~~imputation~~ ✅ `dropna`/`fill
    VALUE|ffill|bfill` done (D).
-7. ~~Compressed inputs `.gz`~~ ✅ done — feature `gzip` (`flate2`, pure-Rust),
-   serial single-pass; default build stays dep-free. Next: `.zst`.
+7. ~~Compressed inputs `.gz` / `.zst`~~ ✅ done — features `gzip` (`flate2`) and
+   `zstd` (pure-Rust `ruzstd`), serial single-pass; default build stays dep-free.
 8. **SIMD CSV scan** (E) — the next big speed lever vs DuckDB.
 
 Each lands as a small commit on the single PR, gated locally (fmt · clippy ·

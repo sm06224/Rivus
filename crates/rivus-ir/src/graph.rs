@@ -347,8 +347,11 @@ pub fn delim_for_path(path: &str) -> u8 {
     let mut lower = path.to_ascii_lowercase();
     // A compression suffix doesn't change the field delimiter: `.tsv.gz` is
     // still tab-delimited. Strip it before checking the data extension.
-    if let Some(stripped) = lower.strip_suffix(".gz") {
-        lower = stripped.to_string();
+    for suf in [".gz", ".zst", ".zstd"] {
+        if let Some(stripped) = lower.strip_suffix(suf) {
+            lower = stripped.to_string();
+            break;
+        }
     }
     if lower.ends_with(".tsv") || lower.ends_with(".tab") {
         b'\t'

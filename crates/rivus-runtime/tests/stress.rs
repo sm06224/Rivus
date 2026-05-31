@@ -1433,3 +1433,36 @@ fn gzip_csv_matches_uncompressed_oracle() {
         assert!(res.errors.is_empty(), "gzip errors @cs={cs}");
     }
 }
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_csv_matches_uncompressed_oracle() {
+    // Same shape as the gzip oracle but for `.zst`: a zstd-encoded CSV must
+    // filter to the same rows as an independent oracle, across chunk sizes. The
+    // fixture is written with the `zstd` crate (an encode-only dev-dependency);
+    // the runtime decodes it with the pure-Rust `ruzstd`.
+    let rows = 6_000usize;
+    let mut text = String::from("id,age\n");
+    let mut ge = 0u64;
+    let mut rng = Rng::new(17);
+    for i in 0..rows {
+        let age = rng.below(100);
+        text.push_str(&format!("{i},{age}\n"));
+        if age >= 50 {
+            ge += 1;
+        }
+    }
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("rivus_zst_{}.csv.zst", std::process::id()));
+    let comp = zstd::stream::encode_all(text.as_bytes(), 0).unwrap();
+    std::fs::write(&path, &comp).unwrap();
+    let _guard = TempCsv(path.clone());
+    let p = path.display();
+
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(&format!("Z:\n open {p}\n |? age >= 50\n;"), cs);
+        assert_eq!(res.total_rows_out(), ge, "zstd filter @cs={cs}");
+        assert!(res.errors.is_empty(), "zstd errors @cs={cs}");
+    }
+}

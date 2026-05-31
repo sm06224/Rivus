@@ -29,6 +29,17 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **zstd input: `open data.csv.zst` (opt-in `--features zstd`).** Reads
+  zstd-compressed CSV/TSV (`.zst` / `.zstd`) through the **pure-Rust `ruzstd`
+  decoder** (no C toolchain). Same serial single-pass, sample-inference path as
+  gzip (the compressed reader is now format-agnostic over `.gz`/`.zst`), bounded
+  memory, forced serial (no byte-range parallel). **The default build stays
+  zero-dependency**: a default binary opening a `.zst` raises an actionable error
+  (`rebuild with --features zstd`). The runtime decode tree is all pure-Rust
+  (`ruzstd`→`twox-hash`); the `.zst` test fixtures are written with the `zstd`
+  crate as an **encode-only `[dev-dependency]`** that never ships. Oracle-tested
+  across chunk sizes. The `.zst`/`.zstd` suffix is stripped before the delimiter
+  is chosen, so `.tsv.zst` stays tab-delimited.
 - **Right & full outer joins: `A &right B` / `A &full B` (std-only).** Complete
   the join family alongside `&` (inner) and `&left`. `&right` keeps every right
   row (left columns padded with type defaults); `&full` keeps every row from

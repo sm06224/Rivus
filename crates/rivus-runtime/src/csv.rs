@@ -1063,9 +1063,10 @@ fn split_record(line: &str, delim: u8) -> Vec<String> {
     out
 }
 
-// ------------------------------------------------------------------ gzip input
+// ----------------------------------------------------------- compressed input
 
-/// Streaming CSV reader for a **gzip-compressed** file (`.csv.gz` / `.tsv.gz`).
+/// Streaming CSV reader for a **compressed** file (gzip `.gz` with feature
+/// `gzip`, zstd `.zst` with feature `zstd`).
 ///
 /// A compressed stream can't be seeked, so the two-pass / byte-range readers
 /// don't apply. Instead this does a single forward pass with *sample inference*:
@@ -1076,9 +1077,9 @@ fn split_record(line: &str, delim: u8) -> Vec<String> {
 /// a sample, so on a column whose type only "widens" after the sample (e.g. an
 /// int column that turns float/text deep in the file) it can mis-type — the
 /// documented trade-off for not being able to re-read a compressed stream.
-#[cfg(feature = "gzip")]
-pub struct GzCsvReader {
-    reader: BufReader<flate2::read::MultiGzDecoder<File>>,
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+pub struct CompressedCsvReader {
+    reader: Box<dyn BufRead + Send>,
     ncols: usize,
     keep: Vec<usize>,
     dtypes: Vec<DataType>,
@@ -1092,10 +1093,45 @@ pub struct GzCsvReader {
     pub bad_rows: usize,
 }
 
-#[cfg(feature = "gzip")]
-impl GzCsvReader {
-    /// Open `path`, decode the gzip header, read the CSV header + a sample to
-    /// infer the schema, and return the reader positioned to yield every row.
+/// Wrap `path`'s file in the right streaming decoder for its extension. `.gz`
+/// needs feature `gzip`, `.zst`/`.zstd` need feature `zstd`; an unsupported
+/// (or feature-disabled) extension returns an actionable error.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+fn open_decoder(path: &str) -> Result<Box<dyn BufRead + Send>, String> {
+    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".gz") {
+        #[cfg(feature = "gzip")]
+        {
+            return Ok(Box::new(BufReader::with_capacity(
+                READ_BUF,
+                flate2::read::MultiGzDecoder::new(f),
+            )));
+        }
+        #[cfg(not(feature = "gzip"))]
+        return Err(format!(
+            "'{path}' is gzip-compressed; rebuild with `--features gzip`"
+        ));
+    }
+    if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+        #[cfg(feature = "zstd")]
+        {
+            let dec = ruzstd::decoding::StreamingDecoder::new(f)
+                .map_err(|e| format!("cannot read zstd '{path}': {e}"))?;
+            return Ok(Box::new(BufReader::with_capacity(READ_BUF, dec)));
+        }
+        #[cfg(not(feature = "zstd"))]
+        return Err(format!(
+            "'{path}' is zstd-compressed; rebuild with `--features zstd`"
+        ));
+    }
+    Err(format!("'{path}' has no supported compression extension"))
+}
+
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+impl CompressedCsvReader {
+    /// Open `path`, wrap it in the right decoder, read the CSV header + a sample
+    /// to infer the schema, and return the reader positioned to yield every row.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         path: &str,
@@ -1104,15 +1140,14 @@ impl GzCsvReader {
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
         delim: u8,
-    ) -> Result<(Schema, GzCsvReader), String> {
-        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut reader = BufReader::with_capacity(READ_BUF, flate2::read::MultiGzDecoder::new(f));
+    ) -> Result<(Schema, CompressedCsvReader), String> {
+        let mut reader = open_decoder(path)?;
 
         // Column names: a declared schema, else the header line, else c0,c1,….
         // A header line is consumed when `header` even if `declared` overrides.
         let mut first = String::new();
         if reader.read_line(&mut first).map_err(|e| e.to_string())? == 0 {
-            return Err("empty gzip CSV".to_string());
+            return Err("empty compressed CSV".to_string());
         }
         let mut pending: Vec<String> = Vec::new();
         let names: Vec<String> = if let Some(d) = declared {
@@ -1129,7 +1164,7 @@ impl GzCsvReader {
         };
         let ncols = names.len();
         if ncols == 0 {
-            return Err("gzip CSV has no columns".to_string());
+            return Err("compressed CSV has no columns".to_string());
         }
         let keep: Vec<usize> = match allow {
             None => (0..ncols).collect(),
@@ -1168,7 +1203,7 @@ impl GzCsvReader {
 
         Ok((
             schema,
-            GzCsvReader {
+            CompressedCsvReader {
                 reader,
                 ncols,
                 keep,

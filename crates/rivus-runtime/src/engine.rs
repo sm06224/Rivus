@@ -597,10 +597,15 @@ fn source_path(op: &Op) -> Option<&str> {
     }
 }
 
-/// Is this source path gzip-compressed? Such sources are read serially in a
-/// single pass (a compressed stream can't be seeked for byte-range parallelism).
-fn is_gzip_source(path: &str) -> bool {
-    path != "-" && path.to_ascii_lowercase().ends_with(".gz")
+/// Is this source path compressed (`.gz`/`.zst`/`.zstd`)? Such sources are read
+/// serially in a single pass (a compressed stream can't be seeked for
+/// byte-range parallelism).
+fn is_compressed_source(path: &str) -> bool {
+    if path == "-" {
+        return false;
+    }
+    let l = path.to_ascii_lowercase();
+    l.ends_with(".gz") || l.ends_with(".zst") || l.ends_with(".zstd")
 }
 
 /// Rank for escalating runtime modes when merging parallel partitions.
@@ -703,10 +708,11 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
         return None;
     }
 
-    // A gzip source can't be seeked (so no byte-range parallel or two-pass) and
-    // its on-disk size is the *compressed* size — force the serial, single-pass
-    // streaming reader (bounded memory), which `run()` falls through to.
-    if source_path(&graph.nodes[src_id].op).is_some_and(is_gzip_source) {
+    // A compressed source can't be seeked (so no byte-range parallel or
+    // two-pass) and its on-disk size is the *compressed* size — force the
+    // serial, single-pass streaming reader (bounded memory), which `run()`
+    // falls through to.
+    if source_path(&graph.nodes[src_id].op).is_some_and(is_compressed_source) {
         return None;
     }
 
