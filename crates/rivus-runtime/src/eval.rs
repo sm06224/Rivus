@@ -70,6 +70,41 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             let pat = arg(1).to_string();
             Value::Bool(regexp_match(&hay, &pat))
         }
+        Func::Replace => {
+            let s = arg(0).to_string();
+            let from = arg(1).to_string();
+            let to = arg(2).to_string();
+            // An empty `from` would loop in `str::replace`'s sense of "between
+            // every char"; keep it a no-op so the result is well-defined.
+            let out = if from.is_empty() {
+                s
+            } else {
+                s.replace(&from, &to)
+            };
+            Value::Str(out)
+        }
+        Func::SplitPart => {
+            let s = arg(0).to_string();
+            let sep = arg(1).to_string();
+            // 1-based field index (DuckDB/awk convention); 0 or out-of-range → "".
+            let n = arg(2).as_f64().unwrap_or(0.0) as i64;
+            let out = if sep.is_empty() || n < 1 {
+                String::new()
+            } else {
+                s.split(sep.as_str())
+                    .nth((n - 1) as usize)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            Value::Str(out)
+        }
+        Func::Concat => {
+            let mut out = String::new();
+            for i in 0..args.len() {
+                out.push_str(&arg(i).to_string());
+            }
+            Value::Str(out)
+        }
     }
 }
 

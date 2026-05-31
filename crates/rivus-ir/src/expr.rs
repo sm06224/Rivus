@@ -76,6 +76,13 @@ pub enum Func {
     /// it (parse/`to_source` are std-only); evaluating it needs the runtime's
     /// off-by-default `regex` feature, else it raises a recoverable error.
     Regexp,
+    /// `replace(s, from, to)` — replace every occurrence of a literal substring.
+    Replace,
+    /// `split_part(s, sep, n)` — the `n`-th field (1-based) after splitting `s`
+    /// on the literal separator `sep`; empty string when out of range.
+    SplitPart,
+    /// `concat(a, b, …)` — concatenate all arguments as text (any arity).
+    Concat,
 }
 
 impl Func {
@@ -92,6 +99,9 @@ impl Func {
             "like" => Func::Like,
             "glob" => Func::Glob,
             "regexp" | "regex" | "matches" => Func::Regexp,
+            "replace" => Func::Replace,
+            "split_part" => Func::SplitPart,
+            "concat" => Func::Concat,
             _ => return None,
         })
     }

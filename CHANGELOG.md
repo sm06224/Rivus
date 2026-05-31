@@ -29,6 +29,14 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **String functions `replace` / `split_part` / `concat` (std-only).** Usable
+  anywhere an expression is (computed columns, filters). `replace(s, from, to)`
+  swaps every literal occurrence (an empty `from` is a no-op); `split_part(s,
+  sep, n)` returns the `n`-th field (1-based, DuckDB/awk convention) after
+  splitting on a literal separator, or empty when out of range; `concat(a, b,
+  …)` joins any number of arguments as text. All lower to `Expr::Func`,
+  round-trip through `to_source`, and are chunk-size independent (oracle-tested).
+  No new dependencies.
 - **Structured telemetry: `rivus run … --json` (std-only).** Emits the run as
   **JSON Lines** on stderr — one `{"event":"node",…}` per flow node (counters:
   `chunks_in/out`, `rows_in/out`, `errors`, `busy_ms`, `rows_per_sec`,
