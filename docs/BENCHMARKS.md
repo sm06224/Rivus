@@ -478,33 +478,35 @@ trick that already took the numeric filter past DuckDB. Tracked in the backlog.
 ### Regex + DuckDB — the high wall (5 M rows, 171 MiB)
 
 Self-generated (`rivus gen clean --rows 5000000`), release (Rivus built
-`--features regex`), median of 3, warm cache. DuckDB 1.1.3 CLI, ripgrep 14.1.
+`--features regex`), median of 3, warm cache, **both writing the full projected
+result to stdout** (`COPY … TO '/dev/stdout'` for DuckDB). DuckDB 1.1.3 CLI.
 
-| pattern | ripgrep | DuckDB | Rivus | note |
+After lowering the parallel threshold to 8 MiB (this file is 171 MiB, so it now
+parallelizes — it used to run serial under the old 256 MiB gate):
+
+| pattern | DuckDB | Rivus (serial) | Rivus (parallel) | note |
 |---|---:|---:|---:|---|
-| regex `^aki[0-9]+$` | 0.33 s | **0.34 s** | 2.28 s | `regexp(name,…)` vs `regexp_matches` (compiled-once) |
-| IN-set `country∈{JP,DE,BR}` | 0.34 s | **0.33 s** | 3.30 s | DuckDB `IN` vs Rivus `or`-chain |
-| numeric `age >= 50` → project | — | **0.34 s** | 1.97 s | grep can't express; Rivus pushdown |
+| regex `^aki[0-9]+$` | **0.69 s** | 2.28 s | 1.10 s | `regexp(name,…)` vs `regexp_matches`, compiled-once |
+| IN-set `country∈{JP,DE,BR}` | **0.55 s** | 3.30 s | 1.05 s | DuckDB `IN` vs Rivus `or`-chain |
+| numeric `age >= 50` → project | **0.69 s** | 1.97 s | 1.10 s | grep can't express; Rivus filter-pushdown |
 
-**This is the wall to beat.** DuckDB lands ~0.33 s on *every* shape — including
-the numeric filter that is Rivus's pushdown showcase — because it has a
-vectorized, parallel CSV reader and runs the whole query multi-threaded. Rivus
-is 6–10× behind here, and the gap is **not** the predicate engine (rust-lang
-regex matches at DuckDB's RE2-class speed): it's the **CSV read path**. Rivus
-does a *serial, two-pass* streaming read (infer types, then build typed columns)
-for these stdout queries; DuckDB reads once, in parallel, into vectors.
+**The wall is now ~1.6–1.9×, down from 6–10×.** Parallel-by-default reads (incl.
+stdout) closed most of it: every shape dropped ~2–3× and the gap to DuckDB went
+from ~5–10× to under 2×. The remaining difference is still the **CSV read path**,
+not the predicate engine (rust-lang regex matches at DuckDB's RE2-class speed):
+Rivus does a *two-pass* streaming read (infer types, then build typed columns)
+where DuckDB reads once into vectors. (On a 363 MiB file the same numeric query
+is 1.8 s vs DuckDB ~1.0 s — the bigger the file, the more the second pass costs.)
 
-So the next lever is read throughput, not features:
-1. ✅ **Parallel reads for stdout sinks** — done. The byte-range parallel reader
-   used to bail to serial on a `save -` (stdout) sink; it now assembles to
-   stdout. On a **363 MiB** file `|? age>=50 |> id name age save -` dropped
-   **5.2 s → 1.8 s** (2.8×), closing the DuckDB gap (1.03 s) from ~5× to ~1.8×.
-   (The 5 M-row / 171 MiB rows above are *below* the 256 MiB threshold so still
-   run serial — lowering/auto-tuning the threshold is the next step.)
-2. **Single-pass inference** (sample + adaptive widen) to drop the second scan.
-3. **mmap + overlap decode with IO**; reuse per-chunk buffers.
-4. **Auto-tune the parallel threshold** (currently 256 MiB, env-overridable via
-   `RIVUS_PARALLEL_MIN_BYTES`) so mid-size files parallelize when it pays.
+Read-throughput levers, by remaining impact:
+1. ✅ **Parallel reads for stdout sinks** — done. The byte-range reader used to
+   bail to serial on a `save -` sink; it now assembles ordered parts to stdout.
+2. ✅ **Lower the parallel threshold to 8 MiB** — done. Measured crossover: below
+   ~6 MiB the thread/part-file overhead makes parallel ~3% slower; from ~8 MiB
+   up it wins 1.7×→3×. Was 256 MiB (so 171 MiB ran serial); now `RIVUS_PARALLEL_MIN_BYTES`-overridable, default 8 MiB.
+3. 📋 **Single-pass inference** (sample + adaptive widen) to drop the second
+   scan — the largest remaining gap (the two-pass read is most of the ~1.7×).
+4. 📋 **mmap + overlap decode with IO**; reuse per-chunk buffers.
 
 DuckDB still buffers (~400 MiB RSS on the 1.1 GB set earlier) where Rivus
 streams at ~10 MiB, so the honest framing stays "Rivus trades some speed for
