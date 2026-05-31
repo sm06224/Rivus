@@ -150,6 +150,21 @@ pub fn render_telemetry_jsonl(graph: &PlanGraph, res: &RunResult) -> String {
     o.num("rows_out", res.total_rows_out() as f64);
     o.num("errors", res.errors.len() as f64);
     o.str("final_mode", &res.final_mode.to_string());
+    // A3: time-to-first-row and the parse phase (source busy), summary-only so
+    // the per-node / per-error line contract stays byte-stable.
+    if let Some(l) = res.first_row_latency {
+        o.num("first_row_latency_ms", l.as_secs_f64() * 1000.0);
+    }
+    let parse_busy_ms: f64 = res
+        .telemetry
+        .iter()
+        .filter(|t| t.kind == "open")
+        .map(|t| t.busy.as_secs_f64() * 1000.0)
+        .sum();
+    o.num("parse_busy_ms", parse_busy_ms);
+    if !res.workers.is_empty() {
+        o.num("workers", res.workers.len() as f64);
+    }
     s.push_str(&o.finish());
     s.push('\n');
     s

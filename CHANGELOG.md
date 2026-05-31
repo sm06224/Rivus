@@ -29,6 +29,14 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **First-row latency & parse phase in `--json` summary (Epic #30 / Pillar A —
+  issue #31, A3).** `RunResult` gains `first_row_latency: Option<Duration>` (wall
+  to the first produced chunk; min across workers in parallel), and the JSONL
+  `summary` line gains `first_row_latency_ms` and `parse_busy_ms` (source busy)
+  — surfacing the previously-collected-but-unrendered `Chunk.meta.created_at`
+  signal. **Summary-only**: the `node` / `error` line keys are byte-stable
+  (existing JSONL contract unchanged). Pure accounting, result-invariant. No new
+  dependencies.
 - **Per-worker telemetry (Epic #30 / Pillar A — issue #31, A2).** A parallel
   (byte-range) run now records a `WorkerTelemetry { worker, rows_out, busy }` per
   worker in `RunResult.workers`, so parallel skew (uneven rows / busy time across

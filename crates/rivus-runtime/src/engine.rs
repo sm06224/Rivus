@@ -59,6 +59,9 @@ pub struct RunResult {
     /// Per-worker breakdown for a parallel run (empty on the serial path). Lets
     /// callers see parallel skew that the node-aggregate `telemetry` hides.
     pub workers: Vec<WorkerTelemetry>,
+    /// Wall time from run start to the first chunk a source produced — the
+    /// "time to first row". `None` if no row was ever produced.
+    pub first_row_latency: Option<Duration>,
 }
 
 impl RunResult {
@@ -193,6 +196,10 @@ fn drive(
     let mut rows_seen: u64 = 0;
     let mut total_captured: usize = 0;
     let mut truncated = false;
+    // Time-to-first-row: wall from the start of the drive loop to the first
+    // chunk any source produces. Pure accounting (does not affect results).
+    let run_start = Instant::now();
+    let mut first_row_latency: Option<Duration> = None;
 
     let mut active = true;
     while active && !fatal {
@@ -224,6 +231,9 @@ fn drive(
                     };
                     match ops[nid].pull(&mut ctx) {
                         Some(chunk) => {
+                            if first_row_latency.is_none() && chunk.len > 0 {
+                                first_row_latency = Some(run_start.elapsed());
+                            }
                             rows_seen += chunk.len as u64;
                             produced.push(chunk);
                             prog.tick(rows_seen);
@@ -324,6 +334,7 @@ fn drive(
         final_mode: mode,
         outputs,
         workers: Vec::new(),
+        first_row_latency,
     }
 }
 
@@ -853,8 +864,13 @@ fn merge_results(
     let mut by_node: BTreeMap<NodeId, Vec<Chunk>> = BTreeMap::new();
     // Per-worker breakdown (one entry per input RunResult, in source order).
     let mut workers: Vec<WorkerTelemetry> = Vec::with_capacity(results.len());
+    // Earliest first-row across workers (they run concurrently).
+    let mut first_row_latency: Option<Duration> = None;
 
     for (worker, res) in results.into_iter().enumerate() {
+        if let Some(l) = res.first_row_latency {
+            first_row_latency = Some(first_row_latency.map_or(l, |cur| cur.min(l)));
+        }
         if mode_rank(res.final_mode) > mode_rank(mode) {
             mode = res.final_mode;
         }
@@ -930,6 +946,7 @@ fn merge_results(
         final_mode: mode,
         outputs,
         workers,
+        first_row_latency,
     }
 }
 

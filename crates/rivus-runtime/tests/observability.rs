@@ -176,3 +176,36 @@ fn parallel_run_records_per_worker_telemetry() {
         "per-worker rows_out must sum to the result"
     );
 }
+
+/// A3: a run records a first-row latency (time to the first produced chunk).
+/// It's `Some` for any run that produces rows, and `None` for an empty result.
+#[test]
+fn first_row_latency_is_recorded() {
+    let rows = 5_000usize;
+    let csv = TempCsv(gendata::write_temp(
+        "obs_firstrow",
+        &gendata::clean(rows, 21),
+    ));
+    let p = csv.0.display();
+
+    // A run that produces rows: latency is recorded.
+    let res = run_src(&format!("F:\n open {p}\n |> name age\n;"), 4096);
+    assert_eq!(res.total_rows_out(), rows as u64);
+    assert!(
+        res.first_row_latency.is_some(),
+        "a producing run must record a first-row latency"
+    );
+
+    // A run whose source yields nothing (impossible filter is post-source, so
+    // instead point at an empty file) records no first row.
+    let empty = TempCsv(gendata::write_temp("obs_empty", "id,age\n"));
+    let res = run_src(
+        &format!("F:\n open {}\n |> id age\n;", empty.0.display()),
+        4096,
+    );
+    assert_eq!(res.total_rows_out(), 0);
+    assert!(
+        res.first_row_latency.is_none(),
+        "an empty source produces no first row"
+    );
+}
