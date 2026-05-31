@@ -33,6 +33,16 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             let needle = arg(1).to_string();
             Value::Bool(hay.contains(&needle))
         }
+        Func::StartsWith => {
+            let hay = arg(0).to_string();
+            let prefix = arg(1).to_string();
+            Value::Bool(hay.starts_with(&prefix))
+        }
+        Func::EndsWith => {
+            let hay = arg(0).to_string();
+            let suffix = arg(1).to_string();
+            Value::Bool(hay.ends_with(&suffix))
+        }
         Func::Substr => {
             let s = arg(0).to_string();
             let start = arg(1).as_f64().unwrap_or(0.0) as usize;
@@ -134,7 +144,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                         .map(|r| to_i64(call_func(*func, args, chunk, r)))
                         .collect(),
                 ),
-                Func::Contains => Column::Bool(
+                Func::Contains | Func::StartsWith | Func::EndsWith => Column::Bool(
                     (0..n)
                         .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
                         .collect(),

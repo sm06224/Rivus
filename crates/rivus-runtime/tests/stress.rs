@@ -1016,3 +1016,43 @@ fn group_percentiles_are_correct_and_chunk_independent() {
         }
     }
 }
+
+#[test]
+fn starts_ends_with_chunk_size_independent() {
+    // starts_with / ends_with row filters must match a row-wise oracle and be
+    // independent of chunk size.
+    let rows = 20_000;
+    let mut rng = Rng::new(29);
+    let mut text = String::from("code\n");
+    let mut starts = 0u64;
+    let mut ends = 0u64;
+    for _ in 0..rows {
+        // codes like "JP-1234" / "US-0007" — prefix is a 2-letter country.
+        let cc = ["JP", "US", "DE"][rng.below(3) as usize];
+        let n = rng.below(10_000);
+        let code = format!("{cc}-{n:04}");
+        if code.starts_with("JP") {
+            starts += 1;
+        }
+        if code.ends_with("7") {
+            ends += 1;
+        }
+        text.push_str(&code);
+        text.push('\n');
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_startsends",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cs in [1usize, 7, 1024, 8192, rows] {
+        let s = run_src(
+            &format!("S:\n open {p}\n |? starts_with(code, \"JP\")\n;"),
+            cs,
+        );
+        assert_eq!(s.total_rows_out(), starts, "starts_with @cs={cs}");
+        let e = run_src(&format!("E:\n open {p}\n |? ends_with(code, \"7\")\n;"), cs);
+        assert_eq!(e.total_rows_out(), ends, "ends_with @cs={cs}");
+        assert!(s.errors.is_empty() && e.errors.is_empty());
+    }
+}

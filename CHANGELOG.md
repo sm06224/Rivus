@@ -7,6 +7,9 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **`starts_with` / `ends_with` string functions (std-only).** Prefix/suffix
+  predicates (`|? starts_with(code, "JP")`, `|? ends_with(name, "e")`) — the
+  typed equivalent of grep `^…` / `…$`. Emit a boolean column. No new deps.
 - **`rivus gen` — self-hosted data generation (dogfooding).** A new CLI
   subcommand emits deterministic, seeded benchmark/demo data to stdout, so
   benches and docs need no external awk/python: `rivus gen clean --rows N

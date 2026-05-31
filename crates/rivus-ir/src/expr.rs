@@ -65,6 +65,8 @@ pub enum Func {
     Trim,
     Substr,
     Contains,
+    StartsWith,
+    EndsWith,
 }
 
 impl Func {
@@ -76,6 +78,8 @@ impl Func {
             "trim" => Func::Trim,
             "substr" => Func::Substr,
             "contains" => Func::Contains,
+            "starts_with" => Func::StartsWith,
+            "ends_with" => Func::EndsWith,
             _ => return None,
         })
     }
@@ -87,6 +91,8 @@ impl Func {
             Func::Trim => "trim",
             Func::Substr => "substr",
             Func::Contains => "contains",
+            Func::StartsWith => "starts_with",
+            Func::EndsWith => "ends_with",
         }
     }
 }
