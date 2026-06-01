@@ -124,6 +124,15 @@ pub fn run_with_progress(
     let preview = opts.max_capture.is_some() && !must_drain(graph);
 
     if hook.is_none() && strat == crate::analytics::Strategy::Parallel {
+        // Parallel group-by (#41): a linear `source → … → group` flow whose
+        // aggregates are byte-identical under partition→merge. Tried before the
+        // stateless path (which bails on a group → serial).
+        if let Some((src, grp, sink)) = eligible_group_flow(graph) {
+            if let Some(mut res) = try_parallel_group(graph, &opts, src, grp, sink) {
+                res.strategy = has_file_source.then(|| format!("{note}; parallel group-by"));
+                return Ok(res);
+            }
+        }
         if let Some(mut res) = try_parallel(graph, &opts, min_parallel) {
             res.strategy = has_file_source.then(|| note.clone());
             return Ok(res);
@@ -986,6 +995,283 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<
     });
 
     Some(merge_results(graph, results, src_errors, src_fatal))
+}
+
+/// If the flow is a single linear pipeline `source → stateless ops → GroupBy →
+/// (leaf | one sink)` with no other stateful operator, return
+/// `(source_id, group_id, optional_sink_id)` — the shape the parallel group-by
+/// scheduler (#41) handles. `None` keeps the caller on the serial path.
+fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<NodeId>)> {
+    let mut source = None;
+    let mut group = None;
+    for node in &graph.nodes {
+        match &node.op {
+            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. } => {
+                if source.is_some() {
+                    return None;
+                }
+                source = Some(node.id);
+            }
+            Op::GroupBy { .. } => {
+                if group.is_some() {
+                    return None;
+                }
+                group = Some(node.id);
+            }
+            Op::Join { .. }
+            | Op::Sort { .. }
+            | Op::Distinct { .. }
+            | Op::Describe
+            | Op::Take { .. }
+            | Op::StreamRef { .. } => return None,
+            Op::Fill {
+                method:
+                    rivus_ir::FillMethod::Ffill
+                    | rivus_ir::FillMethod::Bfill
+                    | rivus_ir::FillMethod::Mean
+                    | rivus_ir::FillMethod::Median,
+                ..
+            } => return None,
+            _ => {}
+        }
+    }
+    let (src, grp) = (source?, group?);
+    // The group's downstream must be empty (leaf) or exactly one (leaf) sink.
+    let sink = match graph.outputs_of(grp).as_slice() {
+        [] => None,
+        [s] => {
+            let s = *s;
+            if !matches!(
+                graph.nodes[s].op,
+                Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. }
+            ) || !graph.outputs_of(s).is_empty()
+            {
+                return None;
+            }
+            Some(s)
+        }
+        _ => return None,
+    };
+    // source → group must be a linear chain (each node one input, one consumer)
+    // so the pre-group ops can run sequentially per worker.
+    let mut cur = grp;
+    while cur != src {
+        let ins = graph.inputs_of(cur);
+        if ins.len() != 1 || graph.outputs_of(ins[0]).len() != 1 {
+            return None;
+        }
+        cur = ins[0];
+    }
+    Some((src, grp, sink))
+}
+
+/// The stateless pre-group ops strictly between `src` and `group`, in
+/// source→group order.
+fn pre_group_path(graph: &PlanGraph, src: NodeId, group: NodeId) -> Vec<NodeId> {
+    let mut path = Vec::new();
+    let mut cur = graph.inputs_of(group)[0];
+    while cur != src {
+        path.push(cur);
+        cur = graph.inputs_of(cur)[0];
+    }
+    path.reverse();
+    path
+}
+
+/// Run the pre-group ops on `chunks` (sequentially; they are stateless), then a
+/// partial `GroupBy` — one worker's partition. Returns the partial group state,
+/// any errors raised, and the rows that reached the group.
+fn worker_partial_group(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    path: &[NodeId],
+    group_id: NodeId,
+    chunks: Vec<Chunk>,
+) -> (operators::GroupBy, Vec<ErrorEvent>, u64) {
+    let mut errors = Vec::new();
+    let mut next_id = 0u64;
+    let mut cur = chunks;
+    for &nid in path {
+        let mut op = operators::build(
+            &graph.nodes[nid].op,
+            &graph.inputs_of(nid),
+            opts.chunk_size,
+            false,
+        );
+        let mut out = Vec::new();
+        let mut ctx = OpCtx {
+            label: label_of(graph, nid),
+            errors: &mut errors,
+            next_chunk_id: &mut next_id,
+        };
+        for c in cur {
+            out.extend(op.process(nid, c, &mut ctx));
+        }
+        out.extend(op.finish(&mut ctx));
+        cur = out;
+    }
+    let mut g = operators::new_group(&graph.nodes[group_id].op).expect("group op");
+    let rows: u64 = cur.iter().map(|c| c.len as u64).sum();
+    let mut ctx = OpCtx {
+        label: label_of(graph, group_id),
+        errors: &mut errors,
+        next_chunk_id: &mut next_id,
+    };
+    for c in cur {
+        g.process(group_id, c, &mut ctx);
+    }
+    (g, errors, rows)
+}
+
+/// Parallel group-by (#41): partition the parsed source, build a partial group
+/// state per worker, and merge them in source order. Only taken when every
+/// aggregate is byte-identical under partition→merge (see `group_parallel_safe`,
+/// checked against the *group-input* schema so a pre-group `cast` to decimal
+/// counts). `None` (→ serial) when ineligible, unsafe, or too small.
+fn try_parallel_group(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    src_id: NodeId,
+    group_id: NodeId,
+    sink_id: Option<NodeId>,
+) -> Option<RunResult> {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
+        return None;
+    }
+    if opts.max_capture.is_some() && !must_drain(graph) {
+        return None;
+    }
+    if source_path(&graph.nodes[src_id].op).is_some_and(is_compressed_source) {
+        return None;
+    }
+
+    // Parse the source once (its parse is internally parallel for a CSV file).
+    let mut src_errors: Vec<ErrorEvent> = Vec::new();
+    let mut next_id: u64 = 0;
+    let mut all: Vec<Chunk> = Vec::new();
+    {
+        let mut src_op = operators::build(&graph.nodes[src_id].op, &[], opts.chunk_size, false);
+        let mut ctx = OpCtx {
+            label: label_of(graph, src_id),
+            errors: &mut src_errors,
+            next_chunk_id: &mut next_id,
+        };
+        while let Some(c) = src_op.pull(&mut ctx) {
+            all.push(c);
+        }
+    }
+    let src_fatal = src_errors.iter().any(ErrorEvent::is_fatal);
+
+    let path = pre_group_path(graph, src_id, group_id);
+    let aggs = match &graph.nodes[group_id].op {
+        Op::GroupBy { aggs, .. } => aggs.clone(),
+        _ => return None,
+    };
+
+    // Resolve each aggregated column's type *at the group input* by running the
+    // pre-group ops on a sample chunk; bail to serial if anything is unsafe.
+    let sample = all.first()?.clone();
+    let (sample_g, _, _) = worker_partial_group(graph, opts, &path, group_id, vec![sample]);
+    let in_schema = sample_g.input_schema()?;
+    let safe = operators::group_parallel_safe(&aggs, |name| {
+        in_schema.index_of(name).map(|i| in_schema.fields[i].dtype)
+    });
+    if !safe || all.len() < threads * 2 {
+        return None; // unsafe aggregate or too small → serial
+    }
+
+    // Partition the source rows and aggregate each partition on a worker.
+    let parts = partition(all, threads);
+    let n_parts = parts.len();
+    let partials: Vec<(operators::GroupBy, Vec<ErrorEvent>, u64)> = std::thread::scope(|scope| {
+        let path = &path;
+        let handles: Vec<_> = parts
+            .into_iter()
+            .map(|chunks| {
+                scope.spawn(move || worker_partial_group(graph, opts, path, group_id, chunks))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Merge partials in source order, then finalize once.
+    let mut iter = partials.into_iter();
+    let (mut merged, mut errors, mut total_rows) = iter.next().expect("≥1 partition");
+    let mut workers = vec![WorkerTelemetry {
+        worker: 0,
+        rows_out: total_rows,
+        busy: Duration::ZERO,
+    }];
+    for (i, (g, errs, rows)) in iter.enumerate() {
+        merged.merge_from(g);
+        errors.extend(errs);
+        total_rows += rows;
+        workers.push(WorkerTelemetry {
+            worker: i + 1,
+            rows_out: rows,
+            busy: Duration::ZERO,
+        });
+    }
+    let mut fin_id: u64 = 0;
+    let out_chunks = {
+        let mut ctx = OpCtx {
+            label: label_of(graph, group_id),
+            errors: &mut errors,
+            next_chunk_id: &mut fin_id,
+        };
+        merged.finish(&mut ctx)
+    };
+    let rows_out: u64 = out_chunks.iter().map(|c| c.len as u64).sum();
+
+    // Telemetry: a source and a group node entry (counts only) + per-worker rows.
+    let mut group_tel = NodeTelemetry::new(group_id, label_of(graph, group_id), "group".into());
+    group_tel.rows_in = total_rows;
+    group_tel.rows_out = rows_out;
+    group_tel.finished = true;
+    let mut src_tel = NodeTelemetry::new(src_id, label_of(graph, src_id), "open".into());
+    src_tel.rows_out = total_rows;
+    src_tel.finished = true;
+
+    let mut res = RunResult {
+        telemetry: vec![src_tel, group_tel],
+        errors: src_errors,
+        final_mode: if src_fatal {
+            Mode::Halted
+        } else {
+            Mode::Normal
+        },
+        outputs: Vec::new(),
+        workers,
+        first_row_latency: None,
+        inference: Vec::new(),
+        strategy: None,
+    };
+    res.errors.extend(errors);
+
+    // Emit to the sink (write once) or capture as the group's leaf output.
+    if let Some(sink) = sink_id {
+        if let Some((path, Err(e))) = write_sink(&graph.nodes[sink].op, &out_chunks) {
+            res.errors.push(
+                ErrorEvent::new(
+                    Severity::Critical,
+                    ErrorScope::Graph,
+                    format!("cannot write '{path}': {e}"),
+                )
+                .at_node(label_of(graph, sink)),
+            );
+        }
+    } else {
+        res.outputs.push(Output {
+            node_id: group_id,
+            label: graph.nodes[group_id].label.clone(),
+            chunks: out_chunks,
+        });
+    }
+    let _ = n_parts;
+    Some(res)
 }
 
 /// In the single-partition path, file sinks were built as collectors; write

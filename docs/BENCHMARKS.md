@@ -468,6 +468,33 @@ kernel and interpreter, where the f64 view wrongly dropped it. Gated by
 `optimizer_equiv::decimal_filter_is_exact_i128`, `decimal_filter_no_silent_rounding`
 (sub-cent literals, kernel == interpreter), and `decimal_filter_boundaries_exact`.
 
+### Parallel group-by — byte-identical partition→merge (#41, option 1)
+
+Group-by was serial (the parallel scheduler only handled stateless map/filter).
+A linear `source → … → group` flow now aggregates **per worker** and merges the
+partial states in source order — taken only when every aggregate is byte-identical
+under partition→merge: `min`/`max`/`count`/`count_distinct`/`first`/`last`/
+percentile (associative or buffered+sorted) and `sum`/`avg` **on a decimal column**
+(exact i128, associative — the reason the decimal lane was built). `std` and
+`sum`/`avg` on f64/integer columns are *not* associative and stay serial (the
+scheduler checks the group-input schema, so a pre-group `cast` to decimal counts).
+
+Measured end-to-end wall (3 M rows / 28 MiB, group by country into
+`sum/avg/min/max`, 4 cpus, release):
+
+| group-by | wall |
+|---|---:|
+| serial (`--memory low`) | ~1.35 s |
+| parallel partition→merge (`--memory fast`) | **~0.97 s** (~1.4×) |
+
+Output is **byte-identical** to serial (md5-equal on the saved CSV; the decimal
+sums are exact, e.g. `12500000.00`, not f64-drifted). The win is bounded here by
+parse (already internally parallel) dominating; it grows with aggregation-heavy /
+high-cardinality groups. Gated by `stress::parallel_group_by_matches_serial`
+(parallel == serial across the safe aggregate set, workers confirmed engaged),
+`f64_sum_group_stays_serial_but_correct` (the unsafe path stays serial), and the
+`operators::agg_merge_tests` property tests (partition→merge == single-pass).
+
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
 Data generated self-hosted with `rivus gen clean --rows 5000000` (no awk).

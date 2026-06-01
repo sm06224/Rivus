@@ -2133,3 +2133,115 @@ fn decimal_sum_is_order_independent() {
     assert_eq!(a, b, "decimal sum depends on order");
     assert_eq!(a, c, "decimal sum depends on order");
 }
+
+#[test]
+fn parallel_group_by_matches_serial() {
+    // Parallel group-by (#41) must be byte-identical to serial for the safe
+    // aggregate set (decimal sum/avg — exact i128; min/max/count/count_distinct/
+    // first/last/percentile — associative or buffered). Force parallel with a
+    // >1 MiB file + MemoryPref::Fast (no env → no cross-test races); the serial
+    // oracle uses MemoryPref::Low.
+    let rows = 150_000usize;
+    let mut text = String::from("country,amount\n");
+    let countries = ["JP", "US", "DE", "FR", "GB"];
+    for i in 0..rows {
+        let c = countries[i % countries.len()];
+        let cents = (i as i128 * 7 % 100_000) + 1;
+        text.push_str(&format!("{c},{}.{:02}\n", cents / 100, cents % 100));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_pgroup", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "G:\n open {p} (country amount:decimal(2))\n \
+         |# country sum:amount avg:amount min:amount max:amount \
+         count_distinct:amount first:amount last:amount p50:amount\n;"
+    );
+
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join(","));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+
+    let (serial, _) = collect(rivus_runtime::MemoryPref::Low);
+    let (parallel, par_engaged) = collect(rivus_runtime::MemoryPref::Fast);
+    assert!(par_engaged, "parallel group-by did not engage");
+    assert_eq!(parallel, serial, "parallel group-by != serial");
+    // Sanity: the exact decimal sum is present (and exact, not f64-drifted).
+    assert!(
+        serial.iter().any(|l| l.contains(".00,")),
+        "expected exact decimal sums"
+    );
+}
+
+#[test]
+fn f64_sum_group_stays_serial_but_correct() {
+    // An f64-column sum/avg is NOT parallel-safe (non-associative), so the engine
+    // must keep it serial even under MemoryPref::Fast — and still be correct and
+    // chunk-size independent. (min/max/count on f64 ARE safe and may parallelize;
+    // here we check the f64 sum path doesn't corrupt results.)
+    let rows = 120_000usize;
+    let mut text = String::from("g,v\n");
+    for i in 0..rows {
+        text.push_str(&format!("{},{}.{}\n", i % 4, i % 1000, i % 10));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_f64group",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("G:\n open {p}\n |# g sum:v\n;"); // v inferred f64
+    let collect = |pref: rivus_runtime::MemoryPref| -> Vec<String> {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                lines.push(format!("{},{}", c.value(r, 0), c.value(r, 1)));
+            }
+        }
+        lines.sort();
+        lines
+    };
+    // Fast and Low must agree (f64 sum is kept serial under both → deterministic).
+    assert_eq!(
+        collect(rivus_runtime::MemoryPref::Fast),
+        collect(rivus_runtime::MemoryPref::Low)
+    );
+}

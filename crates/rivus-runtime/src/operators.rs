@@ -1980,6 +1980,50 @@ impl AggAcc {
         }
     }
 
+    /// Fold another partial accumulator (covering a *later* run of source rows)
+    /// into this one — the deterministic merge that lets a group-by run on
+    /// per-partition workers and recombine in **source order** (#41). `other`
+    /// must be the same `func` and follow `self` in source order (so `first`
+    /// keeps the earliest and `last` the latest). Exact lanes (i128 decimal sum,
+    /// counts, min/max, buffered percentile values) merge byte-identically; the
+    /// f64 moments are folded too but a *parallel* group-by is only enabled when
+    /// no aggregate depends on f64 associativity (the engine gates that).
+    fn merge(&mut self, other: &AggAcc) {
+        self.sum += other.sum;
+        self.sum_sq += other.sum_sq;
+        self.n += other.n;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        // Exact decimal lane (associative i128); a column shares one scale.
+        if let Some(os) = other.dec_scale {
+            let scale = *self.dec_scale.get_or_insert(os);
+            let ou = if os == scale {
+                Some(other.dec_sum)
+            } else {
+                None
+            };
+            match ou.and_then(|ou| self.dec_sum.checked_add(ou)) {
+                Some(s) => self.dec_sum = s,
+                None => self.dec_overflow = true,
+            }
+            self.dec_min = self.dec_min.min(other.dec_min);
+            self.dec_max = self.dec_max.max(other.dec_max);
+        }
+        self.dec_overflow |= other.dec_overflow;
+        for s in &other.distinct {
+            self.distinct.insert(s.clone());
+        }
+        // Source order: `self` precedes `other`, so the earliest non-empty
+        // `first` and the latest non-empty `last` win.
+        if self.first.is_none() {
+            self.first = other.first.clone();
+        }
+        if other.last.is_some() {
+            self.last = other.last.clone();
+        }
+        self.values.extend_from_slice(&other.values);
+    }
+
     /// Numeric aggregate value (sum/avg/min/max/std). `0.0` for an empty group.
     fn num_value(&self) -> f64 {
         match self.func {
@@ -2085,11 +2129,15 @@ struct GroupState {
     accs: Vec<AggAcc>,
 }
 
-struct GroupBy {
+pub(crate) struct GroupBy {
     keys: Vec<String>,
     aggs: Vec<(AggFunc, String)>,
     groups: BTreeMap<String, GroupState>,
     emitted: bool,
+    /// Schema of the chunks fed to this group (the group *input*), captured on
+    /// the first `process`. Lets the parallel scheduler resolve aggregate column
+    /// types after any pre-group `cast`.
+    in_schema: Option<Arc<Schema>>,
 }
 
 impl GroupBy {
@@ -2099,12 +2147,78 @@ impl GroupBy {
             aggs,
             groups: BTreeMap::new(),
             emitted: false,
+            in_schema: None,
         }
+    }
+
+    /// The group-input schema seen so far (`None` before any row).
+    pub(crate) fn input_schema(&self) -> Option<Arc<Schema>> {
+        self.in_schema.clone()
+    }
+
+    /// Fold a *later* partition's partial group state into this one (the
+    /// deterministic, source-ordered merge for parallel group-by; #41). Groups
+    /// present only in `other` are appended (BTreeMap keeps key order, so the
+    /// output row order is identical to a serial run); shared groups merge their
+    /// counts and per-aggregate accumulators via [`AggAcc::merge`]. `other` must
+    /// have the same keys and aggregates and follow `self` in source order.
+    pub(crate) fn merge_from(&mut self, other: GroupBy) {
+        for (key, ostate) in other.groups {
+            match self.groups.get_mut(&key) {
+                Some(s) => {
+                    s.count += ostate.count;
+                    for (a, oa) in s.accs.iter_mut().zip(ostate.accs.iter()) {
+                        a.merge(oa);
+                    }
+                }
+                None => {
+                    self.groups.insert(key, ostate);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a group-by over these aggregates is **byte-identical** under a
+/// partition→merge (parallel) execution, given the resolved type of each
+/// aggregated column (#41). `min`/`max`/`count`/`count_distinct`/`first`/`last`/
+/// percentile are always safe (associative or buffered+sorted); `sum`/`avg` are
+/// safe only on an exact lane (decimal — i128 associative); `std` and `sum`/`avg`
+/// on f64/integer columns are NOT (f64 addition is non-associative; integer sum
+/// rides the f64 accumulator) and keep the serial path.
+pub(crate) fn group_parallel_safe(
+    aggs: &[(AggFunc, String)],
+    col_type: impl Fn(&str) -> Option<DataType>,
+) -> bool {
+    aggs.iter().all(|(f, col)| match f {
+        AggFunc::Min
+        | AggFunc::Max
+        | AggFunc::CountDistinct
+        | AggFunc::First
+        | AggFunc::Last
+        | AggFunc::Pct(_) => true,
+        AggFunc::Sum | AggFunc::Avg => {
+            matches!(col_type(col), Some(DataType::Decimal { .. }))
+        }
+        AggFunc::Std => false,
+    })
+}
+
+/// Build a `GroupBy` operator from a `GroupBy` op (for the parallel scheduler,
+/// which needs the concrete type to merge per-worker state). `None` for any
+/// other op.
+pub(crate) fn new_group(op: &Op) -> Option<GroupBy> {
+    match op {
+        Op::GroupBy { keys, aggs } => Some(GroupBy::new(keys.clone(), aggs.clone())),
+        _ => None,
     }
 }
 
 impl Operator for GroupBy {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.in_schema.is_none() {
+            self.in_schema = Some(chunk.schema.clone());
+        }
         // Resolve every group-key column index; an unknown key warns once and
         // drops the chunk (continue-first — a later, well-formed chunk still
         // aggregates).
@@ -2890,4 +3004,116 @@ fn json_string(out: &mut String, s: &str) {
         }
     }
     out.push('"');
+}
+
+#[cfg(test)]
+mod agg_merge_tests {
+    use super::*;
+    use rivus_core::Decimal;
+
+    // Accumulate `vals` into one AggAcc (the serial single-pass reference).
+    fn single(func: AggFunc, vals: &[Value]) -> AggAcc {
+        let mut a = AggAcc::new(func);
+        for v in vals {
+            a.observe(v);
+        }
+        a
+    }
+
+    // Accumulate `vals` split into `parts` partitions, each into its own AggAcc,
+    // then merge them in source order (mirrors per-worker partials → merge).
+    fn partitioned(func: AggFunc, vals: &[Value], parts: usize) -> AggAcc {
+        let chunks: Vec<&[Value]> = vals.chunks(vals.len().div_ceil(parts.max(1))).collect();
+        let mut accs: Vec<AggAcc> = chunks
+            .iter()
+            .map(|c| {
+                let mut a = AggAcc::new(func);
+                for v in *c {
+                    a.observe(v);
+                }
+                a
+            })
+            .collect();
+        let mut merged = accs.remove(0);
+        for a in &accs {
+            merged.merge(a);
+        }
+        merged
+    }
+
+    #[test]
+    fn decimal_sum_merge_equals_single_pass() {
+        // Decimals whose f64 sum would drift; merged i128 sum must be byte-exact.
+        let vals: Vec<Value> = (0..1000)
+            .map(|i| Value::Dec(Decimal::new((i % 97) + 1, 2)))
+            .collect();
+        for parts in [1, 2, 3, 7, 16] {
+            let s = single(AggFunc::Sum, &vals);
+            let m = partitioned(AggFunc::Sum, &vals, parts);
+            assert_eq!(
+                m.dec_value().unwrap().to_string(),
+                s.dec_value().unwrap().to_string(),
+                "decimal sum merge != single-pass @parts={parts}"
+            );
+            // And exact vs an independent i128 oracle.
+            let oracle: i128 = (0..1000).map(|i| (i % 97) + 1).sum();
+            assert_eq!(m.dec_value().unwrap(), Decimal::new(oracle, 2));
+        }
+    }
+
+    #[test]
+    fn decimal_avg_merge_equals_single_pass() {
+        let vals: Vec<Value> = (0..500)
+            .map(|i| Value::Dec(Decimal::new((i * 7 % 1000) + 1, 2)))
+            .collect();
+        for parts in [1, 2, 5, 13] {
+            let s = single(AggFunc::Avg, &vals);
+            let m = partitioned(AggFunc::Avg, &vals, parts);
+            assert_eq!(
+                m.dec_value().unwrap().to_string(),
+                s.dec_value().unwrap().to_string(),
+                "decimal avg merge != single-pass @parts={parts}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_aggregates_merge_equals_single_pass() {
+        let vals: Vec<Value> = (0..300i64)
+            .map(|i| match i % 5 {
+                0 => Value::I64(i),
+                1 => Value::F64(i as f64 * 1.5),
+                2 => Value::Str(format!("v{}", i % 11)),
+                _ => Value::Dec(Decimal::new(i as i128, 3)),
+            })
+            .collect();
+        for parts in [1, 2, 4, 9] {
+            // min/max (f64, associative), count_distinct, first, last, percentile.
+            for func in [
+                AggFunc::Min,
+                AggFunc::Max,
+                AggFunc::CountDistinct,
+                AggFunc::First,
+                AggFunc::Last,
+                AggFunc::Pct(50),
+                AggFunc::Pct(90),
+            ] {
+                let s = single(func, &vals);
+                let m = partitioned(func, &vals, parts);
+                let (sv, mv) = match func {
+                    AggFunc::CountDistinct => (
+                        s.distinct_count().to_string(),
+                        m.distinct_count().to_string(),
+                    ),
+                    AggFunc::First => (s.first_str().to_string(), m.first_str().to_string()),
+                    AggFunc::Last => (s.last_str().to_string(), m.last_str().to_string()),
+                    _ => (
+                        s.num_value().to_bits().to_string(),
+                        m.num_value().to_bits().to_string(),
+                    ),
+                };
+                assert_eq!(sv, mv, "{func:?} merge != single-pass @parts={parts}");
+            }
+        }
+    }
 }
