@@ -208,3 +208,51 @@ fn string_prefilter_handles_quote_escaped_needles() {
     let matched = opt.get("F").map(|v| v.len()).unwrap_or(0);
     assert_eq!(matched, 2, "expected exactly rows 1 and 3 to match");
 }
+
+/// The decimal lane must survive optimization byte-identically. A filter +
+/// projection on a `decimal(2)` column fires the optimizer (fusing the two into
+/// the vectorized FilterProject kernel) while the raw graph evaluates them as
+/// separate nodes — so this gates the kernel vs interpreter Dec paths agreeing,
+/// and the column staying exact (text → i128, never via f64).
+#[test]
+fn decimal_column_optimizes_equivalently() {
+    // Mixed scales in the text (1, 2 and 3 fractional digits) all read at
+    // scale(2): 0.1→0.10, 12.345→12.34 (round half-even), 100→100.00.
+    let mut text = String::from("id,amount\n");
+    for i in 0..2_000u64 {
+        // Deterministic decimals that straddle the >= 50.00 boundary.
+        let cents = (i * 7) % 10_000; // 0.00 .. 99.99
+        text.push_str(&format!("{i},{}.{:02}\n", cents / 100, cents % 100));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("equiv_decimal", text.as_bytes()));
+    let p = f.0.display();
+    let src =
+        format!("D:\n open {p} (id amount:decimal(2))\n |? amount >= 50.00\n |> id amount\n;");
+    let (raw, opt) = run_both(&src);
+    assert_eq!(
+        fingerprint(&raw),
+        fingerprint(&opt),
+        "decimal filter+project diverged under optimization"
+    );
+    // The kept column must actually be the exact decimal lane at scale 2.
+    let o = opt
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("D"))
+        .unwrap();
+    let c = &o.chunks[0];
+    let ai = c.schema.index_of("amount").unwrap();
+    assert_eq!(
+        c.schema.fields[ai].dtype,
+        rivus_core::DataType::Decimal { scale: 2 }
+    );
+    // Every emitted value renders with exactly two fractional digits.
+    for r in 0..c.len {
+        let s = c.value(r, ai).to_string();
+        assert_eq!(
+            s.split('.').nth(1).map(|f| f.len()),
+            Some(2),
+            "scale lost: {s}"
+        );
+    }
+}

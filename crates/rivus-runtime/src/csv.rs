@@ -22,7 +22,7 @@
 //! overwhelmingly common case — split into pure borrows; quoted records fall
 //! back to an owned, escape-aware split.
 
-use rivus_core::{Column, DataType, Field, Schema, StrColumn};
+use rivus_core::{Column, DataType, DecColumn, Decimal, Field, Schema, StrColumn};
 use rivus_ir::CmpOp;
 use std::borrow::Cow;
 use std::fs::File;
@@ -1022,6 +1022,8 @@ enum ColBuilder {
     Bool(Vec<bool>),
     I64(Vec<i64>),
     F64(Vec<f64>),
+    /// Exact fixed-point lane: unscaled i128 values at a fixed column scale.
+    Dec(Vec<i128>, u8),
     Str(StrColumn),
 }
 
@@ -1031,6 +1033,7 @@ impl ColBuilder {
             DataType::Bool => ColBuilder::Bool(Vec::with_capacity(cap)),
             DataType::I64 => ColBuilder::I64(Vec::with_capacity(cap)),
             DataType::F64 => ColBuilder::F64(Vec::with_capacity(cap)),
+            DataType::Decimal { scale } => ColBuilder::Dec(Vec::with_capacity(cap), scale),
             // Estimate ~8 bytes per string cell for the backing byte buffer.
             _ => ColBuilder::Str(StrColumn::with_capacity(cap, cap * 8)),
         }
@@ -1042,6 +1045,12 @@ impl ColBuilder {
             ColBuilder::Bool(v) => v.push(cell.trim() == "true"),
             ColBuilder::I64(v) => v.push(cell.trim().parse().unwrap_or(0)),
             ColBuilder::F64(v) => v.push(cell.trim().parse().unwrap_or(0.0)),
+            // Exact decimal text → unscaled i128 (no f64). A malformed cell or
+            // i128 overflow yields 0, matching the int/float lanes' default-on-
+            // parse-failure (continue-first; §21.7).
+            ColBuilder::Dec(v, scale) => {
+                v.push(Decimal::parse_scaled(cell.trim(), *scale).map_or(0, |d| d.unscaled))
+            }
             ColBuilder::Str(v) => v.push(cell),
         }
     }
@@ -1051,6 +1060,10 @@ impl ColBuilder {
             ColBuilder::Bool(v) => Column::Bool(std::mem::take(v)),
             ColBuilder::I64(v) => Column::I64(std::mem::take(v)),
             ColBuilder::F64(v) => Column::F64(std::mem::take(v)),
+            ColBuilder::Dec(v, scale) => Column::Dec(DecColumn {
+                unscaled: std::mem::take(v),
+                scale: *scale,
+            }),
             ColBuilder::Str(v) => Column::Str(std::mem::take(v)),
         }
     }

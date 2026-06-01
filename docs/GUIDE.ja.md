@@ -63,7 +63,7 @@ rivus check   -c '…'               # 構文チェックのみ
 | `open PATH as FMT` | 形式を強制（`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`） |
 | `open PATH.gz` / `PATH.zst` | **gzip / zstd 圧縮**された CSV/TSV。`--features gzip` / `--features zstd` でビルドした時のみ。直列・単一パス・有界メモリ。既定（依存ゼロ）ビルドでは `--features …` を促すエラー |
 | `open PATH noheader` | ヘッダ行なし CSV。列名は `c0, c1, c2, …`、先頭行からデータ |
-| `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定。`int`/`i64`, `float`/`f64`, `str`/`string`, `bool`。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持 |
+| `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定。`int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む |
 | `readcsv PATH` / `readjson PATH` | 形式を明示する動詞 |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ） |
 | `open stdin` / `open -` | 標準入力から CSV（または `as FMT`）を読む |
@@ -267,7 +267,7 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 **算術**（括弧内）— `+  -  *  /  %`。`* / %` が `+ -` より強く結合、括弧で入れ子。
 
 **型キャスト** — `expr:type` は値のレーンを再解釈（`int`/`i64`, `float`/`f64`,
-`str`/`string`, `bool`）、最も強く結合：
+`str`/`string`, `bool`, `decimal(N)`）、最も強く結合：
 
 ```
 |? age:int >= 20            # 文字列列を数値として比較
@@ -275,6 +275,23 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 |> (age:str) as age_text    # add-property キャスト（3 つ目の型付け方法）
 cast age:int price:f64      # cast 動詞：列をその場で再型付け
 ```
+
+**厳密 decimal レーン（`decimal(N)`）** — 浮動小数の丸めが許されない場面（金額、
+byte-identical な並列合計）向けのオプトイン固定小数点レーン（`i128` を小数 `N`
+桁でスケール）。値が整数なので `0.1 + 0.2` は厳密に `0.3`、加算は**結合的**＝
+並列の partition→merge が直列と 1 ビットも違わない（f64 では不可能）。読み取り段で
+宣言すると **テキスト→`i128` を f64 非経由で厳密**に読み、式キャストもできます：
+
+```
+open sales.csv (id amount:decimal(2))   # "12.5" を 12.50 として厳密に読む
+|? amount >= 19.99                       # i128 で厳密比較（浮動小数を経由しない）
+|> id amount
+```
+
+スケールは現状必須（`decimal(2)`、bare `decimal` 不可）。`N` 桁を超える小数は
+**round-half-even** で決定的に丸め、不足は 0 詰め、解釈不能セルは `0`（continue-first）。
+既定は従来どおり `i64`/`f64` の高速レーン — `decimal` は「速度より正確性」を
+*選ぶ* ときだけのオプトインです。
 
 **条件** — `case when … then … [else …] end`：
 

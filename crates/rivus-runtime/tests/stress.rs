@@ -1896,3 +1896,127 @@ fn zstd_csv_matches_uncompressed_oracle() {
         assert!(res.errors.is_empty(), "zstd errors @cs={cs}");
     }
 }
+
+#[test]
+fn declared_decimal_chunk_size_independent() {
+    // A decimal(2) column read from text with varied fractional widths. The
+    // value (text → unscaled i128) and its rendering must be identical across
+    // chunk sizes, and exact (never via f64): 0.1→0.10, 12.345→12.34 (round
+    // half-even), 7→7.00.
+    let rows = 4_000usize;
+    let mut text = String::from("id,price\n");
+    let mut expected: Vec<String> = Vec::with_capacity(rows);
+    for i in 0..rows {
+        // Cycle through forms that exercise pad, exact, and round-half-even.
+        let (cell, want) = match i % 4 {
+            0 => ("0.1".to_string(), "0.10"),     // pad up to scale 2
+            1 => ("12.345".to_string(), "12.34"), // 3-digit → round half-even (4 even)
+            2 => ("7".to_string(), "7.00"),       // integer → padded
+            _ => ("12.355".to_string(), "12.36"), // round half-even (5 odd → up)
+        };
+        text.push_str(&format!("{i},{cell}\n"));
+        expected.push(want.to_string());
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_decimal", text.as_bytes()));
+    let p = f.0.display();
+    let mut prev: Option<Vec<String>> = None;
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(
+            &format!("D:\n open {p} (id price:decimal(2))\n |> id price\n;"),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        // Collect (id, rendered price) in id order.
+        let mut got: Vec<(usize, String)> = Vec::with_capacity(rows);
+        for c in &o.chunks {
+            let ii = c.schema.index_of("id").unwrap();
+            let pi = c.schema.index_of("price").unwrap();
+            assert_eq!(
+                c.schema.fields[pi].dtype,
+                rivus_core::DataType::Decimal { scale: 2 },
+                "price is not decimal(2) @cs={cs}"
+            );
+            for r in 0..c.len {
+                let id = c.value(r, ii).to_string().parse::<usize>().unwrap();
+                got.push((id, c.value(r, pi).to_string()));
+            }
+        }
+        got.sort_by_key(|(id, _)| *id);
+        let rendered: Vec<String> = got.into_iter().map(|(_, s)| s).collect();
+        // Exact expected values (proves text→i128 is exact, half-even rounding).
+        assert_eq!(rendered, expected, "decimal values wrong @cs={cs}");
+        // Chunk-size independence: identical across every chunk size.
+        if let Some(p) = &prev {
+            assert_eq!(&rendered, p, "decimal output changed across chunk size");
+        }
+        prev = Some(rendered);
+    }
+}
+
+#[test]
+fn parallel_decimal_chunk_size_independent() {
+    // The streaming-parallel byte-range reader builds decimal columns via the
+    // same ColBuilder as the serial path. This gates that the parallel path is
+    // byte-identical to serial AND chunk-size independent for a decimal(2)
+    // column. The byte-range path only engages with a file sink, so each run
+    // `save`s and we compare the output files byte-for-byte. Force it with a
+    // >1 MiB file + MemoryPref::Fast (no env vars → no cross-test races) and
+    // assert workers actually engaged.
+    let rows = 120_000usize; // ~1.5 MiB of "id,price\n" → crosses the Fast 1 MiB floor
+    let mut text = String::from("id,price\n");
+    for i in 0..rows {
+        // Varied fractional widths to exercise pad / exact / round-half-even.
+        let cell = match i % 4 {
+            0 => format!("{}.1", i % 1000),   // 1 digit → pad to .x0
+            1 => format!("{}.345", i % 1000), // 3 digits → round half-even
+            2 => format!("{}", i % 1000),     // integer → .00
+            _ => format!("{}.355", i % 1000), // 3 digits → round half-even (up)
+        };
+        text.push_str(&format!("{i},{cell}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_par_decimal",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+
+    let run_to_file = |cs: usize, pref: rivus_runtime::MemoryPref, out: &std::path::Path| {
+        let src = format!(
+            "D:\n open {p} (id price:decimal(2))\n |? id >= 1000\n |> id price\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: cs,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run")
+    };
+
+    // Serial oracle (single-threaded reader).
+    let ser_out = TempCsv(gendata::write_temp_bytes("par_decimal_serial", b""));
+    run_to_file(1024, rivus_runtime::MemoryPref::Low, &ser_out.0);
+    let oracle = std::fs::read_to_string(&ser_out.0).expect("read serial out");
+    assert!(oracle.lines().count() > 1000, "oracle unexpectedly small");
+
+    for cs in [1usize, 1000, rows] {
+        let par_out = TempCsv(gendata::write_temp_bytes("par_decimal_parallel", b""));
+        let res = run_to_file(cs, rivus_runtime::MemoryPref::Fast, &par_out.0);
+        assert!(
+            !res.workers.is_empty(),
+            "expected the byte-range parallel reader to engage @cs={cs}"
+        );
+        let got = std::fs::read_to_string(&par_out.0).expect("read parallel out");
+        // Parts are concatenated in source order, so parallel output is
+        // byte-identical to serial (not merely set-equal).
+        assert_eq!(got, oracle, "parallel decimal != serial @cs={cs}");
+    }
+}
