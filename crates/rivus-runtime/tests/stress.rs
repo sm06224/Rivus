@@ -2379,3 +2379,54 @@ fn parallel_jsonl_group_bounded_byte_identical() {
     );
     assert_eq!(parallel, serial, "parallel JSONL group != serial");
 }
+
+#[test]
+fn parallel_jsonl_stateless_byte_identical() {
+    // #49: a JSONL filter+project+save flow parallelizes in the bounded
+    // streaming-parallel path (part files → ordered concat), byte-identical to
+    // serial. Compares the saved output files.
+    let rows = 120_000usize;
+    let mut text = String::new();
+    for i in 0..rows {
+        text.push_str(&format!("{{\"id\":{},\"amount\":{}}}\n", i, i % 1000));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_jsonl_sl",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+    let run_to = |pref: rivus_runtime::MemoryPref, out: &std::path::Path| -> bool {
+        let src = format!(
+            "F:\n open {p}\n |? amount >= 500\n |> id amount\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        !res.workers.is_empty()
+    };
+    let ser = TempCsv(gendata::write_temp_bytes("jsonl_sl_serial", b""));
+    let par = TempCsv(gendata::write_temp_bytes("jsonl_sl_par", b""));
+    assert!(
+        !run_to(rivus_runtime::MemoryPref::Low, &ser.0),
+        "low must be serial"
+    );
+    assert!(
+        run_to(rivus_runtime::MemoryPref::Fast, &par.0),
+        "fast should engage the JSONL streaming-parallel path"
+    );
+    let a = std::fs::read_to_string(&ser.0).unwrap();
+    let b = std::fs::read_to_string(&par.0).unwrap();
+    assert_eq!(a, b, "parallel JSONL stateless != serial");
+    assert!(a.lines().count() > 1000);
+}

@@ -564,38 +564,19 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
-/// Stream a large CSV in parallel: infer the global schema once (in parallel),
-/// then have each worker stream one newline-aligned **byte range** through an
-/// identical stateless sub-DAG and merge in source order — all in bounded
-/// memory (no whole-file materialization). Returns `None` for non-CSV sources
-/// (binary/jsonl large files fall back to the serial streaming reader).
+/// Stream a large **splittable** source (CSV / JSONL) in parallel: infer the
+/// global schema once, then have each worker stream one newline-aligned **byte
+/// range** through an identical stateless sub-DAG to a per-worker part file, all
+/// in bounded memory (no whole-file materialization), and concatenate the parts
+/// in source order. Returns `None` for a non-splittable source, no sink, or too
+/// small (the caller's serial path runs instead).
 fn try_streaming_parallel(
     graph: &PlanGraph,
     opts: &RunOptions,
     src_id: NodeId,
-    path: &str,
     threads: usize,
 ) -> Option<RunResult> {
-    let (projection, prefilter, str_prefilter, header, declared, delim) =
-        match &graph.nodes[src_id].op {
-            Op::OpenCsv {
-                projection,
-                prefilter,
-                str_prefilter,
-                header,
-                declared,
-                delim,
-                ..
-            } => (
-                projection.clone(),
-                prefilter.clone(),
-                str_prefilter.clone(),
-                *header,
-                declared.clone(),
-                *delim,
-            ),
-            _ => return None, // only CSV has a streaming-parallel plan for now
-        };
+    let plan = plan_parallel_source(&graph.nodes[src_id].op, threads)?;
 
     // Each worker streams its byte range to a per-worker *part file* (bounded
     // memory — no output buffering), then the parts are concatenated in source
@@ -615,59 +596,19 @@ fn try_streaming_parallel(
         return None;
     }
 
-    let crate::csv::CsvParallelPlan {
-        schema,
-        dtypes,
-        keep,
-        ncols,
-        ranges,
-        bad_rows,
-        prefilter: pre,
-        str_prefilter: str_pre,
-    } = crate::csv::plan_parallel(
-        path,
-        projection.as_deref(),
-        threads,
-        &prefilter,
-        &str_prefilter,
-        header,
-        declared.as_deref(),
-        delim,
-    )
-    .ok()?;
-    let nparts = ranges.len();
-    if nparts < 2 {
-        return None; // not worth threading; let the caller's serial path run
-    }
-    let schema = std::sync::Arc::new(schema);
-
+    let nparts = plan.ranges.len();
     let part_path = |final_path: &str, i: usize| format!("{final_path}.rivpart{i}");
 
     let results: Vec<RunResult> = std::thread::scope(|scope| {
         let sinks = &sinks;
-        let schema = &schema;
-        let dtypes = &dtypes;
-        let keep = &keep;
-        let pre = &pre;
-        let str_pre = &str_pre;
-        let handles: Vec<_> = ranges
+        let plan = &plan;
+        let handles: Vec<_> = plan
+            .ranges
             .iter()
             .enumerate()
             .map(|(i, &(a, b))| {
                 scope.spawn(move || {
-                    let mut src = Some(operators::csv_range_source(
-                        path,
-                        dtypes.clone(),
-                        keep.clone(),
-                        ncols,
-                        schema.clone(),
-                        a,
-                        b,
-                        opts.chunk_size,
-                        pre.clone(),
-                        str_pre.clone(),
-                        delim,
-                    ));
+                    let mut src = Some(plan.make_source(a, b, opts.chunk_size));
                     let ops: Vec<Box<dyn Operator>> = graph
                         .nodes
                         .iter()
@@ -701,12 +642,12 @@ fn try_streaming_parallel(
     });
 
     let mut src_errors = Vec::new();
-    if bad_rows > 0 {
+    if plan.bad_rows > 0 {
         src_errors.push(
             ErrorEvent::new(
                 Severity::Recoverable,
                 ErrorScope::Item,
-                format!("{bad_rows} malformed row(s) skipped"),
+                format!("{} malformed row(s) skipped", plan.bad_rows),
             )
             .at_node(label_of(graph, src_id)),
         );
@@ -950,7 +891,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<
         if path != "-" {
             if let Ok(meta) = std::fs::metadata(path) {
                 if meta.len() >= min_bytes {
-                    return try_streaming_parallel(graph, opts, src_id, path, threads);
+                    return try_streaming_parallel(graph, opts, src_id, threads);
                 }
             }
         }
@@ -1372,6 +1313,7 @@ struct ParPlan {
     schema: std::sync::Arc<rivus_core::Schema>,
     ranges: Vec<(u64, u64)>,
     path: String,
+    bad_rows: usize,
     src: ParSource,
 }
 
@@ -1460,6 +1402,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 schema: std::sync::Arc::new(plan.schema),
                 ranges: plan.ranges,
                 path: path.to_string(),
+                bad_rows: plan.bad_rows,
                 src: ParSource::Csv {
                     dtypes: plan.dtypes,
                     keep: plan.keep,
@@ -1474,11 +1417,13 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             if path == "-" {
                 return None;
             }
-            let (schema, names, dtypes, ranges, _bad) = crate::jsonl::plan_parallel(path, threads)?;
+            let (schema, names, dtypes, ranges, bad_rows) =
+                crate::jsonl::plan_parallel(path, threads)?;
             Some(ParPlan {
                 schema: std::sync::Arc::new(schema),
                 ranges,
                 path: path.clone(),
+                bad_rows,
                 src: ParSource::Jsonl { names, dtypes },
             })
         }
@@ -2010,8 +1955,7 @@ mod tests {
             .iter()
             .position(|nd| matches!(nd.op, Op::OpenCsv { .. }))
             .unwrap();
-        try_streaming_parallel(&gp, &opts, src_id, &psafe, 4)
-            .expect("streaming-parallel should engage");
+        try_streaming_parallel(&gp, &opts, src_id, 4).expect("streaming-parallel should engage");
 
         let a = std::fs::read_to_string(&out_serial).unwrap();
         let b = std::fs::read_to_string(&out_par).unwrap();
