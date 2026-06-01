@@ -14,6 +14,8 @@
 //! are future work (design doc 03 nested columns / doc 18).
 
 use rivus_core::{Column, DataType, Field, Schema, StrColumn};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 pub struct JsonlData {
     pub schema: Schema,
@@ -214,6 +216,318 @@ fn build_column(dtype: DataType, vals: &[JVal]) -> Column {
             Column::Str(s)
         }
     }
+}
+
+// ------------------------------------------------------------- streaming reader
+
+const JSONL_BUF: usize = 256 * 1024;
+
+/// Streaming per-key type flags — `infer` accumulated one value at a time so the
+/// reader needn't buffer a whole column. Resolves identically to [`infer`].
+#[derive(Clone)]
+struct Flags {
+    any: bool,
+    all_int: bool,
+    all_num: bool,
+    all_bool: bool,
+}
+
+impl Flags {
+    fn new() -> Self {
+        Flags {
+            any: false,
+            all_int: true,
+            all_num: true,
+            all_bool: true,
+        }
+    }
+    fn observe(&mut self, v: &JVal) {
+        match v {
+            JVal::Null => {}
+            JVal::Int(_) => {
+                self.any = true;
+                self.all_bool = false;
+            }
+            JVal::Float(_) => {
+                self.any = true;
+                self.all_int = false;
+                self.all_bool = false;
+            }
+            JVal::Bool(_) => {
+                self.any = true;
+                self.all_int = false;
+                self.all_num = false;
+            }
+            JVal::Str(_) | JVal::Raw(_) => {
+                self.any = true;
+                self.all_int = false;
+                self.all_num = false;
+                self.all_bool = false;
+            }
+        }
+    }
+    fn resolve(&self) -> DataType {
+        if !self.any {
+            DataType::Str
+        } else if self.all_int {
+            DataType::I64
+        } else if self.all_num {
+            DataType::F64
+        } else if self.all_bool {
+            DataType::Bool
+        } else {
+            DataType::Str
+        }
+    }
+}
+
+/// Does the file begin with a top-level JSON array (`[ … ]`)? Such a document is
+/// not line-oriented (an element can span lines), so it can't be streamed or
+/// byte-range split — the caller falls back to the whole-file [`parse`].
+pub fn is_json_array(path: &str) -> bool {
+    let Ok(f) = File::open(path) else {
+        return false;
+    };
+    let mut r = BufReader::new(f);
+    let mut byte = [0u8; 1];
+    loop {
+        match r.read(&mut byte) {
+            Ok(0) => return false,
+            Ok(_) => {
+                let c = byte[0];
+                if matches!(c, b' ' | b'\t' | b'\r' | b'\n') {
+                    continue;
+                }
+                return c == b'[';
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Global schema for a JSON-Lines file (pass 1): the column order from the first
+/// valid object and each key's lane inferred over every row, plus the malformed
+/// line count. Byte-identical to the schema [`parse`] derives.
+fn infer_global(path: &str) -> Result<(Vec<String>, Vec<DataType>, usize), String> {
+    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let mut r = BufReader::with_capacity(JSONL_BUF, f);
+    let mut names: Vec<String> = Vec::new();
+    let mut flags: Vec<Flags> = Vec::new();
+    let mut bad_rows = 0usize;
+    let mut started = false;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match r.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let l = line.trim_end_matches(['\n', '\r']);
+        if l.trim().is_empty() {
+            continue;
+        }
+        match parse_object(l) {
+            Some(obj) => {
+                if !started {
+                    names = obj.iter().map(|(k, _)| k.clone()).collect();
+                    flags = names.iter().map(|_| Flags::new()).collect();
+                    started = true;
+                }
+                for (k, v) in &obj {
+                    if let Some(i) = names.iter().position(|n| n == k) {
+                        flags[i].observe(v);
+                    }
+                }
+            }
+            None => bad_rows += 1,
+        }
+    }
+    if !started {
+        return Err("JSON has no valid objects".to_string());
+    }
+    let dtypes = flags.iter().map(|f| f.resolve()).collect();
+    Ok((names, dtypes, bad_rows))
+}
+
+/// A streaming JSON-Lines reader (bounded memory), two-pass like the CSV reader:
+/// pass 1 ([`infer_global`]) fixes the schema, pass 2 ([`Self::next_columns`])
+/// re-streams the file (or one byte range) yielding one chunk of typed columns at
+/// a time. Byte-identical to the whole-file [`parse`] for line-oriented input.
+pub struct JsonlChunker {
+    reader: BufReader<File>,
+    names: Vec<String>,
+    dtypes: Vec<DataType>,
+    chunk_size: usize,
+    line: String,
+    eof: bool,
+    pos: u64,
+    limit: Option<u64>,
+    pub bad_rows: usize,
+}
+
+impl JsonlChunker {
+    /// Open `path` for whole-file streaming (serial, bounded memory).
+    pub fn open(path: &str, chunk_size: usize) -> Result<(Schema, JsonlChunker), String> {
+        let (names, dtypes, bad_rows) = infer_global(path)?;
+        let schema = Schema::new(
+            names
+                .iter()
+                .zip(&dtypes)
+                .map(|(n, d)| Field::new(n.clone(), *d))
+                .collect(),
+        );
+        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        Ok((
+            schema,
+            JsonlChunker {
+                reader: BufReader::with_capacity(JSONL_BUF, f),
+                names,
+                dtypes,
+                chunk_size: chunk_size.max(1),
+                line: String::new(),
+                eof: false,
+                pos: 0,
+                limit: None,
+                bad_rows,
+            },
+        ))
+    }
+
+    /// Open `path` for streaming one newline-aligned byte range `[start, end)`
+    /// with a pre-inferred global schema — one parallel worker.
+    pub fn for_range(
+        path: &str,
+        names: Vec<String>,
+        dtypes: Vec<DataType>,
+        start: u64,
+        end: u64,
+        chunk_size: usize,
+    ) -> Result<JsonlChunker, String> {
+        let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        Ok(JsonlChunker {
+            reader: BufReader::with_capacity(JSONL_BUF, f),
+            names,
+            dtypes,
+            chunk_size: chunk_size.max(1),
+            line: String::new(),
+            eof: false,
+            pos: start,
+            limit: Some(end),
+            bad_rows: 0,
+        })
+    }
+
+    /// Yield up to `chunk_size` rows as typed columns, or `None` at the end of
+    /// the file / byte range. Malformed lines are skipped (counted in pass 1).
+    pub fn next_columns(&mut self) -> Option<Vec<Column>> {
+        if self.eof {
+            return None;
+        }
+        let mut per_col: Vec<Vec<JVal>> = self.names.iter().map(|_| Vec::new()).collect();
+        let mut got = 0usize;
+        while got < self.chunk_size {
+            if matches!(self.limit, Some(end) if self.pos >= end) {
+                self.eof = true;
+                break;
+            }
+            self.line.clear();
+            let n = match self.reader.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    self.eof = true;
+                    break;
+                }
+            };
+            self.pos += n as u64;
+            let l = self.line.trim_end_matches(['\n', '\r']);
+            if l.trim().is_empty() {
+                continue;
+            }
+            // Malformed lines are skipped (already counted in pass 1).
+            if let Some(obj) = parse_object(l) {
+                for (i, name) in self.names.iter().enumerate() {
+                    let v = obj
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(JVal::Null);
+                    per_col[i].push(v);
+                }
+                got += 1;
+            }
+        }
+        if got == 0 {
+            return None;
+        }
+        Some(
+            self.dtypes
+                .iter()
+                .zip(&per_col)
+                .map(|(d, vals)| build_column(*d, vals))
+                .collect(),
+        )
+    }
+}
+
+/// Plan a byte-range parallel read of a JSON-Lines file: the global schema and
+/// `nparts` newline-aligned ranges covering the file exactly once. Returns
+/// `None` for a top-level array (not splittable) — the caller stays serial.
+/// `(schema, column names, lanes, newline-aligned byte ranges, malformed rows)`.
+pub type JsonlPlan = (Schema, Vec<String>, Vec<DataType>, Vec<(u64, u64)>, usize);
+
+pub fn plan_parallel(path: &str, nparts: usize) -> Option<JsonlPlan> {
+    if is_json_array(path) {
+        return None;
+    }
+    let (names, dtypes, bad_rows) = infer_global(path).ok()?;
+    let ranges = snap_ranges(path, nparts)?;
+    if ranges.len() < 2 {
+        return None;
+    }
+    let schema = Schema::new(
+        names
+            .iter()
+            .zip(&dtypes)
+            .map(|(n, d)| Field::new(n.clone(), *d))
+            .collect(),
+    );
+    Some((schema, names, dtypes, ranges, bad_rows))
+}
+
+/// Split the file into ≤ `nparts` newline-aligned `[start, end)` ranges (no
+/// header, so the first range starts at 0). Each boundary is snapped forward to
+/// the byte just after the next `\n`, so a line never straddles two ranges.
+fn snap_ranges(path: &str, nparts: usize) -> Option<Vec<(u64, u64)>> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let mut f = BufReader::with_capacity(JSONL_BUF, File::open(path).ok()?);
+    let mut bounds = vec![0u64];
+    let mut scratch = String::new();
+    for i in 1..nparts {
+        let approx = len * (i as u64) / (nparts as u64);
+        if approx <= *bounds.last().unwrap() {
+            continue;
+        }
+        if f.seek(SeekFrom::Start(approx)).is_err() {
+            continue;
+        }
+        scratch.clear();
+        let consumed = f.read_line(&mut scratch).ok()?; // finish the partial line
+        let boundary = approx + consumed as u64;
+        if boundary < len && boundary > *bounds.last().unwrap() {
+            bounds.push(boundary);
+        }
+    }
+    bounds.push(len);
+    Some(bounds.windows(2).map(|w| (w[0], w[1])).collect())
 }
 
 // ----------------------------------------------------------------- JSON parsing

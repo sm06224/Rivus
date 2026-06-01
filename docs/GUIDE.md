@@ -594,9 +594,10 @@ Ids:
   RAM (it does not load the file) at **~1.45× faster than DuckDB and ~40× less
   memory** (3.0 s vs 4.4 s / 407 MiB), ~3.8× faster than awk, ~10× faster than
   Python — see [`docs/BENCHMARKS.md`](BENCHMARKS.md).
-- **Parallel by default.** A single-CSV file ≥ **8 MiB** with a `save` sink (incl.
-  `save -`) is streamed across CPU cores automatically (newline-aligned
-  byte-range workers → ordered output), still in bounded memory. On a 171 MiB
+- **Parallel by default.** A single CSV **or JSONL** file ≥ **8 MiB** with a `save`
+  sink (incl. `save -`) is streamed across CPU cores automatically (newline-aligned
+  byte-range workers → ordered output), still in bounded memory. JSONL streams in
+  bounded memory now (no whole-file slurp) and its **group-by** parallelizes too. On a 171 MiB
   filter that's ~1.6 s serial → **~0.4 s** parallel. Tune with
   `RIVUS_PARALLEL_MIN_BYTES` (bytes; `0` = always) or force serial with
   `RIVUS_NO_PARALLEL=1`. Compressed (`.gz`/`.zst`) sources can't be seeked, so

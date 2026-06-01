@@ -1042,6 +1042,11 @@ fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<Node
     eligible_group_flow_inner(graph, true)
 }
 
+/// Splittable sources the bounded byte-range group path can stream (CSV / JSONL).
+fn is_splittable_source(op: &Op) -> bool {
+    matches!(op, Op::OpenCsv { .. } | Op::OpenJsonl { .. })
+}
+
 /// Same shape as [`eligible_group_flow`] but accepting **any** single source
 /// (CSV / JSONL / binary, compressed included) — used by the opt-in *unbounded*
 /// materialized path (#50), which can parallelize a non-splittable source.
@@ -1051,7 +1056,7 @@ fn eligible_group_flow_any(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<
 
 fn eligible_group_flow_inner(
     graph: &PlanGraph,
-    csv_only: bool,
+    splittable_only: bool,
 ) -> Option<(NodeId, NodeId, Option<NodeId>)> {
     let mut source = None;
     let mut group = None;
@@ -1073,8 +1078,8 @@ fn eligible_group_flow_inner(
         }
     }
     let (src, grp) = (source?, group?);
-    // Byte-range streaming is CSV-only; the bounded path rejects other sources.
-    if csv_only && !matches!(graph.nodes[src].op, Op::OpenCsv { .. }) {
+    // The bounded byte-range path needs a splittable source (CSV / JSONL).
+    if splittable_only && !is_splittable_source(&graph.nodes[src].op) {
         return None;
     }
     // The group's downstream must be empty (leaf) or exactly one (leaf) sink.
@@ -1316,47 +1321,8 @@ fn try_parallel_group(
     if opts.max_capture.is_some() && !must_drain(graph) {
         return None;
     }
-    // Byte-range streaming needs a seekable CSV file.
-    let (projection, prefilter, str_prefilter, header, declared, delim) =
-        match &graph.nodes[src_id].op {
-            Op::OpenCsv {
-                projection,
-                prefilter,
-                str_prefilter,
-                header,
-                declared,
-                delim,
-                ..
-            } => (
-                projection.clone(),
-                prefilter.clone(),
-                str_prefilter.clone(),
-                *header,
-                declared.clone(),
-                *delim,
-            ),
-            _ => return None,
-        };
-    let path_str = match source_path(&graph.nodes[src_id].op) {
-        Some(p) if p != "-" && !is_compressed_source(p) => p,
-        _ => return None,
-    };
-
-    let plan = crate::csv::plan_parallel(
-        path_str,
-        projection.as_deref(),
-        threads,
-        &prefilter,
-        &str_prefilter,
-        header,
-        declared.as_deref(),
-        delim,
-    )
-    .ok()?;
-    if plan.ranges.len() < 2 {
-        return None; // not worth threading; serial stays bounded
-    }
-    let schema = std::sync::Arc::new(plan.schema.clone());
+    // Plan a bounded byte-range read of the (splittable) source — CSV or JSONL.
+    let plan = plan_parallel_source(&graph.nodes[src_id].op, threads)?;
     let path_nodes = pre_group_path(graph, src_id, group_id);
     let aggs = match &graph.nodes[group_id].op {
         Op::GroupBy { aggs, .. } => aggs.clone(),
@@ -1367,19 +1333,7 @@ fn try_parallel_group(
     // Resolve the group-input column types (post pre-group ops) from a sample of
     // range 0; bail to serial if any aggregate isn't partition→merge safe.
     let (a0, b0) = plan.ranges[0];
-    let sample_src = operators::csv_range_source(
-        path_str,
-        plan.dtypes.clone(),
-        plan.keep.clone(),
-        plan.ncols,
-        schema.clone(),
-        a0,
-        b0,
-        opts.chunk_size,
-        plan.prefilter.clone(),
-        plan.str_prefilter.clone(),
-        delim,
-    );
+    let sample_src = plan.make_source(a0, b0, opts.chunk_size);
     let in_schema = sample_group_input_schema(graph, opts, sample_src, &src_label, &path_nodes)?;
     let safe = operators::group_parallel_safe(&aggs, |name| {
         in_schema.index_of(name).map(|i| in_schema.fields[i].dtype)
@@ -1391,7 +1345,6 @@ fn try_parallel_group(
     // One streaming worker per byte range; bounded per-worker memory.
     let partials: Vec<(operators::GroupBy, Vec<ErrorEvent>, u64)> = std::thread::scope(|scope| {
         let plan = &plan;
-        let schema = &schema;
         let path_nodes = &path_nodes;
         let src_label = &src_label;
         let handles: Vec<_> = plan
@@ -1399,19 +1352,7 @@ fn try_parallel_group(
             .iter()
             .map(|&(a, b)| {
                 scope.spawn(move || {
-                    let src = operators::csv_range_source(
-                        path_str,
-                        plan.dtypes.clone(),
-                        plan.keep.clone(),
-                        plan.ncols,
-                        schema.clone(),
-                        a,
-                        b,
-                        opts.chunk_size,
-                        plan.prefilter.clone(),
-                        plan.str_prefilter.clone(),
-                        delim,
-                    );
+                    let src = plan.make_source(a, b, opts.chunk_size);
                     stream_into_group(graph, opts, src, src_label, path_nodes, group_id)
                 })
             })
@@ -1422,6 +1363,127 @@ fn try_parallel_group(
     Some(finalize_group_partials(
         graph, src_id, group_id, sink_id, partials,
     ))
+}
+
+/// A planned bounded byte-range read of a splittable source (CSV or JSONL): the
+/// global schema, the newline-aligned ranges, and the per-format knobs needed to
+/// open a streaming worker for any range (#41 / #49).
+struct ParPlan {
+    schema: std::sync::Arc<rivus_core::Schema>,
+    ranges: Vec<(u64, u64)>,
+    path: String,
+    src: ParSource,
+}
+
+enum ParSource {
+    Csv {
+        dtypes: Vec<DataType>,
+        keep: Vec<usize>,
+        ncols: usize,
+        prefilter: Vec<(usize, rivus_ir::CmpOp, f64)>,
+        str_prefilter: Vec<String>,
+        delim: u8,
+    },
+    Jsonl {
+        names: Vec<String>,
+        dtypes: Vec<DataType>,
+    },
+}
+
+impl ParPlan {
+    /// Open a streaming source for byte range `[a, b)`.
+    fn make_source(&self, a: u64, b: u64, chunk_size: usize) -> Box<dyn Operator> {
+        match &self.src {
+            ParSource::Csv {
+                dtypes,
+                keep,
+                ncols,
+                prefilter,
+                str_prefilter,
+                delim,
+            } => operators::csv_range_source(
+                &self.path,
+                dtypes.clone(),
+                keep.clone(),
+                *ncols,
+                self.schema.clone(),
+                a,
+                b,
+                chunk_size,
+                prefilter.clone(),
+                str_prefilter.clone(),
+                *delim,
+            ),
+            ParSource::Jsonl { names, dtypes } => operators::jsonl_range_source(
+                &self.path,
+                names.clone(),
+                dtypes.clone(),
+                self.schema.clone(),
+                a,
+                b,
+                chunk_size,
+            ),
+        }
+    }
+}
+
+/// Plan a bounded byte-range parallel read for a splittable source op (a seekable
+/// CSV or a line-oriented JSONL file with ≥2 ranges). `None` for stdin,
+/// compressed, a JSON array, binary (no streaming reader yet), or too small.
+fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
+    match op {
+        Op::OpenCsv {
+            projection,
+            prefilter,
+            str_prefilter,
+            header,
+            declared,
+            delim,
+            ..
+        } => {
+            let path = source_path(op).filter(|p| *p != "-" && !is_compressed_source(p))?;
+            let plan = crate::csv::plan_parallel(
+                path,
+                projection.as_deref(),
+                threads,
+                prefilter,
+                str_prefilter,
+                *header,
+                declared.as_deref(),
+                *delim,
+            )
+            .ok()?;
+            if plan.ranges.len() < 2 {
+                return None;
+            }
+            Some(ParPlan {
+                schema: std::sync::Arc::new(plan.schema),
+                ranges: plan.ranges,
+                path: path.to_string(),
+                src: ParSource::Csv {
+                    dtypes: plan.dtypes,
+                    keep: plan.keep,
+                    ncols: plan.ncols,
+                    prefilter: plan.prefilter,
+                    str_prefilter: plan.str_prefilter,
+                    delim: *delim,
+                },
+            })
+        }
+        Op::OpenJsonl { path } => {
+            if path == "-" {
+                return None;
+            }
+            let (schema, names, dtypes, ranges, _bad) = crate::jsonl::plan_parallel(path, threads)?;
+            Some(ParPlan {
+                schema: std::sync::Arc::new(schema),
+                ranges,
+                path: path.clone(),
+                src: ParSource::Jsonl { names, dtypes },
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Merge per-worker partial group states in source order, finalize once, and

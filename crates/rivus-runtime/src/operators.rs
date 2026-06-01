@@ -150,6 +150,26 @@ pub fn collector() -> Box<dyn Operator> {
     Box::new(Merge)
 }
 
+/// A streaming JSONL source over one newline-aligned byte range `[start, end)`,
+/// used by the parallel executor (#49). The global schema/types are pre-inferred
+/// (see [`jsonl::plan_parallel`]); on open error it yields nothing (continue-first).
+pub fn jsonl_range_source(
+    path: &str,
+    names: Vec<String>,
+    dtypes: Vec<rivus_core::DataType>,
+    schema: Arc<Schema>,
+    start: u64,
+    end: u64,
+    chunk_size: usize,
+) -> Box<dyn Operator> {
+    match jsonl::JsonlChunker::for_range(path, names, dtypes, start, end, chunk_size) {
+        Ok(ch) => Box::new(SourceJsonl::from_chunker(schema, ch)),
+        Err(_) => Box::new(MemSource {
+            chunks: std::collections::VecDeque::new(),
+        }),
+    }
+}
+
 /// A streaming CSV source over one byte range `[start, end)` of a file, used by
 /// the parallel streaming executor. The global schema/types are pre-inferred
 /// (see [`csv::plan_parallel`]); on open error it yields nothing (continue-first
@@ -785,6 +805,9 @@ struct SourceJsonl {
     path: String,
     chunk_size: usize,
     schema: Arc<Schema>,
+    /// Line-oriented JSONL streams in bounded memory; a top-level array can't be
+    /// streamed (an element may span lines) so it materializes via `jsonl::parse`.
+    chunker: Option<jsonl::JsonlChunker>,
     columns: Vec<Column>,
     cursor: usize,
     total: usize,
@@ -797,6 +820,7 @@ impl SourceJsonl {
             path,
             chunk_size: chunk_size.max(1),
             schema: Schema::empty(),
+            chunker: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -804,8 +828,48 @@ impl SourceJsonl {
         }
     }
 
+    /// A source wrapping an already-built streaming JSONL reader (a parallel
+    /// worker's byte range), with a globally pre-inferred schema.
+    fn from_chunker(schema: Arc<Schema>, chunker: jsonl::JsonlChunker) -> Self {
+        SourceJsonl {
+            path: String::new(),
+            chunk_size: 0,
+            schema,
+            chunker: Some(chunker),
+            columns: Vec::new(),
+            cursor: 0,
+            total: 0,
+            loaded: true,
+        }
+    }
+
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
+        // Line-oriented JSONL → bounded streaming reader; top-level array → the
+        // whole-file parse (can't be streamed).
+        if !jsonl::is_json_array(&self.path) {
+            match jsonl::JsonlChunker::open(&self.path, self.chunk_size) {
+                Ok((schema, ch)) => {
+                    if ch.bad_rows > 0 {
+                        ctx.raise(
+                            ErrorEvent::new(
+                                Severity::Recoverable,
+                                ErrorScope::Item,
+                                format!("{} malformed JSONL line(s) skipped", ch.bad_rows),
+                            )
+                            .at_node(ctx.label.clone()),
+                        );
+                    }
+                    self.schema = Arc::new(schema);
+                    self.chunker = Some(ch);
+                }
+                Err(e) => ctx.raise(
+                    ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
+                        .at_node(ctx.label.clone()),
+                ),
+            }
+            return;
+        }
         let text = match read_input(&self.path) {
             Ok(t) => t,
             Err(e) => {
@@ -851,6 +915,11 @@ impl Operator for SourceJsonl {
     fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
         if !self.loaded {
             self.load(ctx);
+        }
+        if let Some(ch) = &mut self.chunker {
+            let columns = ch.next_columns()?;
+            let id = ctx.fresh_id();
+            return Some(Chunk::new(id, self.schema.clone(), columns));
         }
         if self.cursor >= self.total {
             return None;

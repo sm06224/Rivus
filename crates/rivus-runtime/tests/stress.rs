@@ -2317,3 +2317,65 @@ fn unbounded_group_parallelizes_non_csv_byte_identical() {
     assert_eq!(unbounded, serial, "unbounded group != serial");
     assert_eq!(auto, serial, "auto group != serial");
 }
+
+#[test]
+fn parallel_jsonl_group_bounded_byte_identical() {
+    // #49: JSONL is now a splittable source — its group-by parallelizes in the
+    // bounded byte-range path (no whole-file materialize), byte-identical to
+    // serial. Forced with a >1 MiB file + MemoryPref::Fast (no env races).
+    let rows = 120_000usize;
+    let countries = ["JP", "US", "DE", "FR"];
+    let mut text = String::new();
+    for i in 0..rows {
+        text.push_str(&format!(
+            "{{\"country\":\"{}\",\"amount\":{}}}\n",
+            countries[i % countries.len()],
+            i % 1000
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_jsonl_group",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+    let flow = format!("G:\n open {p}\n |# country min:amount max:amount count_distinct:amount\n;");
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join(","));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+    let (serial, serial_par) = collect(rivus_runtime::MemoryPref::Low);
+    let (parallel, par) = collect(rivus_runtime::MemoryPref::Fast);
+    assert!(!serial_par, "low must be serial");
+    assert!(
+        par,
+        "fast should engage the bounded JSONL byte-range group path"
+    );
+    assert_eq!(parallel, serial, "parallel JSONL group != serial");
+}

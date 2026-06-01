@@ -500,6 +500,14 @@ the materialized first cut — O(input)), with no loss of speed. Output is
 `f64_sum_group_stays_serial_but_correct` (unsafe path stays serial), and
 `operators::agg_merge_tests` (partition→merge == single-pass).
 
+**JSONL too (#49).** JSON Lines is now a splittable, bounded-streaming source: it
+reads in O(1)-per-chunk memory (no whole-file slurp) and its group-by takes the
+same bounded byte-range parallel path. On a 48 MiB / 2 M-row JSONL group-by (2
+groups) peak RSS is **6 MiB serial and 6 MiB parallel** (input-size independent),
+byte-identical to serial (`stress::parallel_jsonl_group_bounded_byte_identical`).
+The bounded path covers CSV + JSONL; non-splittable sources (compressed, binary)
+parallelize their group-by only via the opt-in `--memory unbounded` (#50).
+
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
 Data generated self-hosted with `rivus gen clean --rows 5000000` (no awk).
