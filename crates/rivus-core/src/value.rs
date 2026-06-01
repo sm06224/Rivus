@@ -101,6 +101,66 @@ impl Decimal {
     pub fn to_f64(&self) -> f64 {
         self.unscaled as f64 / Self::pow10(self.scale) as f64
     }
+
+    /// Parse decimal **text** (`"12.34"`, `"-0.5"`, `"100"`, `"+3.0"`, `".5"`,
+    /// `"5."`) into a `Decimal` at exactly `scale` fractional digits — **exact,
+    /// never via `f64`**. Excess fractional digits are rounded half-to-even (the
+    /// same deterministic rule as [`rescale`](Self::rescale), which this reuses),
+    /// fewer are zero-padded. Returns `None` on malformed input (non-digit, empty,
+    /// multiple dots, exponent) or `i128` overflow, so the reader can route a bad
+    /// cell to the error stream (continue-first) instead of panicking.
+    pub fn parse_scaled(s: &str, scale: u8) -> Option<Decimal> {
+        let (neg, rest) = match s.as_bytes().first() {
+            Some(b'-') => (true, &s[1..]),
+            Some(b'+') => (false, &s[1..]),
+            _ => (false, s),
+        };
+        let (int_part, frac_part) = match rest.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (rest, ""),
+        };
+        // At least one digit overall; every remaining byte must be an ASCII digit.
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        if !int_part.bytes().all(|b| b.is_ascii_digit())
+            || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        // The text's own scale is its fractional-digit count; build the unscaled
+        // magnitude exactly, then round to the requested scale.
+        let natural_scale = u8::try_from(frac_part.len()).ok()?;
+        let mut mag: i128 = 0;
+        for &b in int_part.as_bytes().iter().chain(frac_part.as_bytes()) {
+            mag = mag.checked_mul(10)?.checked_add((b - b'0') as i128)?;
+        }
+        let unscaled = if neg { -mag } else { mag };
+        Decimal::new(unscaled, natural_scale).rescale(scale)
+    }
+
+    /// Count the fractional digits in decimal text (`"12.5"` → 1, `"7"` → 0),
+    /// or `None` if the text is not a valid decimal. Used by the reader's
+    /// auto-scale pass to pick a column scale = the max fractional width seen.
+    pub fn fractional_digits(s: &str) -> Option<u8> {
+        let rest = match s.as_bytes().first() {
+            Some(b'-') | Some(b'+') => &s[1..],
+            _ => s,
+        };
+        let (int_part, frac_part) = match rest.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (rest, ""),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        if !int_part.bytes().all(|b| b.is_ascii_digit())
+            || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        u8::try_from(frac_part.len()).ok()
+    }
 }
 
 impl PartialOrd for Decimal {
@@ -314,6 +374,67 @@ mod decimal_tests {
         assert_eq!(v.dtype(), DataType::Decimal { scale: 2 });
         assert_eq!(v.as_f64(), Some(12.5));
         assert_eq!(v.to_string(), "12.50");
+    }
+
+    #[test]
+    fn parse_scaled_is_exact_and_rounds_half_even() {
+        // Exact at the target scale.
+        assert_eq!(
+            Decimal::parse_scaled("12.34", 2),
+            Some(Decimal::new(1234, 2))
+        );
+        assert_eq!(
+            Decimal::parse_scaled("100", 2),
+            Some(Decimal::new(10000, 2))
+        );
+        assert_eq!(Decimal::parse_scaled("-0.5", 2), Some(Decimal::new(-50, 2)));
+        assert_eq!(Decimal::parse_scaled("+3.0", 1), Some(Decimal::new(30, 1)));
+        assert_eq!(Decimal::parse_scaled(".5", 2), Some(Decimal::new(50, 2)));
+        assert_eq!(Decimal::parse_scaled("5.", 0), Some(Decimal::new(5, 0)));
+        // Excess fractional digits round half-to-even.
+        assert_eq!(
+            Decimal::parse_scaled("12.345", 2),
+            Some(Decimal::new(1234, 2))
+        ); // 4 even
+        assert_eq!(
+            Decimal::parse_scaled("12.355", 2),
+            Some(Decimal::new(1236, 2))
+        ); // 5 odd→up
+        assert_eq!(
+            Decimal::parse_scaled("12.344", 2),
+            Some(Decimal::new(1234, 2))
+        );
+        assert_eq!(
+            Decimal::parse_scaled("-12.345", 2),
+            Some(Decimal::new(-1234, 2))
+        );
+        // The canonical f64 trap is exact here: 0.1 and 0.2 at scale 1.
+        let a = Decimal::parse_scaled("0.1", 1).unwrap();
+        let b = Decimal::parse_scaled("0.2", 1).unwrap();
+        assert_eq!(
+            a.checked_add(&b).unwrap(),
+            Decimal::parse_scaled("0.3", 1).unwrap()
+        );
+        // Malformed → None (so the reader can route to the error stream).
+        for bad in ["", "+", "-", "abc", "1.2.3", "1e5", "1 ", " 1", "1,2", "."] {
+            assert_eq!(
+                Decimal::parse_scaled(bad, 2),
+                None,
+                "expected None for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_digits_counts_or_rejects() {
+        assert_eq!(Decimal::fractional_digits("12.5"), Some(1));
+        assert_eq!(Decimal::fractional_digits("7"), Some(0));
+        assert_eq!(Decimal::fractional_digits("-3.1400"), Some(4));
+        assert_eq!(Decimal::fractional_digits(".5"), Some(1));
+        assert_eq!(Decimal::fractional_digits("5."), Some(0));
+        assert_eq!(Decimal::fractional_digits("abc"), None);
+        assert_eq!(Decimal::fractional_digits(""), None);
+        assert_eq!(Decimal::fractional_digits("1.2.3"), None);
     }
 
     #[test]
