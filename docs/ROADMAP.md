@@ -26,6 +26,9 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | **Typed / named columns at `open`** | `open f.csv (id:int, name:str, age:int)` — give a schema instead of inferring; also names a header-less file |
 | 🚧 | **Compressed inputs** | **`.gz` ✅** (feature `gzip`, `flate2`/`miniz_oxide`) and **`.zst` ✅** (feature `zstd`, pure-Rust `ruzstd` decoder) done — serial single-pass with sample inference (compressed streams can't seek → no byte-range parallel); default build stays dep-free. Next: `.zip`/tar. Vetting log in `SUPPLY-CHAIN.md`. |
 | ✅ | **TSV / custom delimiter** (real) | `delim: u8` threaded through `OpenCsv`/`SinkCsv` (std-only). `.tsv`/`.tab` paths split on a tab automatically; `as tsv`/`as csv` overrides the extension. Reader, parallel reader, and sinks all honor it; `to_source` stays faithful. |
+| 📋 | **BOM / encoding handling** | strip a leading UTF-8 BOM (`EF BB BF`) so the first header cell isn't `﻿id`; detect UTF-16 LE/BE BOM and decode (or warn + continue). Today a BOM leaks into the first column name. std-only. Connects to design doc 06 §6.4 "text is stream" (encoding-aware decode) |
+| 📋 | **Exact decimal lane at the reader** (design doc 21) | `open f.csv (price:decimal[(n)])` / `--exact[=auto\|N]`: parse into `Column::Dec` (i128 scaled int, **landed in core**). Scale auto-inferred (max fractional digits, 2-pass) or explicit. Unblocks byte-identical parallel decimal aggregation (#41) and exact money math |
+| 📋 | **Datetime lane at the reader** (design doc 23) | `open f.csv (ts:datetime["yyMMddhhmmss"])` / `--dates`: epoch-integer parse, std-only strptime; bad values warn + continue |
 | 📋 | **Parquet / Arrow** | feature `parquet` via apache **`arrow`/`parquet`** (isolated behind the source/sink trait) |
 | 📋 | **Python pickle**, YAML/TOML/INI/XML/HTML | `pickle` via `serde-pickle`; text formats likely std-only or a small vetted dep |
 | 📋 | Transports: socket / HTTP / subscribe / scheduled-get | `docs/design/18` |
@@ -55,6 +58,8 @@ it in small, gated steps.
 | ✅ | • mid-flow cast | `\|> (age:int) as age` (computed column) **and** the `cast age:int price:f64` verb (re-types columns in place) |
 | ✅ | • derive/add property | `\|> (expr) as name` computed columns (done) |
 | ✅ | String / numeric functions, `case when … then … else` | `upper/lower/trim/len/substr/contains/replace/split_part/concat`, `starts_with/ends_with/like/glob/regexp`, numeric `abs/round/floor/ceil`, null-coalesce `coalesce`, and `case when … then … [else …] end` all done |
+| 📋 | **Optional leading pipe before any stage** | allow (don't require) a `\|` before stages that today have none — `\| sort score`, `\| save out.csv`, `\| group …`. Makes every stage read as a pipe step; bare form still valid. Lexer/parser: treat a stage-leading `\|` as optional whitespace. (back-compat not required per 統括) |
+| 📋 | **Flow prefix for label references** | a sigil so a stage that consumes a named upstream flow is syntactically obvious (today a bare `Adults` could be a label or a column). Proposed `@Label` (or `->Label`) for "inherit/continue this flow", e.g. `Merged: @Adults + @Minors`. Touches lexer/parser/`to_source`; reversible. (back-compat not required) |
 
 ## D. Relational & cleaning operators
 

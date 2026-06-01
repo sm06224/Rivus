@@ -679,3 +679,34 @@ columnar selection-vector / late-materialization design, which is Epic #38 lever
 2 (#40). On CSV today the whole filter node is only ~3% of wall (parse dominates
 at ~2.1 s of 2.7 s), so this kernel work matters for the *columnar* core to come,
 not for end-to-end CSV wall time yet.
+
+### Where the time goes on 1 GB (profiling for the DuckDB gap)
+
+統括 measured a 1 GB / 30 M-row CSV wrangle at ~22 s where DuckDB does ~10 s.
+Profiling the node `busy_ms` (`--json`) on a 1.13 GB / 30 M-row file
+(`open … |? age>=30 |> id age score save out.csv`, 4 cpus):
+
+| | serial busy_ms | note |
+|---|---:|---|
+| **open (CSV parse)** | **12 591** | dominates — line split + per-field parse of 30M×6 |
+| save (CSV write) | 6 897 | second cost — formatting + write of ~20M rows |
+| filter | 429 | the predicate kernel is already cheap (#39) |
+| project | 24 | negligible |
+| serial wall | ~16.9 s | |
+| **default parallel wall** | **~6.8 s** | byte-range parse parallelizes |
+
+Two honest findings:
+
+1. **Declared types barely help**: forcing `(id:int age:int score:f64 …)` to skip
+   schema inference left `open` at 12.5 s (vs 12.6 s inferred). So the two-pass
+   *inference* is **not** the bottleneck — the **pass-2 build (split + parse the
+   30M×6 fields)** is. The next lever is faster field scanning, not fewer passes:
+   SIMD delimiter scan (`,`/`\n` via `core::arch`, no deps — the roadmap's "SIMD
+   CSV scan", revisited now that profiling points here) and faster int/float
+   parsing. Output writing (save) is the second target (buffered formatting).
+2. The default parallel path already turns 16.9 s → 6.8 s; the remaining gap to
+   DuckDB is parse+write throughput per core, which the columnar core (#40) and a
+   SIMD scanner target. **Measurement required before claiming any win.**
+
+(Also tracked: UTF-8 **BOM** at the start of a file is not yet stripped — the
+first header cell keeps the `﻿`; see ROADMAP "Ingestion".)
