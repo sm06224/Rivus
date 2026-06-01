@@ -976,6 +976,9 @@ fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
         Column::Bool(v) => v[a].cmp(&v[b]),
         Column::I64(v) => v[a].cmp(&v[b]),
         Column::F64(v) => v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal),
+        // One column shares a scale, so the unscaled i128 order is the exact
+        // value order — no precision loss in the sort key (design doc 21).
+        Column::Dec(d) => d.unscaled[a].cmp(&d.unscaled[b]),
         Column::Str(v) => v.get(a).cmp(v.get(b)),
     }
 }
@@ -2749,6 +2752,8 @@ fn json_value(out: &mut String, v: &Value) {
         // JSON has no NaN/Infinity → emit null (continue-first).
         Value::F64(f) if f.is_finite() => out.push_str(&f.to_string()),
         Value::F64(_) => out.push_str("null"),
+        // Exact decimal → emit as a JSON number (its Display is a valid number).
+        Value::Dec(d) => out.push_str(&d.to_string()),
         Value::Str(s) => json_string(out, s),
     }
 }

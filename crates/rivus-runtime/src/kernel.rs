@@ -89,7 +89,7 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
         } => {
             let idx = chunk.schema.index_of(name)?;
             match chunk.columns[idx] {
-                Column::I64(_) | Column::F64(_) | Column::Bool(_) => Some(idx),
+                Column::I64(_) | Column::F64(_) | Column::Bool(_) | Column::Dec(_) => Some(idx),
                 Column::Str(_) => None,
             }
         }
@@ -151,6 +151,15 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
                 *m = cmp_scalar(if b { 1.0 } else { 0.0 }, p.op, p.rhs) as u8;
             }
         }
+        // Decimal: compare via the f64 view. The rhs literal is already f64, so
+        // this matches the interpreter's cross-lane compare (design doc 21; an
+        // exact i128 compare against a scaled rhs is a future optimization).
+        Column::Dec(d) => {
+            let pow = 10f64.powi(d.scale as i32);
+            for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                *m = cmp_scalar(u as f64 / pow, p.op, p.rhs) as u8;
+            }
+        }
         Column::Str(_) => mask.fill(0), // compiled out by `num_col`
     }
 }
@@ -171,6 +180,12 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         Column::Bool(v) => {
             for (m, &b) in mask.iter_mut().zip(v.iter()) {
                 *m &= cmp_scalar(if b { 1.0 } else { 0.0 }, p.op, p.rhs) as u8;
+            }
+        }
+        Column::Dec(d) => {
+            let pow = 10f64.powi(d.scale as i32);
+            for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                *m &= cmp_scalar(u as f64 / pow, p.op, p.rhs) as u8;
             }
         }
         Column::Str(_) => mask.fill(0),

@@ -150,12 +150,24 @@ impl From<Vec<String>> for StrColumn {
     }
 }
 
+/// An exact fixed-point column: contiguous `i128` unscaled integers sharing one
+/// `scale` (design doc 21). The whole column rides the decimal lane, so a value
+/// is `unscaled[i] × 10^(−scale)`. Addition over `i128` is exact and
+/// associative, which is what makes parallel aggregation byte-identical.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecColumn {
+    pub unscaled: Vec<i128>,
+    pub scale: u8,
+}
+
 /// A columnar buffer. One variant per execution lane (MVP subset).
 #[derive(Debug, Clone)]
 pub enum Column {
     Bool(Vec<bool>),
     I64(Vec<i64>),
     F64(Vec<f64>),
+    /// Exact fixed-point lane (opt-in; design doc 21).
+    Dec(DecColumn),
     Str(StrColumn),
 }
 
@@ -165,6 +177,7 @@ impl Column {
             Column::Bool(v) => v.len(),
             Column::I64(v) => v.len(),
             Column::F64(v) => v.len(),
+            Column::Dec(v) => v.unscaled.len(),
             Column::Str(v) => v.len(),
         }
     }
@@ -178,6 +191,7 @@ impl Column {
             Column::Bool(_) => DataType::Bool,
             Column::I64(_) => DataType::I64,
             Column::F64(_) => DataType::F64,
+            Column::Dec(v) => DataType::Decimal { scale: v.scale },
             Column::Str(_) => DataType::Str,
         }
     }
@@ -187,6 +201,7 @@ impl Column {
             Column::Bool(v) => Value::Bool(v[row]),
             Column::I64(v) => Value::I64(v[row]),
             Column::F64(v) => Value::F64(v[row]),
+            Column::Dec(v) => Value::Dec(crate::value::Decimal::new(v.unscaled[row], v.scale)),
             Column::Str(v) => Value::Str(v.get(row).to_string()),
         }
     }
@@ -199,6 +214,7 @@ impl Column {
             (Column::Bool(a), Column::Bool(b)) => a.extend_from_slice(b),
             (Column::I64(a), Column::I64(b)) => a.extend_from_slice(b),
             (Column::F64(a), Column::F64(b)) => a.extend_from_slice(b),
+            (Column::Dec(a), Column::Dec(b)) => a.unscaled.extend_from_slice(&b.unscaled),
             (Column::Str(a), Column::Str(b)) => a.append(b),
             _ => {}
         }
@@ -216,6 +232,13 @@ impl Column {
             Column::F64(v) => {
                 Column::F64(indices.iter().map(|o| o.map_or(0.0, |i| v[i])).collect())
             }
+            Column::Dec(v) => Column::Dec(DecColumn {
+                unscaled: indices
+                    .iter()
+                    .map(|o| o.map_or(0, |i| v.unscaled[i]))
+                    .collect(),
+                scale: v.scale,
+            }),
             Column::Str(v) => {
                 let mut out = StrColumn::with_capacity(indices.len(), 0);
                 for o in indices {
@@ -232,6 +255,10 @@ impl Column {
             Column::Bool(v) => Column::Bool(indices.iter().map(|&i| v[i]).collect()),
             Column::I64(v) => Column::I64(indices.iter().map(|&i| v[i]).collect()),
             Column::F64(v) => Column::F64(indices.iter().map(|&i| v[i]).collect()),
+            Column::Dec(v) => Column::Dec(DecColumn {
+                unscaled: indices.iter().map(|&i| v.unscaled[i]).collect(),
+                scale: v.scale,
+            }),
             Column::Str(v) => Column::Str(v.gather(indices)),
         }
     }
