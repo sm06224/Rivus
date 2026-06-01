@@ -1059,20 +1059,80 @@ impl ColBuilder {
 /// Split an unquoted record into field byte-ranges `(start, end)` into `out`
 /// (cleared first), allocating nothing — `out` is reused across rows. Returns
 /// `false` when the line contains a `"` (the caller takes the owned slow path).
+// SWAR (SIMD-within-a-register) byte search: process 8 bytes per step with
+// plain u64 arithmetic — no `core::arch`, no feature gate, host-endian
+// independent (words are read little-endian so byte `i` maps to bits
+// `i*8..i*8+7`).
+const SWAR_LO: u64 = 0x0101_0101_0101_0101;
+const SWAR_HI: u64 = 0x8080_8080_8080_8080;
+const SWAR_LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F; // !SWAR_HI
+
+/// Broadcast byte `b` into every lane of a u64.
+#[inline(always)]
+fn swar_splat(b: u8) -> u64 {
+    SWAR_LO.wrapping_mul(b as u64)
+}
+
+/// For each byte of `word` equal to the byte broadcast in `splat`, set that
+/// lane's high bit (`0x80`) and clear the rest — **exactly one bit per match,
+/// with no cross-byte contamination**, so `trailing_zeros() >> 3` yields the
+/// matching byte index and `m &= m - 1` advances to the next.
+///
+/// The naive `(x - LO) & ~x & HI` zero-byte trick is only reliable as a
+/// *boolean* ("any match?"); its per-byte bits are corrupted by subtraction
+/// borrows (a zero byte followed by a `0x01` lane false-positives), which makes
+/// it wrong for *locating* matches. This borrow-free variant is exact:
+/// `(b & 0x7F) + 0x7F` stays ≤ `0xFE`, so no carry crosses a byte boundary.
+#[inline(always)]
+fn swar_eq_mask(word: u64, splat: u64) -> u64 {
+    let t = word ^ splat; // 0x00 lanes where the byte matches
+                          // 0x80 per lane iff that lane is non-zero (carry-free), then flip so 0x80
+                          // marks the matching (zero) lanes.
+    let nonzero = ((t & SWAR_LO7).wrapping_add(SWAR_LO7) | t) & SWAR_HI;
+    nonzero ^ SWAR_HI
+}
+
+/// Split an unquoted record into field byte-ranges. Scans 8 bytes at a time
+/// (SWAR), recording every `delim` position; bails to the owned slow path
+/// (returns `false`, leaving `out` partially filled — callers re-split and
+/// ignore it) the moment a `"` appears. Byte-identical to a scalar scan: it
+/// finds the exact same delimiter offsets and the exact same quote condition.
 fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
     out.clear();
     let bytes = line.as_bytes();
-    if bytes.contains(&b'"') {
-        return false;
-    }
+    let n = bytes.len();
+    let dsplat = swar_splat(delim);
+    let qsplat = swar_splat(b'"');
     let mut start = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let word = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        // Any `"` in this word → quoted record, take the slow path.
+        if swar_eq_mask(word, qsplat) != 0 {
+            return false;
+        }
+        let mut m = swar_eq_mask(word, dsplat);
+        while m != 0 {
+            let j = i + (m.trailing_zeros() as usize >> 3);
+            out.push((start, j));
+            start = j + 1;
+            m &= m - 1;
+        }
+        i += 8;
+    }
+    // Scalar tail (< 8 bytes), same predicate as the SWAR body.
+    while i < n {
+        let b = bytes[i];
+        if b == b'"' {
+            return false;
+        }
         if b == delim {
             out.push((start, i));
             start = i + 1;
         }
+        i += 1;
     }
-    out.push((start, bytes.len()));
+    out.push((start, n));
     true
 }
 
@@ -1459,5 +1519,83 @@ mod tests {
     fn mixed_column_falls_back_to_str() {
         let data = parse_projected("v\n1\n2\nN/A\n", None, b',').unwrap();
         assert_eq!(data.schema.fields[0].dtype, DataType::Str);
+    }
+
+    // Reference scalar splitter: the byte-by-byte version `split_offsets`
+    // replaced. The SWAR scan must produce identical offsets and the identical
+    // quote-bail decision for every input.
+    fn split_offsets_scalar(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
+        out.clear();
+        let bytes = line.as_bytes();
+        if bytes.contains(&b'"') {
+            return false;
+        }
+        let mut start = 0usize;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == delim {
+                out.push((start, i));
+                start = i + 1;
+            }
+        }
+        out.push((start, bytes.len()));
+        true
+    }
+
+    #[test]
+    fn swar_split_stress_lines() {
+        for i in 0..4000usize {
+            let v = (i as f64 % 200.0) * 0.5 - 50.0;
+            let name = if i % 3 == 0 {
+                String::new()
+            } else {
+                format!("n{i}")
+            };
+            let line = format!("{i},{v},{name}");
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            let ra = split_offsets(&line, &mut a, b',');
+            let rb = split_offsets_scalar(&line, &mut b, b',');
+            assert_eq!(ra, rb, "bail mismatch on {line:?}");
+            if ra {
+                assert_eq!(a, b, "offset mismatch on {line:?} (len {})", line.len());
+            }
+        }
+    }
+
+    #[test]
+    fn swar_split_matches_scalar() {
+        // Cross every word boundary and tail length, with delimiters and quotes
+        // at varied positions, plus empties and runs.
+        let cases = [
+            "",
+            "a",
+            ",",
+            "a,b",
+            "a,b,c",
+            "1,22,333,4444,55555,666666,7777777,88888888,9",
+            ",,,",
+            "abcdefgh,ijklmnop,q",   // 8-byte-aligned fields
+            "abcdefg,hij",           // delim straddling the 8-byte mark
+            "no_delims_here_at_all", // > 8 bytes, zero delims
+            "tab\tsep\there",
+            "has\"quote",
+            "trailing_quote\"",
+            "\"leading_quote",
+            "field1,field2\"x,field3", // quote after some delims → bail
+            "1234567\"",               // quote exactly at the 8th byte (tail)
+            "12345678\"9",             // quote just past a full word
+        ];
+        for case in cases {
+            for &delim in b",\t" {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                let ra = split_offsets(case, &mut a, delim);
+                let rb = split_offsets_scalar(case, &mut b, delim);
+                assert_eq!(ra, rb, "quote-bail mismatch on {case:?} delim={delim}");
+                if ra {
+                    assert_eq!(a, b, "offset mismatch on {case:?} delim={delim}");
+                }
+            }
+        }
     }
 }

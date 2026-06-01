@@ -388,23 +388,50 @@ the `name` column for the ~half of rows the predicate drops (4.1 s → 3.0 s).
 The downstream FilterProject stays authoritative, so output is byte-identical
 (gated by `tests/optimizer_equiv.rs`).
 
-### Negative result — SWAR delimiter scan (not landed)
+### SWAR delimiter scan — landed (overturns the earlier negative result)
 
-Tried replacing the per-byte delimiter loop in `split_offsets` with a
-dependency-free SWAR (SIMD-within-a-register) word-at-a-time scan (8 bytes/step,
-the `(x-0x01..)&!x&0x80..` zero-byte trick, no `unsafe`). Measured on a 92 MiB /
-3 M-row CSV (`filter age>=50`, project `name age`, write), release, 3 runs each:
+`split_offsets` now scans 8 bytes at a time with a dependency-free SWAR
+(SIMD-within-a-register) word loop — `core::arch`-free, `unsafe`-free, host-endian
+independent — fusing the `"`-detection and `,`-location that the scalar path did
+as two separate passes over each line.
 
-| scan | time |
-|---|---:|
-| scalar byte loop | 1.13 s |
-| SWAR 8-byte | 1.14 s |
+**Why the earlier "no win" was wrong (two reasons).**
 
-**No measurable win** — IO and typed column-building dominate this path, not the
-delimiter split. Per the project rule ("'faster' is never asserted without a
-measured number"), the change was dropped rather than add a hand-rolled bit
-trick for nothing. Revisit only if a future profile shows the split as hot
-(e.g. after mmap + buffer-reuse remove the IO/alloc overhead).
+1. *Measurement methodology.* The earlier note measured **end-to-end wall** on a
+   `filter+project+write` path (1.13 vs 1.14 s) where IO + column-build + write are
+   fixed costs that dilute the parse node, and the runs were **not interleaved**, so
+   machine noise (±0.05 s) swamped the signal. Measuring the **`open` node `busy_ms`
+   in interleaved base/SWAR pairs** isolates the parse and exposes a clear win.
+2. *A real bug in the naive mask.* The classic `(x-0x01..)&!x&0x80..` zero-byte
+   trick is only reliable as a **boolean** ("any match?"). Its per-byte high bits
+   are corrupted by subtraction **borrows** — a zero (matching) lane followed by a
+   `0x01` lane false-positives — so using it to **locate** delimiters mis-splits some
+   records (e.g. `1,-49.5,n1`). Caught by a 4000-line parity test
+   (`swar_split_stress_lines`) that the stress suite's chunk-size oracle also flags.
+   The landed version uses a **carry-free** exact mask: `(b & 0x7F) + 0x7F` stays
+   ≤ `0xFE`, so no carry crosses a byte boundary — per-lane exact, location-safe.
+
+**Result (5 M rows / 171 MiB, release, interleaved base/SWAR pairs, `open` node
+`busy_ms`):**
+
+| workload (serial) | scalar `open` | SWAR `open` | speedup |
+|---|---:|---:|---:|
+| `open … save` (all rows built) | ~2120 ms | ~1903 ms | **~10 %** |
+| `open … |? age>=50 |> name age save` | ~1417 ms | ~1168 ms | **~17 %** |
+
+| default parallel (4 cpu) | scalar | SWAR | speedup |
+|---|---:|---:|---:|
+| `open … save`, `open` node `busy_ms` | ~1069 ms | ~1017 ms | **~5 %** |
+| `open … save`, end-to-end wall | ~2.15 s | ~1.91 s | **~11 %** |
+
+Every interleaved pair showed SWAR faster (no overlap). **Byte-identical** output
+confirmed by md5 on both workloads (`b45986b8…`, `a19f4f2e…`) and by the full
+equivalence/stress suites; zero third-party deps unchanged. The win is larger when
+the split is a larger fraction of the parse (the filter path skips building dropped
+rows, so the per-line scan dominates more). Next field-scan lever: faster int/float
+parse — measured to be cheap here (building 2 vs 6 columns barely moved the time, so
+the **scan**, not the per-cell parse, was the cost), so it is *not* pursued without a
+profile that shows parse as hot.
 
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
@@ -700,10 +727,13 @@ Two honest findings:
 1. **Declared types barely help**: forcing `(id:int age:int score:f64 …)` to skip
    schema inference left `open` at 12.5 s (vs 12.6 s inferred). So the two-pass
    *inference* is **not** the bottleneck — the **pass-2 build (split + parse the
-   30M×6 fields)** is. The next lever is faster field scanning, not fewer passes:
-   SIMD delimiter scan (`,`/`\n` via `core::arch`, no deps — the roadmap's "SIMD
-   CSV scan", revisited now that profiling points here) and faster int/float
-   parsing. Output writing (save) is the second target (buffered formatting).
+   30M×6 fields)** is. The next lever is faster field scanning, not fewer passes.
+   **First step landed**: a dependency-free **SWAR delimiter scan** in
+   `split_offsets` (8 bytes/step, carry-free exact mask) — ~10–17 % off the `open`
+   node, byte-identical (see "SWAR delimiter scan — landed" above). A widening to
+   `core::arch` SIMD and faster int/float parse remain open (parse measured cheap
+   here; pursue only behind a profile). Output writing (save) is the second target
+   (buffered formatting).
 2. The default parallel path already turns 16.9 s → 6.8 s; the remaining gap to
    DuckDB is parse+write throughput per core, which the columnar core (#40) and a
    SIMD scanner target. **Measurement required before claiming any win.**
