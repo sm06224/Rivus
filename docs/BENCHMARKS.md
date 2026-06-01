@@ -471,29 +471,34 @@ kernel and interpreter, where the f64 view wrongly dropped it. Gated by
 ### Parallel group-by — byte-identical partition→merge (#41, option 1)
 
 Group-by was serial (the parallel scheduler only handled stateless map/filter).
-A linear `source → … → group` flow now aggregates **per worker** and merges the
-partial states in source order — taken only when every aggregate is byte-identical
-under partition→merge: `min`/`max`/`count`/`count_distinct`/`first`/`last`/
-percentile (associative or buffered+sorted) and `sum`/`avg` **on a decimal column**
-(exact i128, associative — the reason the decimal lane was built). `std` and
-`sum`/`avg` on f64/integer columns are *not* associative and stay serial (the
-scheduler checks the group-input schema, so a pre-group `cast` to decimal counts).
+Each **byte-range streaming worker** now runs its range through the pre-group ops
+into a *partial* group state (the same `plan_parallel` + `csv_range_source` the
+streaming-parallel reader uses), and the partials merge in source order — taken
+only when every aggregate is byte-identical under partition→merge: `min`/`max`/
+`count`/`count_distinct`/`first`/`last`/percentile (associative or buffered+sorted)
+and `sum`/`avg` **on a decimal column** (exact i128, associative — the reason the
+decimal lane was built). `std` and `sum`/`avg` on f64/integer columns are *not*
+associative and stay serial (the scheduler checks the group-input schema, so a
+pre-group `cast` to decimal counts; the pre-group ops are an allowlist).
 
-Measured end-to-end wall (3 M rows / 28 MiB, group by country into
-`sum/avg/min/max`, 4 cpus, release):
+Because each worker holds only its current chunk and its partial group state, peak
+memory is **O(group cardinality), input-size independent** — the bounded-memory
+guarantee is kept on the parallel path. Measured peak RSS (`ru_maxrss`) and
+end-to-end wall (4 cpus, release):
 
-| group-by | wall |
-|---|---:|
-| serial (`--memory low`) | ~1.35 s |
-| parallel partition→merge (`--memory fast`) | **~0.97 s** (~1.4×) |
+| group-by | peak RSS (6 M rows / 53 MiB, 2 groups) | wall (3 M rows, group→sum/avg/min/max) |
+|---|---:|---:|
+| serial (`--memory low`) | 6 MiB | ~1.35 s |
+| parallel, first cut (materialized whole input) | **145 MiB** | — |
+| parallel, byte-range streaming (landed) | **6 MiB** | **~0.97 s** (~1.4×) |
 
-Output is **byte-identical** to serial (md5-equal on the saved CSV; the decimal
-sums are exact, e.g. `12500000.00`, not f64-drifted). The win is bounded here by
-parse (already internally parallel) dominating; it grows with aggregation-heavy /
-high-cardinality groups. Gated by `stress::parallel_group_by_matches_serial`
-(parallel == serial across the safe aggregate set, workers confirmed engaged),
-`f64_sum_group_stays_serial_but_correct` (the unsafe path stays serial), and the
-`operators::agg_merge_tests` property tests (partition→merge == single-pass).
+So streaming brings the parallel path back to the serial **6 MiB** (vs 145 MiB for
+the materialized first cut — O(input)), with no loss of speed. Output is
+**byte-identical** to serial (md5-equal saved CSV; exact decimal sums like
+`12500000.00`, not f64-drifted). Gated by `stress::parallel_group_by_matches_serial`
+(parallel == serial across the safe set, workers engaged),
+`f64_sum_group_stays_serial_but_correct` (unsafe path stays serial), and
+`operators::agg_merge_tests` (partition→merge == single-pass).
 
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 

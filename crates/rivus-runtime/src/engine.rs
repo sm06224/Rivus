@@ -997,41 +997,52 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<
     Some(merge_results(graph, results, src_errors, src_fatal))
 }
 
-/// If the flow is a single linear pipeline `source → stateless ops → GroupBy →
-/// (leaf | one sink)` with no other stateful operator, return
-/// `(source_id, group_id, optional_sink_id)` — the shape the parallel group-by
-/// scheduler (#41) handles. `None` keeps the caller on the serial path.
+/// Stateless ops allowed on the pre-group path (an **allowlist**, so an unknown
+/// or future stateful op is never silently parallelized; #41). Each runs
+/// per-chunk with no cross-row/chunk state, so a byte-range worker can stream its
+/// range through them in bounded memory.
+fn pre_group_op_allowed(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Filter { .. }
+            | Op::Project { .. }
+            | Op::ProjectExpr { .. }
+            | Op::FilterProject { .. }
+            | Op::Rename { .. }
+            | Op::Drop { .. }
+            | Op::Cast { .. }
+            | Op::Reorder { .. }
+            | Op::DropNa { .. }
+            | Op::Fill {
+                method: rivus_ir::FillMethod::Value(_),
+                ..
+            }
+    )
+}
+
+/// If the flow is a single linear pipeline `CSV source → allowlisted stateless
+/// ops → GroupBy → (leaf | one sink)`, return `(source_id, group_id,
+/// optional_sink_id)` — the shape the parallel group-by scheduler (#41) handles.
+/// `None` keeps the caller on the serial (bounded) path.
 fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<NodeId>)> {
     let mut source = None;
     let mut group = None;
     for node in &graph.nodes {
         match &node.op {
-            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. } => {
+            Op::OpenCsv { .. } => {
                 if source.is_some() {
                     return None;
                 }
                 source = Some(node.id);
             }
+            // Byte-range streaming is CSV-only; a non-CSV source stays serial.
+            Op::OpenBinary { .. } | Op::OpenJsonl { .. } => return None,
             Op::GroupBy { .. } => {
                 if group.is_some() {
                     return None;
                 }
                 group = Some(node.id);
             }
-            Op::Join { .. }
-            | Op::Sort { .. }
-            | Op::Distinct { .. }
-            | Op::Describe
-            | Op::Take { .. }
-            | Op::StreamRef { .. } => return None,
-            Op::Fill {
-                method:
-                    rivus_ir::FillMethod::Ffill
-                    | rivus_ir::FillMethod::Bfill
-                    | rivus_ir::FillMethod::Mean
-                    | rivus_ir::FillMethod::Median,
-                ..
-            } => return None,
             _ => {}
         }
     }
@@ -1052,15 +1063,27 @@ fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<Node
         }
         _ => return None,
     };
-    // source → group must be a linear chain (each node one input, one consumer)
-    // so the pre-group ops can run sequentially per worker.
+    // source → group must be a linear chain of *allowlisted* stateless ops (each
+    // node exactly one input and one consumer).
     let mut cur = grp;
+    let mut path_len = 0usize;
     while cur != src {
         let ins = graph.inputs_of(cur);
         if ins.len() != 1 || graph.outputs_of(ins[0]).len() != 1 {
             return None;
         }
-        cur = ins[0];
+        let prev = ins[0];
+        if prev != src {
+            if !pre_group_op_allowed(&graph.nodes[prev].op) {
+                return None;
+            }
+            path_len += 1;
+        }
+        cur = prev;
+    }
+    // No stray nodes: exactly source + pre-group ops + group + optional sink.
+    if graph.nodes.len() != path_len + 2 + sink.is_some() as usize {
+        return None;
     }
     Some((src, grp, sink))
 }
@@ -1078,56 +1101,175 @@ fn pre_group_path(graph: &PlanGraph, src: NodeId, group: NodeId) -> Vec<NodeId> 
     path
 }
 
-/// Run the pre-group ops on `chunks` (sequentially; they are stateless), then a
-/// partial `GroupBy` — one worker's partition. Returns the partial group state,
-/// any errors raised, and the rows that reached the group.
-fn worker_partial_group(
+/// Stream a source through the pre-group ops chunk-by-chunk into a partial
+/// `GroupBy` — one byte-range worker (#41). Holds only the current chunk and the
+/// group state (O(group cardinality)), never the whole range, so peak memory is
+/// input-size independent. Returns the partial state, errors, and rows grouped.
+fn stream_into_group(
     graph: &PlanGraph,
     opts: &RunOptions,
+    mut src: Box<dyn Operator>,
+    src_label: &str,
     path: &[NodeId],
     group_id: NodeId,
-    chunks: Vec<Chunk>,
 ) -> (operators::GroupBy, Vec<ErrorEvent>, u64) {
     let mut errors = Vec::new();
     let mut next_id = 0u64;
-    let mut cur = chunks;
-    for &nid in path {
-        let mut op = operators::build(
-            &graph.nodes[nid].op,
-            &graph.inputs_of(nid),
-            opts.chunk_size,
-            false,
-        );
-        let mut out = Vec::new();
-        let mut ctx = OpCtx {
-            label: label_of(graph, nid),
-            errors: &mut errors,
-            next_chunk_id: &mut next_id,
-        };
-        for c in cur {
-            out.extend(op.process(nid, c, &mut ctx));
+    let mut ops: Vec<(NodeId, Box<dyn Operator>)> = path
+        .iter()
+        .map(|&nid| {
+            (
+                nid,
+                operators::build(
+                    &graph.nodes[nid].op,
+                    &graph.inputs_of(nid),
+                    opts.chunk_size,
+                    false,
+                ),
+            )
+        })
+        .collect();
+    let mut group = operators::new_group(&graph.nodes[group_id].op).expect("group op");
+    let mut rows = 0u64;
+    // Push one chunk through ops[from..] then into the group.
+    let feed = |ops: &mut [(NodeId, Box<dyn Operator>)],
+                from: usize,
+                start: Vec<Chunk>,
+                group: &mut operators::GroupBy,
+                errors: &mut Vec<ErrorEvent>,
+                next_id: &mut u64,
+                rows: &mut u64| {
+        let mut level = start;
+        for (nid, op) in ops.iter_mut().skip(from) {
+            let mut out = Vec::new();
+            let mut ctx = OpCtx {
+                label: label_of(graph, *nid),
+                errors,
+                next_chunk_id: next_id,
+            };
+            for c in level {
+                out.extend(op.process(*nid, c, &mut ctx));
+            }
+            level = out;
         }
-        out.extend(op.finish(&mut ctx));
-        cur = out;
-    }
-    let mut g = operators::new_group(&graph.nodes[group_id].op).expect("group op");
-    let rows: u64 = cur.iter().map(|c| c.len as u64).sum();
-    let mut ctx = OpCtx {
-        label: label_of(graph, group_id),
-        errors: &mut errors,
-        next_chunk_id: &mut next_id,
+        let mut ctx = OpCtx {
+            label: label_of(graph, group_id),
+            errors,
+            next_chunk_id: next_id,
+        };
+        for c in level {
+            *rows += c.len as u64;
+            group.process(group_id, c, &mut ctx);
+        }
     };
-    for c in cur {
-        g.process(group_id, c, &mut ctx);
+    loop {
+        let chunk = {
+            let mut ctx = OpCtx {
+                label: src_label.to_string(),
+                errors: &mut errors,
+                next_chunk_id: &mut next_id,
+            };
+            match src.pull(&mut ctx) {
+                Some(c) => c,
+                None => break,
+            }
+        };
+        feed(
+            &mut ops,
+            0,
+            vec![chunk],
+            &mut group,
+            &mut errors,
+            &mut next_id,
+            &mut rows,
+        );
     }
-    (g, errors, rows)
+    // Trailing finish() per op (allowlisted ops are stateless → empty, but flow
+    // any output through the downstream ops + group for correctness).
+    for i in 0..ops.len() {
+        let trailing = {
+            let mut ctx = OpCtx {
+                label: label_of(graph, ops[i].0),
+                errors: &mut errors,
+                next_chunk_id: &mut next_id,
+            };
+            ops[i].1.finish(&mut ctx)
+        };
+        if !trailing.is_empty() {
+            feed(
+                &mut ops,
+                i + 1,
+                trailing,
+                &mut group,
+                &mut errors,
+                &mut next_id,
+                &mut rows,
+            );
+        }
+    }
+    (group, errors, rows)
 }
 
-/// Parallel group-by (#41): partition the parsed source, build a partial group
-/// state per worker, and merge them in source order. Only taken when every
-/// aggregate is byte-identical under partition→merge (see `group_parallel_safe`,
-/// checked against the *group-input* schema so a pre-group `cast` to decimal
-/// counts). `None` (→ serial) when ineligible, unsafe, or too small.
+/// Resolve the group-input schema (after the pre-group ops) by streaming the
+/// first byte range until an output chunk appears — bounded (one chunk at a
+/// time, no accumulation). `None` if the range yields no rows through the chain.
+fn sample_group_input_schema(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    mut src: Box<dyn Operator>,
+    src_label: &str,
+    path: &[NodeId],
+) -> Option<std::sync::Arc<rivus_core::Schema>> {
+    let mut errors = Vec::new();
+    let mut next_id = 0u64;
+    let mut ops: Vec<(NodeId, Box<dyn Operator>)> = path
+        .iter()
+        .map(|&nid| {
+            (
+                nid,
+                operators::build(
+                    &graph.nodes[nid].op,
+                    &graph.inputs_of(nid),
+                    opts.chunk_size,
+                    false,
+                ),
+            )
+        })
+        .collect();
+    loop {
+        let chunk = {
+            let mut ctx = OpCtx {
+                label: src_label.to_string(),
+                errors: &mut errors,
+                next_chunk_id: &mut next_id,
+            };
+            src.pull(&mut ctx)?
+        };
+        let mut level = vec![chunk];
+        for (nid, op) in &mut ops {
+            let mut out = Vec::new();
+            let mut ctx = OpCtx {
+                label: label_of(graph, *nid),
+                errors: &mut errors,
+                next_chunk_id: &mut next_id,
+            };
+            for c in level {
+                out.extend(op.process(*nid, c, &mut ctx));
+            }
+            level = out;
+        }
+        if let Some(c) = level.first() {
+            return Some(c.schema.clone());
+        }
+    }
+}
+
+/// Parallel group-by (#41): each byte-range worker streams its range through the
+/// pre-group ops into a partial group state (bounded memory — O(group
+/// cardinality), input-size independent, like the streaming-parallel reader),
+/// then the partials merge in source order. Only taken when every aggregate is
+/// byte-identical under partition→merge (checked against the *group-input* schema
+/// so a pre-group `cast` to decimal counts). `None` (→ serial) otherwise.
 fn try_parallel_group(
     graph: &PlanGraph,
     opts: &RunOptions,
@@ -1144,54 +1286,104 @@ fn try_parallel_group(
     if opts.max_capture.is_some() && !must_drain(graph) {
         return None;
     }
-    if source_path(&graph.nodes[src_id].op).is_some_and(is_compressed_source) {
-        return None;
-    }
-
-    // Parse the source once (its parse is internally parallel for a CSV file).
-    let mut src_errors: Vec<ErrorEvent> = Vec::new();
-    let mut next_id: u64 = 0;
-    let mut all: Vec<Chunk> = Vec::new();
-    {
-        let mut src_op = operators::build(&graph.nodes[src_id].op, &[], opts.chunk_size, false);
-        let mut ctx = OpCtx {
-            label: label_of(graph, src_id),
-            errors: &mut src_errors,
-            next_chunk_id: &mut next_id,
+    // Byte-range streaming needs a seekable CSV file.
+    let (projection, prefilter, str_prefilter, header, declared, delim) =
+        match &graph.nodes[src_id].op {
+            Op::OpenCsv {
+                projection,
+                prefilter,
+                str_prefilter,
+                header,
+                declared,
+                delim,
+                ..
+            } => (
+                projection.clone(),
+                prefilter.clone(),
+                str_prefilter.clone(),
+                *header,
+                declared.clone(),
+                *delim,
+            ),
+            _ => return None,
         };
-        while let Some(c) = src_op.pull(&mut ctx) {
-            all.push(c);
-        }
-    }
-    let src_fatal = src_errors.iter().any(ErrorEvent::is_fatal);
+    let path_str = match source_path(&graph.nodes[src_id].op) {
+        Some(p) if p != "-" && !is_compressed_source(p) => p,
+        _ => return None,
+    };
 
-    let path = pre_group_path(graph, src_id, group_id);
+    let plan = crate::csv::plan_parallel(
+        path_str,
+        projection.as_deref(),
+        threads,
+        &prefilter,
+        &str_prefilter,
+        header,
+        declared.as_deref(),
+        delim,
+    )
+    .ok()?;
+    if plan.ranges.len() < 2 {
+        return None; // not worth threading; serial stays bounded
+    }
+    let schema = std::sync::Arc::new(plan.schema.clone());
+    let path_nodes = pre_group_path(graph, src_id, group_id);
     let aggs = match &graph.nodes[group_id].op {
         Op::GroupBy { aggs, .. } => aggs.clone(),
         _ => return None,
     };
+    let src_label = label_of(graph, src_id);
 
-    // Resolve each aggregated column's type *at the group input* by running the
-    // pre-group ops on a sample chunk; bail to serial if anything is unsafe.
-    let sample = all.first()?.clone();
-    let (sample_g, _, _) = worker_partial_group(graph, opts, &path, group_id, vec![sample]);
-    let in_schema = sample_g.input_schema()?;
+    // Resolve the group-input column types (post pre-group ops) from a sample of
+    // range 0; bail to serial if any aggregate isn't partition→merge safe.
+    let (a0, b0) = plan.ranges[0];
+    let sample_src = operators::csv_range_source(
+        path_str,
+        plan.dtypes.clone(),
+        plan.keep.clone(),
+        plan.ncols,
+        schema.clone(),
+        a0,
+        b0,
+        opts.chunk_size,
+        plan.prefilter.clone(),
+        plan.str_prefilter.clone(),
+        delim,
+    );
+    let in_schema = sample_group_input_schema(graph, opts, sample_src, &src_label, &path_nodes)?;
     let safe = operators::group_parallel_safe(&aggs, |name| {
         in_schema.index_of(name).map(|i| in_schema.fields[i].dtype)
     });
-    if !safe || all.len() < threads * 2 {
-        return None; // unsafe aggregate or too small → serial
+    if !safe {
+        return None;
     }
 
-    // Partition the source rows and aggregate each partition on a worker.
-    let parts = partition(all, threads);
-    let n_parts = parts.len();
+    // One streaming worker per byte range; bounded per-worker memory.
     let partials: Vec<(operators::GroupBy, Vec<ErrorEvent>, u64)> = std::thread::scope(|scope| {
-        let path = &path;
-        let handles: Vec<_> = parts
-            .into_iter()
-            .map(|chunks| {
-                scope.spawn(move || worker_partial_group(graph, opts, path, group_id, chunks))
+        let plan = &plan;
+        let schema = &schema;
+        let path_nodes = &path_nodes;
+        let src_label = &src_label;
+        let handles: Vec<_> = plan
+            .ranges
+            .iter()
+            .map(|&(a, b)| {
+                scope.spawn(move || {
+                    let src = operators::csv_range_source(
+                        path_str,
+                        plan.dtypes.clone(),
+                        plan.keep.clone(),
+                        plan.ncols,
+                        schema.clone(),
+                        a,
+                        b,
+                        opts.chunk_size,
+                        plan.prefilter.clone(),
+                        plan.str_prefilter.clone(),
+                        delim,
+                    );
+                    stream_into_group(graph, opts, src, src_label, path_nodes, group_id)
+                })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -1199,7 +1391,7 @@ fn try_parallel_group(
 
     // Merge partials in source order, then finalize once.
     let mut iter = partials.into_iter();
-    let (mut merged, mut errors, mut total_rows) = iter.next().expect("≥1 partition");
+    let (mut merged, mut errors, mut total_rows) = iter.next().expect("≥1 range");
     let mut workers = vec![WorkerTelemetry {
         worker: 0,
         rows_out: total_rows,
@@ -1226,32 +1418,39 @@ fn try_parallel_group(
     };
     let rows_out: u64 = out_chunks.iter().map(|c| c.len as u64).sum();
 
-    // Telemetry: a source and a group node entry (counts only) + per-worker rows.
-    let mut group_tel = NodeTelemetry::new(group_id, label_of(graph, group_id), "group".into());
-    group_tel.rows_in = total_rows;
-    group_tel.rows_out = rows_out;
-    group_tel.finished = true;
-    let mut src_tel = NodeTelemetry::new(src_id, label_of(graph, src_id), "open".into());
-    src_tel.rows_out = total_rows;
-    src_tel.finished = true;
+    // One telemetry entry per node (viz indexes by node id); fill in the counts
+    // we know (source/group/sink) and mark all finished.
+    let mut telemetry: Vec<NodeTelemetry> = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let mut t = NodeTelemetry::new(
+                node.id,
+                label_of(graph, node.id),
+                node.op.kind_str().to_string(),
+            );
+            t.finished = true;
+            t
+        })
+        .collect();
+    telemetry[src_id].rows_out = total_rows;
+    telemetry[group_id].rows_in = total_rows;
+    telemetry[group_id].rows_out = rows_out;
+    if let Some(sink) = sink_id {
+        telemetry[sink].rows_in = rows_out;
+    }
 
     let mut res = RunResult {
-        telemetry: vec![src_tel, group_tel],
-        errors: src_errors,
-        final_mode: if src_fatal {
-            Mode::Halted
-        } else {
-            Mode::Normal
-        },
+        telemetry,
+        errors,
+        final_mode: Mode::Normal,
         outputs: Vec::new(),
         workers,
         first_row_latency: None,
         inference: Vec::new(),
         strategy: None,
     };
-    res.errors.extend(errors);
 
-    // Emit to the sink (write once) or capture as the group's leaf output.
     if let Some(sink) = sink_id {
         if let Some((path, Err(e))) = write_sink(&graph.nodes[sink].op, &out_chunks) {
             res.errors.push(
@@ -1270,7 +1469,6 @@ fn try_parallel_group(
             chunks: out_chunks,
         });
     }
-    let _ = n_parts;
     Some(res)
 }
 

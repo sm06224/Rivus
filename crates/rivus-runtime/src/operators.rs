@@ -2134,10 +2134,6 @@ pub(crate) struct GroupBy {
     aggs: Vec<(AggFunc, String)>,
     groups: BTreeMap<String, GroupState>,
     emitted: bool,
-    /// Schema of the chunks fed to this group (the group *input*), captured on
-    /// the first `process`. Lets the parallel scheduler resolve aggregate column
-    /// types after any pre-group `cast`.
-    in_schema: Option<Arc<Schema>>,
 }
 
 impl GroupBy {
@@ -2147,13 +2143,7 @@ impl GroupBy {
             aggs,
             groups: BTreeMap::new(),
             emitted: false,
-            in_schema: None,
         }
-    }
-
-    /// The group-input schema seen so far (`None` before any row).
-    pub(crate) fn input_schema(&self) -> Option<Arc<Schema>> {
-        self.in_schema.clone()
     }
 
     /// Fold a *later* partition's partial group state into this one (the
@@ -2216,9 +2206,6 @@ pub(crate) fn new_group(op: &Op) -> Option<GroupBy> {
 
 impl Operator for GroupBy {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
-        if self.in_schema.is_none() {
-            self.in_schema = Some(chunk.schema.clone());
-        }
         // Resolve every group-key column index; an unknown key warns once and
         // drops the chunk (continue-first — a later, well-formed chunk still
         // aggregates).
