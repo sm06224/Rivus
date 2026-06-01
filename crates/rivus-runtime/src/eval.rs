@@ -388,59 +388,34 @@ fn f64_to_decimal(x: f64, scale: u8) -> rivus_core::Decimal {
     rivus_core::Decimal::new(unscaled, scale)
 }
 
-/// Quantize a numeric literal `rhs` to a decimal column's `scale` as an unscaled
-/// `i128` (round half-even, matching the reader / `Decimal::rescale`; design 21
-/// §21.4). Returns `None` when the scaled literal can't fit `i128` (huge or
-/// non-finite) so callers degrade to the f64 view identically.
-pub(crate) fn dec_scaled_rhs(rhs: f64, scale: u8) -> Option<i128> {
-    if !rhs.is_finite() {
-        return None;
-    }
-    let mut pow = 1.0f64;
-    for _ in 0..scale {
-        pow *= 10.0;
-    }
-    let scaled = (rhs * pow).round_ties_even();
-    // f64 can't represent i128::MAX exactly; bound conservatively well inside
-    // range (9e37 < 2^127 ≈ 1.7e38) — beyond it, fall back to the f64 view.
-    if scaled.abs() < 9.0e37 {
-        Some(scaled as i128)
-    } else {
-        None
-    }
+/// Exact comparison of a decimal cell (`u` unscaled at `scale`) against an exact
+/// decimal literal `lit`, **shared by the vectorized kernel and the interpreter**
+/// so the two stay byte-identical. The accounting contract (design 21) is that a
+/// decimal comparison **never silently rounds** either operand: `Decimal`'s
+/// ordering rescales both to the larger of the two scales and compares as `i128`
+/// (falling back to the f64 view only if an i128 rescale overflows). This is why
+/// the literal must reach here as its written decimal, not via `f64`.
+#[inline]
+pub(crate) fn dec_cmp(u: i128, scale: u8, op: CmpOp, lit: &rivus_core::Decimal) -> bool {
+    cmp_ord(rivus_core::Decimal::new(u, scale).partial_cmp(lit), op)
 }
 
-/// Exact comparison of a decimal cell (`u` unscaled at `scale`) against a numeric
-/// literal `rhs`, **shared by the vectorized kernel and the interpreter** so the
-/// two stay byte-identical. Comparing as `i128` against the scaled literal avoids
-/// the `u as f64 / 10^scale` division that loses precision once `|u| > 2^53`
-/// (the bug the decimal lane exists to fix). When the literal doesn't fit `i128`
-/// at this scale it degrades to the f64 view — the same fallback on both paths.
+/// Apply `op` to two unscaled `i128` values already at a common scale (the
+/// kernel hoists the rescale out of its row loop, then calls this per cell).
 #[inline]
-pub(crate) fn dec_cmp(u: i128, scale: u8, op: CmpOp, rhs: f64) -> bool {
-    match dec_scaled_rhs(rhs, scale) {
-        Some(r) => dec_cmp_i128(u, op, r),
-        None => dec_cmp_f64_fallback(u, scale, op, rhs),
-    }
+pub(crate) fn dec_cmp_i128(a: i128, op: CmpOp, b: i128) -> bool {
+    cmp_ord(a.partial_cmp(&b), op)
 }
 
-/// Apply `op` to a decimal cell already reduced to its unscaled `i128` against a
-/// literal pre-scaled to the same scale. The kernel hoists the scaling out of its
-/// row loop and calls this per cell (no per-row re-derivation of the literal).
+/// `10^n` as `i128`, or `None` if it overflows (`n > 38`). Used to lift a cell's
+/// unscaled value to a common scale.
 #[inline]
-pub(crate) fn dec_cmp_i128(u: i128, op: CmpOp, scaled_rhs: i128) -> bool {
-    cmp_ord(u.partial_cmp(&scaled_rhs), op)
-}
-
-/// Degraded comparison via the f64 view (used only when the literal doesn't fit
-/// `i128` at the column scale) — identical on the kernel and interpreter paths.
-#[inline]
-pub(crate) fn dec_cmp_f64_fallback(u: i128, scale: u8, op: CmpOp, rhs: f64) -> bool {
-    let mut pow = 1.0f64;
-    for _ in 0..scale {
-        pow *= 10.0;
+pub(crate) fn pow10_i128(n: u8) -> Option<i128> {
+    let mut p: i128 = 1;
+    for _ in 0..n {
+        p = p.checked_mul(10)?;
     }
-    cmp_ord((u as f64 / pow).partial_cmp(&rhs), op)
+    Some(p)
 }
 
 /// Cast a whole column to a target lane (columnar path for computed columns).
@@ -784,14 +759,18 @@ fn dec_field_vs_literal(
         }
         None
     };
-    let lit = |e: &Expr| -> Option<f64> {
+    // The literal as an *exact* decimal (written decimals are `Value::Dec`,
+    // integers `Value::I64`); anything else is left to the numeric/f64 path.
+    let lit = |e: &Expr| -> Option<rivus_core::Decimal> {
         match e {
-            Expr::Literal(v) => v.as_f64(),
+            Expr::Literal(Value::Dec(d)) => Some(*d),
+            Expr::Literal(Value::I64(n)) => Some(rivus_core::Decimal::new(*n as i128, 0)),
+            Expr::Literal(Value::Bool(b)) => Some(rivus_core::Decimal::new(*b as i128, 0)),
             _ => None,
         }
     };
     if let (Some((u, s)), Some(r)) = (dec_cell(left), lit(right)) {
-        return Some(dec_cmp(u, s, op, r));
+        return Some(dec_cmp(u, s, op, &r));
     }
     if let (Some(r), Some((u, s))) = (lit(left), dec_cell(right)) {
         // `literal OP decimal` == `decimal OP_reversed literal`.
@@ -803,7 +782,7 @@ fn dec_field_vs_literal(
             CmpOp::Eq => CmpOp::Eq,
             CmpOp::Ne => CmpOp::Ne,
         };
-        return Some(dec_cmp(u, s, rev, r));
+        return Some(dec_cmp(u, s, rev, &r));
     }
     None
 }

@@ -433,27 +433,40 @@ parse — measured to be cheap here (building 2 vs 6 columns barely moved the ti
 the **scan**, not the per-cell parse, was the cost), so it is *not* pursued without a
 profile that shows parse as hot.
 
-### Exact decimal filter — i128 compare (faster *and* correct, #44)
+### Exact decimal filter — no silent rounding, faster *and* correct (#44)
 
 The decimal lane's filter comparison used the f64 view (`u as f64 / 10^scale`),
 which loses precision once `|unscaled| > 2^53` and re-introduced the float error
-the lane exists to eliminate. Replaced with an exact `i128` compare against the
-literal pre-scaled to the column's scale (round half-even), shared by the kernel
-and interpreter so they stay byte-identical, with the scaling **hoisted out of the
-row loop**. Measured on a `decimal(2)` column, `|? amount > 500.00`, 5 M rows,
-serial, interleaved old/new pairs (`fused` node `busy_ms`):
+the lane exists to eliminate. The **accounting contract** (design 21) is stronger
+than "more accurate f64": a decimal comparison must **never silently round**
+either operand. So the literal is preserved as the *exact decimal it was written
+as* (a numeric literal with a fractional part lexes to `Value::Dec` at its natural
+scale, never via `f64`), and the compare runs at `max(column_scale, literal_scale)`
+as `i128` — the same `Decimal::partial_cmp` rule on the kernel and interpreter, so
+they stay byte-identical. The per-row work is **hoisted**: the literal lifts to the
+common scale once, and each cell is a single `i128` compare whenever the literal's
+scale ≤ the column's (the common case; `factor == 1`).
+
+This fixes a real contract violation in the first cut, which quantized the literal
+to the column scale (round half-even): `amount > 19.995` then wrongly became
+`amount > 20.00` and dropped `20.00`. The exact path keeps `20.00` and matches
+nothing for `amount == 0.305` on a `decimal(2)` column — no rounding either way.
+
+Measured on a `decimal(2)` column, `|? amount > 500.00`, 5 M rows, serial,
+interleaved old/new pairs (`fused` node `busy_ms`):
 
 | decimal filter | `fused` busy_ms |
 |---|---:|
-| old — f64 view (`u as f64 / pow`, per-cell convert + divide + f64 compare) | ~44 ms |
-| new — exact `i128` (hoisted scale, integer compare) | **~22 ms** |
+| old — f64 view (`u as f64 / pow`, per-cell convert + divide + f64 compare) | ~45 ms |
+| new — exact decimal (hoisted lift, one `i128` compare per cell) | **~22 ms** |
 
-So the exact path is **~2× faster** here (it drops a per-cell int→float convert and
-float divide for one integer compare), not merely cost-neutral — and it is now
-*correct* for large values: a `decimal(0)` column with `9007199254740993`
+So the exact, no-rounding path is **~2× faster** (one integer compare replaces a
+per-cell int→float convert + float divide), not merely cost-neutral — and it is
+also *correct* for large values: a `decimal(0)` column with `9007199254740993`
 (`2^53 + 1`, not f64-representable) is kept by `> 9007199254740992` on both the
-kernel and interpreter paths, where the f64 view wrongly dropped it (gated by
-`optimizer_equiv::decimal_filter_is_exact_i128`).
+kernel and interpreter, where the f64 view wrongly dropped it. Gated by
+`optimizer_equiv::decimal_filter_is_exact_i128`, `decimal_filter_no_silent_rounding`
+(sub-cent literals, kernel == interpreter), and `decimal_filter_boundaries_exact`.
 
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 

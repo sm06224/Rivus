@@ -26,7 +26,7 @@
 //! the real lever is the gather (a columnar selection vector — Epic #38 lever 2,
 //! #40). See `docs/BENCHMARKS.md`.
 
-use rivus_core::{Chunk, Column, Value};
+use rivus_core::{Chunk, Column, Decimal, Value};
 use rivus_ir::{Access, CmpOp, Expr};
 use std::cmp::Ordering;
 
@@ -35,6 +35,10 @@ pub struct NumCmp {
     col: usize,
     op: CmpOp,
     rhs: f64,
+    /// The literal as an exact decimal, when it was written as one (or an
+    /// integer). Used for the decimal lane so the compare never rounds the
+    /// literal; the i64/f64/bool lanes keep using `rhs`.
+    rhs_dec: Option<Decimal>,
 }
 
 /// Try to compile a conjunction of predicates into numeric comparisons bound to
@@ -69,13 +73,19 @@ fn flatten_conj(e: &Expr, chunk: &Chunk, out: &mut Vec<NumCmp>) -> Option<()> {
 fn compile_cmp(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk) -> Option<NumCmp> {
     // Accept `field <op> literal` or `literal <op> field` (operator flipped).
     if let (Some(col), Some(rhs)) = (num_col(left, chunk), lit_num(right)) {
-        return Some(NumCmp { col, op, rhs });
+        return Some(NumCmp {
+            col,
+            op,
+            rhs,
+            rhs_dec: lit_dec(right),
+        });
     }
     if let (Some(rhs), Some(col)) = (lit_num(left), num_col(right, chunk)) {
         return Some(NumCmp {
             col,
             op: flip(op),
             rhs,
+            rhs_dec: lit_dec(left),
         });
     }
     None
@@ -100,9 +110,23 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
 fn lit_num(e: &Expr) -> Option<f64> {
     match e {
         Expr::Literal(v) => match v {
-            Value::I64(_) | Value::F64(_) | Value::Bool(_) => v.as_f64(),
+            // `Dec` covers written decimal literals (their f64 view drives the
+            // i64/f64 lanes); the exact value rides along in `rhs_dec`.
+            Value::I64(_) | Value::F64(_) | Value::Bool(_) | Value::Dec(_) => v.as_f64(),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// The literal as an exact decimal (written decimals and integers), for the
+/// decimal lane's no-rounding compare. `None` for an f64 literal (then the
+/// decimal arm degrades to the f64 view).
+fn lit_dec(e: &Expr) -> Option<Decimal> {
+    match e {
+        Expr::Literal(Value::Dec(d)) => Some(*d),
+        Expr::Literal(Value::I64(n)) => Some(Decimal::new(*n as i128, 0)),
+        Expr::Literal(Value::Bool(b)) => Some(Decimal::new(*b as i128, 0)),
         _ => None,
     }
 }
@@ -151,24 +175,84 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
                 *m = cmp_scalar(if b { 1.0 } else { 0.0 }, p.op, p.rhs) as u8;
             }
         }
-        // Decimal: exact i128 compare against the literal scaled to the column's
-        // scale (shared with the interpreter so the two stay byte-identical;
-        // avoids the lossy `u as f64 / 10^scale` once |u| > 2^53). The scaling is
-        // hoisted out of the row loop. #44 / doc 21.
-        Column::Dec(d) => match crate::eval::dec_scaled_rhs(p.rhs, d.scale) {
-            Some(r) => {
-                for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
-                    *m = crate::eval::dec_cmp_i128(u, p.op, r) as u8;
-                }
-            }
-            None => {
-                for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
-                    *m = crate::eval::dec_cmp_f64_fallback(u, d.scale, p.op, p.rhs) as u8;
-                }
-            }
-        },
+        // Decimal: compare against the *exact* decimal literal at the larger of
+        // the two scales — never rounding the literal (accounting contract;
+        // shared with the interpreter so the two stay byte-identical). #44 / doc 21.
+        Column::Dec(d) => dec_write(d, p, mask),
         Column::Str(_) => mask.fill(0), // compiled out by `num_col`
     }
+}
+
+/// Seed/AND helper for the decimal lane (factored so `write_mask` and `and_mask`
+/// share the exact-literal compare). `seed` writes the mask; otherwise ANDs.
+///
+/// The exact compare is `Decimal(u, d.scale) <op> lit` at the larger of the two
+/// scales — the same rule the interpreter runs through `Decimal::partial_cmp`,
+/// so the two are byte-identical. The per-row work (lifting `u` and the literal
+/// to the common scale) is **hoisted**: the literal lifts once, and each cell
+/// only multiplies by `factor` (which is `1` whenever the literal's scale ≤ the
+/// column's — the common case). Overflow on a cell falls back to the exact
+/// per-cell compare, identical to the interpreter.
+fn dec_mask(d: &rivus_core::DecColumn, p: &NumCmp, mask: &mut [u8], seed: bool) {
+    let put = |m: &mut u8, b: bool| {
+        let b = b as u8;
+        if seed {
+            *m = b;
+        } else {
+            *m &= b;
+        }
+    };
+    match p.rhs_dec {
+        Some(lit) => {
+            let common = d.scale.max(lit.scale);
+            match (
+                lit.rescale(common),
+                crate::eval::pow10_i128(common - d.scale),
+            ) {
+                (Some(lit_c), Some(factor)) => {
+                    let r = lit_c.unscaled;
+                    if factor == 1 {
+                        // Common case (literal scale ≤ column scale): the cell is
+                        // already at the common scale — a single i128 compare.
+                        for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                            put(m, crate::eval::dec_cmp_i128(u, p.op, r));
+                        }
+                    } else {
+                        // Literal is finer than the column: lift each cell up.
+                        for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                            let b = match u.checked_mul(factor) {
+                                Some(uc) => crate::eval::dec_cmp_i128(uc, p.op, r),
+                                // Cell-level i128 overflow → exact per-cell compare
+                                // (matches the interpreter's f64-view fallback).
+                                None => crate::eval::dec_cmp(u, d.scale, p.op, &lit),
+                            };
+                            put(m, b);
+                        }
+                    }
+                }
+                // The literal itself can't be lifted to the common scale: exact
+                // per-cell compare for the whole column (rare; huge scale gap).
+                _ => {
+                    for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                        put(m, crate::eval::dec_cmp(u, d.scale, p.op, &lit));
+                    }
+                }
+            }
+        }
+        // No exact literal (an f64 literal): degrade to the f64 view, identically
+        // to the interpreter's numeric path.
+        None => {
+            let pow = 10f64.powi(d.scale as i32);
+            for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                put(m, cmp_scalar(u as f64 / pow, p.op, p.rhs));
+            }
+        }
+    }
+}
+
+#[inline]
+fn dec_write(d: &rivus_core::DecColumn, p: &NumCmp, mask: &mut [u8]) {
+    dec_mask(d, p, mask, true);
 }
 
 /// AND `(col[i] <op> rhs)` into an existing mask (narrowing the conjunction).
@@ -189,18 +273,7 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
                 *m &= cmp_scalar(if b { 1.0 } else { 0.0 }, p.op, p.rhs) as u8;
             }
         }
-        Column::Dec(d) => match crate::eval::dec_scaled_rhs(p.rhs, d.scale) {
-            Some(r) => {
-                for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
-                    *m &= crate::eval::dec_cmp_i128(u, p.op, r) as u8;
-                }
-            }
-            None => {
-                for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
-                    *m &= crate::eval::dec_cmp_f64_fallback(u, d.scale, p.op, p.rhs) as u8;
-                }
-            }
-        },
+        Column::Dec(d) => dec_mask(d, p, mask, false),
         Column::Str(_) => mask.fill(0),
     }
 }
@@ -252,7 +325,12 @@ mod tests {
     }
 
     fn one(col: usize, op: CmpOp, rhs: f64) -> NumCmp {
-        NumCmp { col, op, rhs }
+        NumCmp {
+            col,
+            op,
+            rhs,
+            rhs_dec: None,
+        }
     }
 
     /// Scalar oracle over an f64 column: the surviving indices per `cmp_scalar`.

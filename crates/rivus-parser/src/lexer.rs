@@ -33,7 +33,11 @@ pub enum Tok {
     DollarCur,        // $_
     DollarStack(u32), // $_:N
     Int(i64),
-    Float(f64),
+    /// A float literal: its `f64` value (for the f64/i64 lanes) **and** the exact
+    /// decimal it was written as (natural scale = fractional-digit count). The
+    /// decimal is kept so a comparison against a `decimal` column never has to
+    /// round the literal (accounting contract; design 21 §21.4).
+    Float(f64, rivus_core::Decimal),
     Str(String),
     Word(String),
     Eof,
@@ -313,7 +317,15 @@ impl<'a> Lexer<'a> {
         }
         let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
         if is_float {
-            Tok::Float(text.parse().unwrap())
+            // Natural scale = digits after the dot; build the exact decimal from
+            // the same text (no f64 round-trip), keeping the f64 value too.
+            let frac = text
+                .split_once('.')
+                .map(|(_, f)| f.len() as u8)
+                .unwrap_or(0);
+            let dec = rivus_core::Decimal::parse_scaled(text, frac)
+                .unwrap_or_else(|| rivus_core::Decimal::new(0, frac));
+            Tok::Float(text.parse().unwrap(), dec)
         } else {
             Tok::Int(text.parse().unwrap())
         }

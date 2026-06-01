@@ -325,3 +325,46 @@ fn decimal_filter_boundaries_exact() {
         vec!["4".to_string()]
     );
 }
+
+/// #44 (accounting contract): a decimal comparison must NEVER silently round the
+/// literal. A sub-scale literal keeps full precision — `> 19.995` keeps 20.00
+/// (it must not quantize 19.995 → 20.00 and drop the boundary), `== 0.305`
+/// matches nothing at scale 2, `> 0.299` keeps 0.30. Verified on both the kernel
+/// (simple predicate) and the interpreter (OR predicate) so they agree exactly.
+#[test]
+fn decimal_filter_no_silent_rounding() {
+    let text = "id,amount\n1,0.29\n2,0.30\n3,19.99\n4,20.00\n5,0.31\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "equiv_decimal_noround",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let keep = |pred: &str| -> Vec<String> {
+        // Kernel path (simple predicate) and interpreter path (OR with a
+        // never-true disjunct) must return the identical surviving ids.
+        let k = fingerprints_both(&format!(
+            "D:\n open {p} (id amount:decimal(2))\n |? {pred}\n |> id\n;"
+        ))
+        .1;
+        let i = fingerprints_both(&format!(
+            "D:\n open {p} (id amount:decimal(2))\n |? {pred} or id < 0\n |> id\n;"
+        ))
+        .1;
+        assert_eq!(k, i, "kernel vs interpreter disagree on `{pred}`");
+        k.get("D").cloned().unwrap_or_default()
+    };
+    // 19.995 is NOT rounded to 20.00: 20.00 survives, 19.99 does not.
+    assert_eq!(keep("amount > 19.995"), vec!["4".to_string()]);
+    // 0.305 (scale 3) equals no scale-2 value — no silent rounding to 0.30/0.31.
+    assert!(keep("amount == 0.305").is_empty());
+    // 0.299 keeps 0.30 (and above), drops 0.29.
+    assert_eq!(
+        keep("amount > 0.299"),
+        vec![
+            "2".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "5".to_string()
+        ]
+    );
+}
