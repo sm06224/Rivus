@@ -76,7 +76,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
 | `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
-| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`. e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros |
+| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, or `decimal(N)` (exact fixed-point, see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |
@@ -353,7 +353,7 @@ tighter than `+ -`; nest with parens.
 > computed expression in `( … )`.
 
 **Type casts** — `expr:type` reinterprets a value's lane (`int`/`i64`,
-`float`/`f64`, `str`/`string`, `bool`), binding tightest:
+`float`/`f64`, `str`/`string`, `bool`, `decimal(N)`), binding tightest:
 
 ```
 |? age:int >= 20            # compare a *string* column numerically
@@ -371,6 +371,26 @@ Numeric arithmetic stays integer when both sides are integers (except `/`,
 which is always float, like SQL/pandas). Strings are parsed best-effort to a
 number where arithmetic needs one; division/modulo by zero yields NaN/0 rather
 than crashing (continue-first).
+
+**Exact decimal lane (`decimal(N)`)** — an opt-in fixed-point lane (an `i128`
+scaled by a fixed number of fractional digits `N`) for when float rounding is
+unacceptable — money, byte-identical parallel sums. Because the value is an
+integer, `0.1 + 0.2` is exactly `0.3` and addition is *associative*, so a
+parallel partition-then-merge reduction reproduces a serial one bit-for-bit
+(the property `f64` cannot give). Declare it at the reader for an exact text →
+`i128` read (never via `f64`), or cast to it:
+
+```
+open sales.csv (id amount:decimal(2))   # read "12.5" as 12.50, exact
+|? amount >= 19.99                       # compares exactly (i128, no float)
+|> id amount
+```
+
+The scale is required for now (`decimal(2)`, not bare `decimal`); a cell with
+more fractional digits than `N` is rounded **half-to-even** deterministically,
+fewer are zero-padded, and an unparseable cell becomes `0` (continue-first).
+Everything else stays on the fast `i64`/`f64` lanes by default — `decimal` is
+the "trade speed for exactness" choice, never the default.
 
 ---
 
@@ -670,6 +690,7 @@ primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
            | FUNC '(' expr (',' expr)* ')'
            | 'case' ('when' expr 'then' expr)+ ('else' expr)? 'end' ;
 FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
+TYPE       = 'int'|'i64' | 'float'|'f64' | 'str'|'string'|'text' | 'bool' | 'decimal' '(' INT ')' ;
 AGG        = 'sum' | 'avg' | 'min' | 'max' | 'std'
            | 'count_distinct' | 'nunique' | 'first' | 'last'
            | 'median' | 'p' DIGITS ;   (percentile, 0..=100)
