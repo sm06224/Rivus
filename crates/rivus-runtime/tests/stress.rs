@@ -2430,3 +2430,45 @@ fn parallel_jsonl_stateless_byte_identical() {
     assert_eq!(a, b, "parallel JSONL stateless != serial");
     assert!(a.lines().count() > 1000);
 }
+
+#[test]
+fn parallel_binary_byte_identical() {
+    // #49: fixed-width binary is splittable (record-aligned) — its filter and
+    // group-by parallelize in the bounded byte-range path, byte-identical to
+    // serial. ~150k records (17 B packed) > 1 MiB so MemoryPref::Fast engages it.
+    let rows = 150_000;
+    let bytes = gendata::bin_clean(rows, 7);
+    let f = TempCsv(gendata::write_temp_bytes("stress_bin_par", &bytes));
+    let p = f.0.display();
+    // Stateless filter+project to a file, and a group-by — both parallel paths.
+    for flow in [
+        format!(
+            "F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n |> id age\n save {{OUT}}\n;"
+        ),
+        format!(
+            "F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |# active min:age max:age count_distinct:age\n save {{OUT}}\n;"
+        ),
+    ] {
+        let ser = TempCsv(gendata::write_temp_bytes("bin_ser", b""));
+        let par = TempCsv(gendata::write_temp_bytes("bin_par", b""));
+        let run_to = |pref: rivus_runtime::MemoryPref, out: &std::path::Path| -> bool {
+            let src = flow.replace("{OUT}", &out.display().to_string());
+            let g = rivus_parser::parse(&src).expect("parse");
+            let res = run(
+                &g,
+                RunOptions {
+                    chunk_size: 4096,
+                    memory: pref,
+                    ..Default::default()
+                },
+            )
+            .expect("run");
+            !res.workers.is_empty()
+        };
+        assert!(!run_to(rivus_runtime::MemoryPref::Low, &ser.0), "low serial");
+        assert!(run_to(rivus_runtime::MemoryPref::Fast, &par.0), "fast should parallelize binary");
+        let a = std::fs::read_to_string(&ser.0).unwrap();
+        let b = std::fs::read_to_string(&par.0).unwrap();
+        assert_eq!(a, b, "parallel binary != serial for flow:\n{flow}");
+    }
+}

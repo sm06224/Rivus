@@ -983,9 +983,13 @@ fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<Node
     eligible_group_flow_inner(graph, true)
 }
 
-/// Splittable sources the bounded byte-range group path can stream (CSV / JSONL).
+/// Splittable sources the bounded byte-range path can stream (CSV / JSONL /
+/// fixed-width binary).
 fn is_splittable_source(op: &Op) -> bool {
-    matches!(op, Op::OpenCsv { .. } | Op::OpenJsonl { .. })
+    matches!(
+        op,
+        Op::OpenCsv { .. } | Op::OpenJsonl { .. } | Op::OpenBinary { .. }
+    )
 }
 
 /// Same shape as [`eligible_group_flow`] but accepting **any** single source
@@ -1330,6 +1334,12 @@ enum ParSource {
         names: Vec<String>,
         dtypes: Vec<DataType>,
     },
+    Binary {
+        fields: Vec<(String, rivus_ir::BinType)>,
+        offsets: Vec<usize>,
+        rec_size: usize,
+        endian: rivus_ir::Endian,
+    },
 }
 
 impl ParPlan {
@@ -1363,6 +1373,22 @@ impl ParPlan {
                 self.schema.clone(),
                 a,
                 b,
+                chunk_size,
+            ),
+            ParSource::Binary {
+                fields,
+                offsets,
+                rec_size,
+                endian,
+            } => operators::bin_range_source(
+                &self.path,
+                fields.clone(),
+                offsets.clone(),
+                *rec_size,
+                *endian,
+                self.schema.clone(),
+                a as usize / rec_size,
+                (b - a) as usize / rec_size,
                 chunk_size,
             ),
         }
@@ -1425,6 +1451,48 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 path: path.clone(),
                 bad_rows,
                 src: ParSource::Jsonl { names, dtypes },
+            })
+        }
+        Op::OpenBinary {
+            path,
+            fields,
+            endian,
+            c_align,
+        } => {
+            if path == "-" {
+                return None;
+            }
+            let (offsets, rec_size) = operators::bin_layout(fields, *c_align)?;
+            let len = std::fs::metadata(path).ok()?.len() as usize;
+            let recs = len / rec_size;
+            // Fixed-width → split the record count into ≤ `threads` record ranges;
+            // byte bounds are just `rec_index * rec_size` (no boundary scan).
+            let nparts = threads.min(recs);
+            if nparts < 2 {
+                return None;
+            }
+            let ranges: Vec<(u64, u64)> = (0..nparts)
+                .map(|i| {
+                    let s = recs * i / nparts;
+                    let e = recs * (i + 1) / nparts;
+                    ((s * rec_size) as u64, (e * rec_size) as u64)
+                })
+                .filter(|(a, b)| b > a)
+                .collect();
+            if ranges.len() < 2 {
+                return None;
+            }
+            Some(ParPlan {
+                schema: std::sync::Arc::new(operators::bin_schema(fields)),
+                ranges,
+                path: path.clone(),
+                bad_rows: len % rec_size,
+                src: ParSource::Binary {
+                    fields: fields.clone(),
+                    offsets,
+                    rec_size,
+                    endian: *endian,
+                },
             })
         }
         _ => None,

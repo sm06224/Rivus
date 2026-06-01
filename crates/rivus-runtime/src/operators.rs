@@ -621,9 +621,7 @@ struct SourceBinary {
     c_align: bool,
     chunk_size: usize,
     schema: Arc<Schema>,
-    columns: Vec<Column>,
-    cursor: usize,
-    total: usize,
+    chunker: Option<BinChunker>,
     loaded: bool,
 }
 
@@ -642,94 +640,53 @@ impl SourceBinary {
             c_align,
             chunk_size: chunk_size.max(1),
             schema: Schema::empty(),
-            columns: Vec::new(),
-            cursor: 0,
-            total: 0,
+            chunker: None,
             loaded: false,
+        }
+    }
+
+    /// A source wrapping an already-built streaming binary reader (a parallel
+    /// worker's record range), with a globally known schema.
+    fn from_chunker(schema: Arc<Schema>, chunker: BinChunker) -> Self {
+        SourceBinary {
+            path: String::new(),
+            fields: Vec::new(),
+            endian: Endian::Little,
+            c_align: false,
+            chunk_size: 0,
+            schema,
+            chunker: Some(chunker),
+            loaded: true,
         }
     }
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
-        let bytes = match std::fs::read(&self.path) {
-            Ok(b) => b,
-            Err(e) => {
-                ctx.raise(
-                    ErrorEvent::new(
-                        Severity::Fatal,
-                        ErrorScope::Graph,
-                        format!("cannot open '{}': {e}", self.path),
-                    )
-                    .at_node(ctx.label.clone()),
-                );
-                return;
+        match BinChunker::open(
+            &self.path,
+            self.fields.clone(),
+            self.endian,
+            self.c_align,
+            self.chunk_size,
+        ) {
+            Ok((schema, ch)) => {
+                if ch.trailing > 0 {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Recoverable,
+                            ErrorScope::Item,
+                            format!("{} trailing byte(s) ignored (partial record)", ch.trailing),
+                        )
+                        .at_node(ctx.label.clone()),
+                    );
+                }
+                self.schema = Arc::new(schema);
+                self.chunker = Some(ch);
             }
-        };
-
-        // Per-field byte offsets and record size, honoring C natural alignment
-        // (repr(C)) when requested, otherwise packed.
-        let mut offsets = Vec::with_capacity(self.fields.len());
-        let mut acc = 0usize;
-        let mut max_align = 1usize;
-        for (_, t) in &self.fields {
-            if self.c_align {
-                let a = t.align();
-                max_align = max_align.max(a);
-                acc = round_up(acc, a);
-            }
-            offsets.push(acc);
-            acc += t.size();
+            Err(e) => ctx.raise(
+                ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
+            ),
         }
-        let rec_size = if self.c_align {
-            round_up(acc, max_align)
-        } else {
-            acc
-        };
-        if rec_size == 0 {
-            ctx.raise(
-                ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, "empty binary layout")
-                    .at_node(ctx.label.clone()),
-            );
-            return;
-        }
-        let n = bytes.len() / rec_size;
-        if bytes.len() % rec_size != 0 {
-            ctx.raise(
-                ErrorEvent::new(
-                    Severity::Recoverable,
-                    ErrorScope::Item,
-                    format!(
-                        "{} trailing byte(s) ignored (partial record)",
-                        bytes.len() % rec_size
-                    ),
-                )
-                .at_node(ctx.label.clone()),
-            );
-        }
-
-        let schema_fields = self
-            .fields
-            .iter()
-            .map(|(name, t)| Field::new(name.clone(), t.lane()))
-            .collect();
-        self.schema = Arc::new(Schema::new(schema_fields));
-
-        let mut columns = Vec::with_capacity(self.fields.len());
-        for (fi, (_, t)) in self.fields.iter().enumerate() {
-            let foff = offsets[fi];
-            let sz = t.size();
-            let cell =
-                |r: usize| -> &[u8] { &bytes[r * rec_size + foff..r * rec_size + foff + sz] };
-            let e = self.endian;
-            let col = match t.lane() {
-                DataType::Bool => Column::Bool((0..n).map(|r| cell(r)[0] != 0).collect()),
-                DataType::F64 => Column::F64((0..n).map(|r| decode_f64(cell(r), *t, e)).collect()),
-                _ => Column::I64((0..n).map(|r| decode_int(cell(r), *t, e)).collect()),
-            };
-            columns.push(col);
-        }
-        self.total = n;
-        self.columns = columns;
     }
 }
 
@@ -742,19 +699,196 @@ impl Operator for SourceBinary {
         if !self.loaded {
             self.load(ctx);
         }
-        if self.cursor >= self.total {
-            return None;
-        }
-        let end = (self.cursor + self.chunk_size).min(self.total);
-        let idx: Vec<usize> = (self.cursor..end).collect();
-        let columns = self.columns.iter().map(|c| c.gather(&idx)).collect();
+        let ch = self.chunker.as_mut()?;
+        let columns = ch.next_columns()?;
         let id = ctx.fresh_id();
-        self.cursor = end;
         Some(Chunk::new(id, self.schema.clone(), columns))
     }
 
     fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
         Vec::new()
+    }
+}
+
+/// Field byte-offsets and the record stride for a fixed-width binary layout
+/// (honoring C natural alignment when `c_align`). `None` for an empty layout.
+pub(crate) fn bin_layout(
+    fields: &[(String, BinType)],
+    c_align: bool,
+) -> Option<(Vec<usize>, usize)> {
+    let mut offsets = Vec::with_capacity(fields.len());
+    let mut acc = 0usize;
+    let mut max_align = 1usize;
+    for (_, t) in fields {
+        if c_align {
+            let a = t.align();
+            max_align = max_align.max(a);
+            acc = round_up(acc, a);
+        }
+        offsets.push(acc);
+        acc += t.size();
+    }
+    let rec = if c_align {
+        round_up(acc, max_align)
+    } else {
+        acc
+    };
+    (rec != 0).then_some((offsets, rec))
+}
+
+/// Schema for a fixed-width binary layout (one field per column, declared order).
+pub(crate) fn bin_schema(fields: &[(String, BinType)]) -> Schema {
+    Schema::new(
+        fields
+            .iter()
+            .map(|(n, t)| Field::new(n.clone(), t.lane()))
+            .collect(),
+    )
+}
+
+/// Decode `n` fixed-width records packed in `buf` into one column per field.
+fn decode_bin_batch(
+    buf: &[u8],
+    fields: &[(String, BinType)],
+    offsets: &[usize],
+    rec_size: usize,
+    endian: Endian,
+    n: usize,
+) -> Vec<Column> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(fi, (_, t))| {
+            let foff = offsets[fi];
+            let sz = t.size();
+            let cell = |r: usize| -> &[u8] { &buf[r * rec_size + foff..r * rec_size + foff + sz] };
+            match t.lane() {
+                DataType::Bool => Column::Bool((0..n).map(|r| cell(r)[0] != 0).collect()),
+                DataType::F64 => {
+                    Column::F64((0..n).map(|r| decode_f64(cell(r), *t, endian)).collect())
+                }
+                _ => Column::I64((0..n).map(|r| decode_int(cell(r), *t, endian)).collect()),
+            }
+        })
+        .collect()
+}
+
+/// Streaming fixed-width binary reader (bounded memory): reads `chunk_size`
+/// records per call, decoding straight into columns. Records are fixed width, so
+/// a byte range is exactly `[start_rec, end_rec) * rec_size` — no boundary scan.
+pub(crate) struct BinChunker {
+    reader: std::io::BufReader<std::fs::File>,
+    fields: Vec<(String, BinType)>,
+    offsets: Vec<usize>,
+    rec_size: usize,
+    endian: Endian,
+    chunk_size: usize,
+    recs_left: usize,
+    /// Trailing bytes after the last whole record (reported once by the source).
+    pub trailing: usize,
+}
+
+impl BinChunker {
+    pub(crate) fn open(
+        path: &str,
+        fields: Vec<(String, BinType)>,
+        endian: Endian,
+        c_align: bool,
+        chunk_size: usize,
+    ) -> Result<(Schema, BinChunker), String> {
+        let (offsets, rec_size) = bin_layout(&fields, c_align).ok_or("empty binary layout")?;
+        let len = std::fs::metadata(path)
+            .map_err(|e| format!("cannot open '{path}': {e}"))?
+            .len() as usize;
+        let f = std::fs::File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let schema = bin_schema(&fields);
+        Ok((
+            schema,
+            BinChunker {
+                reader: std::io::BufReader::with_capacity(256 * 1024, f),
+                fields,
+                offsets,
+                rec_size,
+                endian,
+                chunk_size: chunk_size.max(1),
+                recs_left: len / rec_size,
+                trailing: len % rec_size,
+            },
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_range(
+        path: &str,
+        fields: Vec<(String, BinType)>,
+        offsets: Vec<usize>,
+        rec_size: usize,
+        endian: Endian,
+        start_rec: usize,
+        n_recs: usize,
+        chunk_size: usize,
+    ) -> Result<BinChunker, String> {
+        let mut f = std::fs::File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        std::io::Seek::seek(
+            &mut f,
+            std::io::SeekFrom::Start((start_rec * rec_size) as u64),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(BinChunker {
+            reader: std::io::BufReader::with_capacity(256 * 1024, f),
+            fields,
+            offsets,
+            rec_size,
+            endian,
+            chunk_size: chunk_size.max(1),
+            recs_left: n_recs,
+            trailing: 0,
+        })
+    }
+
+    pub(crate) fn next_columns(&mut self) -> Option<Vec<Column>> {
+        if self.recs_left == 0 {
+            return None;
+        }
+        let take = self.chunk_size.min(self.recs_left);
+        let mut buf = vec![0u8; take * self.rec_size];
+        if std::io::Read::read_exact(&mut self.reader, &mut buf).is_err() {
+            self.recs_left = 0;
+            return None;
+        }
+        self.recs_left -= take;
+        Some(decode_bin_batch(
+            &buf,
+            &self.fields,
+            &self.offsets,
+            self.rec_size,
+            self.endian,
+            take,
+        ))
+    }
+}
+
+/// A streaming binary source over one record-aligned byte range, for the
+/// parallel executor (#49). On open error it yields nothing (continue-first).
+#[allow(clippy::too_many_arguments)]
+pub fn bin_range_source(
+    path: &str,
+    fields: Vec<(String, BinType)>,
+    offsets: Vec<usize>,
+    rec_size: usize,
+    endian: Endian,
+    schema: Arc<Schema>,
+    start_rec: usize,
+    n_recs: usize,
+    chunk_size: usize,
+) -> Box<dyn Operator> {
+    match BinChunker::for_range(
+        path, fields, offsets, rec_size, endian, start_rec, n_recs, chunk_size,
+    ) {
+        Ok(ch) => Box::new(SourceBinary::from_chunker(schema, ch)),
+        Err(_) => Box::new(MemSource {
+            chunks: std::collections::VecDeque::new(),
+        }),
     }
 }
 

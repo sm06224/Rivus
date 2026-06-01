@@ -505,8 +505,11 @@ reads in O(1)-per-chunk memory (no whole-file slurp) and its group-by takes the
 same bounded byte-range parallel path. On a 48 MiB / 2 M-row JSONL group-by (2
 groups) peak RSS is **6 MiB serial and 6 MiB parallel** (input-size independent),
 byte-identical to serial (`stress::parallel_jsonl_group_bounded_byte_identical`).
-The bounded path covers CSV + JSONL; non-splittable sources (compressed, binary)
-parallelize their group-by only via the opt-in `--memory unbounded` (#50).
+Fixed-width **binary** is splittable too (record-aligned ranges, no boundary scan)
+and streams bounded — its filter/project and group-by parallelize the same way
+(`stress::parallel_binary_byte_identical`). The bounded path now covers CSV +
+JSONL + binary; only genuinely non-splittable sources (compressed) need the opt-in
+`--memory unbounded` (#50).
 
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
