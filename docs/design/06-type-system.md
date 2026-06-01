@@ -37,6 +37,12 @@ MVP は SIMD lane を `i64`/`f64` に集約して実装。`DataType` enum は la
 できる形にしてあり、`Decimal`/`Big` variant の追加で拡張する（`Column` に対応
 バッファを足すだけ。operator は dtype 分岐を増やす）。
 
+> **Decimal lane の実装可能詳細は [21-exact-decimal](21-exact-decimal.md) を参照。**
+> scaled integer（i128）で加算が結合的・厳密になるため、並列集計（#41）が
+> byte-identical になる。`--exact` / `:decimal[(n)]` でユーザーオプトイン
+> （既定は従来 f64・速度最優先）。GPU 経路（[22](22-gpu-backend.md)）の数値正確性も
+> この decimal lane で担保できる。
+
 ```
         ┌─ 既定 ─────────────┐
  数値 ──┤  SIMD lane (i64/f64) │  ← まずここ。観測で必要なら昇格

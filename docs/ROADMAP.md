@@ -88,6 +88,14 @@ read-throughput, in priority order:
 | 📋 | mmap the source; overlap decode with IO | |
 | 📋 | Re-use buffers across chunks; arena-per-chunk recycling | |
 | 📋 | JIT (Cranelift) for hot predicates/projections | design doc 09; needs a vetted dep |
+| 📋 | **GPU backend** (feature-gated, CPU fallback) | design doc 22; `--accel gpu\|auto\|cpu`; default build stays GPU-free / zero-dep. Beats the memory-bandwidth wall #39 hit — **must measure transfer-inclusive** before adopting |
+
+## G. Correctness as an opt-in lane
+
+| | item | note |
+|---|---|---|
+| 📋 | **Exact decimal lane** (COBOL-style scaled integer) | design doc 21. `--exact[=auto\|N]` / `open f.csv (price:decimal[(n)])`. i128 scaled-integer → addition is associative & exact → **parallel group-by becomes byte-identical** (#41), and money math is exact. Default stays f64 (fastest). Scale auto-inferred or explicit; avg/std divide-then-round deterministically |
+| 📋 | **Parallel group-by / join** (#41) | blocked on byte-identity for f64 sum/avg/std (measured ULP drift from non-associativity). Lands cleanly for decimal & integer columns + order-independent aggs (min/max/count/first/last/pct); f64 sum/avg/std stay serial unless `--exact` |
 
 ## F. Observability & UX
 
