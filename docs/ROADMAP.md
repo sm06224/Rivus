@@ -60,6 +60,7 @@ it in small, gated steps.
 | ✅ | String / numeric functions, `case when … then … else` | `upper/lower/trim/len/substr/contains/replace/split_part/concat`, `starts_with/ends_with/like/glob/regexp`, numeric `abs/round/floor/ceil`, null-coalesce `coalesce`, and `case when … then … [else …] end` all done |
 | 📋 | **Optional leading pipe before any stage** | allow (don't require) a `\|` before stages that today have none — `\| sort score`, `\| save out.csv`, `\| group …`. Makes every stage read as a pipe step; bare form still valid. Lexer/parser: treat a stage-leading `\|` as optional whitespace. (back-compat not required per 統括) |
 | 📋 | **Flow prefix for label references** | a sigil so a stage that consumes a named upstream flow is syntactically obvious (today a bare `Adults` could be a label or a column). Proposed `@Label` (or `->Label`) for "inherit/continue this flow", e.g. `Merged: @Adults + @Minors`. Touches lexer/parser/`to_source`; reversible. (back-compat not required) |
+| 📋 | **Combine derive + cast + rename in one block** | let a single projection stage create columns, cast types, and rename together, e.g. `\|> (price:f64 * qty) as total, age:int as years, name`. Today these split across `\|>` (computed), `cast` (re-type in place) and `rename` (separate verb) — unify them in one `\|>`/`select`-style block so a wrangle reads as one step. Touches parser (mixed projection items: derive\|cast\|rename\|passthrough) + `to_source`; reversible. |
 
 ## D. Relational & cleaning operators
 
