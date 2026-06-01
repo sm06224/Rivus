@@ -1863,6 +1863,39 @@ struct AggAcc {
     /// Buffered numeric values, only for percentile aggregates (`Pct`). Bounded
     /// by group cardinality, so percentiles are pipeline-breakers like sort.
     values: Vec<f64>,
+    /// Exact decimal accumulation (design 21 §21.5): set once a `Value::Dec` is
+    /// observed (a decimal column shares one scale). `sum`/`min`/`max` are kept in
+    /// `i128` so the result is exact and order-independent — the property that
+    /// lets a decimal `sum`/`avg` parallelize byte-identically (#41). `overflow`
+    /// degrades that aggregate to the f64 lane (continue-first; §21.7).
+    dec_scale: Option<u8>,
+    dec_sum: i128,
+    dec_min: i128,
+    dec_max: i128,
+    dec_overflow: bool,
+}
+
+/// Extra fractional digits an exact decimal `avg` carries beyond the input scale
+/// (the exact `sum/count` quotient is rounded half-even to this scale; §21.5).
+const DEC_AVG_EXTRA: u8 = 6;
+
+/// Integer division `num / den` (with `den > 0`) rounded **half-to-even** — the
+/// deterministic rounding the exact decimal `avg` shares with the reader, so the
+/// quotient is identical regardless of how the (exact) `sum` and `count` were
+/// accumulated (serial or parallel partition→merge). `|r|*2` can't overflow:
+/// `|r| < den` and `den` is a row count.
+fn div_round_half_even(num: i128, den: i128) -> i128 {
+    debug_assert!(den > 0);
+    let q = num / den;
+    let r = num % den;
+    let twice = r.abs() * 2;
+    // Round up (toward num's sign) when past the half, or exactly at the half with
+    // an odd quotient (half-to-even); otherwise keep the truncated quotient.
+    if twice > den || (twice == den && q % 2 != 0) {
+        q + num.signum()
+    } else {
+        q
+    }
 }
 
 impl AggAcc {
@@ -1878,6 +1911,11 @@ impl AggAcc {
             last: None,
             distinct: std::collections::HashSet::new(),
             values: Vec::new(),
+            dec_scale: None,
+            dec_sum: 0,
+            dec_min: i128::MAX,
+            dec_max: i128::MIN,
+            dec_overflow: false,
         }
     }
 
@@ -1892,6 +1930,26 @@ impl AggAcc {
                     self.min = self.min.min(x);
                     self.max = self.max.max(x);
                     self.n += 1;
+                    // Exact decimal lane: accumulate the unscaled i128 in parallel
+                    // with the f64 moments (the f64 side still backs `std` and the
+                    // overflow fallback). A column shares one scale.
+                    if let Value::Dec(d) = v {
+                        let s = *self.dec_scale.get_or_insert(d.scale);
+                        // Same-column values share the scale; rescale defensively.
+                        let u = if d.scale == s {
+                            Some(d.unscaled)
+                        } else {
+                            d.rescale(s).map(|r| r.unscaled)
+                        };
+                        match u.and_then(|u| self.dec_sum.checked_add(u).map(|s| (u, s))) {
+                            Some((u, sum)) => {
+                                self.dec_sum = sum;
+                                self.dec_min = self.dec_min.min(u);
+                                self.dec_max = self.dec_max.max(u);
+                            }
+                            None => self.dec_overflow = true,
+                        }
+                    }
                 }
             }
             AggFunc::CountDistinct => {
@@ -1977,6 +2035,35 @@ impl AggAcc {
         let hi = rank.ceil() as usize;
         let frac = rank - lo as f64;
         v[lo] + (v[hi] - v[lo]) * frac
+    }
+
+    /// Exact decimal result for `sum`/`min`/`max`/`avg` on a decimal column, or
+    /// `None` when this aggregate isn't an exact-decimal one (then the caller uses
+    /// the f64 `num_value`). `avg` rounds the exact `sum/count` quotient half-even
+    /// to `scale + DEC_AVG_EXTRA`; an i128 overflow leaves it to the f64 fallback.
+    fn dec_value(&self) -> Option<rivus_core::Decimal> {
+        let scale = self.dec_scale?;
+        if self.dec_overflow {
+            return None;
+        }
+        match self.func {
+            AggFunc::Sum => Some(rivus_core::Decimal::new(self.dec_sum, scale)),
+            AggFunc::Min if self.n > 0 => Some(rivus_core::Decimal::new(self.dec_min, scale)),
+            AggFunc::Max if self.n > 0 => Some(rivus_core::Decimal::new(self.dec_max, scale)),
+            AggFunc::Avg if self.n > 0 => {
+                let out_scale = scale.saturating_add(DEC_AVG_EXTRA);
+                let mut factor: i128 = 1;
+                for _ in 0..(out_scale - scale) {
+                    factor = factor.checked_mul(10)?;
+                }
+                let num = self.dec_sum.checked_mul(factor)?;
+                Some(rivus_core::Decimal::new(
+                    div_round_half_even(num, self.n as i128),
+                    out_scale,
+                ))
+            }
+            _ => None,
+        }
     }
 
     fn distinct_count(&self) -> i64 {
@@ -2125,15 +2212,45 @@ impl Operator for GroupBy {
                     }
                     (DataType::Str, Column::Str(sc))
                 }
-                _ => (
-                    DataType::F64,
-                    Column::F64(
-                        self.groups
+                // sum/avg/min/max/std/pct. On a decimal column these stay exact
+                // (i128) when every group produced an exact result; if any group
+                // overflowed i128 the whole column degrades to f64 (continue-first,
+                // §21.7) so the column stays one uniform type.
+                _ => {
+                    let dec_ok = matches!(
+                        func,
+                        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
+                    ) && !self.groups.is_empty()
+                        && self
+                            .groups
                             .values()
-                            .map(|s| s.accs[j].num_value())
-                            .collect(),
-                    ),
-                ),
+                            .all(|s| s.accs[j].dec_value().is_some());
+                    if dec_ok {
+                        let decs: Vec<rivus_core::Decimal> = self
+                            .groups
+                            .values()
+                            .map(|s| s.accs[j].dec_value().unwrap())
+                            .collect();
+                        // All groups share the column's scale (sum/min/max) or
+                        // scale+extra (avg), so the output scale is uniform.
+                        let scale = decs[0].scale;
+                        let unscaled = decs.iter().map(|d| d.unscaled).collect();
+                        (
+                            DataType::Decimal { scale },
+                            Column::Dec(rivus_core::DecColumn { unscaled, scale }),
+                        )
+                    } else {
+                        (
+                            DataType::F64,
+                            Column::F64(
+                                self.groups
+                                    .values()
+                                    .map(|s| s.accs[j].num_value())
+                                    .collect(),
+                            ),
+                        )
+                    }
+                }
             };
             fields.push(Field::new(name, dtype));
             columns.push(column);
