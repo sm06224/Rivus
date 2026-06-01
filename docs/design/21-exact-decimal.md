@@ -74,6 +74,24 @@ Column::Dec(DecColumn { unscaled: Vec<i128>, scale: u8 })
 - スケールは確定後 schema に載る（`Field { name, DataType::Decimal { scale } }`）。
   `to_source()`（IR 可逆性・原則5）は `decimal(s)` を復元する。
 
+### 21.4.1 比較は決して無言で丸めない（会計契約 — 最重要）
+
+統括方針（2026-06-01）: **会計用 decimal は別格の契約**。丸めが起きるのは
+**格納時のみ**（明示スケールへの `round_half_even`）であって、**比較では一切
+丸めない**。具体的には:
+
+- 比較リテラルは **f64 を経由させず、書かれたとおりの自然スケールの exact
+  Decimal** として保持する（`19.995` は scale=3 の `Decimal{19995,3}`、f64 の
+  `19.99499…` ではない）。数値リテラルに小数点があれば `Value::Dec` に lex する。
+- `decimal 列 OP リテラル` は **`max(列スケール, リテラルスケール)` で i128 比較**
+  （`Decimal::partial_cmp`）。どちらのオペランドも丸めない。i128 が溢れる時だけ
+  f64 ビューに degrade（kernel・interpreter で同一）。
+- 反例（やってはいけない）: リテラルを列スケールへ量子化すると `amount > 19.995`
+  が `> 20.00` になり `20.00` を**黙って落とす**。これは契約違反。
+- 受け入れ: `> 19.995` は `20.00` を残し、`== 0.305` は scale-2 列で 0 件、
+  `> 0.299` は `0.30` を残す。kernel と interpreter で byte-identical
+  （`decimal_filter_no_silent_rounding` で gate）。**会計の正確さ ≠ f64 の近似**。
+
 ## 21.5 集計の意味論（avg/std は「高精度で割って丸める」）
 
 統括決定: **高精度で割って決定的に丸める**。

@@ -433,6 +433,73 @@ parse — measured to be cheap here (building 2 vs 6 columns barely moved the ti
 the **scan**, not the per-cell parse, was the cost), so it is *not* pursued without a
 profile that shows parse as hot.
 
+### Exact decimal filter — no silent rounding, faster *and* correct (#44)
+
+The decimal lane's filter comparison used the f64 view (`u as f64 / 10^scale`),
+which loses precision once `|unscaled| > 2^53` and re-introduced the float error
+the lane exists to eliminate. The **accounting contract** (design 21) is stronger
+than "more accurate f64": a decimal comparison must **never silently round**
+either operand. So the literal is preserved as the *exact decimal it was written
+as* (a numeric literal with a fractional part lexes to `Value::Dec` at its natural
+scale, never via `f64`), and the compare runs at `max(column_scale, literal_scale)`
+as `i128` — the same `Decimal::partial_cmp` rule on the kernel and interpreter, so
+they stay byte-identical. The per-row work is **hoisted**: the literal lifts to the
+common scale once, and each cell is a single `i128` compare whenever the literal's
+scale ≤ the column's (the common case; `factor == 1`).
+
+This fixes a real contract violation in the first cut, which quantized the literal
+to the column scale (round half-even): `amount > 19.995` then wrongly became
+`amount > 20.00` and dropped `20.00`. The exact path keeps `20.00` and matches
+nothing for `amount == 0.305` on a `decimal(2)` column — no rounding either way.
+
+Measured on a `decimal(2)` column, `|? amount > 500.00`, 5 M rows, serial,
+interleaved old/new pairs (`fused` node `busy_ms`):
+
+| decimal filter | `fused` busy_ms |
+|---|---:|
+| old — f64 view (`u as f64 / pow`, per-cell convert + divide + f64 compare) | ~45 ms |
+| new — exact decimal (hoisted lift, one `i128` compare per cell) | **~22 ms** |
+
+So the exact, no-rounding path is **~2× faster** (one integer compare replaces a
+per-cell int→float convert + float divide), not merely cost-neutral — and it is
+also *correct* for large values: a `decimal(0)` column with `9007199254740993`
+(`2^53 + 1`, not f64-representable) is kept by `> 9007199254740992` on both the
+kernel and interpreter, where the f64 view wrongly dropped it. Gated by
+`optimizer_equiv::decimal_filter_is_exact_i128`, `decimal_filter_no_silent_rounding`
+(sub-cent literals, kernel == interpreter), and `decimal_filter_boundaries_exact`.
+
+### Parallel group-by — byte-identical partition→merge (#41, option 1)
+
+Group-by was serial (the parallel scheduler only handled stateless map/filter).
+Each **byte-range streaming worker** now runs its range through the pre-group ops
+into a *partial* group state (the same `plan_parallel` + `csv_range_source` the
+streaming-parallel reader uses), and the partials merge in source order — taken
+only when every aggregate is byte-identical under partition→merge: `min`/`max`/
+`count`/`count_distinct`/`first`/`last`/percentile (associative or buffered+sorted)
+and `sum`/`avg` **on a decimal column** (exact i128, associative — the reason the
+decimal lane was built). `std` and `sum`/`avg` on f64/integer columns are *not*
+associative and stay serial (the scheduler checks the group-input schema, so a
+pre-group `cast` to decimal counts; the pre-group ops are an allowlist).
+
+Because each worker holds only its current chunk and its partial group state, peak
+memory is **O(group cardinality), input-size independent** — the bounded-memory
+guarantee is kept on the parallel path. Measured peak RSS (`ru_maxrss`) and
+end-to-end wall (4 cpus, release):
+
+| group-by | peak RSS (6 M rows / 53 MiB, 2 groups) | wall (3 M rows, group→sum/avg/min/max) |
+|---|---:|---:|
+| serial (`--memory low`) | 6 MiB | ~1.35 s |
+| parallel, first cut (materialized whole input) | **145 MiB** | — |
+| parallel, byte-range streaming (landed) | **6 MiB** | **~0.97 s** (~1.4×) |
+
+So streaming brings the parallel path back to the serial **6 MiB** (vs 145 MiB for
+the materialized first cut — O(input)), with no loss of speed. Output is
+**byte-identical** to serial (md5-equal saved CSV; exact decimal sums like
+`12500000.00`, not f64-drifted). Gated by `stress::parallel_group_by_matches_serial`
+(parallel == serial across the safe set, workers engaged),
+`f64_sum_group_stays_serial_but_correct` (unsafe path stays serial), and
+`operators::agg_merge_tests` (partition→merge == single-pass).
+
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
 Data generated self-hosted with `rivus gen clean --rows 5000000` (no awk).

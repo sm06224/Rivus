@@ -388,6 +388,36 @@ fn f64_to_decimal(x: f64, scale: u8) -> rivus_core::Decimal {
     rivus_core::Decimal::new(unscaled, scale)
 }
 
+/// Exact comparison of a decimal cell (`u` unscaled at `scale`) against an exact
+/// decimal literal `lit`, **shared by the vectorized kernel and the interpreter**
+/// so the two stay byte-identical. The accounting contract (design 21) is that a
+/// decimal comparison **never silently rounds** either operand: `Decimal`'s
+/// ordering rescales both to the larger of the two scales and compares as `i128`
+/// (falling back to the f64 view only if an i128 rescale overflows). This is why
+/// the literal must reach here as its written decimal, not via `f64`.
+#[inline]
+pub(crate) fn dec_cmp(u: i128, scale: u8, op: CmpOp, lit: &rivus_core::Decimal) -> bool {
+    cmp_ord(rivus_core::Decimal::new(u, scale).partial_cmp(lit), op)
+}
+
+/// Apply `op` to two unscaled `i128` values already at a common scale (the
+/// kernel hoists the rescale out of its row loop, then calls this per cell).
+#[inline]
+pub(crate) fn dec_cmp_i128(a: i128, op: CmpOp, b: i128) -> bool {
+    cmp_ord(a.partial_cmp(&b), op)
+}
+
+/// `10^n` as `i128`, or `None` if it overflows (`n > 38`). Used to lift a cell's
+/// unscaled value to a common scale.
+#[inline]
+pub(crate) fn pow10_i128(n: u8) -> Option<i128> {
+    let mut p: i128 = 1;
+    for _ in 0..n {
+        p = p.checked_mul(10)?;
+    }
+    Some(p)
+}
+
 /// Cast a whole column to a target lane (columnar path for computed columns).
 pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
     let n = col.len();
@@ -692,6 +722,11 @@ fn eval_field(name: &str, _access: Access, chunk: &Chunk, row: usize) -> Value {
 
 /// Compare two sub-expressions for a row, taking borrowed fast paths first.
 fn compare_fast(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk, row: usize) -> bool {
+    // Exact decimal lane: a decimal column vs a numeric literal compares as i128
+    // (matching the kernel), not via the lossy f64 view.
+    if let Some(b) = dec_field_vs_literal(left, op, right, chunk, row) {
+        return b;
+    }
     // String fast path: no `String` allocation per side per row.
     if let (Some(a), Some(b)) = (as_str(left, chunk, row), as_str(right, chunk, row)) {
         return cmp_ord(a.partial_cmp(b), op);
@@ -704,6 +739,52 @@ fn compare_fast(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk, row: usize)
     let l = eval(left, chunk, row);
     let r = eval(right, chunk, row);
     compare(&l, op, &r)
+}
+
+/// `decimal_column OP numeric_literal` (either operand order) → exact `i128`
+/// comparison via [`dec_cmp`], matching the kernel. `None` when the operands are
+/// not that shape (the caller then takes its usual numeric/string path).
+fn dec_field_vs_literal(
+    left: &Expr,
+    op: CmpOp,
+    right: &Expr,
+    chunk: &Chunk,
+    row: usize,
+) -> Option<bool> {
+    let dec_cell = |e: &Expr| -> Option<(i128, u8)> {
+        if let Expr::Field { name, .. } = e {
+            if let Some(Column::Dec(d)) = chunk.column(name) {
+                return Some((d.unscaled[row], d.scale));
+            }
+        }
+        None
+    };
+    // The literal as an *exact* decimal (written decimals are `Value::Dec`,
+    // integers `Value::I64`); anything else is left to the numeric/f64 path.
+    let lit = |e: &Expr| -> Option<rivus_core::Decimal> {
+        match e {
+            Expr::Literal(Value::Dec(d)) => Some(*d),
+            Expr::Literal(Value::I64(n)) => Some(rivus_core::Decimal::new(*n as i128, 0)),
+            Expr::Literal(Value::Bool(b)) => Some(rivus_core::Decimal::new(*b as i128, 0)),
+            _ => None,
+        }
+    };
+    if let (Some((u, s)), Some(r)) = (dec_cell(left), lit(right)) {
+        return Some(dec_cmp(u, s, op, &r));
+    }
+    if let (Some(r), Some((u, s))) = (lit(left), dec_cell(right)) {
+        // `literal OP decimal` == `decimal OP_reversed literal`.
+        let rev = match op {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Ge => CmpOp::Le,
+            CmpOp::Eq => CmpOp::Eq,
+            CmpOp::Ne => CmpOp::Ne,
+        };
+        return Some(dec_cmp(u, s, rev, &r));
+    }
+    None
 }
 
 /// Borrow a `&str` for a Field backed by a string column, or a string literal.

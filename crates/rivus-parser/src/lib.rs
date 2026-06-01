@@ -385,7 +385,7 @@ impl Parser {
                         Tok::Str(s) => FillMethod::Value(s),
                         Tok::Word(s) => FillMethod::Value(s),
                         Tok::Int(n) => FillMethod::Value(n.to_string()),
-                        Tok::Float(f) => FillMethod::Value(f.to_string()),
+                        Tok::Float(f, _) => FillMethod::Value(f.to_string()),
                         other => {
                             return Err(self.err(format!("fill expects a value, found {other:?}")))
                         }
@@ -986,9 +986,12 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Literal(Value::I64(n)))
             }
-            Tok::Float(f) => {
+            Tok::Float(_, d) => {
+                // A written decimal literal keeps its exact value (so a compare
+                // against a `decimal` column never rounds it); it still rides the
+                // f64 lane via `Decimal::to_f64()` everywhere else.
                 self.bump();
-                Ok(Expr::Literal(Value::F64(f)))
+                Ok(Expr::Literal(Value::Dec(d)))
             }
             Tok::Str(s) => {
                 self.bump();
@@ -1348,6 +1351,23 @@ mod tests {
         assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
         for needle in ["abs(", "round(", "floor(", "ceil(", "coalesce(", "replace("] {
             assert!(s.contains(needle), "missing {needle} in {s}");
+        }
+    }
+
+    #[test]
+    fn decimal_literal_is_preserved_exactly() {
+        // A written decimal literal must survive to_source as itself (its exact
+        // text), not as an f64 re-render — so a compare against a decimal column
+        // never rounds it. `19.995` and `0.305` are the accounting-contract cases.
+        for (src, lit) in [
+            ("F:\n open s.csv\n |? amount > 19.995\n;", "19.995"),
+            ("F:\n open s.csv\n |? amount == 0.305\n;", "0.305"),
+            ("F:\n open s.csv\n |? x < 100.00\n;", "100.00"),
+        ] {
+            let g = parse(src).unwrap();
+            let s = g.to_source();
+            assert!(s.contains(lit), "literal {lit} lost in {s}");
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
         }
     }
 
