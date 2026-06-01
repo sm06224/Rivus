@@ -627,22 +627,45 @@ fn read_header(
     if n == 0 {
         return Err("empty CSV".to_string());
     }
+    // A UTF-8 BOM (`EF BB BF`) at the very start of the file would otherwise
+    // leak into the first column name (`﻿id`). Strip it from the header line.
+    // The byte offset `n` is unchanged: the BOM bytes were consumed as part of
+    // this first line, so the data still starts at `n` for a header file.
+    let first_trimmed = strip_bom(&first);
     if let Some(d) = declared {
         let names = d.iter().map(|(nm, _)| nm.clone()).collect();
         if header {
             Ok((names, n as u64)) // consume the header line, but use declared names
         } else {
-            r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-            Ok((names, 0)) // header-less: first line is data
+            // Header-less + declared names: the first line is data. Seek past a
+            // BOM if present so it doesn't corrupt the first cell of row 0.
+            let start = bom_len(&first) as u64;
+            r.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+            Ok((names, start))
         }
     } else if header {
-        Ok((split_owned(trim_eol(&first), delim), n as u64))
+        Ok((split_owned(trim_eol(first_trimmed), delim), n as u64))
     } else {
-        let ncols = split_owned(trim_eol(&first), delim).len();
+        let ncols = split_owned(trim_eol(first_trimmed), delim).len();
         let names = (0..ncols).map(|i| format!("c{i}")).collect();
-        r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        Ok((names, 0))
+        let start = bom_len(&first) as u64;
+        r.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        Ok((names, start))
     }
+}
+
+/// Length in bytes of a leading UTF-8 BOM (`EF BB BF`), else 0.
+fn bom_len(s: &str) -> usize {
+    if s.as_bytes().starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    }
+}
+
+/// Strip a leading UTF-8 BOM from a string slice (no-op if absent).
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
 /// Override inferred dtypes with any types declared at `open (col:type …)`.
@@ -682,6 +705,8 @@ pub struct CsvData {
 /// checks are unaffected) but are never inferred, parsed, or allocated — the
 /// projection-pushdown fast path. `allow = None` keeps every column.
 pub fn parse_projected(text: &str, allow: Option<&[String]>, delim: u8) -> Result<CsvData, String> {
+    // Strip a leading UTF-8 BOM so it doesn't leak into the first column name.
+    let text = strip_bom(text);
     let mut lines = text.lines();
     let header = match lines.next() {
         Some(h) => h,
@@ -1383,6 +1408,27 @@ mod tests {
             Column::I64(v) => assert_eq!(v, &[1, 2]),
             _ => panic!("expected i64"),
         }
+    }
+
+    #[test]
+    fn strips_utf8_bom_from_header() {
+        // A BOM before the header must not leak into the first column name, and
+        // the first column's data must still parse (here as i64).
+        let data = parse_projected("\u{feff}id,age\n1,30\n2,15\n", None, b',').unwrap();
+        assert_eq!(data.schema.fields[0].name, "id", "BOM leaked into name");
+        assert_eq!(data.schema.fields[1].name, "age");
+        match &data.columns[0] {
+            Column::I64(v) => assert_eq!(v, &[1, 2]),
+            _ => panic!("first column should parse as i64 once the BOM is gone"),
+        }
+    }
+
+    #[test]
+    fn bom_helpers() {
+        assert_eq!(bom_len("\u{feff}x"), 3);
+        assert_eq!(bom_len("x"), 0);
+        assert_eq!(strip_bom("\u{feff}id,age"), "id,age");
+        assert_eq!(strip_bom("id,age"), "id,age");
     }
 
     #[test]
