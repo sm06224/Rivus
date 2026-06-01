@@ -1896,3 +1896,63 @@ fn zstd_csv_matches_uncompressed_oracle() {
         assert!(res.errors.is_empty(), "zstd errors @cs={cs}");
     }
 }
+
+#[test]
+fn declared_decimal_chunk_size_independent() {
+    // A decimal(2) column read from text with varied fractional widths. The
+    // value (text → unscaled i128) and its rendering must be identical across
+    // chunk sizes, and exact (never via f64): 0.1→0.10, 12.345→12.34 (round
+    // half-even), 7→7.00.
+    let rows = 4_000usize;
+    let mut text = String::from("id,price\n");
+    let mut expected: Vec<String> = Vec::with_capacity(rows);
+    for i in 0..rows {
+        // Cycle through forms that exercise pad, exact, and round-half-even.
+        let (cell, want) = match i % 4 {
+            0 => ("0.1".to_string(), "0.10"),     // pad up to scale 2
+            1 => ("12.345".to_string(), "12.34"), // 3-digit → round half-even (4 even)
+            2 => ("7".to_string(), "7.00"),       // integer → padded
+            _ => ("12.355".to_string(), "12.36"), // round half-even (5 odd → up)
+        };
+        text.push_str(&format!("{i},{cell}\n"));
+        expected.push(want.to_string());
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_decimal", text.as_bytes()));
+    let p = f.0.display();
+    let mut prev: Option<Vec<String>> = None;
+    for cs in [1usize, 7, 1024, rows] {
+        let res = run_src(
+            &format!("D:\n open {p} (id price:decimal(2))\n |> id price\n;"),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        // Collect (id, rendered price) in id order.
+        let mut got: Vec<(usize, String)> = Vec::with_capacity(rows);
+        for c in &o.chunks {
+            let ii = c.schema.index_of("id").unwrap();
+            let pi = c.schema.index_of("price").unwrap();
+            assert_eq!(
+                c.schema.fields[pi].dtype,
+                rivus_core::DataType::Decimal { scale: 2 },
+                "price is not decimal(2) @cs={cs}"
+            );
+            for r in 0..c.len {
+                let id = c.value(r, ii).to_string().parse::<usize>().unwrap();
+                got.push((id, c.value(r, pi).to_string()));
+            }
+        }
+        got.sort_by_key(|(id, _)| *id);
+        let rendered: Vec<String> = got.into_iter().map(|(_, s)| s).collect();
+        // Exact expected values (proves text→i128 is exact, half-even rounding).
+        assert_eq!(rendered, expected, "decimal values wrong @cs={cs}");
+        // Chunk-size independence: identical across every chunk size.
+        if let Some(p) = &prev {
+            assert_eq!(&rendered, p, "decimal output changed across chunk size");
+        }
+        prev = Some(rendered);
+    }
+}

@@ -423,8 +423,7 @@ impl Parser {
                         self.bump(); // column name
                         self.expect(&Tok::Colon)?;
                         let tyword = self.word()?;
-                        let ty = decl_type(&tyword)
-                            .ok_or_else(|| self.err(format!("cast: unknown type '{tyword}'")))?;
+                        let ty = self.finish_type(&tyword)?;
                         casts.push((name, ty));
                     }
                     if casts.is_empty() {
@@ -501,7 +500,7 @@ impl Parser {
             let name = self.word()?;
             let ty = if self.eat(&Tok::Colon) {
                 let t = self.word()?;
-                Some(decl_type(&t).ok_or_else(|| self.err(format!("unknown column type '{t}'")))?)
+                Some(self.finish_type(&t)?)
             } else {
                 None
             };
@@ -512,6 +511,31 @@ impl Parser {
             return Err(self.err("declared schema `( … )` needs at least one column"));
         }
         Ok(cols)
+    }
+
+    /// Resolve a type annotation after its leading word has been consumed. Plain
+    /// lanes (`int`/`f64`/`str`/`bool`) come straight from [`decl_type`];
+    /// `decimal` additionally requires a `(N)` scale suffix (`decimal(2)`) — the
+    /// exact fixed-point lane (design 21). Bare `decimal` (auto-scale) is not yet
+    /// wired in the reader, so it is a clear error rather than a silent default.
+    fn finish_type(&mut self, word: &str) -> Result<DataType, RivusError> {
+        if word.eq_ignore_ascii_case("decimal") {
+            if !self.eat(&Tok::LParen) {
+                return Err(self.err("decimal needs a scale: write decimal(N), e.g. decimal(2)"));
+            }
+            let scale = match self.bump() {
+                Tok::Int(v) if (0..=38).contains(&v) => v as u8,
+                other => {
+                    return Err(self.err(format!(
+                        "decimal(N): N must be an integer 0..=38, found {other:?}"
+                    )))
+                }
+            };
+            self.expect(&Tok::RParen)?;
+            Ok(DataType::Decimal { scale })
+        } else {
+            decl_type(word).ok_or_else(|| self.err(format!("unknown column type '{word}'")))
+        }
     }
 
     /// upstream node.
@@ -931,10 +955,13 @@ impl Parser {
     fn parse_cast(&mut self) -> Result<Expr, RivusError> {
         let e = self.parse_primary()?;
         if self.at(&Tok::Colon) {
-            if let Tok::Word(w) = &self.toks[self.pos + 1].0 {
-                if let Some(ty) = decl_type(w) {
+            if let Tok::Word(w) = self.toks[self.pos + 1].0.clone() {
+                // A recognized lane word, or `decimal` (which carries a `(N)`
+                // suffix), turns `:` into a cast; otherwise leave `:` for the caller.
+                if decl_type(&w).is_some() || w.eq_ignore_ascii_case("decimal") {
                     self.bump(); // ':'
                     self.bump(); // type word
+                    let ty = self.finish_type(&w)?;
                     return Ok(Expr::Cast {
                         expr: Box::new(e),
                         ty,
@@ -1322,6 +1349,24 @@ mod tests {
         for needle in ["abs(", "round(", "floor(", "ceil(", "coalesce(", "replace("] {
             assert!(s.contains(needle), "missing {needle} in {s}");
         }
+    }
+
+    #[test]
+    fn decimal_type_parses_and_is_reversible() {
+        // `decimal(N)` in a declared schema and as an expression/verb cast.
+        for src in [
+            "F:\n open sales.csv (id amount:decimal(2))\n |> id amount\n;",
+            "F:\n open sales.csv\n |> id (amount:decimal(4)) as a\n;",
+            "F:\n open sales.csv\n cast amount:decimal(3)\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(s.contains("decimal("), "decimal type lost in {s}");
+        }
+        // Bare `decimal` (auto-scale) is a clear error, not a silent default.
+        assert!(parse("F:\n open s.csv (a:decimal)\n;").is_err());
+        // A non-integer / out-of-range scale is rejected.
+        assert!(parse("F:\n open s.csv (a:decimal(x))\n;").is_err());
     }
 
     #[test]
