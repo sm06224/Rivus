@@ -65,6 +65,9 @@ it in small, gated steps.
 | ✅ | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅, `fill col VALUE` ✅, `fill col ffill\|bfill` ✅ (directional carry across chunks), **`fill col mean\|median`** ✅ (whole-column statistic over the non-empty numeric cells). All chunk-size independent; bfill/mean/median are pipeline-breakers. Declare a column `:str` so its blanks survive parsing (a numeric column's blank becomes 0 at parse time). |
 | ✅ | More aggregates | `std` (sample), `count_distinct`/`nunique`, `first`, `last`, `median`/`pNN` percentiles (linear interp) all done |
 | ✅ | `rename`, `drop`, `reorder` columns | `rename OLD NEW …`, `drop COL …`, and `reorder COL …` (move named columns to the front, rest follow in order) all done — stateless, parallel-safe, reversible |
+| 📋 | **Datetime lane** (`yyMMddhhmmss` etc.) | design doc 23. `(ts:datetime["fmt"])` / `--dates`; epoch-integer (scaled, like decimal) → exact compare/diff, associative → parallel-safe. `trunc(ts,"day")`/`year`/`hour`/`diff`/`format` for time-series group-by. Bad values → warning + continue |
+| 📋 | **List/array aggregation** | design doc 23. `list:col` (array_agg), `set:col` (distinct), `join:col` (group_concat). New `Column::List` (offsets+values, Arrow-like). Parallel-safe (worker-order concat = byte-identical). Building block for pivot; JSON output emits real arrays |
+| 📋 | **Pivot / unpivot (reshape)** | design doc 23. `pivot rows:… cols:… values:agg:col` (long→wide, dynamic schema, high-cardinality guard) + `unpivot` (wide→long). Pipeline-breaker like sort/group; deterministic column/row order; parallel when the inner group-by is parallel-safe (decimal/int/order-independent aggs) |
 
 ## E. Performance — keep beating DuckDB
 
