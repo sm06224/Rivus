@@ -601,6 +601,17 @@ Ids:
   `RIVUS_PARALLEL_MIN_BYTES` (bytes; `0` = always) or force serial with
   `RIVUS_NO_PARALLEL=1`. Compressed (`.gz`/`.zst`) sources can't be seeked, so
   they read serially.
+- **`--memory low|auto|fast|unbounded`.** The memory/speed knob. `low` forces
+  serial (lowest resource use); `auto` (default) autotunes serial-vs-parallel
+  from CPU count + input size; `fast` parallelizes more aggressively (lower size
+  threshold) — **all three stay in bounded memory**. `unbounded` opts *into*
+  trading the bounded guarantee for speed: it parallelizes even a non-splittable
+  source (compressed / JSONL / binary) by materializing the input (peak memory
+  O(input)). Results are **byte-identical** across all four — only memory/speed
+  differ. **Group-by** parallelizes too: byte-identical aggregates (`min`/`max`/
+  `count`/`count_distinct`/`first`/`last`/percentile and exact-`decimal` `sum`/
+  `avg`) run in bounded memory under `auto`/`fast`; `unbounded` extends that to
+  non-splittable sources.
 - **Live progress.** An interactive `rivus run` prints a `… N rows  T s  R
   rows/s` line on stderr while a long job streams.
 - **Machine-readable telemetry.** `rivus run … --json` emits per-node JSONL

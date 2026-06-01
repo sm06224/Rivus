@@ -133,6 +133,16 @@ pub fn run_with_progress(
                 return Ok(res);
             }
         }
+        // Opt-in unbounded (#50): parallelize a non-splittable source's group-by
+        // by materializing it. Only for `MemoryPref::Unbounded` (the user's
+        // explicit choice to trade bounded memory for speed).
+        if let Some((src, grp, sink)) = eligible_group_flow_any(graph) {
+            if let Some(mut res) = try_unbounded_group(graph, &opts, src, grp, sink) {
+                res.strategy =
+                    has_file_source.then(|| format!("{note}; unbounded group-by (materialized)"));
+                return Ok(res);
+            }
+        }
         if let Some(mut res) = try_parallel(graph, &opts, min_parallel) {
             res.strategy = has_file_source.then(|| note.clone());
             return Ok(res);
@@ -827,6 +837,10 @@ fn parallel_min_bytes_for(pref: crate::analytics::MemoryPref) -> u64 {
         Low => u64::MAX,
         Auto => parallel_min_bytes(),
         Fast => parallel_min_bytes().min(1024 * 1024),
+        // Opt-in unbounded: parallelize at any size (#50). The unbounded behavior
+        // itself (materializing non-splittable sources) is gated separately so it
+        // only fires for this tier.
+        Unbounded => 0,
     }
 }
 
@@ -1022,21 +1036,33 @@ fn pre_group_op_allowed(op: &Op) -> bool {
 
 /// If the flow is a single linear pipeline `CSV source → allowlisted stateless
 /// ops → GroupBy → (leaf | one sink)`, return `(source_id, group_id,
-/// optional_sink_id)` — the shape the parallel group-by scheduler (#41) handles.
-/// `None` keeps the caller on the serial (bounded) path.
+/// optional_sink_id)` — the shape the *bounded* parallel group-by scheduler
+/// (#41) handles. `None` keeps the caller on the serial (bounded) path.
 fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<NodeId>)> {
+    eligible_group_flow_inner(graph, true)
+}
+
+/// Same shape as [`eligible_group_flow`] but accepting **any** single source
+/// (CSV / JSONL / binary, compressed included) — used by the opt-in *unbounded*
+/// materialized path (#50), which can parallelize a non-splittable source.
+fn eligible_group_flow_any(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<NodeId>)> {
+    eligible_group_flow_inner(graph, false)
+}
+
+fn eligible_group_flow_inner(
+    graph: &PlanGraph,
+    csv_only: bool,
+) -> Option<(NodeId, NodeId, Option<NodeId>)> {
     let mut source = None;
     let mut group = None;
     for node in &graph.nodes {
         match &node.op {
-            Op::OpenCsv { .. } => {
+            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. } => {
                 if source.is_some() {
                     return None;
                 }
                 source = Some(node.id);
             }
-            // Byte-range streaming is CSV-only; a non-CSV source stays serial.
-            Op::OpenBinary { .. } | Op::OpenJsonl { .. } => return None,
             Op::GroupBy { .. } => {
                 if group.is_some() {
                     return None;
@@ -1047,6 +1073,10 @@ fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<Node
         }
     }
     let (src, grp) = (source?, group?);
+    // Byte-range streaming is CSV-only; the bounded path rejects other sources.
+    if csv_only && !matches!(graph.nodes[src].op, Op::OpenCsv { .. }) {
+        return None;
+    }
     // The group's downstream must be empty (leaf) or exactly one (leaf) sink.
     let sink = match graph.outputs_of(grp).as_slice() {
         [] => None,
@@ -1389,9 +1419,24 @@ fn try_parallel_group(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Merge partials in source order, then finalize once.
+    Some(finalize_group_partials(
+        graph, src_id, group_id, sink_id, partials,
+    ))
+}
+
+/// Merge per-worker partial group states in source order, finalize once, and
+/// build the `RunResult` (full per-node telemetry, per-worker rows, sink write or
+/// leaf capture). Shared by the bounded streaming (#41) and opt-in unbounded
+/// (#50) group paths.
+fn finalize_group_partials(
+    graph: &PlanGraph,
+    src_id: NodeId,
+    group_id: NodeId,
+    sink_id: Option<NodeId>,
+    partials: Vec<(operators::GroupBy, Vec<ErrorEvent>, u64)>,
+) -> RunResult {
     let mut iter = partials.into_iter();
-    let (mut merged, mut errors, mut total_rows) = iter.next().expect("≥1 range");
+    let (mut merged, mut errors, mut total_rows) = iter.next().expect("≥1 worker");
     let mut workers = vec![WorkerTelemetry {
         worker: 0,
         rows_out: total_rows,
@@ -1468,6 +1513,156 @@ fn try_parallel_group(
             label: graph.nodes[group_id].label.clone(),
             chunks: out_chunks,
         });
+    }
+    res
+}
+
+/// Run the pre-group ops on already-materialized `chunks` then a partial
+/// `GroupBy` — one worker of the opt-in **unbounded** path (#50), which trades
+/// the bounded guarantee (the whole input is materialized before partitioning) to
+/// parallelize a non-splittable source (compressed / JSONL / binary).
+fn worker_partial_group_materialized(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    path: &[NodeId],
+    group_id: NodeId,
+    chunks: Vec<Chunk>,
+) -> (operators::GroupBy, Vec<ErrorEvent>, u64) {
+    let mut errors = Vec::new();
+    let mut next_id = 0u64;
+    let mut cur = chunks;
+    for &nid in path {
+        let mut op = operators::build(
+            &graph.nodes[nid].op,
+            &graph.inputs_of(nid),
+            opts.chunk_size,
+            false,
+        );
+        let mut out = Vec::new();
+        let mut ctx = OpCtx {
+            label: label_of(graph, nid),
+            errors: &mut errors,
+            next_chunk_id: &mut next_id,
+        };
+        for c in cur {
+            out.extend(op.process(nid, c, &mut ctx));
+        }
+        out.extend(op.finish(&mut ctx));
+        cur = out;
+    }
+    let mut g = operators::new_group(&graph.nodes[group_id].op).expect("group op");
+    let rows: u64 = cur.iter().map(|c| c.len as u64).sum();
+    let mut ctx = OpCtx {
+        label: label_of(graph, group_id),
+        errors: &mut errors,
+        next_chunk_id: &mut next_id,
+    };
+    for c in cur {
+        g.process(group_id, c, &mut ctx);
+    }
+    (g, errors, rows)
+}
+
+/// Opt-in **unbounded** parallel group-by (#50): materialize the whole input,
+/// partition it, and aggregate each partition in parallel. Trades the bounded
+/// guarantee for speed on a **non-splittable** source the streaming path can't
+/// parallelize — only ever taken for `MemoryPref::Unbounded` (the user's explicit
+/// choice). Still byte-identical to serial (same deterministic merge); the only
+/// difference is peak memory (O(input)). `None` if not unbounded, not the group
+/// shape, unsafe aggregates, or too small.
+fn try_unbounded_group(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    src_id: NodeId,
+    group_id: NodeId,
+    sink_id: Option<NodeId>,
+) -> Option<RunResult> {
+    if opts.memory != crate::analytics::MemoryPref::Unbounded {
+        return None;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
+        return None;
+    }
+    if opts.max_capture.is_some() && !must_drain(graph) {
+        return None;
+    }
+
+    // Materialize the source (the opt-in unbounded cost).
+    let mut src_errors: Vec<ErrorEvent> = Vec::new();
+    let mut next_id: u64 = 0;
+    let mut all: Vec<Chunk> = Vec::new();
+    {
+        let mut src_op = operators::build(&graph.nodes[src_id].op, &[], opts.chunk_size, false);
+        let mut ctx = OpCtx {
+            label: label_of(graph, src_id),
+            errors: &mut src_errors,
+            next_chunk_id: &mut next_id,
+        };
+        while let Some(c) = src_op.pull(&mut ctx) {
+            all.push(c);
+        }
+    }
+    let src_fatal = src_errors.iter().any(ErrorEvent::is_fatal);
+
+    let path = pre_group_path(graph, src_id, group_id);
+    let aggs = match &graph.nodes[group_id].op {
+        Op::GroupBy { aggs, .. } => aggs.clone(),
+        _ => return None,
+    };
+    // Safety against the group-input schema (post pre-group ops): run the first
+    // chunk through the pre-group ops and read the resulting schema.
+    let in_schema = {
+        let mut errors = Vec::new();
+        let mut nid_ctr = 0u64;
+        let mut cur = vec![all.first()?.clone()];
+        for &nid in &path {
+            let mut op = operators::build(
+                &graph.nodes[nid].op,
+                &graph.inputs_of(nid),
+                opts.chunk_size,
+                false,
+            );
+            let mut out = Vec::new();
+            let mut ctx = OpCtx {
+                label: label_of(graph, nid),
+                errors: &mut errors,
+                next_chunk_id: &mut nid_ctr,
+            };
+            for c in cur {
+                out.extend(op.process(nid, c, &mut ctx));
+            }
+            cur = out;
+        }
+        cur.first().map(|c| c.schema.clone())?
+    };
+    let safe = operators::group_parallel_safe(&aggs, |name| {
+        in_schema.index_of(name).map(|i| in_schema.fields[i].dtype)
+    });
+    if !safe || all.len() < threads * 2 {
+        return None;
+    }
+
+    let parts = partition(all, threads);
+    let partials: Vec<(operators::GroupBy, Vec<ErrorEvent>, u64)> = std::thread::scope(|scope| {
+        let path = &path;
+        let handles: Vec<_> = parts
+            .into_iter()
+            .map(|chunks| {
+                scope.spawn(move || {
+                    worker_partial_group_materialized(graph, opts, path, group_id, chunks)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut res = finalize_group_partials(graph, src_id, group_id, sink_id, partials);
+    res.errors.splice(0..0, src_errors);
+    if src_fatal {
+        res.final_mode = Mode::Halted;
     }
     Some(res)
 }

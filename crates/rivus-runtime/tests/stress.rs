@@ -2245,3 +2245,75 @@ fn f64_sum_group_stays_serial_but_correct() {
         collect(rivus_runtime::MemoryPref::Low)
     );
 }
+
+#[test]
+fn unbounded_group_parallelizes_non_csv_byte_identical() {
+    // #50: a non-splittable source (JSONL) can't use the bounded streaming group
+    // path, so it stays serial under auto/fast. With the opt-in `Unbounded` tier
+    // the engine materializes + partitions to parallelize it — still byte-identical
+    // to serial; only memory differs.
+    let rows = 60_000usize;
+    let countries = ["JP", "US", "DE", "FR"];
+    let mut text = String::new();
+    for i in 0..rows {
+        text.push_str(&format!(
+            "{{\"country\":\"{}\",\"amount\":{}}}\n",
+            countries[i % countries.len()],
+            i % 1000
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_unbounded_jsonl",
+        text.as_bytes(),
+    ));
+    // Rename so the reader picks JSONL from the extension.
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+    let flow = format!("G:\n open {p}\n |# country min:amount max:amount count_distinct:amount\n;");
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join(","));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+    let (serial, serial_par) = collect(rivus_runtime::MemoryPref::Low);
+    let (auto, auto_par) = collect(rivus_runtime::MemoryPref::Auto);
+    let (unbounded, unbounded_par) = collect(rivus_runtime::MemoryPref::Unbounded);
+    // auto/low never materialize a non-splittable group → serial (bounded).
+    assert!(!serial_par, "low must be serial");
+    assert!(
+        !auto_par,
+        "auto must NOT silently go unbounded on a JSONL group"
+    );
+    // unbounded parallelizes it, byte-identical.
+    assert!(
+        unbounded_par,
+        "unbounded should parallelize the JSONL group"
+    );
+    assert_eq!(unbounded, serial, "unbounded group != serial");
+    assert_eq!(auto, serial, "auto group != serial");
+}

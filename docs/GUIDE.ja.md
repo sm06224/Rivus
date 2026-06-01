@@ -456,6 +456,14 @@ rivus run sessions.riv --telemetry-addr 127.0.0.1:9000   # メトリクスをラ
   171 MiB のフィルタで直列 ~1.6 秒 → 並列 **~0.4 秒**。`RIVUS_PARALLEL_MIN_BYTES`
   （バイト、`0` で常時）で調整、`RIVUS_NO_PARALLEL=1` で直列強制。圧縮入力
   （`.gz`/`.zst`）はシーク不可なので直列。
+- **`--memory low|auto|fast|unbounded`。** メモリ/速度の knob。`low`＝直列強制
+  （最小資源）、`auto`（既定）＝CPU数・入力サイズで自律調律、`fast`＝より積極的に
+  並列（閾値を下げる）— **この3つは有界メモリのまま**。`unbounded` は**明示的に**
+  有界を犠牲に速度を取るオプトイン: 分割不可ソース（圧縮/JSONL/binary）も入力を
+  materialize して並列化（peak メモリ O(入力)）。4 つとも結果は **byte-identical**で、
+  違うのはメモリ/速度だけ。**group-by** も並列化: byte-identical な集計
+  （`min`/`max`/`count`/`count_distinct`/`first`/`last`/percentile と exact-`decimal`
+  の `sum`/`avg`）は `auto`/`fast` で有界並列、`unbounded` で分割不可ソースにも拡張。
 - **ライブ進捗。** 対話的な `rivus run` は長いジョブ中、stderr に
   `… N rows  T s  R rows/s` を表示。
 - **機械可読テレメトリ。** `rivus run … --json` でノードごとの JSONL

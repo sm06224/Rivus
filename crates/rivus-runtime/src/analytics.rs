@@ -75,6 +75,11 @@ pub enum MemoryPref {
     Auto,
     /// Prefer `Parallel` aggressively (a lower size threshold than `Auto`).
     Fast,
+    /// Explicitly trade the bounded-memory guarantee for speed: parallelize even
+    /// non-splittable sources (compressed / JSONL / binary) by materializing the
+    /// input, opt-in only (#50). Peak memory is O(input). `Auto`/`Fast`/`Low`
+    /// never do this — only this tier, chosen by the user.
+    Unbounded,
 }
 
 impl MemoryPref {
@@ -83,6 +88,7 @@ impl MemoryPref {
             "low" => Some(MemoryPref::Low),
             "auto" => Some(MemoryPref::Auto),
             "fast" => Some(MemoryPref::Fast),
+            "unbounded" => Some(MemoryPref::Unbounded),
             _ => None,
         }
     }
@@ -92,6 +98,7 @@ impl MemoryPref {
             MemoryPref::Low => "memory=low",
             MemoryPref::Auto => "memory=auto",
             MemoryPref::Fast => "memory=fast",
+            MemoryPref::Unbounded => "memory=unbounded",
         }
     }
 }
@@ -113,7 +120,7 @@ pub fn choose_strategy(
             Strategy::Serial,
             "memory=low: forced serial (single-thread, bounded)".into(),
         ),
-        MemoryPref::Auto | MemoryPref::Fast => {
+        MemoryPref::Auto | MemoryPref::Fast | MemoryPref::Unbounded => {
             if env.cpus < 2 {
                 return (
                     Strategy::Serial,
