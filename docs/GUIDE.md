@@ -587,6 +587,19 @@ Ids:
   (rows in/out, busy_ms, rows/s, selectivity, mode) + errors + a summary to
   stderr (stdout stays clean data); `--telemetry-addr HOST:PORT` streams it to a
   TCP socket for a live viewer.
+- **Live dashboard.** `rivus run … --tui` repaints an ANSI dashboard on stderr
+  (per-node bars, rows/s, state) as the run streams. `rivus run … --serve [ADDR]`
+  launches a tiny std-only HTTP server (default an ephemeral loopback port):
+  open the printed URL for a live browser dashboard (`GET /`), poll `GET
+  /snapshot`, or subscribe to `GET /events` (Server-Sent Events). Heavy drawing
+  is in the browser; Rust ships only JSON snapshots — no extra dependencies.
+  A live view (`--tui`/`--serve`) honours `--memory` but always runs **serial**
+  so the stream stays coherent (one ordered chunk sequence, not interleaved
+  workers); when the autotuner would otherwise have gone parallel the surfaced
+  strategy says so — e.g. `… → parallel; live observation → serial`. For the
+  fastest headless run, drop the live flag and let `--memory auto` parallelise.
+  A parallel run's per-worker breakdown (`rows_out`/`busy_ms`) is exposed in the
+  `--json` summary as `worker_breakdown` so parallel skew is visible.
 - **The optimizer runs by default** (dedup sources, fuse filter+project,
   projection pushdown, filter pushdown into the reader). `rivus explain` shows
   exactly what it did and regenerates the source from the optimized IR.

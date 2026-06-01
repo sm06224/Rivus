@@ -7,9 +7,121 @@
 use rivus_core::Chunk;
 use rivus_ir::PlanGraph;
 use rivus_optimizer::OptReport;
-use rivus_runtime::{Output, RunResult};
+use rivus_runtime::{Output, RunResult, RuntimeSnapshot};
 
 const BAR_WIDTH: usize = 14;
+
+/// Render a live [`RuntimeSnapshot`] as a single ANSI TUI frame (Pillar B, B1).
+/// Deterministic and pure (no I/O), so it's unit-testable: the caller clears the
+/// screen / repositions the cursor and prints this each tick. Bars are
+/// normalized to the busiest node's `rows_out`; a huge DAG is capped to the top
+/// `MAX_ROWS` nodes by rows_out (with a "+N more" line) so a terminal can't be
+/// flooded. `elapsed`/`rows_seen`/`mode` head the frame.
+pub fn render_snapshot_frame(snap: &RuntimeSnapshot) -> String {
+    const MAX_ROWS: usize = 24;
+    const BAR: usize = 20;
+    let mut s = String::new();
+    let secs = snap.elapsed.as_secs_f64();
+    let rate = if secs > 0.0 {
+        snap.rows_seen as f64 / secs
+    } else {
+        0.0
+    };
+    s.push_str(&format!(
+        "\u{2550}\u{2550} Rivus live \u{2550}\u{2550}  {} rows  {:.1}s  {} rows/s  [{}]\n",
+        group_thousands(snap.rows_seen),
+        secs,
+        group_thousands(rate as u64),
+        snap.mode
+    ));
+
+    // Order by rows_out desc for the "hot nodes" view; cap to MAX_ROWS.
+    let mut idx: Vec<usize> = (0..snap.nodes.len()).collect();
+    idx.sort_by(|&a, &b| snap.nodes[b].rows_out.cmp(&snap.nodes[a].rows_out));
+    let max_rows = snap.nodes.iter().map(|n| n.rows_out).max().unwrap_or(0);
+    let shown = idx.len().min(MAX_ROWS);
+    for &i in idx.iter().take(shown) {
+        let n = &snap.nodes[i];
+        let filled = if max_rows > 0 {
+            ((n.rows_out as f64 / max_rows as f64) * BAR as f64).round() as usize
+        } else {
+            0
+        };
+        let bar: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(BAR - filled);
+        let flag = if n.finished { "done" } else { "live" };
+        let errs = if n.errors > 0 {
+            format!(" !{}", n.errors)
+        } else {
+            String::new()
+        };
+        s.push_str(&format!(
+            "  {:<14} {:<8} {bar} {:>10} rows {flag}{errs}\n",
+            truncate(&n.label, 14),
+            truncate(&n.kind, 8),
+            group_thousands(n.rows_out),
+        ));
+    }
+    if idx.len() > shown {
+        s.push_str(&format!("  … +{} more node(s)\n", idx.len() - shown));
+    }
+    s
+}
+
+/// Truncate a label to `n` chars with an ellipsis, for fixed-width TUI columns.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let keep: String = s.chars().take(n.saturating_sub(1)).collect();
+        format!("{keep}\u{2026}")
+    }
+}
+
+/// Encode a [`RuntimeSnapshot`] as one JSON object (for the `/snapshot` route
+/// and SSE `/events` stream). std-only — hand-rolled, with a nested `nodes`
+/// array. Numbers are integers/floats; strings are escaped.
+pub fn render_snapshot_json(snap: &RuntimeSnapshot) -> String {
+    let mut s = String::from("{");
+    s.push_str(&format!(
+        "\"elapsed_ms\":{:.3},\"rows_seen\":{},\"mode\":",
+        snap.elapsed.as_secs_f64() * 1000.0,
+        snap.rows_seen
+    ));
+    json_escape_into(&mut s, &snap.mode.to_string());
+    s.push_str(",\"nodes\":[");
+    for (i, n) in snap.nodes.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{{\"node_id\":{},\"label\":", n.node_id));
+        json_escape_into(&mut s, &n.label);
+        s.push_str(",\"kind\":");
+        json_escape_into(&mut s, &n.kind);
+        s.push_str(&format!(
+            ",\"rows_in\":{},\"rows_out\":{},\"errors\":{},\"mode\":",
+            n.rows_in, n.rows_out, n.errors
+        ));
+        json_escape_into(&mut s, &n.mode.to_string());
+        s.push_str(&format!(",\"finished\":{}}}", n.finished));
+    }
+    s.push_str("]}");
+    s
+}
+
+/// Group an integer with thousands separators (1234567 → "1,234,567").
+fn group_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let first = b.len() % 3;
+    for (i, &c) in b.iter().enumerate() {
+        if i > 0 && i >= first && (i - first).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c as char);
+    }
+    out
+}
 
 pub fn render_run(graph: &PlanGraph, res: &RunResult) -> String {
     let mut s = String::new();
@@ -150,6 +262,52 @@ pub fn render_telemetry_jsonl(graph: &PlanGraph, res: &RunResult) -> String {
     o.num("rows_out", res.total_rows_out() as f64);
     o.num("errors", res.errors.len() as f64);
     o.str("final_mode", &res.final_mode.to_string());
+    // A3: time-to-first-row and the parse phase (source busy), summary-only so
+    // the per-node / per-error line contract stays byte-stable.
+    if let Some(l) = res.first_row_latency {
+        o.num("first_row_latency_ms", l.as_secs_f64() * 1000.0);
+    }
+    let parse_busy_ms: f64 = res
+        .telemetry
+        .iter()
+        .filter(|t| t.kind == "open")
+        .map(|t| t.busy.as_secs_f64() * 1000.0)
+        .sum();
+    o.num("parse_busy_ms", parse_busy_ms);
+    if !res.workers.is_empty() {
+        o.num("workers", res.workers.len() as f64);
+        // A2 exposure (#36): per-worker rows_out / busy so parallel skew is
+        // visible, not just the worker count. Hand-rolled JSON array.
+        let mut arr = String::from("[");
+        for (i, w) in res.workers.iter().enumerate() {
+            if i > 0 {
+                arr.push(',');
+            }
+            arr.push_str(&format!(
+                "{{\"worker\":{},\"rows_out\":{},\"busy_ms\":{:.3}}}",
+                w.worker,
+                w.rows_out,
+                w.busy.as_secs_f64() * 1000.0
+            ));
+        }
+        arr.push(']');
+        o.raw("worker_breakdown", &arr);
+    }
+    // A4: columns whose inferred type widened (int→float). Summary-only; the
+    // node/error line contract stays byte-stable.
+    let widened: Vec<&str> = res
+        .inference
+        .iter()
+        .filter(|(_, _, w)| *w)
+        .map(|(n, _, _)| n.as_str())
+        .collect();
+    if !widened.is_empty() {
+        o.str("widened_columns", &widened.join(","));
+    }
+    // C3: the autotuner's strategy decision (Pillar C). Summary-only.
+    if let Some(st) = &res.strategy {
+        o.str("strategy", st);
+    }
     s.push_str(&o.finish());
     s.push('\n');
     s
@@ -213,6 +371,12 @@ impl JsonObj {
     fn null(&mut self, k: &str) {
         self.key(k);
         self.buf.push_str("null");
+    }
+    /// Emit `key:json` with the value inserted verbatim (already-valid JSON,
+    /// e.g. a nested array). Used for the per-worker breakdown (A2 exposure).
+    fn raw(&mut self, k: &str, json: &str) {
+        self.key(k);
+        self.buf.push_str(json);
     }
     fn finish(mut self) -> String {
         self.buf.push('}');

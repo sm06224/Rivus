@@ -26,6 +26,9 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | **Typed / named columns at `open`** | `open f.csv (id:int, name:str, age:int)` — give a schema instead of inferring; also names a header-less file |
 | 🚧 | **Compressed inputs** | **`.gz` ✅** (feature `gzip`, `flate2`/`miniz_oxide`) and **`.zst` ✅** (feature `zstd`, pure-Rust `ruzstd` decoder) done — serial single-pass with sample inference (compressed streams can't seek → no byte-range parallel); default build stays dep-free. Next: `.zip`/tar. Vetting log in `SUPPLY-CHAIN.md`. |
 | ✅ | **TSV / custom delimiter** (real) | `delim: u8` threaded through `OpenCsv`/`SinkCsv` (std-only). `.tsv`/`.tab` paths split on a tab automatically; `as tsv`/`as csv` overrides the extension. Reader, parallel reader, and sinks all honor it; `to_source` stays faithful. |
+| 📋 | **BOM / encoding handling** | strip a leading UTF-8 BOM (`EF BB BF`) so the first header cell isn't `﻿id`; detect UTF-16 LE/BE BOM and decode (or warn + continue). Today a BOM leaks into the first column name. std-only. Connects to design doc 06 §6.4 "text is stream" (encoding-aware decode) |
+| 📋 | **Exact decimal lane at the reader** (design doc 21) | `open f.csv (price:decimal[(n)])` / `--exact[=auto\|N]`: parse into `Column::Dec` (i128 scaled int, **landed in core**). Scale auto-inferred (max fractional digits, 2-pass) or explicit. Unblocks byte-identical parallel decimal aggregation (#41) and exact money math |
+| 📋 | **Datetime lane at the reader** (design doc 23) | `open f.csv (ts:datetime["yyMMddhhmmss"])` / `--dates`: epoch-integer parse, std-only strptime; bad values warn + continue |
 | 📋 | **Parquet / Arrow** | feature `parquet` via apache **`arrow`/`parquet`** (isolated behind the source/sink trait) |
 | 📋 | **Python pickle**, YAML/TOML/INI/XML/HTML | `pickle` via `serde-pickle`; text formats likely std-only or a small vetted dep |
 | 📋 | Transports: socket / HTTP / subscribe / scheduled-get | `docs/design/18` |
@@ -55,6 +58,9 @@ it in small, gated steps.
 | ✅ | • mid-flow cast | `\|> (age:int) as age` (computed column) **and** the `cast age:int price:f64` verb (re-types columns in place) |
 | ✅ | • derive/add property | `\|> (expr) as name` computed columns (done) |
 | ✅ | String / numeric functions, `case when … then … else` | `upper/lower/trim/len/substr/contains/replace/split_part/concat`, `starts_with/ends_with/like/glob/regexp`, numeric `abs/round/floor/ceil`, null-coalesce `coalesce`, and `case when … then … [else …] end` all done |
+| 📋 | **Optional leading pipe before any stage** | allow (don't require) a `\|` before stages that today have none — `\| sort score`, `\| save out.csv`, `\| group …`. Makes every stage read as a pipe step; bare form still valid. Lexer/parser: treat a stage-leading `\|` as optional whitespace. (back-compat not required per 統括) |
+| 📋 | **Flow prefix for label references** | a sigil so a stage that consumes a named upstream flow is syntactically obvious (today a bare `Adults` could be a label or a column). Proposed `@Label` (or `->Label`) for "inherit/continue this flow", e.g. `Merged: @Adults + @Minors`. Touches lexer/parser/`to_source`; reversible. (back-compat not required) |
+| 📋 | **Combine derive + cast + rename in one block** | let a single projection stage create columns, cast types, and rename together, e.g. `\|> (price:f64 * qty) as total, age:int as years, name`. Today these split across `\|>` (computed), `cast` (re-type in place) and `rename` (separate verb) — unify them in one `\|>`/`select`-style block so a wrangle reads as one step. Touches parser (mixed projection items: derive\|cast\|rename\|passthrough) + `to_source`; reversible. |
 
 ## D. Relational & cleaning operators
 
@@ -65,6 +71,9 @@ it in small, gated steps.
 | ✅ | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅, `fill col VALUE` ✅, `fill col ffill\|bfill` ✅ (directional carry across chunks), **`fill col mean\|median`** ✅ (whole-column statistic over the non-empty numeric cells). All chunk-size independent; bfill/mean/median are pipeline-breakers. Declare a column `:str` so its blanks survive parsing (a numeric column's blank becomes 0 at parse time). |
 | ✅ | More aggregates | `std` (sample), `count_distinct`/`nunique`, `first`, `last`, `median`/`pNN` percentiles (linear interp) all done |
 | ✅ | `rename`, `drop`, `reorder` columns | `rename OLD NEW …`, `drop COL …`, and `reorder COL …` (move named columns to the front, rest follow in order) all done — stateless, parallel-safe, reversible |
+| 📋 | **Datetime lane** (`yyMMddhhmmss` etc.) | design doc 23. `(ts:datetime["fmt"])` / `--dates`; epoch-integer (scaled, like decimal) → exact compare/diff, associative → parallel-safe. `trunc(ts,"day")`/`year`/`hour`/`diff`/`format` for time-series group-by. Bad values → warning + continue |
+| 📋 | **List/array aggregation** | design doc 23. `list:col` (array_agg), `set:col` (distinct), `join:col` (group_concat). New `Column::List` (offsets+values, Arrow-like). Parallel-safe (worker-order concat = byte-identical). Building block for pivot; JSON output emits real arrays |
+| 📋 | **Pivot / unpivot (reshape)** | design doc 23. `pivot rows:… cols:… values:agg:col` (long→wide, dynamic schema, high-cardinality guard) + `unpivot` (wide→long). Pipeline-breaker like sort/group; deterministic column/row order; parallel when the inner group-by is parallel-safe (decimal/int/order-independent aggs) |
 
 ## E. Performance — keep beating DuckDB
 
@@ -80,13 +89,22 @@ read-throughput, in priority order:
 | ✅ | Allocation-free field split, 256 KiB IO buffers | |
 | ✅ | **Parallel reads incl. stdout sinks** | `save -` now assembles ordered parts to stdout; 363 MiB filter 5.2 s → 1.8 s (2.8×). Env knobs `RIVUS_PARALLEL_MIN_BYTES` / `RIVUS_NO_PARALLEL` |
 | ✅ | **Lower the parallel threshold (8 MiB)** | was 256 MiB (mid-size files ran serial); measured crossover and wired `parallel_min_bytes()` into the engine. 171 MiB filter: serial 1.6 s → parallel 0.4–0.7 s. `RIVUS_PARALLEL_MIN_BYTES`-overridable |
-| 📋 | **Single-pass inference** (sample + adaptive widen) | drop the second full scan that streaming type-inference costs |
+| ❌ | ~~**Single-pass retain-buffer reader**~~ (evaluated, dropped) | prototyped to drop the second scan; **measured *slower*** than two-pass on warm cache (4.0 s vs 3.4 s on 288 MB) — holding all lines in memory costs more than the page-cached re-read saves. Not shipped (faster needs a measured number). May return for cold-cache/network FS. See `BENCHMARKS.md` |
+| ✅ | **Adaptive execution strategy** (Epic #30 / Pillar C, #33) | std-only host probe (`Analytics`: cpus + `/proc/meminfo`) → autotuner picks **serial vs parallel** and surfaces the decision (`RunResult.strategy`, `--json` `"strategy"`). `--memory low\|auto\|fast`; default `auto` parallelizes ≥8 MiB on multicore. 288 MB filter: serial 3.53 s → parallel **1.13 s** (3.1×), byte-identical |
 | 📋 | **SIMD CSV scan** (`std::arch`, no deps) | find `,`/`\n` with SSE2/AVX2; bench-gated (SWAR tried, no win at current bottleneck — revisit after the above) |
-| 📋 | **Vectorized / SIMD predicate kernels** for more shapes | extend `kernel.rs` beyond numeric conjunctions |
-| 📋 | Push computed-column / string predicates into the reader | extend prefilter |
+| 🚧 | **Vectorized / SIMD predicate kernels** (Epic #38 lever 1 / #39) | kernel refactored to a **branch-free byte-mask** form (auto-vectorized, zero `unsafe`/deps; ~5% on multi-pred filters). Hand-written AVX2 **measured → no win** (compare is memory-bandwidth-bound; the *gather* dominates) so it was dropped — see `docs/BENCHMARKS.md`. Real lever = columnar selection vector (#40). String compares beyond numeric still planned |
+| 🚧 | Push computed-column / string predicates into the reader | **string literal-substring prefilter ✅** (`contains`/`starts_with`/`ends_with`/`==`/`like`-literal → ripgrep-style raw-line pre-scan, result-invariant superset; Epic #30 C4(i)), now also on the **parallel byte-range path ✅** (#35, with per-worker skip telemetry; quote/newline needles declined for safety, #37). Computed-column predicates + pushing the pre-scan into pass-1 inference still planned |
 | 📋 | mmap the source; overlap decode with IO | |
 | 📋 | Re-use buffers across chunks; arena-per-chunk recycling | |
 | 📋 | JIT (Cranelift) for hot predicates/projections | design doc 09; needs a vetted dep |
+| 📋 | **GPU backend** (feature-gated, CPU fallback) | design doc 22; `--accel gpu\|auto\|cpu`; default build stays GPU-free / zero-dep. Beats the memory-bandwidth wall #39 hit — **must measure transfer-inclusive** before adopting |
+
+## G. Correctness as an opt-in lane
+
+| | item | note |
+|---|---|---|
+| 📋 | **Exact decimal lane** (COBOL-style scaled integer) | design doc 21. `--exact[=auto\|N]` / `open f.csv (price:decimal[(n)])`. i128 scaled-integer → addition is associative & exact → **parallel group-by becomes byte-identical** (#41), and money math is exact. Default stays f64 (fastest). Scale auto-inferred or explicit; avg/std divide-then-round deterministically |
+| 📋 | **Parallel group-by / join** (#41) | blocked on byte-identity for f64 sum/avg/std (measured ULP drift from non-associativity). Lands cleanly for decimal & integer columns + order-independent aggs (min/max/count/first/last/pct); f64 sum/avg/std stay serial unless `--exact` |
 
 ## F. Observability & UX
 
@@ -94,6 +112,7 @@ read-throughput, in priority order:
 |---|---|---|
 | ✅ | Live progress, execution-graph viz, error stream | |
 | ✅ | Structured telemetry stream (JSONL on stderr/socket) | **done** — `rivus run … --json` emits one JSON object per node (counters: chunks/rows in·out, busy_ms, rows/s, selectivity, mode) + per error event + a summary; stdout stays clean. `--telemetry-addr HOST:PORT` streams the same JSONL to a TCP socket (a live feed for an external viewer), falling back to stderr on a connection error. std-only (no serde, `std::net`). |
+| ✅ | Live dashboard (TUI + browser) | **done** (Epic #30 Pillar B) — `rivus run … --tui` repaints an ANSI dashboard on stderr; `--serve [ADDR]` runs a std-only HTTP/1.1 + SSE server (embedded HTML/JS/SVG at `GET /`, `GET /snapshot`, live `GET /events`). Browser does the drawing; Rust ships JSON snapshots from `RuntimeSnapshot`. Zero new deps. **#36**: `--tui`/`--serve` now honor `--memory` (live observation still runs serial for a coherent stream, and the surfaced strategy says so — `…→ parallel; live observation → serial`); per-worker breakdown (A2) exposed in the `--json` summary as `worker_breakdown`; serve hardened with a read timeout + connection cap. |
 | 📋 | `\| view` interactive grid (Out-GridView), live analytics GUI | design doc 19; streaming, never full-materialize |
 | 📋 | Shell completion from IR/schema; nushell value interop | design doc 19 |
 

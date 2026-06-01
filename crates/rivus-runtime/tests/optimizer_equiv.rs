@@ -148,3 +148,63 @@ fn optimizer_preserves_computed_columns() {
         assert_eq!(raw, opt, "optimized != unoptimized for: {src}");
     }
 }
+
+#[test]
+fn string_prefilter_is_a_superset_and_preserves_results() {
+    // The string prefilter is a raw-line substring pre-scan: a row whose
+    // substring appears in the WRONG column must still be excluded by the
+    // authoritative FilterProject. Optimized must equal unoptimized for every
+    // string predicate shape that pushes a needle down.
+    let data = concat!(
+        "id,country,name\n",
+        "1,US,JPman\n", // "JP" only in name → must NOT match contains(country,"JP")
+        "2,JP,bob\n",   // genuine match
+        "3,US,carol\n",
+        "4,US,upJPper\n", // "JP" mid-name → must NOT match
+        "5,JP,JPse\n",    // genuine match (and "JP" in name too)
+    )
+    .as_bytes();
+    let f = TempCsv(gendata::write_temp_bytes("opt_strpf", data));
+    let p = f.0.display();
+
+    for src in [
+        format!("F:\n open {p}\n |? contains(country, \"JP\")\n |> id country name\n;"),
+        format!("F:\n open {p}\n |? country == \"JP\"\n |> id country\n;"),
+        format!("F:\n open {p}\n |? starts_with(country, \"J\")\n |> id\n;"),
+        format!("F:\n open {p}\n |? like(country, \"JP%\")\n |> id\n;"),
+    ] {
+        let (raw, opt) = fingerprints_both(&src);
+        assert_eq!(raw, opt, "string prefilter changed results for: {src}");
+    }
+}
+
+#[test]
+fn string_prefilter_handles_quote_escaped_needles() {
+    // Issue #37: the raw-line pre-scan sees quote-ESCAPED bytes (`"` → `""`),
+    // but the logical field value is decoded. A needle containing `"` (or a
+    // newline) must therefore NOT be pushed down, or a row whose decoded value
+    // matches would be dropped at the reader — a false negative. The optimizer
+    // now declines such needles; the result must stay byte-identical to the
+    // unoptimized run (FilterProject is still authoritative).
+    //
+    // Row 1's `text` field is quoted with an escaped quote: raw bytes are
+    // `a""b` while the decoded value is `a"b`, which matches `contains(text,
+    // "a\"b")`. A naive raw-line `contains("a\"b")` would miss it.
+    let data = concat!(
+        "id,text\n",
+        "1,\"x a\"\"b y\"\n", // decoded: x a"b y   → matches contains(text,"a\"b")
+        "2,plain\n",          // no match
+        "3,\"a\"\"b\"\n",     // decoded: a"b       → matches
+    )
+    .as_bytes();
+    let f = TempCsv(gendata::write_temp_bytes("opt_strpf_quote", data));
+    let p = f.0.display();
+
+    // Needle `a"b` contains a quote → must not be pushed; result still correct.
+    let src = format!("F:\n open {p}\n |? contains(text, \"a\\\"b\")\n |> id text\n;");
+    let (raw, opt) = fingerprints_both(&src);
+    assert_eq!(raw, opt, "quote-escaped needle changed results: {src}");
+    // Sanity: the predicate really matches the two escaped rows (not zero/all).
+    let matched = opt.get("F").map(|v| v.len()).unwrap_or(0);
+    assert_eq!(matched, 2, "expected exactly rows 1 and 3 to match");
+}

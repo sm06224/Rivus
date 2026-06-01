@@ -105,6 +105,10 @@ pub struct CsvChunker {
     line: String,
     /// Rows skipped in pass 1 for wrong arity (reported once by the source).
     pub bad_rows: usize,
+    /// Rows the pushed-down prefilter skipped *building* (definitely-out rows).
+    /// Pure accounting for telemetry — the result is unchanged, since the
+    /// downstream `FilterProject` would have dropped exactly these rows anyway.
+    pub rows_prefiltered: u64,
     eof: bool,
     /// Current byte offset and an optional end (for streaming one byte range of
     /// the file in a parallel worker). `limit == None` streams to EOF.
@@ -112,8 +116,23 @@ pub struct CsvChunker {
     limit: Option<u64>,
     /// Compiled pushed-down numeric predicates (skip building failing rows).
     prefilter: Vec<PreCmp>,
+    /// Required literal substrings: a raw line lacking any of them is skipped
+    /// before splitting (a ripgrep-style superset pre-scan; FilterProject is
+    /// still authoritative downstream). Empty = no string pre-scan.
+    str_prefilter: Vec<String>,
+    /// Per-kept-column inference `(name, type, widened)` for telemetry (A4).
+    /// Empty when the schema was declared or sample-inferred.
+    inference: Vec<(String, DataType, bool)>,
     /// Field delimiter byte (`b','` for CSV, `b'\t'` for TSV).
     delim: u8,
+}
+
+impl CsvChunker {
+    /// The per-column inference outcome (A4 telemetry); empty for declared or
+    /// sample-inferred schemas.
+    pub fn inference(&self) -> &[(String, DataType, bool)] {
+        &self.inference
+    }
 }
 
 impl CsvChunker {
@@ -132,12 +151,22 @@ impl CsvChunker {
         chunk_size: usize,
         preview: bool,
         prefilter: &[(String, CmpOp, f64)],
+        str_prefilter: &[String],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
         delim: u8,
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
-            return Self::open_preview(path, allow, chunk_size, prefilter, header, declared, delim);
+            return Self::open_preview(
+                path,
+                allow,
+                chunk_size,
+                prefilter,
+                str_prefilter,
+                header,
+                declared,
+                delim,
+            );
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -174,6 +203,13 @@ impl CsvChunker {
             }
         }
         let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
+        // Inference outcome (A4 telemetry) — captured before declared types
+        // override, so `widened` reflects what the data forced.
+        let inference: Vec<(String, DataType, bool)> = keep
+            .iter()
+            .enumerate()
+            .map(|(k, &ci)| (names[ci].clone(), dtypes[k], flags[k].widened()))
+            .collect();
         apply_declared_types(&mut dtypes, &keep, declared);
 
         let mut fields = Vec::with_capacity(keep.len());
@@ -200,8 +236,11 @@ impl CsvChunker {
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 bad_rows: bad,
+                rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
+                inference,
+                str_prefilter: str_prefilter.to_vec(),
                 pos: 0,
                 limit: None,
                 delim,
@@ -217,6 +256,7 @@ impl CsvChunker {
         allow: Option<&[String]>,
         chunk_size: usize,
         prefilter: &[(String, CmpOp, f64)],
+        str_prefilter: &[String],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
         delim: u8,
@@ -276,8 +316,11 @@ impl CsvChunker {
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 bad_rows: bad,
+                rows_prefiltered: 0,
                 eof: false,
                 prefilter: pre,
+                inference: Vec::new(),
+                str_prefilter: str_prefilter.to_vec(),
                 pos: 0,
                 limit: None,
                 delim,
@@ -298,6 +341,7 @@ impl CsvChunker {
         end: u64,
         chunk_size: usize,
         prefilter: Vec<PreCmp>,
+        str_prefilter: Vec<String>,
         delim: u8,
     ) -> Result<CsvChunker, String> {
         let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -310,8 +354,11 @@ impl CsvChunker {
             chunk_size: chunk_size.max(1),
             line: String::new(),
             bad_rows: 0,
+            rows_prefiltered: 0,
             eof: false,
             prefilter,
+            inference: Vec::new(),
+            str_prefilter,
             pos: start,
             limit: Some(end),
             delim,
@@ -358,6 +405,15 @@ impl CsvChunker {
             if l.trim().is_empty() {
                 continue;
             }
+            // String prefilter: a required literal substring is missing from the
+            // raw line, so no field can satisfy the predicate — skip before
+            // splitting (ripgrep-style; FilterProject stays authoritative).
+            if !self.str_prefilter.is_empty()
+                && !self.str_prefilter.iter().all(|n| l.contains(n.as_str()))
+            {
+                self.rows_prefiltered += 1;
+                continue;
+            }
             if split_offsets(l, &mut offsets, self.delim) {
                 if offsets.len() != self.ncols {
                     continue;
@@ -366,6 +422,7 @@ impl CsvChunker {
                 // out (conservative; the downstream FilterProject is final).
                 if !self.prefilter.is_empty() && !row_passes_prefilter(&self.prefilter, l, &offsets)
                 {
+                    self.rows_prefiltered += 1;
                     continue;
                 }
                 for (k, &ci) in self.keep.iter().enumerate() {
@@ -404,6 +461,10 @@ pub struct CsvParallelPlan {
     pub bad_rows: usize,
     /// Compiled pushed-down prefilter (raw col index, op, rhs) for each worker.
     pub prefilter: Vec<PreCmp>,
+    /// Required literal substrings for the raw-line pre-scan (#35): each worker
+    /// skips a raw line lacking one before splitting it (FilterProject stays
+    /// authoritative). Empty = no string pre-scan.
+    pub str_prefilter: Vec<String>,
 }
 
 /// Build a [`CsvParallelPlan`]: read the header, snap `nthreads` byte ranges to
@@ -415,6 +476,7 @@ pub fn plan_parallel(
     allow: Option<&[String]>,
     nthreads: usize,
     prefilter: &[(String, CmpOp, f64)],
+    str_prefilter: &[String],
     header: bool,
     declared: Option<&[(String, Option<DataType>)]>,
     delim: u8,
@@ -477,6 +539,7 @@ pub fn plan_parallel(
         ranges,
         bad_rows: bad,
         prefilter: pre,
+        str_prefilter: str_prefilter.to_vec(),
     })
 }
 
@@ -564,22 +627,45 @@ fn read_header(
     if n == 0 {
         return Err("empty CSV".to_string());
     }
+    // A UTF-8 BOM (`EF BB BF`) at the very start of the file would otherwise
+    // leak into the first column name (`﻿id`). Strip it from the header line.
+    // The byte offset `n` is unchanged: the BOM bytes were consumed as part of
+    // this first line, so the data still starts at `n` for a header file.
+    let first_trimmed = strip_bom(&first);
     if let Some(d) = declared {
         let names = d.iter().map(|(nm, _)| nm.clone()).collect();
         if header {
             Ok((names, n as u64)) // consume the header line, but use declared names
         } else {
-            r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-            Ok((names, 0)) // header-less: first line is data
+            // Header-less + declared names: the first line is data. Seek past a
+            // BOM if present so it doesn't corrupt the first cell of row 0.
+            let start = bom_len(&first) as u64;
+            r.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+            Ok((names, start))
         }
     } else if header {
-        Ok((split_owned(trim_eol(&first), delim), n as u64))
+        Ok((split_owned(trim_eol(first_trimmed), delim), n as u64))
     } else {
-        let ncols = split_owned(trim_eol(&first), delim).len();
+        let ncols = split_owned(trim_eol(first_trimmed), delim).len();
         let names = (0..ncols).map(|i| format!("c{i}")).collect();
-        r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        Ok((names, 0))
+        let start = bom_len(&first) as u64;
+        r.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        Ok((names, start))
     }
+}
+
+/// Length in bytes of a leading UTF-8 BOM (`EF BB BF`), else 0.
+fn bom_len(s: &str) -> usize {
+    if s.as_bytes().starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    }
+}
+
+/// Strip a leading UTF-8 BOM from a string slice (no-op if absent).
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
 /// Override inferred dtypes with any types declared at `open (col:type …)`.
@@ -619,6 +705,8 @@ pub struct CsvData {
 /// checks are unaffected) but are never inferred, parsed, or allocated — the
 /// projection-pushdown fast path. `allow = None` keeps every column.
 pub fn parse_projected(text: &str, allow: Option<&[String]>, delim: u8) -> Result<CsvData, String> {
+    // Strip a leading UTF-8 BOM so it doesn't leak into the first column name.
+    let text = strip_bom(text);
     let mut lines = text.lines();
     let header = match lines.next() {
         Some(h) => h,
@@ -919,6 +1007,14 @@ impl Flags {
             DataType::Str
         }
     }
+
+    /// Did inference "widen" a numeric column? True only for the genuinely
+    /// interesting case: all-float but not all-int — i.e. it looked integer
+    /// until a later cell forced F64. A purely textual column is not "widened",
+    /// it's just `Str`. Pure observation (telemetry); does not affect `resolve`.
+    fn widened(&self) -> bool {
+        self.any && self.all_float && !self.all_int
+    }
 }
 
 /// A typed, pre-sized column accumulator.
@@ -963,20 +1059,80 @@ impl ColBuilder {
 /// Split an unquoted record into field byte-ranges `(start, end)` into `out`
 /// (cleared first), allocating nothing — `out` is reused across rows. Returns
 /// `false` when the line contains a `"` (the caller takes the owned slow path).
+// SWAR (SIMD-within-a-register) byte search: process 8 bytes per step with
+// plain u64 arithmetic — no `core::arch`, no feature gate, host-endian
+// independent (words are read little-endian so byte `i` maps to bits
+// `i*8..i*8+7`).
+const SWAR_LO: u64 = 0x0101_0101_0101_0101;
+const SWAR_HI: u64 = 0x8080_8080_8080_8080;
+const SWAR_LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F; // !SWAR_HI
+
+/// Broadcast byte `b` into every lane of a u64.
+#[inline(always)]
+fn swar_splat(b: u8) -> u64 {
+    SWAR_LO.wrapping_mul(b as u64)
+}
+
+/// For each byte of `word` equal to the byte broadcast in `splat`, set that
+/// lane's high bit (`0x80`) and clear the rest — **exactly one bit per match,
+/// with no cross-byte contamination**, so `trailing_zeros() >> 3` yields the
+/// matching byte index and `m &= m - 1` advances to the next.
+///
+/// The naive `(x - LO) & ~x & HI` zero-byte trick is only reliable as a
+/// *boolean* ("any match?"); its per-byte bits are corrupted by subtraction
+/// borrows (a zero byte followed by a `0x01` lane false-positives), which makes
+/// it wrong for *locating* matches. This borrow-free variant is exact:
+/// `(b & 0x7F) + 0x7F` stays ≤ `0xFE`, so no carry crosses a byte boundary.
+#[inline(always)]
+fn swar_eq_mask(word: u64, splat: u64) -> u64 {
+    let t = word ^ splat; // 0x00 lanes where the byte matches
+                          // 0x80 per lane iff that lane is non-zero (carry-free), then flip so 0x80
+                          // marks the matching (zero) lanes.
+    let nonzero = ((t & SWAR_LO7).wrapping_add(SWAR_LO7) | t) & SWAR_HI;
+    nonzero ^ SWAR_HI
+}
+
+/// Split an unquoted record into field byte-ranges. Scans 8 bytes at a time
+/// (SWAR), recording every `delim` position; bails to the owned slow path
+/// (returns `false`, leaving `out` partially filled — callers re-split and
+/// ignore it) the moment a `"` appears. Byte-identical to a scalar scan: it
+/// finds the exact same delimiter offsets and the exact same quote condition.
 fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
     out.clear();
     let bytes = line.as_bytes();
-    if bytes.contains(&b'"') {
-        return false;
-    }
+    let n = bytes.len();
+    let dsplat = swar_splat(delim);
+    let qsplat = swar_splat(b'"');
     let mut start = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let word = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        // Any `"` in this word → quoted record, take the slow path.
+        if swar_eq_mask(word, qsplat) != 0 {
+            return false;
+        }
+        let mut m = swar_eq_mask(word, dsplat);
+        while m != 0 {
+            let j = i + (m.trailing_zeros() as usize >> 3);
+            out.push((start, j));
+            start = j + 1;
+            m &= m - 1;
+        }
+        i += 8;
+    }
+    // Scalar tail (< 8 bytes), same predicate as the SWAR body.
+    while i < n {
+        let b = bytes[i];
+        if b == b'"' {
+            return false;
+        }
         if b == delim {
             out.push((start, i));
             start = i + 1;
         }
+        i += 1;
     }
-    out.push((start, bytes.len()));
+    out.push((start, n));
     true
 }
 
@@ -1315,6 +1471,27 @@ mod tests {
     }
 
     #[test]
+    fn strips_utf8_bom_from_header() {
+        // A BOM before the header must not leak into the first column name, and
+        // the first column's data must still parse (here as i64).
+        let data = parse_projected("\u{feff}id,age\n1,30\n2,15\n", None, b',').unwrap();
+        assert_eq!(data.schema.fields[0].name, "id", "BOM leaked into name");
+        assert_eq!(data.schema.fields[1].name, "age");
+        match &data.columns[0] {
+            Column::I64(v) => assert_eq!(v, &[1, 2]),
+            _ => panic!("first column should parse as i64 once the BOM is gone"),
+        }
+    }
+
+    #[test]
+    fn bom_helpers() {
+        assert_eq!(bom_len("\u{feff}x"), 3);
+        assert_eq!(bom_len("x"), 0);
+        assert_eq!(strip_bom("\u{feff}id,age"), "id,age");
+        assert_eq!(strip_bom("id,age"), "id,age");
+    }
+
+    #[test]
     fn skips_malformed_rows() {
         let data = parse_projected("a,b\n1,2\nonly_one_field\n3,4\n", None, b',').unwrap();
         assert_eq!(data.bad_rows, 1);
@@ -1342,5 +1519,83 @@ mod tests {
     fn mixed_column_falls_back_to_str() {
         let data = parse_projected("v\n1\n2\nN/A\n", None, b',').unwrap();
         assert_eq!(data.schema.fields[0].dtype, DataType::Str);
+    }
+
+    // Reference scalar splitter: the byte-by-byte version `split_offsets`
+    // replaced. The SWAR scan must produce identical offsets and the identical
+    // quote-bail decision for every input.
+    fn split_offsets_scalar(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
+        out.clear();
+        let bytes = line.as_bytes();
+        if bytes.contains(&b'"') {
+            return false;
+        }
+        let mut start = 0usize;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == delim {
+                out.push((start, i));
+                start = i + 1;
+            }
+        }
+        out.push((start, bytes.len()));
+        true
+    }
+
+    #[test]
+    fn swar_split_stress_lines() {
+        for i in 0..4000usize {
+            let v = (i as f64 % 200.0) * 0.5 - 50.0;
+            let name = if i % 3 == 0 {
+                String::new()
+            } else {
+                format!("n{i}")
+            };
+            let line = format!("{i},{v},{name}");
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            let ra = split_offsets(&line, &mut a, b',');
+            let rb = split_offsets_scalar(&line, &mut b, b',');
+            assert_eq!(ra, rb, "bail mismatch on {line:?}");
+            if ra {
+                assert_eq!(a, b, "offset mismatch on {line:?} (len {})", line.len());
+            }
+        }
+    }
+
+    #[test]
+    fn swar_split_matches_scalar() {
+        // Cross every word boundary and tail length, with delimiters and quotes
+        // at varied positions, plus empties and runs.
+        let cases = [
+            "",
+            "a",
+            ",",
+            "a,b",
+            "a,b,c",
+            "1,22,333,4444,55555,666666,7777777,88888888,9",
+            ",,,",
+            "abcdefgh,ijklmnop,q",   // 8-byte-aligned fields
+            "abcdefg,hij",           // delim straddling the 8-byte mark
+            "no_delims_here_at_all", // > 8 bytes, zero delims
+            "tab\tsep\there",
+            "has\"quote",
+            "trailing_quote\"",
+            "\"leading_quote",
+            "field1,field2\"x,field3", // quote after some delims → bail
+            "1234567\"",               // quote exactly at the 8th byte (tail)
+            "12345678\"9",             // quote just past a full word
+        ];
+        for case in cases {
+            for &delim in b",\t" {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                let ra = split_offsets(case, &mut a, delim);
+                let rb = split_offsets_scalar(case, &mut b, delim);
+                assert_eq!(ra, rb, "quote-bail mismatch on {case:?} delim={delim}");
+                if ra {
+                    assert_eq!(a, b, "offset mismatch on {case:?} delim={delim}");
+                }
+            }
+        }
     }
 }

@@ -324,6 +324,7 @@ fn to_i64(v: Value) -> i64 {
     match v {
         Value::I64(x) => x,
         Value::F64(x) => x as i64,
+        Value::Dec(d) => d.to_f64() as i64,
         Value::Bool(b) => b as i64,
         Value::Str(s) => s
             .trim()
@@ -339,6 +340,7 @@ fn to_f64(v: Value) -> f64 {
     match v {
         Value::I64(x) => x as f64,
         Value::F64(x) => x,
+        Value::Dec(d) => d.to_f64(),
         Value::Bool(b) => b as i64 as f64,
         Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
         Value::Null => f64::NAN,
@@ -351,6 +353,7 @@ fn to_bool(v: Value) -> bool {
         Value::Bool(b) => b,
         Value::I64(x) => x != 0,
         Value::F64(x) => x != 0.0,
+        Value::Dec(d) => d.unscaled != 0,
         Value::Str(s) => s.trim().eq_ignore_ascii_case("true") || s.trim() == "1",
         Value::Null => false,
     }
@@ -361,10 +364,28 @@ fn cast_value(v: Value, ty: DataType) -> Value {
     match ty {
         DataType::I64 => Value::I64(to_i64(v)),
         DataType::F64 => Value::F64(to_f64(v)),
+        // Cast to decimal at a fixed scale: route through the f64 view and
+        // round-half-even to the target scale (the reader has an exact text
+        // path; this covers computed casts). Design doc 21.
+        DataType::Decimal { scale } => Value::Dec(f64_to_decimal(to_f64(v), scale)),
         DataType::Bool => Value::Bool(to_bool(v)),
         DataType::Str => Value::Str(v.to_string()),
         DataType::Null => Value::Null,
     }
+}
+
+/// Build a `Decimal` at `scale` from an f64 (round-half-even on the last digit).
+fn f64_to_decimal(x: f64, scale: u8) -> rivus_core::Decimal {
+    if !x.is_finite() {
+        return rivus_core::Decimal::new(0, scale);
+    }
+    let mut pow = 1.0f64;
+    for _ in 0..scale {
+        pow *= 10.0;
+    }
+    // `round_ties_even` gives banker's rounding, matching Decimal::rescale.
+    let unscaled = (x * pow).round_ties_even() as i128;
+    rivus_core::Decimal::new(unscaled, scale)
 }
 
 /// Cast a whole column to a target lane (columnar path for computed columns).
@@ -373,6 +394,13 @@ pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
     match ty {
         DataType::I64 => Column::I64((0..n).map(|i| to_i64(col.value_at(i))).collect()),
         DataType::F64 => Column::F64((0..n).map(|i| to_f64(col.value_at(i))).collect()),
+        DataType::Decimal { scale } => {
+            // Build the unscaled i128 lane per cell (design doc 21).
+            let unscaled = (0..n)
+                .map(|i| f64_to_decimal(to_f64(col.value_at(i)), scale).unscaled)
+                .collect();
+            Column::Dec(rivus_core::DecColumn { unscaled, scale })
+        }
         DataType::Bool => Column::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
         DataType::Str => {
             let mut s = StrColumn::with_capacity(n, n * 8);
@@ -492,6 +520,10 @@ fn const_column(v: &Value, n: usize) -> Column {
     match v {
         Value::I64(x) => Column::I64(vec![*x; n]),
         Value::F64(x) => Column::F64(vec![*x; n]),
+        Value::Dec(d) => Column::Dec(rivus_core::DecColumn {
+            unscaled: vec![d.unscaled; n],
+            scale: d.scale,
+        }),
         Value::Bool(x) => Column::Bool(vec![*x; n]),
         Value::Str(s) => {
             let mut c = StrColumn::with_capacity(n, s.len() * n);
@@ -512,6 +544,10 @@ fn num_lane(e: &Expr, chunk: &Chunk) -> (Vec<f64>, bool) {
         Column::I64(v) => (v.iter().map(|&x| x as f64).collect(), true),
         Column::Bool(v) => (v.iter().map(|&x| if x { 1.0 } else { 0.0 }).collect(), true),
         Column::F64(v) => (v, false),
+        Column::Dec(d) => {
+            let pow = 10f64.powi(d.scale as i32);
+            (d.unscaled.iter().map(|&u| u as f64 / pow).collect(), false)
+        }
         Column::Str(s) => {
             let lane = (0..s.len())
                 .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
@@ -690,6 +726,7 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
         Expr::Field { name, .. } => match chunk.column(name)? {
             Column::I64(v) => Some(v[row] as f64),
             Column::F64(v) => Some(v[row]),
+            Column::Dec(d) => Some(d.unscaled[row] as f64 / 10f64.powi(d.scale as i32)),
             Column::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
             Column::Str(_) => None,
         },

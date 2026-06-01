@@ -38,6 +38,32 @@ The maintainer squash-merges and wants near-zero merge effort. So:
   cargo deny check bans sources licenses    # advisories needs network → CI
   ```
 
+## Tool & edit discipline (hard-won; violating this has shipped broken pushes)
+
+Root cause of past breakage: firing many tool calls in one batch — especially
+**dependent** read→edit→build chains in parallel — corrupts the output stream,
+desyncs my view of disk state, and produces edits I *think* landed but didn't.
+That has caused over-claiming commit messages and broken pushes. So:
+
+- **Small batches, verify, then proceed.** One logical step per turn
+  (a few *independent* calls at most). NEVER batch dependent calls
+  (`Read`→`Edit`, `Edit`→`build`, `commit`→`push`) — each needs the prior result.
+- **Trust disk, not memory.** Before editing, `Read` the exact lines; after a
+  surprising result, re-Read rather than assume. A failed `Edit` (string not
+  found) means the change did NOT apply — fix it before moving on, never paper over.
+- **Gate is a numeric checkpoint, not a vibe.** Before every push confirm with
+  counts: clippy `warning/error` count **= 0**, `test result` FAILED **= 0**,
+  zero-dep (`cargo tree -p rivus-cli --edges normal` = rivus-* only). Build must
+  succeed — a build failure makes `cargo test` report `0 passed`, which is NOT green.
+- **Commit messages claim only what's on disk.** If a message says "hardens X",
+  `git show HEAD:path` must contain that change. No aspirational wording.
+- **Recover forward, don't rewrite history.** Force-push is denied here. If a
+  broken commit was pushed, fix on top (or `reset --soft` onto the remote then
+  re-commit) and fast-forward push. Note the supersession in the new message.
+- **GitHub posts are expensive and permanent.** Get hashes/facts right the first
+  time (read them from `git`, don't recall them); avoid bursts of corrective
+  comments. One accurate comment beats three retractions.
+
 ## Benchmarking discipline
 
 - Target the three regimes explicitly: **large**, **error-heavy**, **mixed-type**
@@ -81,12 +107,28 @@ Concretely:
   error stream. No panics on bad input.
 - **Chunk-native & chunk-size independent:** results must not depend on
   `chunk_size` (stress-tested).
+- **Byte-identical across execution strategies:** serial vs parallel vs any
+  backend must produce the *same bytes*. Floating-point is the trap — f64
+  addition is **non-associative**, so a parallel partition-then-merge `sum`/
+  `avg`/`std` drifts by a ULP and is NOT byte-identical (measured; #41). Exact
+  reductions (`min`/`max`/`count`/`first`/`last`/`percentile`) and **integer /
+  decimal** lanes *are* associative and safe to parallelize. Exact money math is
+  the opt-in **decimal lane** (i128 scaled integer, `docs/design/21`): `--exact`
+  / `:decimal`. Never silently relax byte-identity for f64 — keep it serial or
+  route through decimal.
 
 ## Roadmap (staged: MVP → optimize → JIT → distributed)
 
-Live backlog with measured status is in `docs/BENCHMARKS.md`. Current focus:
-operator fusion → projection pushdown → vectorized/SIMD predicate kernels →
-Arrow-backed columns → parallel scheduler. Then JIT (Cranelift), then distributed.
+Live backlog with measured status is in `docs/BENCHMARKS.md` and
+`docs/ROADMAP.md`. **Read `docs/HANDOVER.md` for the current cross-session
+context** (what's landed, the open #41 question, measured findings, next levers).
+
+Measured current focus (the 1 GB profile points here): **SIMD CSV scan + faster
+field parse** (parse is ~75% of wall, not inference) → buffered output → the
+opt-in **decimal lane** at the reader (unblocks byte-identical parallel
+group-by, #41) → datetime lane / list-agg / pivot (`docs/design/23`). Heavy
+optional backends (Arrow, Cranelift JIT, GPU `docs/design/22`) stay
+feature-gated behind the operator/eval boundary with a CPU fallback.
 
 ## Repo map
 

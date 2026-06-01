@@ -14,9 +14,10 @@
 //!   --chunk-size <N>          rows per chunk emitted by sources (default 4096)
 //!   --no-opt                  disable the IR optimizer (run/explain)
 
+mod serve;
 mod viz;
 
-use rivus_runtime::{gendata, run, RunOptions};
+use rivus_runtime::{gendata, run, run_with_progress, MemoryPref, RunOptions, RuntimeSnapshot};
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
@@ -52,6 +53,13 @@ fn main() -> ExitCode {
     let mut optimize = true;
     let mut telemetry_json = false;
     let mut telemetry_addr: Option<String> = None;
+    // `--serve [ADDR]`: launch the live HTTP/SSE dashboard (Pillar B). The
+    // optional address defaults to an ephemeral loopback port.
+    let mut serve_addr: Option<String> = None;
+    // `--tui`: repaint a live ANSI dashboard on stderr as the run streams.
+    let mut tui = false;
+    // `--memory low|auto|fast` (Pillar C): reader memory/speed strategy.
+    let mut memory = MemoryPref::default();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -84,6 +92,30 @@ fn main() -> ExitCode {
                         return ExitCode::from(2);
                     }
                 }
+            }
+            // Live dashboard: `--serve` (ephemeral loopback port) or
+            // `--serve HOST:PORT`. The next arg is the address only if it isn't
+            // another flag.
+            "--tui" => tui = true,
+            "--memory" => {
+                i += 1;
+                match args.get(i).and_then(|s| MemoryPref::parse(s)) {
+                    Some(m) => memory = m,
+                    None => {
+                        eprintln!("error: --memory expects low|auto|fast");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--serve" => {
+                let addr = match args.get(i + 1) {
+                    Some(a) if !a.starts_with("--") => {
+                        i += 1;
+                        a.clone()
+                    }
+                    _ => "127.0.0.1:0".to_string(),
+                };
+                serve_addr = Some(addr);
             }
             "--chunk-size" => {
                 i += 1;
@@ -205,6 +237,15 @@ fn main() -> ExitCode {
                 eprint!("{}", viz::render_opt_report(&report));
                 eprintln!();
             }
+            // Live dashboard: run the flow on a worker thread that publishes
+            // snapshots to a Hub, and serve the embedded HTML/SSE UI here.
+            if let Some(addr) = &serve_addr {
+                return run_served(&graph, addr, chunk_size, memory);
+            }
+            // `--tui`: repaint a live ANSI frame on stderr each tick.
+            if tui {
+                return run_tui(&graph, chunk_size, memory);
+            }
             // Live progress only when stderr is a terminal (keep logs/pipes
             // clean) and not in JSONL mode.
             let progress = !telemetry_json && std::io::stderr().is_terminal();
@@ -217,6 +258,7 @@ fn main() -> ExitCode {
                     chunk_size,
                     progress,
                     max_capture: Some(1000),
+                    memory,
                 },
             ) {
                 Ok(res) => {
@@ -266,6 +308,105 @@ fn send_telemetry(addr: &str, jsonl: &str) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(addr)?;
     stream.write_all(jsonl.as_bytes())?;
     stream.flush()
+}
+
+/// `rivus run … --serve [ADDR]`: run the flow on a worker thread that publishes
+/// live snapshots to a [`serve::Hub`], while this thread serves the embedded
+/// HTML/SSE dashboard. Falls back to a plain run if the address can't be bound.
+fn run_served(
+    graph: &rivus_ir::PlanGraph,
+    addr: &str,
+    chunk_size: usize,
+    memory: MemoryPref,
+) -> ExitCode {
+    let (listener, local) = match serve::bind(addr) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("warning: --serve cannot bind '{addr}' ({e}); running without the dashboard");
+            return match run(
+                graph,
+                RunOptions {
+                    chunk_size,
+                    progress: false,
+                    max_capture: Some(1000),
+                    memory,
+                },
+            ) {
+                Ok(res) if res.final_mode == rivus_core::Mode::Halted => ExitCode::FAILURE,
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("runtime error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    };
+    eprintln!("\u{2550}\u{2550} Rivus live \u{2550}\u{2550}  dashboard: http://{local}/  (Ctrl-C to stop)");
+
+    let hub = serve::Hub::new();
+    let worker_hub = std::sync::Arc::clone(&hub);
+    // Clone the graph for the worker thread (PlanGraph: Clone).
+    let g = graph.clone();
+    let worker = std::thread::spawn(move || {
+        let mut hook = |s: &RuntimeSnapshot| worker_hub.publish(viz::render_snapshot_json(s));
+        let res = run_with_progress(
+            &g,
+            RunOptions {
+                chunk_size,
+                progress: false,
+                max_capture: Some(1000),
+                memory,
+            },
+            Some(&mut hook),
+        );
+        worker_hub.finish();
+        res.map(|r| r.final_mode)
+            .unwrap_or(rivus_core::Mode::Halted)
+    });
+
+    // Serve the dashboard on this thread until the run finishes.
+    serve::serve(listener, hub);
+    match worker.join() {
+        Ok(rivus_core::Mode::Halted) => ExitCode::FAILURE,
+        Ok(_) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+/// `rivus run … --tui`: repaint a live ANSI dashboard frame on stderr each tick
+/// (Pillar B, B1). Uses the same progress hook as `--serve`; the run stays on
+/// the serial path so frames are coherent.
+fn run_tui(graph: &rivus_ir::PlanGraph, chunk_size: usize, memory: MemoryPref) -> ExitCode {
+    use std::io::Write as _;
+    let to_tty = std::io::stderr().is_terminal();
+    let mut hook = |s: &RuntimeSnapshot| {
+        let frame = viz::render_snapshot_frame(s);
+        let mut err = std::io::stderr().lock();
+        if to_tty {
+            // Clear screen + home cursor, then paint the frame.
+            let _ = write!(err, "\x1b[2J\x1b[H{frame}");
+        } else {
+            let _ = writeln!(err, "{frame}");
+        }
+        let _ = err.flush();
+    };
+    match run_with_progress(
+        graph,
+        RunOptions {
+            chunk_size,
+            progress: false,
+            max_capture: Some(1000),
+            memory,
+        },
+        Some(&mut hook),
+    ) {
+        Ok(res) if res.final_mode == rivus_core::Mode::Halted => ExitCode::FAILURE,
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("runtime error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `rivus gen <shape> [--rows N] [--seed S] [--ratio R]` — write deterministic,
@@ -355,7 +496,7 @@ fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
-         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--json|--telemetry-addr HOST:PORT]  run a flow\n\
+         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--memory low|auto|fast] [--json|--telemetry-addr HOST:PORT|--tui|--serve [ADDR]]  run a flow\n\
          \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
          \x20 rivus check   <program>                                parse only\n\
          \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\

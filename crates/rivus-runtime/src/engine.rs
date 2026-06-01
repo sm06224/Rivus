@@ -12,8 +12,8 @@
 //! accumulates on the error stream and the flow keeps running.
 
 use crate::operators::{self, OpCtx, Operator};
-use crate::telemetry::NodeTelemetry;
-use rivus_core::{Chunk, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
+use crate::telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
+use rivus_core::{Chunk, DataType, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
 use rivus_ir::{HookAction, HookEvent, NodeId, Op, PlanGraph};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -30,6 +30,11 @@ pub struct RunOptions {
     /// `open big.csv` previews instantly in bounded memory instead of
     /// materializing the whole file. A file sink (`save`) always drains in full.
     pub max_capture: Option<usize>,
+    /// Execution-strategy preference (Pillar C). `Auto` (default) autotunes
+    /// serial-vs-parallel from CPU count + input size; `Low` forces the
+    /// single-thread bounded reader; `Fast` prefers the byte-range parallel
+    /// reader more aggressively. All produce byte-identical results.
+    pub memory: crate::analytics::MemoryPref,
 }
 
 impl Default for RunOptions {
@@ -38,6 +43,7 @@ impl Default for RunOptions {
             chunk_size: 4096,
             progress: false,
             max_capture: None,
+            memory: crate::analytics::MemoryPref::Auto,
         }
     }
 }
@@ -56,6 +62,19 @@ pub struct RunResult {
     pub errors: Vec<ErrorEvent>,
     pub final_mode: Mode,
     pub outputs: Vec<Output>,
+    /// Per-worker breakdown for a parallel run (empty on the serial path). Lets
+    /// callers see parallel skew that the node-aggregate `telemetry` hides.
+    pub workers: Vec<WorkerTelemetry>,
+    /// Wall time from run start to the first chunk a source produced — the
+    /// "time to first row". `None` if no row was ever produced.
+    pub first_row_latency: Option<Duration>,
+    /// Per-column type-inference outcomes `(name, type, widened)` from CSV
+    /// sources that inferred a schema (A4 telemetry). Empty for declared/sample
+    /// schemas and non-CSV sources.
+    pub inference: Vec<(String, DataType, bool)>,
+    /// The autotuner's chosen-strategy rationale (Pillar C): serial-vs-parallel
+    /// and why. `None` when there is no file source to decide on.
+    pub strategy: Option<String>,
 }
 
 impl RunResult {
@@ -67,19 +86,103 @@ impl RunResult {
     }
 }
 
+/// A live-progress subscriber: called with a [`RuntimeSnapshot`] periodically as
+/// a (serial) run streams. The base for live TUI / HTTP dashboards (Pillar B).
+/// `None` everywhere is the default and costs nothing (no snapshot is built).
+pub type ProgressHook<'a> = &'a mut dyn FnMut(&RuntimeSnapshot);
+
 pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError> {
+    run_with_progress(graph, opts, None)
+}
+
+/// Like [`run`], but with an optional live-progress hook (Observability §14.4 /
+/// Epic #30 A5). The hook fires on the serial path only — the parallel path runs
+/// workers silently and reports per-worker telemetry in the final `RunResult`.
+pub fn run_with_progress(
+    graph: &PlanGraph,
+    opts: RunOptions,
+    hook: Option<ProgressHook>,
+) -> Result<RunResult, RivusError> {
     if graph.topo_order().is_none() {
         return Err(RivusError::Build("flow graph contains a cycle".into()));
     }
-    // Data-parallel fast path for stateless, single-source flows; else serial.
-    if let Some(res) = try_parallel(graph, &opts) {
+    // Pillar C autotuner: decide serial-vs-parallel from the host probe + input
+    // size, and surface the rationale (Observability §13). The decision is
+    // *measured* — the byte-range parallel reader is both faster and
+    // bounded-memory (see `analytics`), so `Auto`/`Fast` attempt it and `Low`
+    // forces single-thread. A live hook always forces serial (coherent stream).
+    let env = crate::analytics::Analytics::probe();
+    let src_size = single_file_source_size(graph);
+    let min_parallel = parallel_min_bytes_for(opts.memory);
+    let (strat, note) =
+        crate::analytics::choose_strategy(opts.memory, &env, src_size, min_parallel);
+    // Only a real file source has a strategy worth reporting.
+    let has_file_source = single_file_source(graph).is_some();
+    // Sink-less, non-blocking flows with a capture cap are previews: let the
+    // CSV source sample-infer its schema so it starts instantly (and never
+    // materialize for the parallel path).
+    let preview = opts.max_capture.is_some() && !must_drain(graph);
+
+    if hook.is_none() && strat == crate::analytics::Strategy::Parallel {
+        if let Some(mut res) = try_parallel(graph, &opts, min_parallel) {
+            res.strategy = has_file_source.then(|| note.clone());
+            return Ok(res);
+        }
+        // Parallel was chosen but didn't run: a preview (latency-first, stays
+        // serial) or a non-partitionable flow (stateful op, multiple sources).
+        let ops = build_ops(graph, &opts, None, preview);
+        let mut res = drive(graph, ops, 0, opts.progress, opts.max_capture, hook);
+        let why = if preview {
+            "preview → serial"
+        } else {
+            "not partitionable → serial"
+        };
+        res.strategy = has_file_source.then(|| format!("{note}; {why}"));
         return Ok(res);
     }
-    // Sink-less, non-blocking flows with a capture cap are previews: let the
-    // CSV source sample-infer its schema so it starts instantly.
-    let preview = opts.max_capture.is_some() && !must_drain(graph);
+    // A live hook (TUI / --serve) forces this serial path so the dashboard sees
+    // a single coherent stream. If the autotuner would otherwise have gone
+    // parallel, say so in the rationale rather than mislabel the run "parallel".
+    let live = hook.is_some();
     let ops = build_ops(graph, &opts, None, preview);
-    Ok(drive(graph, ops, 0, opts.progress, opts.max_capture))
+    let mut res = drive(graph, ops, 0, opts.progress, opts.max_capture, hook);
+    res.strategy = has_file_source.then(|| {
+        if live && strat == crate::analytics::Strategy::Parallel {
+            format!("{note}; live observation → serial")
+        } else {
+            note.clone()
+        }
+    });
+    Ok(res)
+}
+
+/// Build a cheap point-in-time [`RuntimeSnapshot`] from the live node telemetry.
+/// O(nodes); only called when a progress hook is attached.
+fn build_snapshot(
+    elapsed: Duration,
+    rows_seen: u64,
+    mode: Mode,
+    telemetry: &[NodeTelemetry],
+) -> RuntimeSnapshot {
+    let nodes = telemetry
+        .iter()
+        .map(|t| NodeSnapshot {
+            node_id: t.node_id,
+            label: t.label.clone(),
+            kind: t.kind.clone(),
+            rows_in: t.rows_in,
+            rows_out: t.rows_out,
+            errors: t.errors,
+            mode: t.mode,
+            finished: t.finished,
+        })
+        .collect();
+    RuntimeSnapshot {
+        elapsed,
+        rows_seen,
+        mode,
+        nodes,
+    }
 }
 
 /// A flow that must read all input to be correct: a file sink (writes every
@@ -153,15 +256,22 @@ fn build_ops(
 
 /// Drive the DAG to completion with a pre-built operator set (the chunk-granular
 /// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
+#[allow(clippy::too_many_arguments)]
 fn drive(
     graph: &PlanGraph,
     mut ops: Vec<Box<dyn Operator>>,
     chunk_id_base: u64,
     progress: bool,
     max_capture: Option<usize>,
+    mut hook: Option<ProgressHook>,
 ) -> RunResult {
+    // (hook is mutated in place via as_mut() to publish snapshots)
     let n = graph.nodes.len();
     let topo = graph.topo_order().expect("acyclic (checked by caller)");
+    // Publish a live snapshot every `SNAPSHOT_EVERY` source chunks when a hook
+    // is attached (cheap, O(nodes), and only when subscribed).
+    const SNAPSHOT_EVERY: u64 = 8;
+    let mut chunks_pulled: u64 = 0;
 
     // Only a sink-less, non-blocking flow may stop the source early on a cap.
     let must_drain = must_drain(graph);
@@ -190,6 +300,10 @@ fn drive(
     let mut rows_seen: u64 = 0;
     let mut total_captured: usize = 0;
     let mut truncated = false;
+    // Time-to-first-row: wall from the start of the drive loop to the first
+    // chunk any source produces. Pure accounting (does not affect results).
+    let run_start = Instant::now();
+    let mut first_row_latency: Option<Duration> = None;
 
     let mut active = true;
     while active && !fatal {
@@ -221,9 +335,24 @@ fn drive(
                     };
                     match ops[nid].pull(&mut ctx) {
                         Some(chunk) => {
+                            if first_row_latency.is_none() && chunk.len > 0 {
+                                first_row_latency = Some(run_start.elapsed());
+                            }
                             rows_seen += chunk.len as u64;
                             produced.push(chunk);
                             prog.tick(rows_seen);
+                            // A5: publish a periodic live snapshot to a subscriber.
+                            chunks_pulled += 1;
+                            if let Some(h) = hook.as_mut() {
+                                if chunks_pulled.is_multiple_of(SNAPSHOT_EVERY) {
+                                    h(&build_snapshot(
+                                        run_start.elapsed(),
+                                        rows_seen,
+                                        mode,
+                                        &telemetry,
+                                    ));
+                                }
+                            }
                         }
                         None => finished_now = true,
                     }
@@ -293,6 +422,21 @@ fn drive(
 
     prog.finish(rows_seen);
 
+    // A4: gather per-column inference outcomes from any source that inferred a
+    // schema (telemetry; empty otherwise). Cheap, runs once at the end.
+    let inference: Vec<(String, DataType, bool)> =
+        ops.iter().flat_map(|op| op.inference()).collect();
+
+    // A5: a final snapshot so a subscriber always observes the terminal state.
+    if let Some(h) = hook.as_mut() {
+        h(&build_snapshot(
+            run_start.elapsed(),
+            rows_seen,
+            mode,
+            &telemetry,
+        ));
+    }
+
     if truncated {
         if let Some(cap) = max_capture {
             errors.push(ErrorEvent::new(
@@ -320,6 +464,12 @@ fn drive(
         errors,
         final_mode: mode,
         outputs,
+        workers: Vec::new(),
+        first_row_latency,
+        inference,
+        // The autotuner's rationale is set by `run_with_progress` (it owns the
+        // serial-vs-parallel decision); drive itself doesn't decide.
+        strategy: None,
     }
 }
 
@@ -407,23 +557,26 @@ fn try_streaming_parallel(
     path: &str,
     threads: usize,
 ) -> Option<RunResult> {
-    let (projection, prefilter, header, declared, delim) = match &graph.nodes[src_id].op {
-        Op::OpenCsv {
-            projection,
-            prefilter,
-            header,
-            declared,
-            delim,
-            ..
-        } => (
-            projection.clone(),
-            prefilter.clone(),
-            *header,
-            declared.clone(),
-            *delim,
-        ),
-        _ => return None, // only CSV has a streaming-parallel plan for now
-    };
+    let (projection, prefilter, str_prefilter, header, declared, delim) =
+        match &graph.nodes[src_id].op {
+            Op::OpenCsv {
+                projection,
+                prefilter,
+                str_prefilter,
+                header,
+                declared,
+                delim,
+                ..
+            } => (
+                projection.clone(),
+                prefilter.clone(),
+                str_prefilter.clone(),
+                *header,
+                declared.clone(),
+                *delim,
+            ),
+            _ => return None, // only CSV has a streaming-parallel plan for now
+        };
 
     // Each worker streams its byte range to a per-worker *part file* (bounded
     // memory — no output buffering), then the parts are concatenated in source
@@ -451,11 +604,13 @@ fn try_streaming_parallel(
         ranges,
         bad_rows,
         prefilter: pre,
+        str_prefilter: str_pre,
     } = crate::csv::plan_parallel(
         path,
         projection.as_deref(),
         threads,
         &prefilter,
+        &str_prefilter,
         header,
         declared.as_deref(),
         delim,
@@ -475,6 +630,7 @@ fn try_streaming_parallel(
         let dtypes = &dtypes;
         let keep = &keep;
         let pre = &pre;
+        let str_pre = &str_pre;
         let handles: Vec<_> = ranges
             .iter()
             .enumerate()
@@ -490,6 +646,7 @@ fn try_streaming_parallel(
                         b,
                         opts.chunk_size,
                         pre.clone(),
+                        str_pre.clone(),
                         delim,
                     ));
                     let ops: Vec<Box<dyn Operator>> = graph
@@ -517,7 +674,7 @@ fn try_streaming_parallel(
                             }
                         })
                         .collect();
-                    drive(graph, ops, (i as u64) << 40, false, None)
+                    drive(graph, ops, (i as u64) << 40, false, None, None)
                 })
             })
             .collect();
@@ -652,12 +809,53 @@ fn parallel_min_bytes() -> u64 {
         .unwrap_or(8 * 1024 * 1024)
 }
 
+/// The byte-range threshold the autotuner uses for a given preference. `Low`
+/// never parallelizes (`u64::MAX`); `Auto` uses [`parallel_min_bytes`]; `Fast`
+/// is more aggressive (1 MiB, still env-overridable to a smaller floor).
+fn parallel_min_bytes_for(pref: crate::analytics::MemoryPref) -> u64 {
+    use crate::analytics::MemoryPref::*;
+    match pref {
+        Low => u64::MAX,
+        Auto => parallel_min_bytes(),
+        Fast => parallel_min_bytes().min(1024 * 1024),
+    }
+}
+
+/// The single file-source node id, if the flow has exactly one and it's a real
+/// file (not stdin `-`). Used to decide whether a strategy is worth reporting.
+fn single_file_source(graph: &PlanGraph) -> Option<NodeId> {
+    let mut found: Option<NodeId> = None;
+    for node in &graph.nodes {
+        if matches!(
+            node.op,
+            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. }
+        ) {
+            if found.is_some() {
+                return None; // multiple sources
+            }
+            found = Some(node.id);
+        }
+    }
+    let id = found?;
+    match source_path(&graph.nodes[id].op) {
+        Some(p) if p != "-" => Some(id),
+        _ => None,
+    }
+}
+
+/// On-disk size of the single file source, for the autotuner's size threshold.
+fn single_file_source_size(graph: &PlanGraph) -> Option<u64> {
+    let id = single_file_source(graph)?;
+    let path = source_path(&graph.nodes[id].op)?;
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
 /// Attempt data-parallel execution. Eligible flows have exactly one file source
 /// and no stateful operators (group/join/stream). The source is parsed once
 /// (its parse is already internally parallel), then contiguous chunk partitions
 /// are run through identical stateless sub-DAGs on worker threads and merged in
 /// source order. Returns `None` (→ serial) when ineligible or too small.
-fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
+fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<RunResult> {
     let threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1);
@@ -722,8 +920,9 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
 
     // The chunk-partition path materializes the whole input to split it. For a
     // large file, stream it in parallel instead (byte ranges, no buffering);
-    // non-CSV large sources fall back to the serial streaming reader.
-    let min_bytes = parallel_min_bytes();
+    // non-CSV large sources fall back to the serial streaming reader. The
+    // threshold is the autotuner's (`min_bytes`), so the decision and the reader
+    // agree exactly.
     if let Some(path) = source_path(&graph.nodes[src_id].op) {
         if path != "-" {
             if let Ok(meta) = std::fs::metadata(path) {
@@ -759,7 +958,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
             Some((src_id, operators::mem_source(all))),
             false,
         );
-        let mut res = drive(graph, ops, 0, false, None);
+        let mut res = drive(graph, ops, 0, false, None, None);
         // Write any collected sink (build_ops made it a collector).
         flush_parallel_sinks(graph, &mut res);
         res.errors.splice(0..0, src_errors);
@@ -779,7 +978,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions) -> Option<RunResult> {
                 scope.spawn(move || {
                     let src = operators::mem_source(chunks);
                     let ops = build_ops(graph, opts, Some((src_id, src)), false);
-                    drive(graph, ops, (i as u64) << 40, false, None)
+                    drive(graph, ops, (i as u64) << 40, false, None, None)
                 })
             })
             .collect();
@@ -847,11 +1046,41 @@ fn merge_results(
     let mut errors: Vec<ErrorEvent> = src_errors;
     let mut mode = Mode::Normal;
     let mut by_node: BTreeMap<NodeId, Vec<Chunk>> = BTreeMap::new();
+    // Per-worker breakdown (one entry per input RunResult, in source order).
+    let mut workers: Vec<WorkerTelemetry> = Vec::with_capacity(results.len());
+    // Earliest first-row across workers (they run concurrently).
+    let mut first_row_latency: Option<Duration> = None;
 
-    for res in results {
+    for (worker, res) in results.into_iter().enumerate() {
+        if let Some(l) = res.first_row_latency {
+            first_row_latency = Some(first_row_latency.map_or(l, |cur| cur.min(l)));
+        }
         if mode_rank(res.final_mode) > mode_rank(mode) {
             mode = res.final_mode;
         }
+        // This worker's contribution: the rows that reached its sink/leaf nodes
+        // (a sink's `rows_in`), plus any rows captured as un-sinked output.
+        // Captured before the per-node sums fold it away. In the streaming-
+        // parallel path the sink is a collector writing a part file, so its
+        // `rows_in` is the right "rows this worker produced".
+        let mut w_rows: u64 = 0;
+        for (i, t) in res.telemetry.iter().enumerate() {
+            if matches!(
+                graph.nodes[i].op,
+                Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. } | Op::SinkPrint
+            ) {
+                w_rows += t.rows_in;
+            }
+        }
+        for o in &res.outputs {
+            w_rows += o.chunks.iter().map(|c| c.len as u64).sum::<u64>();
+        }
+        let w_busy = res.telemetry.iter().map(|t| t.busy).sum();
+        workers.push(WorkerTelemetry {
+            worker,
+            rows_out: w_rows,
+            busy: w_busy,
+        });
         errors.extend(res.errors);
         for (i, t) in res.telemetry.into_iter().enumerate() {
             telemetry[i].chunks_in += t.chunks_in;
@@ -900,6 +1129,14 @@ fn merge_results(
         errors,
         final_mode: mode,
         outputs,
+        workers,
+        first_row_latency,
+        // Per-worker byte-range readers infer globally; the merged view doesn't
+        // surface their inference (empty — telemetry, not a contract).
+        inference: Vec::new(),
+        // `run_with_progress` stamps the parallel rationale onto the returned
+        // result; merge_results itself doesn't decide.
+        strategy: None,
     }
 }
 
@@ -1020,7 +1257,7 @@ mod tests {
         ))
         .unwrap();
         let ops = build_ops(&gs, &opts, None, false);
-        let _ = drive(&gs, ops, 0, false, None);
+        let _ = drive(&gs, ops, 0, false, None, None);
 
         // Forced streaming-parallel over 4 byte ranges → ordered part-file concat.
         let gp = rivus_parser::parse(&format!(

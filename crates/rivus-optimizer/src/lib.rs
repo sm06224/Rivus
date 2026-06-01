@@ -11,7 +11,8 @@
 //!
 //! Rules are added incrementally (design doc 08). The first is `dedup_sources`.
 
-use rivus_ir::{CmpOp, Edge, EdgeKind, Expr, Node, NodeId, Op, PlanGraph};
+use rivus_core::Value;
+use rivus_ir::{CmpOp, Edge, EdgeKind, Expr, Func, Node, NodeId, Op, PlanGraph};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -51,10 +52,116 @@ pub fn optimize(graph: PlanGraph) -> (PlanGraph, OptReport) {
     let graph = fuse_linear(graph, &mut report);
     let graph = project_pushdown(graph, &mut report);
     let graph = filter_pushdown(graph, &mut report);
+    let graph = string_prefilter(graph, &mut report);
     (graph, report)
 }
 
-/// **Filter pushdown.** Annotate a CSV source with the simple numeric
+/// **String prefilter pushdown.** Annotate a CSV source with required literal
+/// substrings drawn from its single `FilterProject` consumer's predicates
+/// (`contains(field,"S")`, `field == "S"`, `starts_with`/`ends_with`, and the
+/// literal run of a `like` pattern). The reader then skips any raw line that
+/// lacks the substring *before* splitting it — a ripgrep-style byte pre-scan.
+///
+/// Safety: this is a **superset** filter (a line containing the substring may
+/// still fail the real predicate; a line lacking it can never pass), and the
+/// `FilterProject` downstream re-checks every surviving row — so the result is
+/// unchanged. Only top-level `and` conjuncts contribute (never under `or`).
+fn string_prefilter(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
+    let mut pushed = 0usize;
+    for sid in 0..graph.nodes.len() {
+        if !matches!(
+            &graph.nodes[sid].op,
+            Op::OpenCsv { str_prefilter, .. } if str_prefilter.is_empty()
+        ) {
+            continue;
+        }
+        let consumers = graph.outputs_of(sid);
+        if consumers.len() != 1 {
+            continue;
+        }
+        let preds = match &graph.nodes[consumers[0]].op {
+            Op::FilterProject { preds, .. } => preds.clone(),
+            _ => continue,
+        };
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        for p in &preds {
+            collect_conjuncts(p, &mut conjuncts);
+        }
+        let needles: Vec<String> = conjuncts
+            .into_iter()
+            .filter_map(literal_substring_atom)
+            .filter(|s| prescan_safe(s))
+            .collect();
+        if needles.is_empty() {
+            continue;
+        }
+        if let Op::OpenCsv { str_prefilter, .. } = &mut graph.nodes[sid].op {
+            *str_prefilter = needles;
+            pushed += 1;
+        }
+    }
+    if pushed > 0 {
+        report.applied.push(format!(
+            "string_prefilter: literal-substring pre-scan on {pushed} source read(s)"
+        ));
+    }
+    graph
+}
+
+/// Extract a required literal substring from a predicate, if one is implied:
+/// `contains(f,"S")`, `f == "S"`, `starts_with(f,"S")`, `ends_with(f,"S")`, or
+/// the leading literal run of `like(f,"S%…")`. `None` when no substring is
+/// guaranteed to appear in a matching line (e.g. `!=`, `or`, numeric, regex).
+fn literal_substring_atom(e: &Expr) -> Option<String> {
+    // `field == "literal"` — the whole literal must appear in the line.
+    if let Expr::Compare {
+        left,
+        op: CmpOp::Eq,
+        right,
+    } = e
+    {
+        if let (Expr::Field { .. }, Expr::Literal(Value::Str(s))) = (left.as_ref(), right.as_ref())
+        {
+            return Some(s.clone());
+        }
+        if let (Expr::Literal(Value::Str(s)), Expr::Field { .. }) = (left.as_ref(), right.as_ref())
+        {
+            return Some(s.clone());
+        }
+    }
+    // String functions whose match requires a literal substring to be present.
+    if let Expr::Func { func, args } = e {
+        let lit = match args.get(1) {
+            Some(Expr::Literal(Value::Str(s))) => s.as_str(),
+            _ => return None,
+        };
+        return match func {
+            Func::Contains | Func::StartsWith | Func::EndsWith => Some(lit.to_string()),
+            // `like` with a leading literal run (`"abc%…"` / `"abc_…"`): the run
+            // up to the first wildcard must appear. No leading run → no needle.
+            Func::Like => {
+                let run: String = lit.chars().take_while(|&c| c != '%' && c != '_').collect();
+                (!run.is_empty()).then_some(run)
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Whether a literal needle is safe for the reader's **raw-line** byte pre-scan
+/// (issue #37). The pre-scan runs `line.contains(needle)` on the un-decoded CSV
+/// bytes, but a logical field value is stored quote-escaped: an embedded `"` is
+/// written `""`, and `\n`/`\r` inside a quoted field span multiple raw lines.
+/// So a needle containing any of those could fail to match a row that the real
+/// predicate accepts — a **false negative** that would break the superset
+/// guarantee. We simply decline to push such needles; `FilterProject` still
+/// checks every row, so the result stays correct (we only forgo the speedup).
+/// The delimiter itself is safe: a value containing it is quoted, so the needle
+/// still appears verbatim in the raw bytes.
+fn prescan_safe(needle: &str) -> bool {
+    !needle.is_empty() && !needle.contains(['"', '\n', '\r'])
+}
 /// `field <cmp> number` predicates of its single `FilterProject` consumer, so
 /// the reader can skip *building* rows that are definitely out. Conservative
 /// and additive: the `FilterProject` is left untouched (it re-checks every

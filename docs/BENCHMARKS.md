@@ -388,23 +388,50 @@ the `name` column for the ~half of rows the predicate drops (4.1 s → 3.0 s).
 The downstream FilterProject stays authoritative, so output is byte-identical
 (gated by `tests/optimizer_equiv.rs`).
 
-### Negative result — SWAR delimiter scan (not landed)
+### SWAR delimiter scan — landed (overturns the earlier negative result)
 
-Tried replacing the per-byte delimiter loop in `split_offsets` with a
-dependency-free SWAR (SIMD-within-a-register) word-at-a-time scan (8 bytes/step,
-the `(x-0x01..)&!x&0x80..` zero-byte trick, no `unsafe`). Measured on a 92 MiB /
-3 M-row CSV (`filter age>=50`, project `name age`, write), release, 3 runs each:
+`split_offsets` now scans 8 bytes at a time with a dependency-free SWAR
+(SIMD-within-a-register) word loop — `core::arch`-free, `unsafe`-free, host-endian
+independent — fusing the `"`-detection and `,`-location that the scalar path did
+as two separate passes over each line.
 
-| scan | time |
-|---|---:|
-| scalar byte loop | 1.13 s |
-| SWAR 8-byte | 1.14 s |
+**Why the earlier "no win" was wrong (two reasons).**
 
-**No measurable win** — IO and typed column-building dominate this path, not the
-delimiter split. Per the project rule ("'faster' is never asserted without a
-measured number"), the change was dropped rather than add a hand-rolled bit
-trick for nothing. Revisit only if a future profile shows the split as hot
-(e.g. after mmap + buffer-reuse remove the IO/alloc overhead).
+1. *Measurement methodology.* The earlier note measured **end-to-end wall** on a
+   `filter+project+write` path (1.13 vs 1.14 s) where IO + column-build + write are
+   fixed costs that dilute the parse node, and the runs were **not interleaved**, so
+   machine noise (±0.05 s) swamped the signal. Measuring the **`open` node `busy_ms`
+   in interleaved base/SWAR pairs** isolates the parse and exposes a clear win.
+2. *A real bug in the naive mask.* The classic `(x-0x01..)&!x&0x80..` zero-byte
+   trick is only reliable as a **boolean** ("any match?"). Its per-byte high bits
+   are corrupted by subtraction **borrows** — a zero (matching) lane followed by a
+   `0x01` lane false-positives — so using it to **locate** delimiters mis-splits some
+   records (e.g. `1,-49.5,n1`). Caught by a 4000-line parity test
+   (`swar_split_stress_lines`) that the stress suite's chunk-size oracle also flags.
+   The landed version uses a **carry-free** exact mask: `(b & 0x7F) + 0x7F` stays
+   ≤ `0xFE`, so no carry crosses a byte boundary — per-lane exact, location-safe.
+
+**Result (5 M rows / 171 MiB, release, interleaved base/SWAR pairs, `open` node
+`busy_ms`):**
+
+| workload (serial) | scalar `open` | SWAR `open` | speedup |
+|---|---:|---:|---:|
+| `open … save` (all rows built) | ~2120 ms | ~1903 ms | **~10 %** |
+| `open … |? age>=50 |> name age save` | ~1417 ms | ~1168 ms | **~17 %** |
+
+| default parallel (4 cpu) | scalar | SWAR | speedup |
+|---|---:|---:|---:|
+| `open … save`, `open` node `busy_ms` | ~1069 ms | ~1017 ms | **~5 %** |
+| `open … save`, end-to-end wall | ~2.15 s | ~1.91 s | **~11 %** |
+
+Every interleaved pair showed SWAR faster (no overlap). **Byte-identical** output
+confirmed by md5 on both workloads (`b45986b8…`, `a19f4f2e…`) and by the full
+equivalence/stress suites; zero third-party deps unchanged. The win is larger when
+the split is a larger fraction of the parse (the filter path skips building dropped
+rows, so the per-line scan dominates more). Next field-scan lever: faster int/float
+parse — measured to be cheap here (building 2 vs 6 columns barely moved the time, so
+the **scan**, not the per-cell parse, was the cost), so it is *not* pursued without a
+profile that shows parse as hot.
 
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
@@ -515,8 +542,9 @@ Read-throughput levers, by remaining impact:
    done. Mid-size files (8–256 MiB) now take the streaming-parallel reader
    instead of the slower in-memory path. `RIVUS_PARALLEL_MIN_BYTES`-overridable
    (default 8 MiB); `RIVUS_NO_PARALLEL=1` forces serial.
-3. 📋 **Single-pass inference** (sample + adaptive widen) to drop the second
-   scan — the largest remaining single-thread gap.
+3. ❌ **Single-pass retain-buffer reader** — *evaluated and dropped*: measured
+   slower than two-pass on a warm cache (see the Pillar C section below). The
+   real single-thread→multi-thread win is the byte-range parallel reader.
 4. 📋 **mmap + overlap decode with IO**; reuse per-chunk buffers.
 
 DuckDB still buffers (~400 MiB RSS on the 1.1 GB set earlier) where Rivus
@@ -524,3 +552,191 @@ streams at ~10 MiB, so the honest framing stays "Rivus trades some speed for
 bounded memory and a zero-dependency default" — and the roadmap goal is to close
 the read-throughput gap until that trade is near-free. ripgrep remains the right
 tool for "match lines in a file"; Rivus composes with it (`rg … | rivus …`).
+
+### String prefilter pushdown (Epic #30 / Pillar C C4(i), 5 M rows, 171 MiB)
+
+`filter_pushdown` now also lifts **literal-substring** predicates
+(`contains` / `starts_with` / `ends_with` / `==` / the literal run of `like`)
+into the reader as a ripgrep-style raw-line byte pre-scan: a line lacking the
+needle is skipped *before* it's split into fields. It's a **superset** filter
+(the downstream `FilterProject` re-checks every survivor, so the result is
+byte-identical — a substring landing in the wrong column is still rejected), and
+it costs no extra memory.
+
+Measured: `… |? contains(country, "JP") |> id name age save -`, serial
+(best of 3, 171 MiB, ~1 M matching rows):
+
+| | wall | rows out |
+|---|---:|---:|
+| without prefilter (`--no-opt`) | 3.45 s | 1,001,313 |
+| with string prefilter | **1.70 s** | 1,001,313 |
+
+**~2.0× on the serial path** — the win is skipping the split+build of the ~80%
+of rows that can't match. Result is identical (count matches DuckDB's
+`country LIKE '%JP%'`). The skipped-row count is surfaced as A1 telemetry
+(`prefilter skipped N row(s) at the reader`). The byte-range *parallel* reader
+doesn't apply the string pre-scan yet (it stays on the numeric prefilter); that
+extension is tracked for a later slice.
+
+### Adaptive execution strategy (Epic #30 / Pillar C, #33) — and a dropped idea
+
+Pillar C closes the "両立ループ" (visibility → strategy → speed): a std-only host
+probe (`rivus_runtime::analytics::Analytics::probe` — logical CPUs, available
+RAM from `/proc/meminfo`; both overridable with `RIVUS_CPUS` / `RIVUS_RAM_BYTES`
+for deterministic tests) feeds an autotuner (`choose_strategy`) that picks the
+execution strategy and **surfaces the decision** on `RunResult.strategy` (shown
+in the `--json` summary as `"strategy"`). The user knob is
+`--memory low|auto|fast`:
+
+- `low` — force the single-thread bounded reader (lowest resource use).
+- `auto` (default) — parallelize when ≥2 CPUs **and** the input clears the
+  byte-range threshold (8 MiB); small inputs stay serial.
+- `fast` — same, with a more aggressive threshold (1 MiB).
+
+All three return **byte-identical** results (guaranteed by
+`streaming_parallel_matches_serial` and the new
+`memory_strategy_is_result_invariant_and_surfaced` test).
+
+Measured (288 MB clean CSV, `|? age >= 20 |> name age save out.csv`, 4 cpus,
+warm cache, best of 4):
+
+| `--memory` | strategy chosen | wall | rows out |
+|---|---|---:|---:|
+| `low` | forced serial (two-pass) | 3.53 s | 6,223,068 |
+| `auto` (default) | byte-range parallel | **1.13 s** | 6,223,068 |
+| `fast` | byte-range parallel | 1.13 s | 6,223,068 |
+
+**~3.1× faster on the default path, byte-identical output.** The decision is
+self-describing, e.g.
+`"memory=auto: 288130173 B ≥ 8388608 B, 4 cpus → parallel"`.
+
+> **Dropped idea — single-pass retain-buffer reader (honest negative result).**
+> The roadmap listed "single-pass inference (drop the second scan)" as the
+> largest single-thread gap. We prototyped it: read the data region into memory
+> once, infer globally over the buffer, then build columns from the buffer (no
+> second disk scan), gated to files within a RAM budget (which is why an earlier
+> draft probed available RAM). It is byte-identical and
+> chunk-size independent — but it was **measured *slower*** than the two-pass
+> reader on a warm cache (4.0 s vs 3.4 s on the file above): holding every line as
+> an owned `String` creates allocation/memory pressure, while the "second scan"
+> it eliminates is a nearly-free re-read from the OS page cache. Per the project
+> law ("faster is never asserted without a measured number"), we did **not** ship
+> it. The genuinely measured single-thread→multi-thread win is the byte-range
+> parallel reader, so Pillar C's adaptive decision is **serial vs parallel**, not
+> a single-pass reader swap. (A single-pass reader could still pay off on
+> cold-cache / network filesystems where the second physical read is expensive;
+> it can return behind a measured win for that regime.)
+
+
+### String prefilter on the parallel path (Epic #30 / #35)
+
+The literal-substring prefilter (C4(i)) originally engaged only on the *serial*
+reader: the byte-range parallel workers hard-coded an empty `str_prefilter`, so
+the default `--memory auto` path (which parallelizes files ≥8 MiB — i.e. exactly
+the large-file regime the prefilter targets) never applied it. #35 threads
+`str_prefilter` through `plan_parallel` → `for_range` so every worker runs the
+same raw-line pre-scan, and the per-worker skip counts surface as A1 telemetry
+(one `prefilter skipped N row(s)` Info per worker, summing to total − matching).
+
+Correctness is covered by `string_prefilter_engages_on_parallel_path`: a forced
+streaming-parallel run is **byte-identical** to a forced-serial run of the same
+program, and the workers' skip telemetry sums to the independently-derived
+(total − matching) count.
+
+Honest performance note (171 MiB, 5 M rows, 4 cpus, warm cache, a 0%-selectivity
+`contains(name,"Zzqx")` so parse — not output — dominates; best of 5):
+
+| | prefilter on | prefilter off (`--no-opt`) |
+|---|---:|---:|
+| **parallel** (default) | 0.246 s | 0.246 s |
+| **serial** (`RIVUS_NO_PARALLEL=1`) | 2.218 s | 2.218 s |
+
+Two honest takeaways: (1) the **parallel reader itself is the ~9× win** here
+(0.25 s vs 2.22 s); (2) at this query shape the string-prefilter shows **no
+measurable end-to-end gain on/off**, because the two-pass reader's *pass-1 global
+type inference* scans and splits every row regardless — the prefilter only avoids
+*pass-2 column building*, which is already near-zero at 0% selectivity. The
+prefilter still earns its keep on shapes where pass-2 building dominates (the
+earlier `contains(country,"JP")` serial measurement), and #35's value is making
+it **engage on the default parallel path at all** (previously a silent no-op
+there) with exact, surfaced accounting. Pushing the pre-scan into *pass-1
+inference* — so it can skip the dominant scan too — is a tracked follow-up.
+
+### SIMD predicate kernel — branch-free mask refactor + measured AVX2 negative result (Epic #38 / #39)
+
+Lever 1 of the "aggressive structural bets" Epic (#38) is the vectorized
+predicate kernel. Two things were done, both measured:
+
+**1. Branch-free byte-mask refactor (landed).** The kernel
+(`crates/rivus-runtime/src/kernel.rs`) used to build surviving-index `Vec`s and
+narrow them predicate-by-predicate. It now writes a **byte mask** (`(v <cmp>
+rhs) as u8`, no branch, no `push`) over each contiguous `&[i64]`/`&[f64]` lane,
+ANDs masks for a conjunction, and collects indices in one final pass. This is
+what LLVM auto-vectorizes into packed SIMD compares — **zero `unsafe`, zero
+deps**. Measured on the 5 M-row / 179 MiB clean set, serial, `--no-opt` (so all
+rows reach `FilterProject`), `age >= 30 and score < 50.0` (the `filter` node's
+own `busy_ms` from `--json`, best of 5):
+
+| kernel | filter node busy_ms |
+|---|---:|
+| previous (index-narrowing) | ~81 ms |
+| **branch-free mask (this PR)** | **~77 ms** |
+
+A small (~5%) but real win, and a cleaner base for the columnar gather (#40).
+
+**2. Hand-written AVX2 `f64` kernel (prototyped, measured, NOT landed).** An
+explicit `core::arch::x86_64` AVX2 compare (`_mm256_cmp_pd` + movemask, runtime
+`is_x86_feature_detected!`, scalar fallback, byte-identical incl. NaN via the
+ordered `_OQ` predicates) was implemented and benchmarked against the
+auto-vectorized scalar form on a 5 M-element `f64` column (30 iters, release):
+
+| stage | scalar | AVX2 |
+|---|---:|---:|
+| mask production only (compare) | 5.5 ms | 5.8 ms |
+| full `run()` hi-sel (70%) | 44.1 ms | 42.1 ms |
+| full `run()` lo-sel (2%) | 9.5 ms | 9.8 ms |
+
+The compare is **memory-bandwidth-bound** (~40 MB read for 5 M `f64`), so
+explicit AVX2 ties or slightly *loses* to LLVM's auto-vectorization — and the
+full-run cost is dominated by **index collection** (the `keep.push(i)` gather),
+not the compare (5.5 ms of a 44 ms run). Per the project law — *faster is never
+asserted without a measured number* — the `unsafe` intrinsic path was **dropped**
+rather than shipped for no measured gain. The real lever is the gather itself: a
+columnar selection-vector / late-materialization design, which is Epic #38 lever
+2 (#40). On CSV today the whole filter node is only ~3% of wall (parse dominates
+at ~2.1 s of 2.7 s), so this kernel work matters for the *columnar* core to come,
+not for end-to-end CSV wall time yet.
+
+### Where the time goes on 1 GB (profiling for the DuckDB gap)
+
+統括 measured a 1 GB / 30 M-row CSV wrangle at ~22 s where DuckDB does ~10 s.
+Profiling the node `busy_ms` (`--json`) on a 1.13 GB / 30 M-row file
+(`open … |? age>=30 |> id age score save out.csv`, 4 cpus):
+
+| | serial busy_ms | note |
+|---|---:|---|
+| **open (CSV parse)** | **12 591** | dominates — line split + per-field parse of 30M×6 |
+| save (CSV write) | 6 897 | second cost — formatting + write of ~20M rows |
+| filter | 429 | the predicate kernel is already cheap (#39) |
+| project | 24 | negligible |
+| serial wall | ~16.9 s | |
+| **default parallel wall** | **~6.8 s** | byte-range parse parallelizes |
+
+Two honest findings:
+
+1. **Declared types barely help**: forcing `(id:int age:int score:f64 …)` to skip
+   schema inference left `open` at 12.5 s (vs 12.6 s inferred). So the two-pass
+   *inference* is **not** the bottleneck — the **pass-2 build (split + parse the
+   30M×6 fields)** is. The next lever is faster field scanning, not fewer passes.
+   **First step landed**: a dependency-free **SWAR delimiter scan** in
+   `split_offsets` (8 bytes/step, carry-free exact mask) — ~10–17 % off the `open`
+   node, byte-identical (see "SWAR delimiter scan — landed" above). A widening to
+   `core::arch` SIMD and faster int/float parse remain open (parse measured cheap
+   here; pursue only behind a profile). Output writing (save) is the second target
+   (buffered formatting).
+2. The default parallel path already turns 16.9 s → 6.8 s; the remaining gap to
+   DuckDB is parse+write throughput per core, which the columnar core (#40) and a
+   SIMD scanner target. **Measurement required before claiming any win.**
+
+(Also tracked: UTF-8 **BOM** at the start of a file is not yet stripped — the
+first header cell keeps the `﻿`; see ROADMAP "Ingestion".)
