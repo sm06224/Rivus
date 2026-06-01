@@ -388,6 +388,61 @@ fn f64_to_decimal(x: f64, scale: u8) -> rivus_core::Decimal {
     rivus_core::Decimal::new(unscaled, scale)
 }
 
+/// Quantize a numeric literal `rhs` to a decimal column's `scale` as an unscaled
+/// `i128` (round half-even, matching the reader / `Decimal::rescale`; design 21
+/// §21.4). Returns `None` when the scaled literal can't fit `i128` (huge or
+/// non-finite) so callers degrade to the f64 view identically.
+pub(crate) fn dec_scaled_rhs(rhs: f64, scale: u8) -> Option<i128> {
+    if !rhs.is_finite() {
+        return None;
+    }
+    let mut pow = 1.0f64;
+    for _ in 0..scale {
+        pow *= 10.0;
+    }
+    let scaled = (rhs * pow).round_ties_even();
+    // f64 can't represent i128::MAX exactly; bound conservatively well inside
+    // range (9e37 < 2^127 ≈ 1.7e38) — beyond it, fall back to the f64 view.
+    if scaled.abs() < 9.0e37 {
+        Some(scaled as i128)
+    } else {
+        None
+    }
+}
+
+/// Exact comparison of a decimal cell (`u` unscaled at `scale`) against a numeric
+/// literal `rhs`, **shared by the vectorized kernel and the interpreter** so the
+/// two stay byte-identical. Comparing as `i128` against the scaled literal avoids
+/// the `u as f64 / 10^scale` division that loses precision once `|u| > 2^53`
+/// (the bug the decimal lane exists to fix). When the literal doesn't fit `i128`
+/// at this scale it degrades to the f64 view — the same fallback on both paths.
+#[inline]
+pub(crate) fn dec_cmp(u: i128, scale: u8, op: CmpOp, rhs: f64) -> bool {
+    match dec_scaled_rhs(rhs, scale) {
+        Some(r) => dec_cmp_i128(u, op, r),
+        None => dec_cmp_f64_fallback(u, scale, op, rhs),
+    }
+}
+
+/// Apply `op` to a decimal cell already reduced to its unscaled `i128` against a
+/// literal pre-scaled to the same scale. The kernel hoists the scaling out of its
+/// row loop and calls this per cell (no per-row re-derivation of the literal).
+#[inline]
+pub(crate) fn dec_cmp_i128(u: i128, op: CmpOp, scaled_rhs: i128) -> bool {
+    cmp_ord(u.partial_cmp(&scaled_rhs), op)
+}
+
+/// Degraded comparison via the f64 view (used only when the literal doesn't fit
+/// `i128` at the column scale) — identical on the kernel and interpreter paths.
+#[inline]
+pub(crate) fn dec_cmp_f64_fallback(u: i128, scale: u8, op: CmpOp, rhs: f64) -> bool {
+    let mut pow = 1.0f64;
+    for _ in 0..scale {
+        pow *= 10.0;
+    }
+    cmp_ord((u as f64 / pow).partial_cmp(&rhs), op)
+}
+
 /// Cast a whole column to a target lane (columnar path for computed columns).
 pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
     let n = col.len();
@@ -692,6 +747,11 @@ fn eval_field(name: &str, _access: Access, chunk: &Chunk, row: usize) -> Value {
 
 /// Compare two sub-expressions for a row, taking borrowed fast paths first.
 fn compare_fast(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk, row: usize) -> bool {
+    // Exact decimal lane: a decimal column vs a numeric literal compares as i128
+    // (matching the kernel), not via the lossy f64 view.
+    if let Some(b) = dec_field_vs_literal(left, op, right, chunk, row) {
+        return b;
+    }
     // String fast path: no `String` allocation per side per row.
     if let (Some(a), Some(b)) = (as_str(left, chunk, row), as_str(right, chunk, row)) {
         return cmp_ord(a.partial_cmp(b), op);
@@ -704,6 +764,48 @@ fn compare_fast(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk, row: usize)
     let l = eval(left, chunk, row);
     let r = eval(right, chunk, row);
     compare(&l, op, &r)
+}
+
+/// `decimal_column OP numeric_literal` (either operand order) → exact `i128`
+/// comparison via [`dec_cmp`], matching the kernel. `None` when the operands are
+/// not that shape (the caller then takes its usual numeric/string path).
+fn dec_field_vs_literal(
+    left: &Expr,
+    op: CmpOp,
+    right: &Expr,
+    chunk: &Chunk,
+    row: usize,
+) -> Option<bool> {
+    let dec_cell = |e: &Expr| -> Option<(i128, u8)> {
+        if let Expr::Field { name, .. } = e {
+            if let Some(Column::Dec(d)) = chunk.column(name) {
+                return Some((d.unscaled[row], d.scale));
+            }
+        }
+        None
+    };
+    let lit = |e: &Expr| -> Option<f64> {
+        match e {
+            Expr::Literal(v) => v.as_f64(),
+            _ => None,
+        }
+    };
+    if let (Some((u, s)), Some(r)) = (dec_cell(left), lit(right)) {
+        return Some(dec_cmp(u, s, op, r));
+    }
+    if let (Some(r), Some((u, s))) = (lit(left), dec_cell(right)) {
+        // `literal OP decimal` == `decimal OP_reversed literal`.
+        let rev = match op {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Ge => CmpOp::Le,
+            CmpOp::Eq => CmpOp::Eq,
+            CmpOp::Ne => CmpOp::Ne,
+        };
+        return Some(dec_cmp(u, s, rev, r));
+    }
+    None
 }
 
 /// Borrow a `&str` for a Field backed by a string column, or a string literal.

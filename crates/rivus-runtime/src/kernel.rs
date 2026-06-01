@@ -151,15 +151,22 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
                 *m = cmp_scalar(if b { 1.0 } else { 0.0 }, p.op, p.rhs) as u8;
             }
         }
-        // Decimal: compare via the f64 view. The rhs literal is already f64, so
-        // this matches the interpreter's cross-lane compare (design doc 21; an
-        // exact i128 compare against a scaled rhs is a future optimization).
-        Column::Dec(d) => {
-            let pow = 10f64.powi(d.scale as i32);
-            for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
-                *m = cmp_scalar(u as f64 / pow, p.op, p.rhs) as u8;
+        // Decimal: exact i128 compare against the literal scaled to the column's
+        // scale (shared with the interpreter so the two stay byte-identical;
+        // avoids the lossy `u as f64 / 10^scale` once |u| > 2^53). The scaling is
+        // hoisted out of the row loop. #44 / doc 21.
+        Column::Dec(d) => match crate::eval::dec_scaled_rhs(p.rhs, d.scale) {
+            Some(r) => {
+                for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                    *m = crate::eval::dec_cmp_i128(u, p.op, r) as u8;
+                }
             }
-        }
+            None => {
+                for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                    *m = crate::eval::dec_cmp_f64_fallback(u, d.scale, p.op, p.rhs) as u8;
+                }
+            }
+        },
         Column::Str(_) => mask.fill(0), // compiled out by `num_col`
     }
 }
@@ -182,12 +189,18 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
                 *m &= cmp_scalar(if b { 1.0 } else { 0.0 }, p.op, p.rhs) as u8;
             }
         }
-        Column::Dec(d) => {
-            let pow = 10f64.powi(d.scale as i32);
-            for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
-                *m &= cmp_scalar(u as f64 / pow, p.op, p.rhs) as u8;
+        Column::Dec(d) => match crate::eval::dec_scaled_rhs(p.rhs, d.scale) {
+            Some(r) => {
+                for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                    *m &= crate::eval::dec_cmp_i128(u, p.op, r) as u8;
+                }
             }
-        }
+            None => {
+                for (m, &u) in mask.iter_mut().zip(d.unscaled.iter()) {
+                    *m &= crate::eval::dec_cmp_f64_fallback(u, d.scale, p.op, p.rhs) as u8;
+                }
+            }
+        },
         Column::Str(_) => mask.fill(0),
     }
 }

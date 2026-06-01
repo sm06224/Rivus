@@ -256,3 +256,72 @@ fn decimal_column_optimizes_equivalently() {
         );
     }
 }
+
+/// #44: decimal filter comparisons are exact (i128), not via the lossy f64 view,
+/// and the kernel and interpreter agree. Uses unscaled values straddling 2^53,
+/// where `u as f64` collapses adjacent integers — the f64 path would mis-decide.
+#[test]
+fn decimal_filter_is_exact_i128() {
+    // 2^53 = 9007199254740992; 9007199254740993 is NOT representable in f64.
+    let text = "id,big\n\
+        1,9007199254740992\n\
+        2,9007199254740993\n\
+        3,9007199254740994\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "equiv_decimal_exact",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+
+    // Simple predicate → vectorized kernel; OR predicate → interpreter. Both must
+    // keep exactly id 2 and 3 (big > 2^53), which the f64 view gets wrong.
+    let kernel_src =
+        format!("D:\n open {p} (id big:decimal(0))\n |? big > 9007199254740992\n |> id\n;");
+    let interp_src = format!(
+        "D:\n open {p} (id big:decimal(0))\n |? big > 9007199254740992 or id < 0\n |> id\n;"
+    );
+    let kernel = fingerprints_both(&kernel_src).1;
+    let interp = fingerprints_both(&interp_src).1;
+    assert_eq!(
+        kernel, interp,
+        "kernel and interpreter disagree on exact decimal"
+    );
+    let kept = kernel.get("D").cloned().unwrap_or_default();
+    assert_eq!(
+        kept,
+        vec!["2".to_string(), "3".to_string()],
+        "exact i128 compare wrong: {kept:?}"
+    );
+}
+
+/// #44: scale-2 boundary equality/inequality compares exactly (e.g. `== 0.30`,
+/// `> 19.99`), and stays byte-identical raw vs optimized.
+#[test]
+fn decimal_filter_boundaries_exact() {
+    let text = "id,amount\n\
+        1,0.30\n\
+        2,0.29\n\
+        3,19.99\n\
+        4,20.00\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "equiv_decimal_bound",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let eq = fingerprints_both(&format!(
+        "D:\n open {p} (id amount:decimal(2))\n |? amount == 0.30\n |> id\n;"
+    ));
+    assert_eq!(eq.0, eq.1);
+    assert_eq!(
+        eq.1.get("D").cloned().unwrap_or_default(),
+        vec!["1".to_string()]
+    );
+    let gt = fingerprints_both(&format!(
+        "D:\n open {p} (id amount:decimal(2))\n |? amount > 19.99\n |> id\n;"
+    ));
+    assert_eq!(gt.0, gt.1);
+    assert_eq!(
+        gt.1.get("D").cloned().unwrap_or_default(),
+        vec!["4".to_string()]
+    );
+}
