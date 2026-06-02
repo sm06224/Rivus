@@ -2543,3 +2543,53 @@ fn f64_parallel_sum_needs_canonical_order_decimal_is_exact_today() {
         "decimal sum is exact & chunk-independent today"
     );
 }
+
+#[test]
+fn parallel_group_final_mode_matches_serial() {
+    // #48: the parallel group-by must derive `final_mode` from its workers'
+    // errors (so a fatal halts the run and the CLI exit code matches serial),
+    // not hardcode Normal. Fatals are not reachable on this path with valid input
+    // (the range source yields empty on open error rather than raising fatal), so
+    // this guards the common case: clean input → Normal on BOTH paths (and the
+    // fix derives Halted from any fatal error exactly as the serial path does).
+    let rows = 130_000usize;
+    let countries = ["JP", "US", "DE", "FR"];
+    let mut text = String::from("country,amount\n");
+    for i in 0..rows {
+        text.push_str(&format!(
+            "{},{}\n",
+            countries[i % countries.len()],
+            i % 1000
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_group_mode",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("G:\n open {p}\n |# country min:amount max:amount\n;");
+    let mode = |pref: rivus_runtime::MemoryPref| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run")
+        .final_mode
+    };
+    let serial = mode(rivus_runtime::MemoryPref::Low);
+    let parallel = mode(rivus_runtime::MemoryPref::Fast);
+    assert_eq!(
+        serial,
+        rivus_core::Mode::Normal,
+        "clean input → Normal (serial)"
+    );
+    assert_eq!(
+        parallel, serial,
+        "parallel group-by final_mode must match serial"
+    );
+}
