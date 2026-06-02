@@ -131,10 +131,21 @@ impl Decimal {
         // The text's own scale is its fractional-digit count; build the unscaled
         // magnitude exactly, then round to the requested scale.
         let natural_scale = u8::try_from(frac_part.len()).ok()?;
-        let mut mag: i128 = 0;
-        for &b in int_part.as_bytes().iter().chain(frac_part.as_bytes()) {
-            mag = mag.checked_mul(10)?.checked_add((b - b'0') as i128)?;
-        }
+        // SWAR fast path (#71): ≤18 total digits fit `u64` with no overflow, so
+        // skip the per-digit `checked_*` (which never trips in this range). The
+        // digits are already validated above; process int then frac as one
+        // stream. Byte-identical to the scalar loop — same magnitude, and the
+        // checked loop also never returns `None` for ≤18 digits.
+        let mag: i128 = if int_part.len() + frac_part.len() <= 18 {
+            let acc = crate::numparse::accumulate_digits_u64(int_part.as_bytes(), 0);
+            crate::numparse::accumulate_digits_u64(frac_part.as_bytes(), acc) as i128
+        } else {
+            let mut mag: i128 = 0;
+            for &b in int_part.as_bytes().iter().chain(frac_part.as_bytes()) {
+                mag = mag.checked_mul(10)?.checked_add((b - b'0') as i128)?;
+            }
+            mag
+        };
         let unscaled = if neg { -mag } else { mag };
         Decimal::new(unscaled, natural_scale).rescale(scale)
     }
@@ -866,6 +877,185 @@ mod decimal_tests {
                 "expected None for {bad:?}"
             );
         }
+    }
+
+    /// The SWAR fast path (≤18 digits) in `parse_scaled` must be byte-identical
+    /// to the scalar checked-i128 loop. Reference replicates the scalar magnitude
+    /// build; sweep widths around the 8/18-digit boundaries, signs, dot
+    /// positions, and target scales. #71.
+    #[test]
+    fn swar_decimal_parse_matches_scalar() {
+        // Independent scalar reference: same parse, but always the checked loop.
+        fn reference(s: &str, scale: u8) -> Option<Decimal> {
+            let (neg, rest) = match s.as_bytes().first() {
+                Some(b'-') => (true, &s[1..]),
+                Some(b'+') => (false, &s[1..]),
+                _ => (false, s),
+            };
+            let (int_part, frac_part) = match rest.split_once('.') {
+                Some((i, f)) => (i, f),
+                None => (rest, ""),
+            };
+            if int_part.is_empty() && frac_part.is_empty() {
+                return None;
+            }
+            if !int_part.bytes().all(|b| b.is_ascii_digit())
+                || !frac_part.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let natural_scale = u8::try_from(frac_part.len()).ok()?;
+            let mut mag: i128 = 0;
+            for &b in int_part.as_bytes().iter().chain(frac_part.as_bytes()) {
+                mag = mag.checked_mul(10)?.checked_add((b - b'0') as i128)?;
+            }
+            let unscaled = if neg { -mag } else { mag };
+            Decimal::new(unscaled, natural_scale).rescale(scale)
+        }
+
+        let mut cases: Vec<String> = Vec::new();
+        let signs = ["", "-", "+"];
+        for &sign in &signs {
+            for ilen in 0..=20usize {
+                for flen in 0..=20usize {
+                    if ilen + flen == 0 {
+                        continue;
+                    }
+                    let ints = "1234567890".repeat(3);
+                    let fracs = "9876543210".repeat(3);
+                    let mut s = String::from(sign);
+                    s.push_str(&ints[..ilen]);
+                    s.push('.');
+                    s.push_str(&fracs[..flen]);
+                    cases.push(s);
+                }
+            }
+        }
+        // Plus the explicit edge forms and a few malformed inputs.
+        for extra in [
+            "0", ".5", "5.", "100", "00100", "-0.0", "+0", "1.2.3", "", "-", "abc", "1e5",
+        ] {
+            cases.push(extra.to_string());
+        }
+        for s in &cases {
+            for scale in [0u8, 1, 2, 6, 18] {
+                assert_eq!(
+                    Decimal::parse_scaled(s, scale),
+                    reference(s, scale),
+                    "decimal parse mismatch on {s:?} scale={scale}"
+                );
+            }
+        }
+    }
+
+    /// Micro-benchmark (ignored; run with
+    /// `cargo test -p rivus-core --release --lib bench_decimal_parse -- --ignored --nocapture`):
+    /// decimal magnitude build, scalar checked-i128 loop vs the SWAR fast path. #71.
+    #[test]
+    #[ignore]
+    fn bench_decimal_parse() {
+        use std::time::Instant;
+        // Scalar reference parser (the pre-#71 magnitude loop).
+        fn scalar(s: &str, scale: u8) -> Option<Decimal> {
+            let (neg, rest) = match s.as_bytes().first() {
+                Some(b'-') => (true, &s[1..]),
+                Some(b'+') => (false, &s[1..]),
+                _ => (false, s),
+            };
+            let (int_part, frac_part) = match rest.split_once('.') {
+                Some((i, f)) => (i, f),
+                None => (rest, ""),
+            };
+            if int_part.is_empty() && frac_part.is_empty() {
+                return None;
+            }
+            if !int_part.bytes().all(|b| b.is_ascii_digit())
+                || !frac_part.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let natural_scale = u8::try_from(frac_part.len()).ok()?;
+            let mut mag: i128 = 0;
+            for &b in int_part.as_bytes().iter().chain(frac_part.as_bytes()) {
+                mag = mag.checked_mul(10)?.checked_add((b - b'0') as i128)?;
+            }
+            let unscaled = if neg { -mag } else { mag };
+            Decimal::new(unscaled, natural_scale).rescale(scale)
+        }
+
+        let samples: Vec<String> = (0..1024u64)
+            .map(|i| {
+                format!(
+                    "{}.{:02}",
+                    i.wrapping_mul(2_654_435_761) % 1_000_000,
+                    i % 100
+                )
+            })
+            .collect();
+        let bytes: usize = samples.iter().map(|s| s.len()).sum();
+        let reps = 4000usize;
+
+        let t = Instant::now();
+        let mut a = 0i128;
+        for _ in 0..reps {
+            for s in &samples {
+                a = a.wrapping_add(scalar(s, 4).map_or(0, |d| d.unscaled));
+            }
+        }
+        let scal = t.elapsed();
+        let t = Instant::now();
+        let mut b = 0i128;
+        for _ in 0..reps {
+            for s in &samples {
+                b = b.wrapping_add(Decimal::parse_scaled(s, 4).map_or(0, |d| d.unscaled));
+            }
+        }
+        let swar = t.elapsed();
+        assert_eq!(a, b);
+        let mbps = |d: std::time::Duration| (bytes * reps) as f64 / d.as_secs_f64() / 1e6;
+        println!(
+            "\n[#71 decimal-parse | short ~8-digit] {} samples × {reps} reps",
+            samples.len()
+        );
+        println!("  scalar checked: {:?}  {:.0} MB/s", scal, mbps(scal));
+        println!(
+            "  SWAR fast:      {:?}  {:.0} MB/s  ({:.2}x scalar)",
+            swar,
+            mbps(swar),
+            scal.as_secs_f64() / swar.as_secs_f64()
+        );
+
+        // Wide regime (16-digit integer part): the 8-digit SWAR block dominates.
+        let wide: Vec<String> = (0..1024u64)
+            .map(|i| format!("{}.{:04}", 1_000_000_000_000u64 + i, i % 10000))
+            .collect();
+        let wbytes: usize = wide.iter().map(|s| s.len()).sum();
+        let t = Instant::now();
+        let mut c = 0i128;
+        for _ in 0..reps {
+            for s in &wide {
+                c = c.wrapping_add(scalar(s, 4).map_or(0, |d| d.unscaled));
+            }
+        }
+        let wscal = t.elapsed();
+        let t = Instant::now();
+        let mut d = 0i128;
+        for _ in 0..reps {
+            for s in &wide {
+                d = d.wrapping_add(Decimal::parse_scaled(s, 4).map_or(0, |d| d.unscaled));
+            }
+        }
+        let wswar = t.elapsed();
+        assert_eq!(c, d);
+        let wmbps = |x: std::time::Duration| (wbytes * reps) as f64 / x.as_secs_f64() / 1e6;
+        println!("[#71 decimal-parse | wide 16-digit]");
+        println!("  scalar checked: {:?}  {:.0} MB/s", wscal, wmbps(wscal));
+        println!(
+            "  SWAR fast:      {:?}  {:.0} MB/s  ({:.2}x scalar)",
+            wswar,
+            wmbps(wswar),
+            wscal.as_secs_f64() / wswar.as_secs_f64()
+        );
     }
 
     #[test]
