@@ -28,6 +28,7 @@ mod tests {
             str_prefilter: Vec::new(),
             header: true,
             declared: None,
+            dt_formats: Vec::new(),
             delim: b',',
         });
         let b = g.add_node(Op::Filter {
@@ -53,6 +54,7 @@ mod tests {
             str_prefilter: Vec::new(),
             header: true,
             declared: None,
+            dt_formats: Vec::new(),
             delim: b',',
         });
         let b = g.add_node(Op::Filter {

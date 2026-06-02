@@ -94,6 +94,20 @@ pub enum Func {
     /// `coalesce(a, b, …)` — the first argument whose text is non-empty (any
     /// arity); empty string if all are empty. The SQL/pandas null-coalesce.
     Coalesce,
+    /// Datetime field extractors (design 23): `year(ts)`/`month(ts)`/`day(ts)`/
+    /// `hour(ts)`/`minute(ts)`/`second(ts)` — each returns an `i64`.
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    /// `trunc(ts, "day")` — truncate a datetime to a `year`/`month`/`day`/`hour`/
+    /// `minute`/`second` boundary (the time-series group-by key); returns a
+    /// datetime at the same unit. Design 23.
+    Trunc,
+    /// `format(ts, "yyyy-MM-dd")` — render a datetime as text. Design 23.
+    Format,
 }
 
 impl Func {
@@ -118,6 +132,14 @@ impl Func {
             "floor" => Func::Floor,
             "ceil" => Func::Ceil,
             "coalesce" => Func::Coalesce,
+            "year" => Func::Year,
+            "month" => Func::Month,
+            "day" => Func::Day,
+            "hour" => Func::Hour,
+            "minute" => Func::Minute,
+            "second" => Func::Second,
+            "trunc" => Func::Trunc,
+            "format" => Func::Format,
             _ => return None,
         })
     }
@@ -142,6 +164,14 @@ impl Func {
             Func::Floor => "floor",
             Func::Ceil => "ceil",
             Func::Coalesce => "coalesce",
+            Func::Year => "year",
+            Func::Month => "month",
+            Func::Day => "day",
+            Func::Hour => "hour",
+            Func::Minute => "minute",
+            Func::Second => "second",
+            Func::Trunc => "trunc",
+            Func::Format => "format",
         }
     }
 }

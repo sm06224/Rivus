@@ -194,6 +194,264 @@ impl fmt::Display for Decimal {
     }
 }
 
+/// Resolution of the datetime lane's epoch `ticks` (design 23). Default `Sec`
+/// (a `yyMMddhhmmss` timestamp is second-precision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimeUnit {
+    Sec,
+    Milli,
+    Micro,
+    Nano,
+}
+
+impl TimeUnit {
+    /// Ticks per second.
+    pub fn per_sec(self) -> i64 {
+        match self {
+            TimeUnit::Sec => 1,
+            TimeUnit::Milli => 1_000,
+            TimeUnit::Micro => 1_000_000,
+            TimeUnit::Nano => 1_000_000_000,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimeUnit::Sec => "s",
+            TimeUnit::Milli => "ms",
+            TimeUnit::Micro => "us",
+            TimeUnit::Nano => "ns",
+        }
+    }
+    pub fn parse(s: &str) -> Option<TimeUnit> {
+        match s {
+            "s" | "sec" => Some(TimeUnit::Sec),
+            "ms" | "milli" => Some(TimeUnit::Milli),
+            "us" | "micro" => Some(TimeUnit::Micro),
+            "ns" | "nano" => Some(TimeUnit::Nano),
+            _ => None,
+        }
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian civil date (Howard Hinnant's
+/// algorithm; std-only, exact for the full i64 range).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Inverse of [`days_from_civil`]: `(year, month, day)` from days-since-epoch.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// A timestamp on the **datetime lane** (design 23): integer `ticks` since the
+/// Unix epoch in `unit` resolution (UTC; no timezone yet). The integer form is
+/// exact and associative — like the decimal lane — so `min`/`max`/`count`/`first`/
+/// `last` parallelize byte-identically. Comparison is across units exact (i128).
+#[derive(Debug, Clone, Copy)]
+pub struct DateTime {
+    pub ticks: i64,
+    pub unit: TimeUnit,
+}
+
+impl PartialEq for DateTime {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for DateTime {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Compare absolute instants regardless of unit (cross-multiply in i128).
+        let a = self.ticks as i128 * other.unit.per_sec() as i128;
+        let b = other.ticks as i128 * self.unit.per_sec() as i128;
+        a.partial_cmp(&b)
+    }
+}
+
+impl DateTime {
+    /// Common fixed-width / ISO timestamp formats, tried in order, for
+    /// auto-inferring a bare `:datetime` column or a datetime *literal* in a
+    /// predicate (design 23). Shared by the reader and the comparison path so
+    /// the two agree on what a given text means.
+    pub const AUTO_FORMATS: &'static [&'static str] = &[
+        "yyyy-MM-ddTHH:mm:ss",
+        "yyyy-MM-dd HH:mm:ss",
+        "yyyy-MM-dd",
+        "yyyyMMddHHmmss",
+        "yyMMddHHmmss",
+        "yyyyMMdd",
+    ];
+
+    pub fn new(ticks: i64, unit: TimeUnit) -> Self {
+        DateTime { ticks, unit }
+    }
+
+    /// Parse `s` by trying each [`AUTO_FORMATS`] entry in order (first match
+    /// wins), at `unit`. `None` if none match (continue-first at the call site).
+    ///
+    /// [`AUTO_FORMATS`]: DateTime::AUTO_FORMATS
+    pub fn parse_auto(s: &str, unit: TimeUnit) -> Option<DateTime> {
+        let s = s.trim();
+        Self::AUTO_FORMATS
+            .iter()
+            .find_map(|f| Self::parse_with_format(s, f, unit))
+    }
+
+    /// `(year, month, day, hour, minute, second)` in UTC (whole-second part).
+    pub fn fields(&self) -> (i64, i64, i64, i64, i64, i64) {
+        let secs = self.ticks.div_euclid(self.unit.per_sec());
+        let day = secs.div_euclid(86400);
+        let sod = secs.rem_euclid(86400);
+        let (y, m, d) = civil_from_days(day);
+        (y, m, d, sod / 3600, (sod / 60) % 60, sod % 60)
+    }
+
+    /// Truncate to a calendar/clock boundary (`year`/`month`/`day`/`hour`/
+    /// `minute`/`second`), returning a `DateTime` at the same `unit` — the
+    /// time-series group-by key (design 23). Integer math, so byte-identical
+    /// across execution strategies. An unknown field truncates to the second.
+    pub fn truncated(&self, field: &str) -> DateTime {
+        let (y, mo, d, h, mi, se) = self.fields();
+        let (y, mo, d, h, mi, se) = match field {
+            "year" => (y, 1, 1, 0, 0, 0),
+            "month" => (y, mo, 1, 0, 0, 0),
+            "day" => (y, mo, d, 0, 0, 0),
+            "hour" => (y, mo, d, h, 0, 0),
+            "minute" => (y, mo, d, h, mi, 0),
+            _ => (y, mo, d, h, mi, se), // "second" / unknown → whole second
+        };
+        let secs = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+        DateTime::new(secs * self.unit.per_sec(), self.unit)
+    }
+
+    /// Parse `s` with a `strptime`-style `fmt` (tokens `yyyy`/`yy`/`MM`/`dd`/`HH`
+    /// or `hh`/`mm`/`ss`; any other char is a literal that must match) into a
+    /// `DateTime` at `unit`. `None` on any mismatch (the reader routes a bad cell
+    /// to the error stream / epoch-0, continue-first).
+    pub fn parse_with_format(s: &str, fmt: &str, unit: TimeUnit) -> Option<DateTime> {
+        let (sb, fb) = (s.as_bytes(), fmt.as_bytes());
+        let (mut si, mut fi) = (0usize, 0usize);
+        let (mut y, mut mo, mut d, mut h, mut mi, mut se) = (1970i64, 1i64, 1i64, 0i64, 0i64, 0i64);
+        // Read `n` ASCII digits from `s` at `si`, advancing it.
+        let read = |sb: &[u8], si: &mut usize, n: usize| -> Option<i64> {
+            let mut v = 0i64;
+            for _ in 0..n {
+                let b = *sb.get(*si)?;
+                if !b.is_ascii_digit() {
+                    return None;
+                }
+                v = v * 10 + (b - b'0') as i64;
+                *si += 1;
+            }
+            Some(v)
+        };
+        while fi < fb.len() {
+            let rest = &fmt[fi..];
+            if let Some(tok) = ["yyyy", "yy", "MM", "dd", "HH", "hh", "mm", "ss"]
+                .into_iter()
+                .find(|t| rest.starts_with(t))
+            {
+                let n = tok.len();
+                let v = read(sb, &mut si, n)?;
+                match tok {
+                    "yyyy" => y = v,
+                    // Fixed two-digit-year pivot (design 23): 00–68 → 20xx,
+                    // 69–99 → 19xx (the POSIX/Unix convention; deterministic).
+                    "yy" => y = if v <= 68 { 2000 + v } else { 1900 + v },
+                    "MM" => mo = v,
+                    "dd" => d = v,
+                    "HH" | "hh" => h = v,
+                    "mm" => mi = v,
+                    "ss" => se = v,
+                    _ => unreachable!(),
+                }
+                fi += n;
+            } else {
+                // Literal byte must match.
+                if sb.get(si) != fb.get(fi) {
+                    return None;
+                }
+                si += 1;
+                fi += 1;
+            }
+        }
+        if si != sb.len() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+            return None;
+        }
+        let secs = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+        Some(DateTime::new(secs * unit.per_sec(), unit))
+    }
+
+    /// Render with a `strftime`-style `fmt` (same tokens as `parse_with_format`).
+    pub fn format(&self, fmt: &str) -> String {
+        let (y, mo, d, h, mi, se) = self.fields();
+        let fb = fmt.as_bytes();
+        let mut out = String::with_capacity(fmt.len() + 8);
+        let mut fi = 0usize;
+        while fi < fb.len() {
+            let rest = &fmt[fi..];
+            if let Some(tok) = ["yyyy", "yy", "MM", "dd", "HH", "hh", "mm", "ss"]
+                .into_iter()
+                .find(|t| rest.starts_with(t))
+            {
+                use std::fmt::Write as _;
+                match tok {
+                    "yyyy" => {
+                        let _ = write!(out, "{y:04}");
+                    }
+                    "yy" => {
+                        let _ = write!(out, "{:02}", y.rem_euclid(100));
+                    }
+                    "MM" => {
+                        let _ = write!(out, "{mo:02}");
+                    }
+                    "dd" => {
+                        let _ = write!(out, "{d:02}");
+                    }
+                    "HH" | "hh" => {
+                        let _ = write!(out, "{h:02}");
+                    }
+                    "mm" => {
+                        let _ = write!(out, "{mi:02}");
+                    }
+                    "ss" => {
+                        let _ = write!(out, "{se:02}");
+                    }
+                    _ => unreachable!(),
+                }
+                fi += tok.len();
+            } else {
+                out.push(fb[fi] as char);
+                fi += 1;
+            }
+        }
+        out
+    }
+}
+
+impl fmt::Display for DateTime {
+    /// Default ISO-8601 (`yyyy-MM-ddTHH:mm:ss`); sub-second ticks are truncated to
+    /// the whole second in this rendering.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.format("yyyy-MM-ddTHH:mm:ss"))
+    }
+}
+
 /// A single scalar value. Used for literals, predicate evaluation and the
 /// "current object" (`$_`) field access. Bulk data lives in [`crate::Column`].
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +464,8 @@ pub enum Value {
     F64(f64),
     /// Exact fixed-point lane (opt-in; design doc 21).
     Dec(Decimal),
+    /// Datetime lane (epoch ticks; design doc 23).
+    DateTime(DateTime),
     Str(String),
 }
 
@@ -217,6 +477,7 @@ impl Value {
             Value::I64(_) => DataType::I64,
             Value::F64(_) => DataType::F64,
             Value::Dec(d) => DataType::Decimal { scale: d.scale },
+            Value::DateTime(t) => DataType::DateTime { unit: t.unit },
             Value::Str(_) => DataType::Str,
         }
     }
@@ -227,6 +488,7 @@ impl Value {
             Value::I64(v) => Some(*v as f64),
             Value::F64(v) => Some(*v),
             Value::Dec(d) => Some(d.to_f64()),
+            Value::DateTime(t) => Some(t.ticks as f64),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             _ => None,
         }
@@ -245,6 +507,7 @@ impl fmt::Display for Value {
             Value::I64(v) => write!(f, "{v}"),
             Value::F64(v) => write!(f, "{v}"),
             Value::Dec(d) => write!(f, "{d}"),
+            Value::DateTime(t) => write!(f, "{t}"),
             Value::Str(s) => write!(f, "{s}"),
         }
     }
@@ -263,6 +526,10 @@ pub enum DataType {
     Decimal {
         scale: u8,
     },
+    /// Datetime lane: epoch ticks at a fixed `unit` (design doc 23).
+    DateTime {
+        unit: TimeUnit,
+    },
     /// Stream-based text (see design doc 09 "Text is stream").
     Str,
 }
@@ -275,6 +542,10 @@ impl fmt::Display for DataType {
             DataType::I64 => f.write_str("i64"),
             DataType::F64 => f.write_str("f64"),
             DataType::Decimal { scale } => write!(f, "decimal({scale})"),
+            // The unit is omitted (always `Sec` in the MVP) so the annotation
+            // round-trips as the bare `datetime` the parser accepts; an explicit
+            // `:datetime("fmt")` is rendered from `OpenCsv.dt_formats`, not here.
+            DataType::DateTime { .. } => f.write_str("datetime"),
             DataType::Str => f.write_str("str"),
         }
     }
@@ -443,5 +714,58 @@ mod decimal_tests {
         assert!(big.checked_add(&Decimal::new(1, 0)).is_none());
         // Rescaling up past i128 range also reports None (caller degrades).
         assert!(Decimal::new(i128::MAX / 5, 0).rescale(2).is_none());
+    }
+
+    #[test]
+    fn datetime_parse_format_roundtrips() {
+        // Epoch itself.
+        let dt = DateTime::parse_with_format(
+            "1970-01-01T00:00:00",
+            "yyyy-MM-ddTHH:mm:ss",
+            TimeUnit::Sec,
+        )
+        .unwrap();
+        assert_eq!(dt.ticks, 0);
+        // A known instant: 2020-02-29 12:34:56 UTC (leap day) = 1582979696 s.
+        let dt = DateTime::parse_with_format(
+            "2020-02-29 12:34:56",
+            "yyyy-MM-dd HH:mm:ss",
+            TimeUnit::Sec,
+        )
+        .unwrap();
+        assert_eq!(dt.ticks, 1_582_979_696);
+        // Round-trips back to the same text.
+        assert_eq!(dt.format("yyyy-MM-dd HH:mm:ss"), "2020-02-29 12:34:56");
+        // Default Display is ISO-8601 with a `T`.
+        assert_eq!(dt.to_string(), "2020-02-29T12:34:56");
+        // Two-digit year token + compact format.
+        let c = DateTime::parse_with_format("210304050607", "yyMMddHHmmss", TimeUnit::Sec).unwrap();
+        assert_eq!(c.format("yyyy-MM-dd HH:mm:ss"), "2021-03-04 05:06:07");
+    }
+
+    #[test]
+    fn datetime_rejects_invalid_and_partial() {
+        // Month/day out of range.
+        assert!(DateTime::parse_with_format("2020-13-01", "yyyy-MM-dd", TimeUnit::Sec).is_none());
+        assert!(DateTime::parse_with_format("2020-00-10", "yyyy-MM-dd", TimeUnit::Sec).is_none());
+        assert!(DateTime::parse_with_format("2020-01-32", "yyyy-MM-dd", TimeUnit::Sec).is_none());
+        // Literal mismatch / trailing input.
+        assert!(DateTime::parse_with_format("2020/01/01", "yyyy-MM-dd", TimeUnit::Sec).is_none());
+        assert!(DateTime::parse_with_format("2020-01-01x", "yyyy-MM-dd", TimeUnit::Sec).is_none());
+        // Non-digit where a digit is required.
+        assert!(DateTime::parse_with_format("20-0a-01", "yy-MM-dd", TimeUnit::Sec).is_none());
+    }
+
+    #[test]
+    fn datetime_compares_across_units_exactly() {
+        // 1 second in millis vs 1 second in seconds are equal instants.
+        let a = DateTime::new(1_000, TimeUnit::Milli);
+        let b = DateTime::new(1, TimeUnit::Sec);
+        assert_eq!(a, b);
+        assert!(DateTime::new(999, TimeUnit::Milli) < b);
+        assert!(DateTime::new(1_001, TimeUnit::Milli) > b);
+        // Sub-second resolution preserved in ticks but truncated in Display.
+        let m = DateTime::new(1_500, TimeUnit::Milli);
+        assert_eq!(m.to_string(), "1970-01-01T00:00:01");
     }
 }

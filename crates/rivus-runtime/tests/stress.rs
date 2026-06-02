@@ -2593,3 +2593,370 @@ fn parallel_group_final_mode_matches_serial() {
         "parallel group-by final_mode must match serial"
     );
 }
+
+/// Collect a column's per-row `Value::to_string()` across all chunks of the
+/// output labeled `label` (used to inspect the datetime lane's ISO rendering).
+fn collect_strings(res: &rivus_runtime::RunResult, label: &str, col: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let o = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some(label))
+        .expect("labeled output");
+    for c in &o.chunks {
+        if let Some(ci) = c.schema.index_of(col) {
+            for r in 0..c.len {
+                out.push(c.value(r, ci).to_string());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn datetime_column_parses_and_is_chunk_size_independent() {
+    // A `:datetime("yyMMddHHmmss")` column parses fixed-width timestamps into the
+    // exact integer-tick lane (design 23). A non-matching cell is continue-first
+    // (epoch 0, no fatal). The result must not depend on chunk size.
+    let text = "ts,id\n\
+                260601143000,1\n\
+                991231235959,2\n\
+                bad,3\n\
+                700101000000,4\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_datetime",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |> ts id\n;");
+
+    let want_ts = vec![
+        "2026-06-01T14:30:00".to_string(), // yy=26 → 2026
+        "1999-12-31T23:59:59".to_string(), // yy=99 → 1999 (pivot >68 → 19xx)
+        "1970-01-01T00:00:00".to_string(), // "bad" → epoch 0 (continue-first)
+        "1970-01-01T00:00:00".to_string(), // yy=70 → 1970
+    ];
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert!(
+            !res.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+            "datetime parse must never raise a fatal (cz={cz})"
+        );
+        assert_eq!(
+            collect_strings(&res, "D", "ts"),
+            want_ts,
+            "datetime ISO rendering changed at chunk_size {cz}"
+        );
+        assert_eq!(
+            collect_i64(&res, "D", "id"),
+            vec![1, 2, 3, 4],
+            "row alignment changed at chunk_size {cz}"
+        );
+        // The declared lane is DateTime, not a string fallback.
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        let ci = o.chunks[0].schema.index_of("ts").unwrap();
+        assert!(
+            matches!(
+                o.chunks[0].schema.fields[ci].dtype,
+                rivus_core::DataType::DateTime { .. }
+            ),
+            "ts column must be the datetime lane at chunk_size {cz}"
+        );
+    }
+}
+
+#[test]
+fn datetime_auto_infer_common_formats() {
+    // A bare `:datetime` (no explicit format) auto-infers common shapes per cell:
+    // ISO-with-T, ISO-with-space, and bare date all resolve; junk → epoch 0.
+    let text = "ts\n\
+                2026-06-01T14:30:00\n\
+                2026-06-01 14:30:00\n\
+                2026-06-01\n\
+                nope\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_dt_auto", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (ts:datetime)\n |> ts\n;");
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "D", "ts"),
+        vec![
+            "2026-06-01T14:30:00".to_string(),
+            "2026-06-01T14:30:00".to_string(),
+            "2026-06-01T00:00:00".to_string(),
+            "1970-01-01T00:00:00".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn datetime_filter_by_literal_same_lane() {
+    // `|? ts >= "literal"` parses the literal into the datetime lane and compares
+    // instants exactly (design 23) — not the lossy f64 view, and not a string
+    // compare. Chunk-size independent.
+    let text = "ts,id\n\
+                260601143000,1\n\
+                260601000000,2\n\
+                991231235959,3\n\
+                700101120000,4\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_dt_filter",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    // Threshold = 2026-06-01 00:00:00. Rows: r0 2026-06-01 14:30 (>=), r1 exactly
+    // equal (>=), r2 1999-12-31 (no), r3 1970-01-01 (no).
+    let flow = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts >= \"260601000000\"\n |> id\n;"
+    );
+    for cz in [1usize, 2, 3, 4096] {
+        assert_eq!(
+            collect_i64(&run_src(&flow, cz), "D", "id"),
+            vec![1, 2],
+            "datetime >= literal changed at chunk_size {cz}"
+        );
+    }
+    // Strict `<` excludes the equal row; `==` keeps only it.
+    let lt = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts < \"260601000000\"\n |> id\n;"
+    );
+    assert_eq!(collect_i64(&run_src(&lt, 4096), "D", "id"), vec![3, 4]);
+    let eq = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts == \"260601000000\"\n |> id\n;"
+    );
+    assert_eq!(collect_i64(&run_src(&eq, 4096), "D", "id"), vec![2]);
+    // An ISO-form literal resolves to the same instant as the compact column.
+    let iso = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts >= \"2026-06-01\"\n |> id\n;"
+    );
+    assert_eq!(collect_i64(&run_src(&iso, 4096), "D", "id"), vec![1, 2]);
+    // An unparseable literal is continue-first: no instant satisfies an ordering
+    // (so `>=` keeps nothing), while `!=` keeps every row (none equals it).
+    let bad_ge = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts >= \"not-a-date\"\n |> id\n;"
+    );
+    // An all-filtered flow emits no chunks for the output node.
+    let bad = run_src(&bad_ge, 4096);
+    let kept: usize = bad
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("D"))
+        .map_or(0, |o| o.chunks.iter().map(|c| c.len).sum());
+    assert_eq!(
+        kept, 0,
+        "`>=` against an unparseable literal must keep no rows"
+    );
+    let bad_ne = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts != \"not-a-date\"\n |> id\n;"
+    );
+    assert_eq!(
+        collect_i64(&run_src(&bad_ne, 4096), "D", "id"),
+        vec![1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn datetime_functions_and_daily_groupby() {
+    // Field extractors, `trunc`, `format`, and a time-series daily group-by
+    // (design 23) — all integer math, so chunk-size independent.
+    let text = "ts,v\n\
+                260601143000,10\n\
+                260601090000,5\n\
+                260602120000,7\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_dt_funcs",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+
+    // Extractors over row 0 (2026-06-01 14:30:00).
+    let ext = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") v:int)\n \
+         |> (year(ts)) as y (month(ts)) as mo (day(ts)) as d (hour(ts)) as h (minute(ts)) as mi (second(ts)) as se\n;"
+    );
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&ext, cz);
+        assert_eq!(collect_i64(&res, "D", "y")[0], 2026, "year (cz={cz})");
+        assert_eq!(collect_i64(&res, "D", "mo")[0], 6);
+        assert_eq!(collect_i64(&res, "D", "d")[0], 1);
+        assert_eq!(collect_i64(&res, "D", "h")[0], 14);
+        assert_eq!(collect_i64(&res, "D", "mi")[0], 30);
+        assert_eq!(collect_i64(&res, "D", "se")[0], 0);
+    }
+
+    // `trunc(ts,"day")` stays on the datetime lane; `format` renders it.
+    let tr = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") v:int)\n \
+         |> (format(trunc(ts, \"day\"), \"yyyy-MM-dd\")) as day v\n;"
+    );
+    assert_eq!(
+        collect_strings(&run_src(&tr, 4096), "D", "day"),
+        vec![
+            "2026-06-01".to_string(),
+            "2026-06-01".to_string(),
+            "2026-06-02".to_string(),
+        ],
+    );
+
+    // Daily aggregation: sum(v) grouped by the truncated day.
+    let grp = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") v:int)\n \
+         |> (format(trunc(ts, \"day\"), \"yyyy-MM-dd\")) as day v\n \
+         |# day sum:v\n;"
+    );
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&grp, cz);
+        let days = collect_strings(&res, "D", "day");
+        let sums = collect_i64(&res, "D", "sum_v");
+        let mut pairs: Vec<(String, i64)> = days.into_iter().zip(sums).collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("2026-06-01".to_string(), 15), // 10 + 5
+                ("2026-06-02".to_string(), 7),
+            ],
+            "daily sum changed at chunk_size {cz}"
+        );
+    }
+}
+
+#[test]
+fn datetime_parallel_matches_serial_and_chunk_size() {
+    // The byte-range parallel reader builds datetime columns with the same
+    // `DtSpec` as the serial reader, so a datetime read + filter + daily
+    // group-by must be byte-identical across serial/parallel and chunk size
+    // (design 23 step 3c; integer ticks are exact + associative).
+    let rows = 20_000;
+    let mut rng = Rng::new(11);
+    let mut text = String::from("ts,v\n");
+    // Three days in 2026-06; a compact yyMMddHHmmss timestamp per row.
+    let days = ["260601", "260602", "260603"];
+    for _ in 0..rows {
+        let day = days[rng.below(days.len() as u64) as usize];
+        let hh = rng.below(24);
+        let mm = rng.below(60);
+        let ss = rng.below(60);
+        let v = rng.below(1000) as i64;
+        text.push_str(&format!("{day}{hh:02}{mm:02}{ss:02},{v}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_dt_par", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") v:int)\n \
+         |? ts >= \"260602000000\"\n \
+         |> (format(trunc(ts, \"day\"), \"yyyy-MM-dd\")) as day v\n \
+         |# day sum:v max:v\n;"
+    );
+
+    // Collect (day, sum_v, max_v) as a sorted, chunk/strategy-independent key.
+    let snapshot = |pref: rivus_runtime::MemoryPref, cz: usize| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let days = collect_strings(&res, "D", "day");
+        let sums = collect_i64(&res, "D", "sum_v");
+        let maxs = collect_i64(&res, "D", "max_v");
+        let mut rows: Vec<(String, i64, i64)> = days
+            .into_iter()
+            .zip(sums)
+            .zip(maxs)
+            .map(|((d, s), m)| (d, s, m))
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let reference = snapshot(rivus_runtime::MemoryPref::Low, 4096);
+    // Only the days >= 2026-06-02 survive the filter.
+    assert_eq!(
+        reference.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        vec!["2026-06-02".to_string(), "2026-06-03".to_string()],
+    );
+    for pref in [
+        rivus_runtime::MemoryPref::Low,
+        rivus_runtime::MemoryPref::Fast,
+    ] {
+        for cz in [1usize, 7, 256, 4096] {
+            assert_eq!(
+                snapshot(pref, cz),
+                reference,
+                "datetime group-by diverged at pref={pref:?} chunk_size={cz}"
+            );
+        }
+    }
+}
+
+#[test]
+fn datetime_min_max_groupby_keeps_datetime_type() {
+    // `min:ts` / `max:ts` over a datetime column must stay on the datetime lane
+    // (exact ticks + DateTime type, ISO rendering), not collapse to f64 (#53).
+    let text = "g,ts\n\
+                a,260601143000\n\
+                a,260601090000\n\
+                b,260602120000\n\
+                b,260602235959\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_dt_minmax",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow =
+        format!("D:\n open {p} (g:str ts:datetime(\"yyMMddHHmmss\"))\n |# g min:ts max:ts\n;");
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow, cz);
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        for col in ["min_ts", "max_ts"] {
+            let ci = o.chunks[0].schema.index_of(col).unwrap();
+            assert!(
+                matches!(
+                    o.chunks[0].schema.fields[ci].dtype,
+                    rivus_core::DataType::DateTime { .. }
+                ),
+                "{col} must stay on the datetime lane (cz={cz})"
+            );
+        }
+        // Pair (g, min_ts, max_ts) regardless of group order.
+        let gs = collect_strings(&res, "D", "g");
+        let mins = collect_strings(&res, "D", "min_ts");
+        let maxs = collect_strings(&res, "D", "max_ts");
+        let mut rows: Vec<(String, String, String)> = gs
+            .into_iter()
+            .zip(mins)
+            .zip(maxs)
+            .map(|((g, mn), mx)| (g, mn, mx))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "a".to_string(),
+                    "2026-06-01T09:00:00".to_string(),
+                    "2026-06-01T14:30:00".to_string()
+                ),
+                (
+                    "b".to_string(),
+                    "2026-06-02T12:00:00".to_string(),
+                    "2026-06-02T23:59:59".to_string()
+                ),
+            ],
+            "datetime min/max changed at chunk_size {cz}"
+        );
+    }
+}

@@ -100,6 +100,10 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
             let idx = chunk.schema.index_of(name)?;
             match chunk.columns[idx] {
                 Column::I64(_) | Column::F64(_) | Column::Bool(_) | Column::Dec(_) => Some(idx),
+                // Datetime stays off the f64 kernel (ns ticks > 2^53 lose
+                // precision as f64); it routes to the interpreter's exact i64
+                // `dt_cmp` instead, so kernel and interpreter agree. Design 23 / #53.
+                Column::DateTime(_) => None,
                 Column::Str(_) => None,
             }
         }
@@ -179,7 +183,10 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         // the two scales — never rounding the literal (accounting contract;
         // shared with the interpreter so the two stay byte-identical). #44 / doc 21.
         Column::Dec(d) => dec_write(d, p, mask),
-        Column::Str(_) => mask.fill(0), // compiled out by `num_col`
+        // Datetime is never compiled into the kernel (`num_col` returns `None`
+        // for it) — it routes to the interpreter's exact i64 `dt_cmp`. This arm
+        // is unreachable; it exists only for match exhaustiveness. #53.
+        Column::DateTime(_) | Column::Str(_) => mask.fill(0),
     }
 }
 
@@ -274,7 +281,8 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
             }
         }
         Column::Dec(d) => dec_mask(d, p, mask, false),
-        Column::Str(_) => mask.fill(0),
+        // Unreachable: `num_col` excludes datetime (routed to `dt_cmp`). #53.
+        Column::DateTime(_) | Column::Str(_) => mask.fill(0),
     }
 }
 

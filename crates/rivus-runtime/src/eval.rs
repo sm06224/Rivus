@@ -120,6 +120,52 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             }
             Value::Str(String::new())
         }
+        // Datetime field extractors (design 23). The argument is coerced to a
+        // `DateTime` (a datetime cell as-is, or a text/epoch value parsed into
+        // the lane); a non-datetime that won't coerce yields `Null`.
+        Func::Year | Func::Month | Func::Day | Func::Hour | Func::Minute | Func::Second => {
+            match as_datetime(arg(0)) {
+                Some(dt) => {
+                    let (y, mo, d, h, mi, se) = dt.fields();
+                    Value::I64(match func {
+                        Func::Year => y,
+                        Func::Month => mo,
+                        Func::Day => d,
+                        Func::Hour => h,
+                        Func::Minute => mi,
+                        _ => se,
+                    })
+                }
+                None => Value::Null,
+            }
+        }
+        // `trunc(ts, "day")` → datetime truncated to the boundary (same unit).
+        Func::Trunc => match as_datetime(arg(0)) {
+            Some(dt) => Value::DateTime(dt.truncated(arg(1).to_string().trim())),
+            None => Value::Null,
+        },
+        // `format(ts, "fmt")` → text rendering. A non-datetime coerces to its
+        // text form (so `format` is total / continue-first).
+        Func::Format => {
+            let fmt = arg(1).to_string();
+            match as_datetime(arg(0)) {
+                Some(dt) => Value::Str(dt.format(&fmt)),
+                None => Value::Str(arg(0).to_string()),
+            }
+        }
+    }
+}
+
+/// Coerce a value to a [`DateTime`] for the datetime functions (design 23): a
+/// datetime cell is taken as-is; a text value is auto-parsed (second unit); an
+/// integer is read as epoch seconds. Anything else → `None` (continue-first).
+fn as_datetime(v: Value) -> Option<rivus_core::DateTime> {
+    use rivus_core::{DateTime, TimeUnit};
+    match v {
+        Value::DateTime(dt) => Some(dt),
+        Value::Str(s) => DateTime::parse_auto(&s, TimeUnit::Sec),
+        Value::I64(n) => Some(DateTime::new(n, TimeUnit::Sec)),
+        _ => None,
     }
 }
 
@@ -325,6 +371,7 @@ fn to_i64(v: Value) -> i64 {
         Value::I64(x) => x,
         Value::F64(x) => x as i64,
         Value::Dec(d) => d.to_f64() as i64,
+        Value::DateTime(t) => t.ticks,
         Value::Bool(b) => b as i64,
         Value::Str(s) => s
             .trim()
@@ -341,6 +388,7 @@ fn to_f64(v: Value) -> f64 {
         Value::I64(x) => x as f64,
         Value::F64(x) => x,
         Value::Dec(d) => d.to_f64(),
+        Value::DateTime(t) => t.ticks as f64,
         Value::Bool(b) => b as i64 as f64,
         Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
         Value::Null => f64::NAN,
@@ -354,6 +402,7 @@ fn to_bool(v: Value) -> bool {
         Value::I64(x) => x != 0,
         Value::F64(x) => x != 0.0,
         Value::Dec(d) => d.unscaled != 0,
+        Value::DateTime(t) => t.ticks != 0,
         Value::Str(s) => s.trim().eq_ignore_ascii_case("true") || s.trim() == "1",
         Value::Null => false,
     }
@@ -368,6 +417,9 @@ fn cast_value(v: Value, ty: DataType) -> Value {
         // round-half-even to the target scale (the reader has an exact text
         // path; this covers computed casts). Design doc 21.
         DataType::Decimal { scale } => Value::Dec(f64_to_decimal(to_f64(v), scale)),
+        // Cast to datetime treats the value as epoch ticks at the target unit
+        // (the reader has an exact text path; this covers computed casts).
+        DataType::DateTime { unit } => Value::DateTime(rivus_core::DateTime::new(to_i64(v), unit)),
         DataType::Bool => Value::Bool(to_bool(v)),
         DataType::Str => Value::Str(v.to_string()),
         DataType::Null => Value::Null,
@@ -431,6 +483,10 @@ pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
                 .collect();
             Column::Dec(rivus_core::DecColumn { unscaled, scale })
         }
+        DataType::DateTime { unit } => {
+            let ticks = (0..n).map(|i| to_i64(col.value_at(i))).collect();
+            Column::DateTime(rivus_core::DtColumn { ticks, unit })
+        }
         DataType::Bool => Column::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
         DataType::Str => {
             let mut s = StrColumn::with_capacity(n, n * 8);
@@ -460,11 +516,25 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
         Expr::Func { func, args } => {
             let n = chunk.len;
             match func {
-                Func::Len => Column::I64(
+                // Integer-valued funcs: `len` and the datetime field extractors
+                // (design 23) all yield an i64 lane.
+                Func::Len
+                | Func::Year
+                | Func::Month
+                | Func::Day
+                | Func::Hour
+                | Func::Minute
+                | Func::Second => Column::I64(
                     (0..n)
                         .map(|r| to_i64(call_func(*func, args, chunk, r)))
                         .collect(),
                 ),
+                // `trunc` stays on the datetime lane (truncated ticks, same unit).
+                Func::Trunc => {
+                    let vals: Vec<Value> =
+                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    column_from_values(vals)
+                }
                 // `regexp(col, "literal")` compiles the pattern once for the
                 // whole chunk (per-row compilation is catastrophic — ~10× slower).
                 Func::Regexp if regex_literal(args).is_some() => regexp_column(args, chunk),
@@ -523,6 +593,23 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
         .iter()
         .all(|v| matches!(v, Value::I64(_) | Value::F64(_) | Value::Bool(_)));
     let all_bool = !vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Bool(_)));
+    // All-datetime → keep the datetime lane (e.g. `trunc(ts, "day")`), carrying
+    // the first cell's unit (every cell shares it). Design 23.
+    if let Some(Value::DateTime(first)) = vals.first() {
+        if vals.iter().all(|v| matches!(v, Value::DateTime(_))) {
+            let unit = first.unit;
+            return Column::DateTime(rivus_core::DtColumn {
+                ticks: vals
+                    .iter()
+                    .map(|v| match v {
+                        Value::DateTime(t) => t.ticks,
+                        _ => 0,
+                    })
+                    .collect(),
+                unit,
+            });
+        }
+    }
     if all_bool {
         Column::Bool(
             vals.iter()
@@ -554,6 +641,10 @@ fn const_column(v: &Value, n: usize) -> Column {
             unscaled: vec![d.unscaled; n],
             scale: d.scale,
         }),
+        Value::DateTime(t) => Column::DateTime(rivus_core::DtColumn {
+            ticks: vec![t.ticks; n],
+            unit: t.unit,
+        }),
         Value::Bool(x) => Column::Bool(vec![*x; n]),
         Value::Str(s) => {
             let mut c = StrColumn::with_capacity(n, s.len() * n);
@@ -578,6 +669,9 @@ fn num_lane(e: &Expr, chunk: &Chunk) -> (Vec<f64>, bool) {
             let pow = 10f64.powi(d.scale as i32);
             (d.unscaled.iter().map(|&u| u as f64 / pow).collect(), false)
         }
+        // DateTime arithmetic operates on the raw integer tick lane (epoch ticks
+        // at the column's unit); diffs/offsets stay integer.
+        Column::DateTime(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
         Column::Str(s) => {
             let lane = (0..s.len())
                 .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
@@ -808,6 +902,10 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
             Column::I64(v) => Some(v[row] as f64),
             Column::F64(v) => Some(v[row]),
             Column::Dec(d) => Some(d.unscaled[row] as f64 / 10f64.powi(d.scale as i32)),
+            // Datetime is *not* read through this f64 lane: ns ticks exceed 2^53
+            // and `tick as f64` would silently lose precision. A datetime field
+            // routes to the owned-`Value` path → `dt_cmp` (exact i64). Design 23 / #53.
+            Column::DateTime(_) => None,
             Column::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
             Column::Str(_) => None,
         },
@@ -824,7 +922,43 @@ fn cmp_ord(ord: Option<Ordering>, op: CmpOp) -> bool {
     )
 }
 
+/// Datetime-aware comparison: when one operand is a `DateTime`, compare on the
+/// exact integer-tick lane rather than the lossy f64 view (design 23 / #53).
+///
+/// * two datetimes → exact cross-unit instant order;
+/// * datetime vs a text literal → parse the literal into the same lane (the
+///   datetime's unit, auto-inferring its format) and compare instants
+///   (`|? ts >= "260601000000"`). A literal matching no known format is not a
+///   valid instant, so only `!=` holds (continue-first; no fatal).
+/// * datetime vs an **integer** literal → the integer is a raw tick count at the
+///   column's unit; compared exactly in `i64` (no `tick as f64` rounding, so it
+///   is correct even for nanosecond ticks past 2^53).
+///
+/// Returns `None` when neither operand is a datetime (normal path applies), or
+/// for datetime-vs-float (a nonsensical mix; the f64 view handles it downstream).
+fn dt_cmp(l: &Value, op: CmpOp, r: &Value) -> Option<bool> {
+    let parse = |s: &str, unit| rivus_core::DateTime::parse_auto(s, unit);
+    match (l, r) {
+        (Value::DateTime(a), Value::DateTime(b)) => Some(cmp_ord(a.partial_cmp(b), op)),
+        (Value::DateTime(a), Value::Str(s)) => Some(match parse(s, a.unit) {
+            Some(b) => cmp_ord(a.partial_cmp(&b), op),
+            None => op == CmpOp::Ne,
+        }),
+        (Value::Str(s), Value::DateTime(b)) => Some(match parse(s, b.unit) {
+            Some(a) => cmp_ord(a.partial_cmp(b), op),
+            None => op == CmpOp::Ne,
+        }),
+        // Integer literal = raw ticks at the column's unit → exact i64 order.
+        (Value::DateTime(a), Value::I64(n)) => Some(cmp_ord(a.ticks.partial_cmp(n), op)),
+        (Value::I64(n), Value::DateTime(b)) => Some(cmp_ord(n.partial_cmp(&b.ticks), op)),
+        _ => None,
+    }
+}
+
 fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
+    if let Some(b) = dt_cmp(l, op, r) {
+        return b;
+    }
     let ord = match (l, r) {
         (Value::Str(a), Value::Str(b)) => a.partial_cmp(b),
         _ => match (l.as_f64(), r.as_f64()) {
@@ -840,6 +974,51 @@ fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
         },
     };
     cmp_ord(ord, op)
+}
+
+#[cfg(test)]
+mod dt_cmp_tests {
+    use super::dt_cmp;
+    use rivus_core::{DateTime, TimeUnit, Value};
+    use rivus_ir::CmpOp;
+
+    /// Two nanosecond instants 1 ns apart, both past 2^53, where `tick as f64`
+    /// collapses them — the adversarial case from #53. `dt_cmp` must order them
+    /// exactly (i64), never via the f64 view.
+    #[test]
+    fn nanosecond_compare_is_exact_past_2_pow_53() {
+        let base = 1_700_000_000_000_000_000_i64; // ≈ 2023 in ns, ≫ 2^53
+        assert!(
+            base as f64 == (base + 1) as f64,
+            "precondition: f64 loses 1ns"
+        );
+
+        let a = Value::DateTime(DateTime::new(base, TimeUnit::Nano));
+        let b = Value::DateTime(DateTime::new(base + 1, TimeUnit::Nano));
+        // Strict order is resolved (f64 would call them equal).
+        assert_eq!(dt_cmp(&a, CmpOp::Lt, &b), Some(true));
+        assert_eq!(dt_cmp(&a, CmpOp::Ge, &b), Some(false));
+        assert_eq!(dt_cmp(&a, CmpOp::Eq, &b), Some(false));
+        assert_eq!(dt_cmp(&a, CmpOp::Ne, &b), Some(true));
+
+        // Integer literal = raw ticks at the column's unit, compared in i64.
+        assert_eq!(dt_cmp(&a, CmpOp::Eq, &Value::I64(base)), Some(true));
+        assert_eq!(dt_cmp(&a, CmpOp::Ge, &Value::I64(base + 1)), Some(false));
+        assert_eq!(dt_cmp(&b, CmpOp::Gt, &Value::I64(base)), Some(true));
+    }
+
+    /// Cross-unit comparison stays exact (1 s == 1000 ms), and an unparseable
+    /// text literal is continue-first (only `!=` holds).
+    #[test]
+    fn cross_unit_and_bad_literal() {
+        let s = Value::DateTime(DateTime::new(1, TimeUnit::Sec));
+        let ms = Value::DateTime(DateTime::new(1_000, TimeUnit::Milli));
+        assert_eq!(dt_cmp(&s, CmpOp::Eq, &ms), Some(true));
+
+        let bad = Value::Str("not-a-date".into());
+        assert_eq!(dt_cmp(&s, CmpOp::Ge, &bad), Some(false));
+        assert_eq!(dt_cmp(&s, CmpOp::Ne, &bad), Some(true));
+    }
 }
 
 #[cfg(test)]

@@ -76,7 +76,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
 | `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
-| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, or `decimal(N)` (exact fixed-point, see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly |
+| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), or `datetime[("fmt")]` (exact timestamps; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |
@@ -391,6 +391,34 @@ more fractional digits than `N` is rounded **half-to-even** deterministically,
 fewer are zero-padded, and an unparseable cell becomes `0` (continue-first).
 Everything else stays on the fast `i64`/`f64` lanes by default — `decimal` is
 the "trade speed for exactness" choice, never the default.
+
+**Datetime lane (`datetime[("fmt")]`)** — read fixed-width / ISO timestamps as
+**exact instants** (an `i64` count of seconds from the Unix epoch, UTC), not as
+text or a lossy float. Like `decimal`, the integer form is exact and
+*associative*, so datetime `min`/`max`/`count` and a date-bucketed group-by are
+byte-identical in parallel. Declare a parse format, or let it auto-infer common
+shapes:
+
+```
+open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
+|? ts >= "2026-06-01"                            # literal parsed to the same lane
+|> (format(trunc(ts, "day"), "yyyy-MM-dd")) as day msg
+|# day count:msg                                 # rows per day (time series)
+```
+
+- **Format tokens** (a small `strptime` subset, std-only): `yyyy` `yy` `MM`
+  `dd` `HH`/`hh` `mm` `ss`; any other character is a literal that must match.
+  Two-digit years pivot `00–68 → 20xx`, `69–99 → 19xx` (deterministic). A bare
+  `:datetime` (no format) auto-infers `yyyy-MM-ddTHH:mm:ss`, `yyyy-MM-dd HH:mm:ss`,
+  `yyyy-MM-dd`, `yyyyMMddHHmmss`, `yyMMddHHmmss`, `yyyyMMdd` in that order.
+- **Comparisons** parse the text literal into the same lane and compare
+  instants (`ts >= "260601000000"`), so the literal's shape need not match the
+  column's. A cell or literal that matches no format becomes epoch `0` / a
+  non-instant (continue-first; only `!=` holds against it).
+- **Functions**: `year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)`
+  `second(ts)` (→ integers); `trunc(ts, "day"|"hour"|"minute"|"month"|"year")`
+  (→ datetime bucket key); `format(ts, "fmt")` (→ text); `ts2 - ts1` (→ second
+  difference). Default rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss`.
 
 ---
 

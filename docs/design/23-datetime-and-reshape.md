@@ -44,20 +44,48 @@ Tz       = Naive | Utc | FixedOffset(i32 sec)  // MVP は Naive/Utc
 | 比較 | `|? ts >= "260601000000"` | リテラルは同 lane にパースして整数比較 |
 | 差分 | `(ts2 - ts1) as secs` | i64 差（秒）。結合的 |
 | 切り捨て | `trunc(ts, "day")` / `trunc(ts,"hour")` | group-by キー用。整数除算で決定的 |
-| 部分取り出し | `year(ts) month(ts) day(ts) hour(ts)` | i64 を返す（既存 computed-column 20 に関数追加） |
+| 部分取り出し | `year(ts) month(ts) day(ts) hour(ts) minute(ts) second(ts)` | i64 を返す（既存 computed-column 20 に関数追加） |
 | 整形 | `format(ts, "yyyy-MM-dd")` | 出力時に文字列化 |
+
+### 精度の契約（#53・#44 系譜 — exact レーンは比較で精度を黙って落とさない）
+decimal（#44）と同じく、**datetime は比較・min/max を f64 経由にしない**。
+`2^53 ns ≒ 1970+104日` なので現実の ns tick（~1.7e18）は f64 で隣接値が潰れる。
+よって：
+- **比較は exact i64**：interpreter の `dt_cmp` が
+  - datetime×datetime → i128 cross-unit、
+  - datetime×テキストリテラル → 同 lane に `parse_auto` して比較、
+  - datetime×**整数**リテラル → 整数を「列 unit の生 tick」として i64 比較。
+  kernel は `num_col` で datetime を**除外**（f64 経路を撤廃）→ 全 datetime 比較が
+  interpreter に集約され、kernel==interpreter が自明に一致。
+- **min/max は exact i64 tick で集計し DateTime 型を保持**（`AggAcc.dt_min/dt_max`、
+  f64 列に落とさない）。整数ゆえ結合的 → 並列 group-by でも byte-identical。
+- **キャビアット（未 exact／設計判断）**: datetime の **算術（`ts2-ts1`）・sum・avg は
+  現状 f64 レーン**（`num_lane` の `tick as f64`）。ns では誤差が出るが、(1) 時刻の
+  sum/avg は意味のある instant ではない、(2) sum/avg は parallel-safe 条件が
+  decimal 限定なので datetime では直列に倒れる、ため latent。`diff` の exact i64 化は
+  i64 ネイティブ算術レーン導入時にまとめて対応予定（#53 follow-up）。
+- 受け入れ: ns・>2^53 を跨ぐ敵対的テスト（`eval::dt_cmp_tests`・
+  `operators::agg_merge_tests::datetime_minmax_is_exact_i64_and_type_preserving`）。
 
 `trunc`/`year`/`hour` 等は **時系列 group-by の鍵**（「日ごと集計」「時間帯別」）。
 これらは整数演算なので並列集計が byte-identical。
 
 ### 段階実装
-1. コア型 `DataType::DateTime{unit,tz}` / `Column::DateTime` / `Value::DateTime`、
-   `value_at`/`gather`/`Display`（既定 ISO8601 整形）。等価ユニットテスト。
-2. パーサ：`:datetime[("fmt")]` 注釈 ＋ `--dates`。std-only な strptime/strftime
-   最小実装。書式往復（`to_source` 可逆・原則5）。不正値 continue-first テスト。
-3. 演算子：比較（リテラル同 lane 化）、`trunc`/`year`/`month`/`day`/`hour`/`diff`、
-   `format`。`optimizer_equiv` 等価ゲート、chunk-size 非依存。
-4. 時系列 group-by の例とベンチ（日次/時間帯別集計）。
+1. ✅ **landed** コア型 `DataType::DateTime{unit}` / `Column::DateTime` /
+   `Value::DateTime`、`value_at`/`gather`/`Display`（既定 ISO8601 整形）、
+   厳密な i128 跨ぎ比較。等価ユニットテスト。（MVP は `unit=Sec`・naive UTC、
+   `tz` は未導入。）
+2. ✅ **landed** パーサ：`:datetime[("fmt")]` 注釈。std-only な strptime/strftime
+   最小実装（`yyyy yy MM dd HH/hh mm ss`、2桁年ピボット 00–68→20xx）。書式は
+   `OpenCsv.dt_formats` に載せて `to_source` 往復（原則5）。直列 CSV リーダー
+   （圧縮含む）で `ColBuilder::DateTime`。不正値→epoch 0（continue-first）。
+   （`--dates` フラグは未実装＝列注釈で代替。）
+3. ✅ **landed** 演算子：比較（リテラルを同 lane へ auto-parse）、`year`/`month`/
+   `day`/`hour`/`minute`/`second`、`trunc`、`format`、`diff`（`ts2-ts1`）。
+   並列バイト範囲リーダーも `DtSpec` を `Arc` 共有して対応 → serial/parallel ×
+   chunk-size sweep の等価テスト（`tests/stress.rs`）。
+4. ⏳ 時系列 group-by の例は GUIDE と stress テストに収録済み。専用ベンチ（日次/
+   時間帯別の大規模集計）は **未追加**（機能であり最適化ではないため後回し）。
 
 ---
 
