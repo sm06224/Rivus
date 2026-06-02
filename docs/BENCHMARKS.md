@@ -456,6 +456,44 @@ adopting" rule (cf. #39, #45), `fill_buf` is **not adopted**; a real parse win n
 needs either breaking the two-pass (a memory trade-off) or SIMD value parsing — a
 dedicated, measured effort.
 
+### Columnar / selection-vector (#40) — measured: gather is negligible, deferred
+
+#40 proposes a columnar core whose lever (per #39) is reducing the **gather**
+(materializing surviving rows into new columns) that dominates the *filter
+kernel's internal* time. Measured the fused `filter+project` node (which performs
+that gather) against parse, 5 M rows, serial:
+
+| flow (`open … |? age>=X |> name age save`) | fused (filter+gather) | open (parse) |
+|---|---:|---:|
+| `age>=50` (~mid selectivity) | ~15 ms | ~908 ms |
+| `age>=18` (~high selectivity) | ~27 ms | ~943 ms |
+| `age>=89` (~low selectivity) | ~0.6 ms | ~833 ms |
+
+So the gather a columnar rewrite targets is **~0.5–27 ms — under 3 % of parse, and
+a fraction of a percent of the whole pipeline**. #39 was right that gather
+dominates the *filter kernel's* cost, but the filter kernel is itself negligible
+next to parse (and the now-optimized save). A columnar/selection-vector rewrite is
+a large architectural change with **near-zero measured payoff for these
+workloads**, so per the measure-before-adopting rule it is **deferred** until a
+gather-dominated workload appears (e.g. very wide projections, repeated
+re-gathering, or an alternate execution backend where the row-wise gather is the
+bottleneck).
+
+**Where parse time actually goes (measured).** Interleaved `open` over 5 M rows is
+**~1430 ms whether it builds all 6 columns (no projection) or 1 (`|> id`)** — i.e.
+per-column value building (parse + string copy) is *not* the dominant cost (an
+earlier note guessing it was is corrected here). The cost is the per-row work done
+regardless of projection: the **read + full-line split, run in both passes** of the
+two-pass reader (the split scans every field to find record boundaries even for
+unkept columns; the split itself is already SWAR-optimized). So **SIMD value
+parsing is also low-payoff**, and gather (#40) is negligible. The one lever that
+would meaningfully cut parse is **eliminating the second pass** (split once, not
+twice) — but that trades either chunk-size-independent typing (sampled/single-pass
+inference) or memory (buffer the parsed values), and was measured no-win in
+warm-cache earlier; it is a deliberate design trade-off for the maintainer, not an
+autonomous change. Net: parse is at its **floor for the bounded, chunk-size-
+independent two-pass design**; save is optimized; the DuckDB gap is structural.
+
 ### Exact decimal filter — no silent rounding, faster *and* correct (#44)
 
 The decimal lane's filter comparison used the f64 view (`u as f64 / 10^scale`),

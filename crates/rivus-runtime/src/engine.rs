@@ -1560,10 +1560,20 @@ fn finalize_group_partials(
         telemetry[sink].rows_in = rows_out;
     }
 
+    // Halt the run if any worker (or the merge) raised a fatal error, so the
+    // parallel group-by's final mode — and the CLI exit code — match the serial
+    // path. Data is unaffected (#48; the serial/`merge_results` paths derive the
+    // mode the same way).
+    let final_mode = if errors.iter().any(ErrorEvent::is_fatal) {
+        Mode::Halted
+    } else {
+        Mode::Normal
+    };
+
     let mut res = RunResult {
         telemetry,
         errors,
-        final_mode: Mode::Normal,
+        final_mode,
         outputs: Vec::new(),
         workers,
         first_row_latency: None,
