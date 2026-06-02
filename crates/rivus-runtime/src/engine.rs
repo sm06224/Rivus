@@ -1409,6 +1409,16 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             delim,
             ..
         } => {
+            // A declared `:datetime` column carries an explicit parse format that
+            // the byte-range workers don't thread through yet, so keep such reads
+            // on the serial path (the reference). Design 23 step 2.
+            if let Some(d) = declared {
+                if d.iter()
+                    .any(|(_, t)| matches!(t, Some(DataType::DateTime { .. })))
+                {
+                    return None;
+                }
+            }
             let path = source_path(op).filter(|p| *p != "-" && !is_compressed_source(p))?;
             let plan = crate::csv::plan_parallel(
                 path,

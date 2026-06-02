@@ -328,7 +328,9 @@ impl DateTime {
                 let v = read(sb, &mut si, n)?;
                 match tok {
                     "yyyy" => y = v,
-                    "yy" => y = 2000 + v,
+                    // Fixed two-digit-year pivot (design 23): 00–68 → 20xx,
+                    // 69–99 → 19xx (the POSIX/Unix convention; deterministic).
+                    "yy" => y = if v <= 68 { 2000 + v } else { 1900 + v },
                     "MM" => mo = v,
                     "dd" => d = v,
                     "HH" | "hh" => h = v,
@@ -498,7 +500,10 @@ impl fmt::Display for DataType {
             DataType::I64 => f.write_str("i64"),
             DataType::F64 => f.write_str("f64"),
             DataType::Decimal { scale } => write!(f, "decimal({scale})"),
-            DataType::DateTime { unit } => write!(f, "datetime({})", unit.as_str()),
+            // The unit is omitted (always `Sec` in the MVP) so the annotation
+            // round-trips as the bare `datetime` the parser accepts; an explicit
+            // `:datetime("fmt")` is rendered from `OpenCsv.dt_formats`, not here.
+            DataType::DateTime { .. } => f.write_str("datetime"),
             DataType::Str => f.write_str("str"),
         }
     }

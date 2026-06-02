@@ -2593,3 +2593,102 @@ fn parallel_group_final_mode_matches_serial() {
         "parallel group-by final_mode must match serial"
     );
 }
+
+/// Collect a column's per-row `Value::to_string()` across all chunks of the
+/// output labeled `label` (used to inspect the datetime lane's ISO rendering).
+fn collect_strings(res: &rivus_runtime::RunResult, label: &str, col: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let o = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some(label))
+        .expect("labeled output");
+    for c in &o.chunks {
+        if let Some(ci) = c.schema.index_of(col) {
+            for r in 0..c.len {
+                out.push(c.value(r, ci).to_string());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn datetime_column_parses_and_is_chunk_size_independent() {
+    // A `:datetime("yyMMddHHmmss")` column parses fixed-width timestamps into the
+    // exact integer-tick lane (design 23). A non-matching cell is continue-first
+    // (epoch 0, no fatal). The result must not depend on chunk size.
+    let text = "ts,id\n\
+                260601143000,1\n\
+                991231235959,2\n\
+                bad,3\n\
+                700101000000,4\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_datetime",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |> ts id\n;");
+
+    let want_ts = vec![
+        "2026-06-01T14:30:00".to_string(), // yy=26 → 2026
+        "1999-12-31T23:59:59".to_string(), // yy=99 → 1999 (pivot >68 → 19xx)
+        "1970-01-01T00:00:00".to_string(), // "bad" → epoch 0 (continue-first)
+        "1970-01-01T00:00:00".to_string(), // yy=70 → 1970
+    ];
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert!(
+            !res.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+            "datetime parse must never raise a fatal (cz={cz})"
+        );
+        assert_eq!(
+            collect_strings(&res, "D", "ts"),
+            want_ts,
+            "datetime ISO rendering changed at chunk_size {cz}"
+        );
+        assert_eq!(
+            collect_i64(&res, "D", "id"),
+            vec![1, 2, 3, 4],
+            "row alignment changed at chunk_size {cz}"
+        );
+        // The declared lane is DateTime, not a string fallback.
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        let ci = o.chunks[0].schema.index_of("ts").unwrap();
+        assert!(
+            matches!(
+                o.chunks[0].schema.fields[ci].dtype,
+                rivus_core::DataType::DateTime { .. }
+            ),
+            "ts column must be the datetime lane at chunk_size {cz}"
+        );
+    }
+}
+
+#[test]
+fn datetime_auto_infer_common_formats() {
+    // A bare `:datetime` (no explicit format) auto-infers common shapes per cell:
+    // ISO-with-T, ISO-with-space, and bare date all resolve; junk → epoch 0.
+    let text = "ts\n\
+                2026-06-01T14:30:00\n\
+                2026-06-01 14:30:00\n\
+                2026-06-01\n\
+                nope\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_dt_auto", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (ts:datetime)\n |> ts\n;");
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "D", "ts"),
+        vec![
+            "2026-06-01T14:30:00".to_string(),
+            "2026-06-01T14:30:00".to_string(),
+            "2026-06-01T00:00:00".to_string(),
+            "1970-01-01T00:00:00".to_string(),
+        ],
+    );
+}

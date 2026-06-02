@@ -244,6 +244,12 @@ pub enum Op {
         /// columns positionally (overriding the header / `c0…`) and, where a
         /// type is given, fixes that column's lane instead of inferring it.
         declared: Option<Vec<(String, Option<DataType>)>>,
+        /// Strptime-style parse formats for `:datetime("fmt")` columns, keyed by
+        /// column name (design 23). Only columns given an *explicit* format
+        /// appear here; a bare `:datetime` (auto-infer) has no entry. Carried
+        /// alongside `declared` because the format is a read-time parse hint, not
+        /// part of the (Copy) lane tag `DataType::DateTime`.
+        dt_formats: Vec<(String, String)>,
         /// Field delimiter byte. `b','` for CSV (the default); `b'\t'` for a
         /// `.tsv`/`.tab` file or `open f.x as tsv`. Std-only — the reader just
         /// splits on a different byte.
@@ -471,6 +477,7 @@ impl Op {
                 str_prefilter,
                 header,
                 declared,
+                dt_formats,
                 delim,
             } => {
                 let mut s = format!("open {path}");
@@ -485,6 +492,15 @@ impl Op {
                     let parts: Vec<String> = cols
                         .iter()
                         .map(|(n, t)| match t {
+                            // Datetime renders in its annotation form
+                            // (`datetime` or `datetime("fmt")`), not the DataType
+                            // Display, so an explicit parse format round-trips.
+                            Some(DataType::DateTime { .. }) => {
+                                match dt_formats.iter().find(|(c, _)| c == n) {
+                                    Some((_, fmt)) => format!("{n}:datetime({fmt:?})"),
+                                    None => format!("{n}:datetime"),
+                                }
+                            }
                             Some(t) => format!("{n}:{t}"),
                             None => n.clone(),
                         })

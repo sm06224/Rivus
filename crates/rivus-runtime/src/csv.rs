@@ -22,11 +22,14 @@
 //! overwhelmingly common case — split into pure borrows; quoted records fall
 //! back to an owned, escape-aware split.
 
-use rivus_core::{Column, DataType, DecColumn, Decimal, Field, Schema, StrColumn};
+use rivus_core::{
+    Column, DataType, DateTime, DecColumn, Decimal, DtColumn, Field, Schema, StrColumn, TimeUnit,
+};
 use rivus_ir::CmpOp;
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::sync::Arc;
 
 /// Read buffer for the streaming reader. Larger than the 8 KiB default to cut
 /// syscalls on big sequential scans (inference and build each stream the file).
@@ -101,6 +104,10 @@ pub struct CsvChunker {
     ncols: usize,
     keep: Vec<usize>,
     dtypes: Vec<DataType>,
+    /// Per-kept-column datetime parse spec (design 23): `Some` for a
+    /// `:datetime` column (carrying its explicit or auto formats), `None`
+    /// otherwise. Aligned to `dtypes`/`keep` order.
+    dt_specs: Vec<Option<Arc<DtSpec>>>,
     chunk_size: usize,
     line: String,
     /// Rows skipped in pass 1 for wrong arity (reported once by the source).
@@ -154,6 +161,7 @@ impl CsvChunker {
         str_prefilter: &[String],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
+        dt_formats: &[(String, String)],
         delim: u8,
     ) -> Result<(Schema, CsvChunker), String> {
         if preview {
@@ -165,6 +173,7 @@ impl CsvChunker {
                 str_prefilter,
                 header,
                 declared,
+                dt_formats,
                 delim,
             );
         }
@@ -211,6 +220,7 @@ impl CsvChunker {
             .map(|(k, &ci)| (names[ci].clone(), dtypes[k], flags[k].widened()))
             .collect();
         apply_declared_types(&mut dtypes, &keep, declared);
+        let dt_specs = build_dt_specs(&names, &keep, &dtypes, dt_formats);
 
         let mut fields = Vec::with_capacity(keep.len());
         for (k, &ci) in keep.iter().enumerate() {
@@ -233,6 +243,7 @@ impl CsvChunker {
                 ncols,
                 keep,
                 dtypes,
+                dt_specs,
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 bad_rows: bad,
@@ -259,6 +270,7 @@ impl CsvChunker {
         str_prefilter: &[String],
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
+        dt_formats: &[(String, String)],
         delim: u8,
     ) -> Result<(Schema, CsvChunker), String> {
         let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -294,6 +306,7 @@ impl CsvChunker {
         }
         let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
         apply_declared_types(&mut dtypes, &keep, declared);
+        let dt_specs = build_dt_specs(&names, &keep, &dtypes, dt_formats);
         let mut fields = Vec::with_capacity(keep.len());
         for (k, &ci) in keep.iter().enumerate() {
             fields.push(Field::new(names[ci].clone(), dtypes[k]));
@@ -313,6 +326,7 @@ impl CsvChunker {
                 ncols,
                 keep,
                 dtypes,
+                dt_specs,
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 bad_rows: bad,
@@ -346,11 +360,16 @@ impl CsvChunker {
     ) -> Result<CsvChunker, String> {
         let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        // The parallel planner does not partition datetime-bearing reads (it
+        // bails to the serial path), so any datetime column here falls back to
+        // the auto spec (`None`).
+        let dt_specs = vec![None; dtypes.len()];
         Ok(CsvChunker {
             reader: BufReader::with_capacity(READ_BUF, f),
             ncols,
             keep,
             dtypes,
+            dt_specs,
             chunk_size: chunk_size.max(1),
             line: String::new(),
             bad_rows: 0,
@@ -375,7 +394,10 @@ impl CsvChunker {
         let mut builders: Vec<ColBuilder> = self
             .dtypes
             .iter()
-            .map(|d| ColBuilder::with_capacity(*d, self.chunk_size))
+            .enumerate()
+            .map(|(k, d)| {
+                ColBuilder::with_capacity_dt(*d, self.chunk_size, self.dt_specs[k].clone())
+            })
             .collect();
         // Reused field byte-ranges (no per-row allocation on the unquoted fast
         // path); quoted records fall back to an owned split.
@@ -1018,22 +1040,107 @@ impl Flags {
 }
 
 /// A typed, pre-sized column accumulator.
+/// Parse spec for a `:datetime` column (design 23): the resolution `unit` and an
+/// ordered list of candidate strptime formats. An explicit `:datetime("fmt")`
+/// has a single format; a bare `:datetime` carries the auto-infer list, tried in
+/// order per cell (first match wins). Shared across chunks via `Arc` so the
+/// per-chunk builders don't re-clone the format strings.
+#[derive(Debug)]
+struct DtSpec {
+    unit: TimeUnit,
+    formats: Vec<String>,
+}
+
+/// Common fixed-width / ISO timestamp formats tried (in order) for a bare
+/// `:datetime` column with no explicit format (design 23).
+const AUTO_DT_FORMATS: &[&str] = &[
+    "yyyy-MM-ddTHH:mm:ss",
+    "yyyy-MM-dd HH:mm:ss",
+    "yyyy-MM-dd",
+    "yyyyMMddHHmmss",
+    "yyMMddHHmmss",
+    "yyyyMMdd",
+];
+
+/// Build the per-kept-column datetime parse specs (design 23): `Some` for each
+/// `:datetime` column (with its explicit `dt_formats` entry, or the auto list),
+/// `None` otherwise. Aligned to `keep`/`dtypes` order.
+fn build_dt_specs(
+    names: &[String],
+    keep: &[usize],
+    dtypes: &[DataType],
+    dt_formats: &[(String, String)],
+) -> Vec<Option<Arc<DtSpec>>> {
+    keep.iter()
+        .enumerate()
+        .map(|(k, &ci)| match dtypes[k] {
+            DataType::DateTime { unit } => {
+                let spec = match dt_formats.iter().find(|(c, _)| *c == names[ci]) {
+                    Some((_, fmt)) => DtSpec {
+                        unit,
+                        formats: vec![fmt.clone()],
+                    },
+                    None => DtSpec::auto(unit),
+                };
+                Some(Arc::new(spec))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+impl DtSpec {
+    fn auto(unit: TimeUnit) -> Self {
+        DtSpec {
+            unit,
+            formats: AUTO_DT_FORMATS.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Parse one cell to epoch ticks, trying each candidate format in order.
+    /// A cell matching none yields `0` (epoch) — the same default-on-parse-
+    /// failure the int/float/decimal lanes use (continue-first; design 23).
+    #[inline]
+    fn parse(&self, cell: &str) -> i64 {
+        let s = cell.trim();
+        for fmt in &self.formats {
+            if let Some(dt) = DateTime::parse_with_format(s, fmt, self.unit) {
+                return dt.ticks;
+            }
+        }
+        0
+    }
+}
+
 enum ColBuilder {
     Bool(Vec<bool>),
     I64(Vec<i64>),
     F64(Vec<f64>),
     /// Exact fixed-point lane: unscaled i128 values at a fixed column scale.
     Dec(Vec<i128>, u8),
+    /// Datetime lane: epoch ticks at the spec's unit, parsed via the spec's
+    /// candidate formats (design 23).
+    DateTime(Vec<i64>, Arc<DtSpec>),
     Str(StrColumn),
 }
 
 impl ColBuilder {
     fn with_capacity(dtype: DataType, cap: usize) -> Self {
+        Self::with_capacity_dt(dtype, cap, None)
+    }
+
+    /// Like [`with_capacity`], but a `:datetime` column may carry an explicit
+    /// parse spec (from `:datetime("fmt")`); `None` falls back to the auto list.
+    fn with_capacity_dt(dtype: DataType, cap: usize, dt_spec: Option<Arc<DtSpec>>) -> Self {
         match dtype {
             DataType::Bool => ColBuilder::Bool(Vec::with_capacity(cap)),
             DataType::I64 => ColBuilder::I64(Vec::with_capacity(cap)),
             DataType::F64 => ColBuilder::F64(Vec::with_capacity(cap)),
             DataType::Decimal { scale } => ColBuilder::Dec(Vec::with_capacity(cap), scale),
+            DataType::DateTime { unit } => ColBuilder::DateTime(
+                Vec::with_capacity(cap),
+                dt_spec.unwrap_or_else(|| Arc::new(DtSpec::auto(unit))),
+            ),
             // Estimate ~8 bytes per string cell for the backing byte buffer.
             _ => ColBuilder::Str(StrColumn::with_capacity(cap, cap * 8)),
         }
@@ -1051,6 +1158,7 @@ impl ColBuilder {
             ColBuilder::Dec(v, scale) => {
                 v.push(Decimal::parse_scaled(cell.trim(), *scale).map_or(0, |d| d.unscaled))
             }
+            ColBuilder::DateTime(v, spec) => v.push(spec.parse(cell)),
             ColBuilder::Str(v) => v.push(cell),
         }
     }
@@ -1063,6 +1171,10 @@ impl ColBuilder {
             ColBuilder::Dec(v, scale) => Column::Dec(DecColumn {
                 unscaled: std::mem::take(v),
                 scale: *scale,
+            }),
+            ColBuilder::DateTime(v, spec) => Column::DateTime(DtColumn {
+                ticks: std::mem::take(v),
+                unit: spec.unit,
             }),
             ColBuilder::Str(v) => Column::Str(std::mem::take(v)),
         }
@@ -1252,6 +1364,8 @@ pub struct CompressedCsvReader {
     ncols: usize,
     keep: Vec<usize>,
     dtypes: Vec<DataType>,
+    /// Per-kept-column datetime parse spec (design 23); aligned to `dtypes`.
+    dt_specs: Vec<Option<Arc<DtSpec>>>,
     chunk_size: usize,
     delim: u8,
     /// Sample rows buffered during inference, emitted before streaming the rest.
@@ -1308,6 +1422,7 @@ impl CompressedCsvReader {
         chunk_size: usize,
         header: bool,
         declared: Option<&[(String, Option<DataType>)]>,
+        dt_formats: &[(String, String)],
         delim: u8,
     ) -> Result<(Schema, CompressedCsvReader), String> {
         let mut reader = open_decoder(path)?;
@@ -1363,6 +1478,7 @@ impl CompressedCsvReader {
         }
         let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
         apply_declared_types(&mut dtypes, &keep, declared);
+        let dt_specs = build_dt_specs(&names, &keep, &dtypes, dt_formats);
 
         let mut fields = Vec::with_capacity(keep.len());
         for (k, &ci) in keep.iter().enumerate() {
@@ -1377,6 +1493,7 @@ impl CompressedCsvReader {
                 ncols,
                 keep,
                 dtypes,
+                dt_specs,
                 chunk_size: chunk_size.max(1),
                 delim,
                 pending,
@@ -1420,7 +1537,10 @@ impl CompressedCsvReader {
         let mut builders: Vec<ColBuilder> = self
             .dtypes
             .iter()
-            .map(|d| ColBuilder::with_capacity(*d, self.chunk_size))
+            .enumerate()
+            .map(|(k, d)| {
+                ColBuilder::with_capacity_dt(*d, self.chunk_size, self.dt_specs[k].clone())
+            })
             .collect();
         let mut got = 0usize;
 

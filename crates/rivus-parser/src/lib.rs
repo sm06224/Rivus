@@ -25,7 +25,7 @@
 mod lexer;
 
 use lexer::{Lexer, Tok};
-use rivus_core::{DataType, Mode, RivusError, Severity, Value};
+use rivus_core::{DataType, Mode, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
     Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, FillMethod, Func, Hook,
     HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
@@ -37,6 +37,7 @@ pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
         toks,
         pos: 0,
         g: PlanGraph::new(),
+        last_dt_fmt: None,
     };
     p.parse_program()?;
     Ok(p.g)
@@ -46,6 +47,11 @@ struct Parser {
     toks: Vec<(Tok, u32)>,
     pos: usize,
     g: PlanGraph,
+    /// Scratch: the `:datetime("fmt")` format captured by the most recent
+    /// `finish_type` call (design 23). `parse_decl_schema` takes it after each
+    /// column so the format can be carried on `OpenCsv.dt_formats`. `None` for a
+    /// bare `:datetime` (auto-infer) or any non-datetime type.
+    last_dt_fmt: Option<String>,
 }
 
 impl Parser {
@@ -493,14 +499,24 @@ impl Parser {
     /// `open`. Space-separated (like `readbin`); a type fixes that column's
     /// lane, otherwise it is inferred. Types: `int`/`i64`, `float`/`f64`,
     /// `str`/`string`, `bool`.
-    fn parse_decl_schema(&mut self) -> Result<Vec<(String, Option<DataType>)>, RivusError> {
+    #[allow(clippy::type_complexity)]
+    fn parse_decl_schema(
+        &mut self,
+    ) -> Result<(Vec<(String, Option<DataType>)>, Vec<(String, String)>), RivusError> {
         self.expect(&Tok::LParen)?;
         let mut cols = Vec::new();
+        let mut dt_formats = Vec::new();
         while !self.at(&Tok::RParen) && !self.at(&Tok::Eof) {
             let name = self.word()?;
             let ty = if self.eat(&Tok::Colon) {
                 let t = self.word()?;
-                Some(self.finish_type(&t)?)
+                let dt = self.finish_type(&t)?;
+                // A `:datetime("fmt")` column carries its explicit parse format
+                // out-of-band (it is not part of the Copy lane tag). Design 23.
+                if let Some(fmt) = self.last_dt_fmt.take() {
+                    dt_formats.push((name.clone(), fmt));
+                }
+                Some(dt)
             } else {
                 None
             };
@@ -510,7 +526,7 @@ impl Parser {
         if cols.is_empty() {
             return Err(self.err("declared schema `( … )` needs at least one column"));
         }
-        Ok(cols)
+        Ok((cols, dt_formats))
     }
 
     /// Resolve a type annotation after its leading word has been consumed. Plain
@@ -519,6 +535,27 @@ impl Parser {
     /// exact fixed-point lane (design 21). Bare `decimal` (auto-scale) is not yet
     /// wired in the reader, so it is a clear error rather than a silent default.
     fn finish_type(&mut self, word: &str) -> Result<DataType, RivusError> {
+        // Reset the datetime-format scratch; only a `datetime("fmt")` sets it.
+        self.last_dt_fmt = None;
+        if word.eq_ignore_ascii_case("datetime") {
+            // Optional explicit strptime format: `datetime("yyMMddhhmmss")`. A
+            // bare `datetime` auto-infers common formats at read time (design 23).
+            // The unit is `Sec` in the MVP (sub-second tokens come later).
+            if self.eat(&Tok::LParen) {
+                match self.bump() {
+                    Tok::Str(fmt) => self.last_dt_fmt = Some(fmt),
+                    other => {
+                        return Err(self.err(format!(
+                            "datetime(\"fmt\"): expected a quoted format string, found {other:?}"
+                        )))
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+            }
+            return Ok(DataType::DateTime {
+                unit: TimeUnit::Sec,
+            });
+        }
         if word.eq_ignore_ascii_case("decimal") {
             if !self.eat(&Tok::LParen) {
                 return Err(self.err("decimal needs a scale: write decimal(N), e.g. decimal(2)"));
@@ -560,10 +597,11 @@ impl Parser {
                     self.bump();
                 }
                 // Optional declared schema `(col[:type] ...)` (CSV only).
-                let decl = if self.at(&Tok::LParen) {
-                    Some(self.parse_decl_schema()?)
+                let (decl, dtf) = if self.at(&Tok::LParen) {
+                    let (cols, dtf) = self.parse_decl_schema()?;
+                    (Some(cols), dtf)
                 } else {
-                    None
+                    (None, Vec::new())
                 };
                 let delim = resolve_delim(&path, explicit.as_deref());
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
@@ -571,13 +609,17 @@ impl Parser {
                 })?;
                 let mut op = fmt.into_op(path, delim);
                 if let Op::OpenCsv {
-                    header, declared, ..
+                    header,
+                    declared,
+                    dt_formats,
+                    ..
                 } = &mut op
                 {
                     if noheader {
                         *header = false;
                     }
                     *declared = decl;
+                    *dt_formats = dtf;
                 }
                 Ok(self.g.add_node(op))
             }
@@ -592,6 +634,7 @@ impl Parser {
                     str_prefilter: Vec::new(),
                     header: true,
                     declared: None,
+                    dt_formats: Vec::new(),
                 }))
             }
             Tok::Word(w) if w == "readjson" => {
@@ -1151,6 +1194,7 @@ impl Format {
                 str_prefilter: Vec::new(),
                 header: true,
                 declared: None,
+                dt_formats: Vec::new(),
                 delim,
             },
             // The JSON reader accepts both NDJSON and a top-level array, so both
@@ -1387,6 +1431,39 @@ mod tests {
         assert!(parse("F:\n open s.csv (a:decimal)\n;").is_err());
         // A non-integer / out-of-range scale is rejected.
         assert!(parse("F:\n open s.csv (a:decimal(x))\n;").is_err());
+    }
+
+    #[test]
+    fn datetime_type_parses_and_is_reversible() {
+        // Explicit `:datetime("fmt")` and bare `:datetime` (auto-infer), both in
+        // a declared schema and as a cast (design 23).
+        for src in [
+            "F:\n open log.csv (ts:datetime(\"yyMMddHHmmss\") msg)\n |> ts msg\n;",
+            "F:\n open log.csv (ts:datetime id:int)\n |> ts\n;",
+            "F:\n open log.csv\n cast ts:datetime\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(s.contains("datetime"), "datetime type lost in {s}");
+        }
+        // The explicit format string survives verbatim through to_source.
+        let s = parse("F:\n open log.csv (ts:datetime(\"yyMMddHHmmss\"))\n;")
+            .unwrap()
+            .to_source();
+        assert!(s.contains("yyMMddHHmmss"), "format lost in {s}");
+        // The format must be carried on the OpenCsv op (not just the type tag).
+        match &parse("F:\n open log.csv (ts:datetime(\"yyyy-MM-dd\"))\n;")
+            .unwrap()
+            .nodes[0]
+            .op
+        {
+            Op::OpenCsv { dt_formats, .. } => {
+                assert_eq!(dt_formats, &[("ts".to_string(), "yyyy-MM-dd".to_string())]);
+            }
+            o => panic!("expected OpenCsv, got {o:?}"),
+        }
+        // A non-string format argument is a clear error, not a silent default.
+        assert!(parse("F:\n open s.csv (a:datetime(123))\n;").is_err());
     }
 
     #[test]

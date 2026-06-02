@@ -234,6 +234,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             str_prefilter,
             header,
             declared,
+            dt_formats,
             delim,
         } => Box::new(SourceCsv::new(
             path.clone(),
@@ -244,6 +245,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             str_prefilter.clone(),
             *header,
             declared.clone(),
+            dt_formats.clone(),
             *delim,
         )),
         Op::OpenBinary {
@@ -345,6 +347,8 @@ struct SourceCsv {
     str_prefilter: Vec<String>,
     header: bool,
     declared: Option<Vec<(String, Option<DataType>)>>,
+    /// Explicit `:datetime("fmt")` parse formats, keyed by column name (design 23).
+    dt_formats: Vec<(String, String)>,
     /// Field delimiter byte (`b','` CSV, `b'\t'` TSV).
     delim: u8,
     schema: Arc<Schema>,
@@ -370,6 +374,7 @@ impl SourceCsv {
         str_prefilter: Vec<String>,
         header: bool,
         declared: Option<Vec<(String, Option<DataType>)>>,
+        dt_formats: Vec<(String, String)>,
         delim: u8,
     ) -> Self {
         SourceCsv {
@@ -382,6 +387,7 @@ impl SourceCsv {
             str_prefilter,
             header,
             declared,
+            dt_formats,
             delim,
             schema: Schema::empty(),
             stream: None,
@@ -406,6 +412,7 @@ impl SourceCsv {
             str_prefilter: Vec::new(),
             header: true,
             declared: None,
+            dt_formats: Vec::new(),
             delim: b',',
             schema,
             stream: Some(chunker),
@@ -433,6 +440,7 @@ impl SourceCsv {
                 &self.str_prefilter,
                 self.header,
                 self.declared.as_deref(),
+                &self.dt_formats,
                 self.delim,
             ) {
                 Ok((schema, chunker)) => {
@@ -468,6 +476,7 @@ impl SourceCsv {
             self.chunk_size,
             self.header,
             self.declared.as_deref(),
+            &self.dt_formats,
             self.delim,
         ) {
             Ok((schema, reader)) => {
