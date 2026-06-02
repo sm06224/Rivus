@@ -902,7 +902,10 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
             Column::I64(v) => Some(v[row] as f64),
             Column::F64(v) => Some(v[row]),
             Column::Dec(d) => Some(d.unscaled[row] as f64 / 10f64.powi(d.scale as i32)),
-            Column::DateTime(d) => Some(d.ticks[row] as f64),
+            // Datetime is *not* read through this f64 lane: ns ticks exceed 2^53
+            // and `tick as f64` would silently lose precision. A datetime field
+            // routes to the owned-`Value` path → `dt_cmp` (exact i64). Design 23 / #53.
+            Column::DateTime(_) => None,
             Column::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
             Column::Str(_) => None,
         },
@@ -920,16 +923,19 @@ fn cmp_ord(ord: Option<Ordering>, op: CmpOp) -> bool {
 }
 
 /// Datetime-aware comparison: when one operand is a `DateTime`, compare on the
-/// exact integer-tick lane rather than the lossy f64 view (design 23).
+/// exact integer-tick lane rather than the lossy f64 view (design 23 / #53).
 ///
 /// * two datetimes → exact cross-unit instant order;
 /// * datetime vs a text literal → parse the literal into the same lane (the
 ///   datetime's unit, auto-inferring its format) and compare instants
 ///   (`|? ts >= "260601000000"`). A literal matching no known format is not a
 ///   valid instant, so only `!=` holds (continue-first; no fatal).
+/// * datetime vs an **integer** literal → the integer is a raw tick count at the
+///   column's unit; compared exactly in `i64` (no `tick as f64` rounding, so it
+///   is correct even for nanosecond ticks past 2^53).
 ///
 /// Returns `None` when neither operand is a datetime (normal path applies), or
-/// for datetime-vs-number (handled by the raw-tick f64 view downstream).
+/// for datetime-vs-float (a nonsensical mix; the f64 view handles it downstream).
 fn dt_cmp(l: &Value, op: CmpOp, r: &Value) -> Option<bool> {
     let parse = |s: &str, unit| rivus_core::DateTime::parse_auto(s, unit);
     match (l, r) {
@@ -942,6 +948,9 @@ fn dt_cmp(l: &Value, op: CmpOp, r: &Value) -> Option<bool> {
             Some(a) => cmp_ord(a.partial_cmp(b), op),
             None => op == CmpOp::Ne,
         }),
+        // Integer literal = raw ticks at the column's unit → exact i64 order.
+        (Value::DateTime(a), Value::I64(n)) => Some(cmp_ord(a.ticks.partial_cmp(n), op)),
+        (Value::I64(n), Value::DateTime(b)) => Some(cmp_ord(n.partial_cmp(&b.ticks), op)),
         _ => None,
     }
 }
@@ -965,6 +974,51 @@ fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
         },
     };
     cmp_ord(ord, op)
+}
+
+#[cfg(test)]
+mod dt_cmp_tests {
+    use super::dt_cmp;
+    use rivus_core::{DateTime, TimeUnit, Value};
+    use rivus_ir::CmpOp;
+
+    /// Two nanosecond instants 1 ns apart, both past 2^53, where `tick as f64`
+    /// collapses them — the adversarial case from #53. `dt_cmp` must order them
+    /// exactly (i64), never via the f64 view.
+    #[test]
+    fn nanosecond_compare_is_exact_past_2_pow_53() {
+        let base = 1_700_000_000_000_000_000_i64; // ≈ 2023 in ns, ≫ 2^53
+        assert!(
+            base as f64 == (base + 1) as f64,
+            "precondition: f64 loses 1ns"
+        );
+
+        let a = Value::DateTime(DateTime::new(base, TimeUnit::Nano));
+        let b = Value::DateTime(DateTime::new(base + 1, TimeUnit::Nano));
+        // Strict order is resolved (f64 would call them equal).
+        assert_eq!(dt_cmp(&a, CmpOp::Lt, &b), Some(true));
+        assert_eq!(dt_cmp(&a, CmpOp::Ge, &b), Some(false));
+        assert_eq!(dt_cmp(&a, CmpOp::Eq, &b), Some(false));
+        assert_eq!(dt_cmp(&a, CmpOp::Ne, &b), Some(true));
+
+        // Integer literal = raw ticks at the column's unit, compared in i64.
+        assert_eq!(dt_cmp(&a, CmpOp::Eq, &Value::I64(base)), Some(true));
+        assert_eq!(dt_cmp(&a, CmpOp::Ge, &Value::I64(base + 1)), Some(false));
+        assert_eq!(dt_cmp(&b, CmpOp::Gt, &Value::I64(base)), Some(true));
+    }
+
+    /// Cross-unit comparison stays exact (1 s == 1000 ms), and an unparseable
+    /// text literal is continue-first (only `!=` holds).
+    #[test]
+    fn cross_unit_and_bad_literal() {
+        let s = Value::DateTime(DateTime::new(1, TimeUnit::Sec));
+        let ms = Value::DateTime(DateTime::new(1_000, TimeUnit::Milli));
+        assert_eq!(dt_cmp(&s, CmpOp::Eq, &ms), Some(true));
+
+        let bad = Value::Str("not-a-date".into());
+        assert_eq!(dt_cmp(&s, CmpOp::Ge, &bad), Some(false));
+        assert_eq!(dt_cmp(&s, CmpOp::Ne, &bad), Some(true));
+    }
 }
 
 #[cfg(test)]

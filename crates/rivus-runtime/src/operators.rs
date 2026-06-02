@@ -10,7 +10,8 @@ use crate::eval;
 use crate::jsonl;
 use crate::kernel;
 use rivus_core::{
-    Chunk, Column, DataType, ErrorEvent, ErrorScope, Field, Schema, Severity, StrColumn, Value,
+    Chunk, Column, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field, Schema, Severity,
+    StrColumn, TimeUnit, Value,
 };
 use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, FillMethod, JoinKind, NodeId, Op};
 use std::collections::{BTreeMap, HashMap};
@@ -2090,6 +2091,13 @@ struct AggAcc {
     dec_min: i128,
     dec_max: i128,
     dec_overflow: bool,
+    /// Exact datetime lane (design 23 / #53): set once a `Value::DateTime` is
+    /// observed (a column shares one unit). `min`/`max` are kept as exact `i64`
+    /// ticks — never `tick as f64` — so they are correct at nanosecond
+    /// resolution (ticks past 2^53) and the result keeps the `DateTime` type.
+    dt_unit: Option<TimeUnit>,
+    dt_min: i64,
+    dt_max: i64,
 }
 
 /// Extra fractional digits an exact decimal `avg` carries beyond the input scale
@@ -2133,6 +2141,9 @@ impl AggAcc {
             dec_min: i128::MAX,
             dec_max: i128::MIN,
             dec_overflow: false,
+            dt_unit: None,
+            dt_min: i64::MAX,
+            dt_max: i64::MIN,
         }
     }
 
@@ -2166,6 +2177,15 @@ impl AggAcc {
                             }
                             None => self.dec_overflow = true,
                         }
+                    }
+                    // Exact datetime lane: keep min/max as i64 ticks (design 23 /
+                    // #53). A column shares one unit. min/max are associative →
+                    // byte-identical in parallel; sum/avg stay on the f64 side
+                    // (not meaningful instants; not parallel-safe — engine gates).
+                    if let Value::DateTime(t) = v {
+                        self.dt_unit.get_or_insert(t.unit);
+                        self.dt_min = self.dt_min.min(t.ticks);
+                        self.dt_max = self.dt_max.max(t.ticks);
                     }
                 }
             }
@@ -2227,6 +2247,12 @@ impl AggAcc {
             self.dec_max = self.dec_max.max(other.dec_max);
         }
         self.dec_overflow |= other.dec_overflow;
+        // Exact datetime lane (associative i64); a column shares one unit.
+        if let Some(ou) = other.dt_unit {
+            self.dt_unit.get_or_insert(ou);
+            self.dt_min = self.dt_min.min(other.dt_min);
+            self.dt_max = self.dt_max.max(other.dt_max);
+        }
         for s in &other.distinct {
             self.distinct.insert(s.clone());
         }
@@ -2323,6 +2349,19 @@ impl AggAcc {
                     out_scale,
                 ))
             }
+            _ => None,
+        }
+    }
+
+    /// Exact datetime result for `min`/`max` on a datetime column, or `None`
+    /// when this aggregate isn't an exact-datetime `min`/`max` (then the caller
+    /// uses the f64 `num_value`). Keeps the `i64` ticks and the column's unit, so
+    /// the result is exact at any resolution and stays the `DateTime` type. #53.
+    fn dt_value(&self) -> Option<DateTime> {
+        let unit = self.dt_unit?;
+        match self.func {
+            AggFunc::Min if self.n > 0 => Some(DateTime::new(self.dt_min, unit)),
+            AggFunc::Max if self.n > 0 => Some(DateTime::new(self.dt_max, unit)),
             _ => None,
         }
     }
@@ -2535,6 +2574,23 @@ impl Operator for GroupBy {
                 // overflowed i128 the whole column degrades to f64 (continue-first,
                 // §21.7) so the column stays one uniform type.
                 _ => {
+                    // Exact datetime min/max → keep the DateTime lane (i64 ticks,
+                    // same unit), never an f64 column. #53.
+                    let dt_ok = matches!(func, AggFunc::Min | AggFunc::Max)
+                        && !self.groups.is_empty()
+                        && self.groups.values().all(|s| s.accs[j].dt_value().is_some());
+                    if dt_ok {
+                        let dts: Vec<DateTime> = self
+                            .groups
+                            .values()
+                            .map(|s| s.accs[j].dt_value().unwrap())
+                            .collect();
+                        let unit = dts[0].unit;
+                        let ticks = dts.iter().map(|d| d.ticks).collect();
+                        fields.push(Field::new(name, DataType::DateTime { unit }));
+                        columns.push(Column::DateTime(DtColumn { ticks, unit }));
+                        continue;
+                    }
                     let dec_ok = matches!(
                         func,
                         AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
@@ -3332,6 +3388,38 @@ mod agg_merge_tests {
             // And exact vs an independent i128 oracle.
             let oracle: i128 = (0..1000).map(|i| (i % 97) + 1).sum();
             assert_eq!(m.dec_value().unwrap(), Decimal::new(oracle, 2));
+        }
+    }
+
+    #[test]
+    fn datetime_minmax_is_exact_i64_and_type_preserving() {
+        // Nanosecond ticks past 2^53, adjacent (1 ns apart): `tick as f64` would
+        // collapse them, so an f64 min/max would be wrong and would drop the
+        // DateTime type. The i64 lane must be exact and keep `DateTime`. #53.
+        let base = 1_700_000_000_000_000_000_i64; // ≈ 2023 in ns, ≫ 2^53
+        assert!(
+            base as f64 == (base + 1) as f64,
+            "precondition: f64 loses 1ns"
+        );
+        let vals: Vec<Value> = [base + 2, base + 9, base, base + 5, base + 1]
+            .into_iter()
+            .map(|t| Value::DateTime(DateTime::new(t, TimeUnit::Nano)))
+            .collect();
+
+        for parts in [1usize, 2, 3, 5] {
+            let mn = partitioned(AggFunc::Min, &vals, parts);
+            let mx = partitioned(AggFunc::Max, &vals, parts);
+            // Exact i64 extremes, type preserved (DateTime, Nano), parallel-safe.
+            assert_eq!(mn.dt_value(), Some(DateTime::new(base, TimeUnit::Nano)));
+            assert_eq!(mx.dt_value(), Some(DateTime::new(base + 9, TimeUnit::Nano)));
+            // The exact min/max are distinct (the f64 lane could not tell them
+            // from one another up here): single-pass agrees with the merge.
+            let s_mn = single(AggFunc::Min, &vals);
+            assert_eq!(
+                mn.dt_value(),
+                s_mn.dt_value(),
+                "min merge != single @{parts}"
+            );
         }
     }
 

@@ -2897,3 +2897,66 @@ fn datetime_parallel_matches_serial_and_chunk_size() {
         }
     }
 }
+
+#[test]
+fn datetime_min_max_groupby_keeps_datetime_type() {
+    // `min:ts` / `max:ts` over a datetime column must stay on the datetime lane
+    // (exact ticks + DateTime type, ISO rendering), not collapse to f64 (#53).
+    let text = "g,ts\n\
+                a,260601143000\n\
+                a,260601090000\n\
+                b,260602120000\n\
+                b,260602235959\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_dt_minmax",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow =
+        format!("D:\n open {p} (g:str ts:datetime(\"yyMMddHHmmss\"))\n |# g min:ts max:ts\n;");
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow, cz);
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        for col in ["min_ts", "max_ts"] {
+            let ci = o.chunks[0].schema.index_of(col).unwrap();
+            assert!(
+                matches!(
+                    o.chunks[0].schema.fields[ci].dtype,
+                    rivus_core::DataType::DateTime { .. }
+                ),
+                "{col} must stay on the datetime lane (cz={cz})"
+            );
+        }
+        // Pair (g, min_ts, max_ts) regardless of group order.
+        let gs = collect_strings(&res, "D", "g");
+        let mins = collect_strings(&res, "D", "min_ts");
+        let maxs = collect_strings(&res, "D", "max_ts");
+        let mut rows: Vec<(String, String, String)> = gs
+            .into_iter()
+            .zip(mins)
+            .zip(maxs)
+            .map(|((g, mn), mx)| (g, mn, mx))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "a".to_string(),
+                    "2026-06-01T09:00:00".to_string(),
+                    "2026-06-01T14:30:00".to_string()
+                ),
+                (
+                    "b".to_string(),
+                    "2026-06-02T12:00:00".to_string(),
+                    "2026-06-02T23:59:59".to_string()
+                ),
+            ],
+            "datetime min/max changed at chunk_size {cz}"
+        );
+    }
+}

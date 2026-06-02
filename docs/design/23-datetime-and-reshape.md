@@ -44,8 +44,28 @@ Tz       = Naive | Utc | FixedOffset(i32 sec)  // MVP は Naive/Utc
 | 比較 | `|? ts >= "260601000000"` | リテラルは同 lane にパースして整数比較 |
 | 差分 | `(ts2 - ts1) as secs` | i64 差（秒）。結合的 |
 | 切り捨て | `trunc(ts, "day")` / `trunc(ts,"hour")` | group-by キー用。整数除算で決定的 |
-| 部分取り出し | `year(ts) month(ts) day(ts) hour(ts)` | i64 を返す（既存 computed-column 20 に関数追加） |
+| 部分取り出し | `year(ts) month(ts) day(ts) hour(ts) minute(ts) second(ts)` | i64 を返す（既存 computed-column 20 に関数追加） |
 | 整形 | `format(ts, "yyyy-MM-dd")` | 出力時に文字列化 |
+
+### 精度の契約（#53・#44 系譜 — exact レーンは比較で精度を黙って落とさない）
+decimal（#44）と同じく、**datetime は比較・min/max を f64 経由にしない**。
+`2^53 ns ≒ 1970+104日` なので現実の ns tick（~1.7e18）は f64 で隣接値が潰れる。
+よって：
+- **比較は exact i64**：interpreter の `dt_cmp` が
+  - datetime×datetime → i128 cross-unit、
+  - datetime×テキストリテラル → 同 lane に `parse_auto` して比較、
+  - datetime×**整数**リテラル → 整数を「列 unit の生 tick」として i64 比較。
+  kernel は `num_col` で datetime を**除外**（f64 経路を撤廃）→ 全 datetime 比較が
+  interpreter に集約され、kernel==interpreter が自明に一致。
+- **min/max は exact i64 tick で集計し DateTime 型を保持**（`AggAcc.dt_min/dt_max`、
+  f64 列に落とさない）。整数ゆえ結合的 → 並列 group-by でも byte-identical。
+- **キャビアット（未 exact／設計判断）**: datetime の **算術（`ts2-ts1`）・sum・avg は
+  現状 f64 レーン**（`num_lane` の `tick as f64`）。ns では誤差が出るが、(1) 時刻の
+  sum/avg は意味のある instant ではない、(2) sum/avg は parallel-safe 条件が
+  decimal 限定なので datetime では直列に倒れる、ため latent。`diff` の exact i64 化は
+  i64 ネイティブ算術レーン導入時にまとめて対応予定（#53 follow-up）。
+- 受け入れ: ns・>2^53 を跨ぐ敵対的テスト（`eval::dt_cmp_tests`・
+  `operators::agg_merge_tests::datetime_minmax_is_exact_i64_and_type_preserving`）。
 
 `trunc`/`year`/`hour` 等は **時系列 group-by の鍵**（「日ごと集計」「時間帯別」）。
 これらは整数演算なので並列集計が byte-identical。
