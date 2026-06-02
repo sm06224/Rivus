@@ -1182,6 +1182,9 @@ fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
         // One column shares a scale, so the unscaled i128 order is the exact
         // value order — no precision loss in the sort key (design doc 21).
         Column::Dec(d) => d.unscaled[a].cmp(&d.unscaled[b]),
+        // One column shares a unit, so the integer tick order is the exact
+        // chronological order.
+        Column::DateTime(d) => d.ticks[a].cmp(&d.ticks[b]),
         Column::Str(v) => v.get(a).cmp(v.get(b)),
     }
 }
@@ -2976,6 +2979,9 @@ fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
                 rivus_core::Decimal::new(d.unscaled[row], d.scale)
             );
         }
+        Column::DateTime(d) => {
+            let _ = write!(line, "{}", rivus_core::DateTime::new(d.ticks[row], d.unit));
+        }
         Column::Str(s) => {
             let cell = s.get(row);
             if cell.bytes().any(|b| b == delim) || cell.contains('"') || cell.contains('\n') {
@@ -3237,6 +3243,11 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
                 rivus_core::Decimal::new(d.unscaled[row], d.scale)
             );
         }
+        // Datetime has no JSON literal form → emit a quoted ISO-8601 string.
+        Column::DateTime(d) => json_string(
+            out,
+            &rivus_core::DateTime::new(d.ticks[row], d.unit).to_string(),
+        ),
         Column::Str(s) => json_string(out, s.get(row)),
     }
 }

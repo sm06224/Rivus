@@ -99,7 +99,11 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
         } => {
             let idx = chunk.schema.index_of(name)?;
             match chunk.columns[idx] {
-                Column::I64(_) | Column::F64(_) | Column::Bool(_) | Column::Dec(_) => Some(idx),
+                Column::I64(_)
+                | Column::F64(_)
+                | Column::Bool(_)
+                | Column::Dec(_)
+                | Column::DateTime(_) => Some(idx),
                 Column::Str(_) => None,
             }
         }
@@ -179,6 +183,9 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         // the two scales — never rounding the literal (accounting contract;
         // shared with the interpreter so the two stay byte-identical). #44 / doc 21.
         Column::Dec(d) => dec_write(d, p, mask),
+        // DateTime: compare the raw integer tick lane (epoch ticks at the
+        // column's unit). The literal is lifted to the same unit upstream.
+        Column::DateTime(d) => cmp_i64_into(&d.ticks, p.op, p.rhs, mask),
         Column::Str(_) => mask.fill(0), // compiled out by `num_col`
     }
 }
@@ -274,6 +281,11 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
             }
         }
         Column::Dec(d) => dec_mask(d, p, mask, false),
+        Column::DateTime(d) => {
+            for (m, &t) in mask.iter_mut().zip(d.ticks.iter()) {
+                *m &= cmp_scalar(t as f64, p.op, p.rhs) as u8;
+            }
+        }
         Column::Str(_) => mask.fill(0),
     }
 }

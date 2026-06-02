@@ -14,10 +14,10 @@ pub mod error;
 pub mod schema;
 pub mod value;
 
-pub use chunk::{Chunk, ChunkMeta, Column, DecColumn, Mode, StrColumn};
+pub use chunk::{Chunk, ChunkMeta, Column, DecColumn, DtColumn, Mode, StrColumn};
 pub use error::{ErrorEvent, ErrorScope, Result, RivusError, Severity};
 pub use schema::{Field, Schema};
-pub use value::{DataType, Decimal, Value};
+pub use value::{DataType, DateTime, Decimal, TimeUnit, Value};
 
 #[cfg(test)]
 mod tests {
