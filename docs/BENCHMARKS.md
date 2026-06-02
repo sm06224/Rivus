@@ -961,3 +961,37 @@ sub-PRs (vectorized integer/decimal/epoch parse → fused scan→build into the 
 layout #40) are where the remaining parse throughput is expected. End-to-end
 `open` improvement from this step alone is bounded by the scan's share of parse;
 measured separately as those land.
+
+---
+
+## SIMD-native parse — SWAR integer parse (#71 step 2, landed)
+
+Second step of #71: a **vectorized-within-register (SWAR)** integer parser
+replacing `str::parse::<i64>()` on the two hot lanes — the pass-2 `I64` column
+build and the pass-1 `all_int` inference. 8 ASCII digits are converted per step
+via pairwise horizontal sums (Lemire), gated by a branch-free 8-digit range
+check; the common ≤18-digit case skips std's per-digit `checked_mul`/
+`checked_add`. **Exact i64, no f64. Dependency-zero** (pure `u64` arithmetic, no
+`core::arch`, no `unsafe`).
+
+**Byte-identical by construction**: `parse_i64_fast` returns `Some(v)` *only*
+when `v` is provably what `i64::from_str` yields, and `None` (defer to std) for
+every edge — empty, lone sign, any non-digit byte, or ≥19 digits (possible
+overflow). Proven against std across exhaustive small ranges, every 1–20-digit
+boundary length, signs, overflow at `i64::MIN/MAX±1`, and non-numeric/UTF-8
+inputs (`swar_int_parse_matches_std`); the inference `is_ok` decision is
+unchanged.
+
+**Micro-bench** (`bench_int_parse`, release, 1024 samples × 4000 reps):
+
+| regime | std `from_str` | SWAR fast | speedup |
+|---|---:|---:|---:|
+| short / mixed (1–7 digit ids) | 1009 MB/s | 1121 MB/s | **1.11×** |
+| wide (16-digit ids) | 933 MB/s | 2013 MB/s | **2.16×** |
+
+**Honest finding**: the win scales with digit width. Typical short CSV ints gain
+only ~1.11× (std `from_str` is already tight there, matching the earlier "int
+parse measured cheap" note); wide integer keys/epoch-as-int gain 2.16×. No
+regression on the common case, real win on the wide one. The remaining #71 lever
+is the fused scan→build into the SoA layout (#40), where the parse result is
+written contiguously without the per-cell `trim`/dispatch.

@@ -996,7 +996,9 @@ impl Flags {
         // also a float, so skip the redundant f64 parse — but it is never a
         // bool, so clear that lane.
         if self.all_int {
-            if c.parse::<i64>().is_ok() {
+            // SWAR fast path; `None` (edges/overflow) falls back to std so the
+            // is-integer decision stays exactly `parse::<i64>().is_ok()`.
+            if parse_i64_fast(c).is_some() || c.parse::<i64>().is_ok() {
                 self.all_bool = false;
                 return;
             }
@@ -1150,7 +1152,7 @@ impl ColBuilder {
     fn push(&mut self, cell: &str) {
         match self {
             ColBuilder::Bool(v) => v.push(cell.trim() == "true"),
-            ColBuilder::I64(v) => v.push(cell.trim().parse().unwrap_or(0)),
+            ColBuilder::I64(v) => v.push(parse_i64_cell(cell.trim())),
             ColBuilder::F64(v) => v.push(cell.trim().parse().unwrap_or(0.0)),
             // Exact decimal text → unscaled i128 (no f64). A malformed cell or
             // i128 overflow yields 0, matching the int/float lanes' default-on-
@@ -1334,6 +1336,92 @@ fn split_offsets_swar(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> b
     }
     out.push((start, n));
     true
+}
+
+// ---------------------------------------------------------------------------
+// SWAR integer parse (#71 step 2): vectorized-within-register digit conversion.
+// `parse_i64_fast` is **byte-identical by construction** to
+// `s.parse::<i64>().unwrap_or(0)`: it returns `Some(v)` *only* when `v` is
+// provably the value `i64::from_str` would yield, and `None` (defer to std) for
+// every edge — empty, a sign with no digits, any non-digit byte, or ≥19 digits
+// (potential overflow; let std's checked path decide). So the caller's result
+// is identical whichever path runs; the SWAR path just skips std's per-digit
+// `checked_mul`/`checked_add` for the common ≤18-digit case. Exact i64, no f64.
+// ---------------------------------------------------------------------------
+
+/// True iff all 8 bytes of the little-endian `word` are ASCII `'0'..='9'`
+/// (Lemire's branch-free range check). Used to gate the SWAR digit parse.
+#[inline(always)]
+fn is_eight_digits(word: u64) -> bool {
+    ((word & 0xF0F0_F0F0_F0F0_F0F0)
+        | (((word.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
+        == 0x3333_3333_3333_3333
+}
+
+/// Parse exactly 8 ASCII digits (little-endian `word`, byte 0 = leftmost digit)
+/// into their value via SWAR pairwise horizontal sums — no per-digit multiply
+/// or branch. Caller guarantees [`is_eight_digits`] (else the result is junk).
+#[inline(always)]
+fn parse_8_digits_swar(word: u64) -> u64 {
+    let mut v = word - 0x3030_3030_3030_3030;
+    v = (v * 10 + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    v = (v * 10000 + (v >> 32)) & 0x0000_0000_FFFF_FFFF;
+    v
+}
+
+/// Fast path for `s.parse::<i64>()`. `Some(v)` only when byte-identical to std
+/// (see the section comment); `None` defers to std for every edge case.
+#[inline]
+fn parse_i64_fast(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    if n == 0 {
+        return None;
+    }
+    // Optional single leading sign, exactly as `i64::from_str` accepts.
+    let (neg, mut i) = match bytes[0] {
+        b'-' => (true, 1usize),
+        b'+' => (false, 1usize),
+        _ => (false, 0usize),
+    };
+    let ndigits = n - i;
+    // No digits after a lone sign, or ≥19 digits (may overflow i64) → let std
+    // decide. 18 digits always fit (< 10^18 < i64::MAX) and parse without carry.
+    if ndigits == 0 || ndigits > 18 {
+        return None;
+    }
+    let mut val: u64 = 0;
+    // SWAR 8-digit blocks (each validated; any non-digit byte → defer to std).
+    while i + 8 <= n {
+        let word = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        if !is_eight_digits(word) {
+            return None;
+        }
+        val = val * 100_000_000 + parse_8_digits_swar(word);
+        i += 8;
+    }
+    // Scalar remainder (< 8 bytes), same digit predicate.
+    while i < n {
+        let d = bytes[i].wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        val = val * 10 + d as u64;
+        i += 1;
+    }
+    // val ≤ 10^18 - 1 < i64::MAX, so both casts are exact (incl. -10^18).
+    Some(if neg { -(val as i64) } else { val as i64 })
+}
+
+/// `s.parse::<i64>().unwrap_or(0)` on the continue-first default, via the SWAR
+/// fast path when it applies (byte-identical) else std. `s` must be pre-trimmed.
+#[inline]
+fn parse_i64_cell(s: &str) -> i64 {
+    match parse_i64_fast(s) {
+        Some(v) => v,
+        None => s.parse::<i64>().unwrap_or(0),
+    }
 }
 
 /// Observe one record into per-column type `flags` (kept columns only), using
@@ -1805,6 +1893,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `parse_i64_cell` must be byte-identical to `s.parse::<i64>().unwrap_or(0)`
+    /// for every input, and `parse_i64_fast(s).is_some()` must imply
+    /// `s.parse::<i64>().is_ok()` (so the inference decision is unchanged). #71.
+    #[test]
+    fn swar_int_parse_matches_std() {
+        let mut cases: Vec<String> = vec![
+            String::new(),
+            "-".into(),
+            "+".into(),
+            "0".into(),
+            "-0".into(),
+            "+7".into(),
+            "00042".into(),
+            "007".into(),
+            "12".into(),
+            "123456789".into(),          // crosses the 8-digit block
+            "1234567890123456".into(),   // 16 digits
+            "999999999999999999".into(), // 18 nines (max fast width)
+            "-999999999999999999".into(),
+            "1000000000000000000".into(),  // 19 digits, fits → std path
+            "9223372036854775807".into(),  // i64::MAX (19 digits)
+            "9223372036854775808".into(),  // i64::MAX+1 → Err → 0
+            "-9223372036854775808".into(), // i64::MIN
+            "-9223372036854775809".into(), // i64::MIN-1 → Err → 0
+            "99999999999999999999999".into(), // way overflow
+            "12a45".into(),
+            "1.5".into(),
+            " 12".into(), // not trimmed → non-digit lead → defer/Err
+            "12 ".into(),
+            "1_000".into(),
+            "++1".into(),
+            "--1".into(),
+            "0x1F".into(),
+            "日本1".into(),
+        ];
+        // Exhaustive small range + every 1..=20-digit boundary length.
+        for v in -2000i64..=2000 {
+            cases.push(v.to_string());
+        }
+        for d in 1..=20usize {
+            cases.push("9".repeat(d));
+            cases.push(format!("-{}", "9".repeat(d)));
+            cases.push(format!("1{}", "0".repeat(d.saturating_sub(1))));
+        }
+        for s in &cases {
+            let std = s.parse::<i64>().unwrap_or(0);
+            assert_eq!(parse_i64_cell(s), std, "value mismatch on {s:?}");
+            if parse_i64_fast(s).is_some() {
+                assert!(s.parse::<i64>().is_ok(), "fast accepted a non-i64: {s:?}");
+            }
+        }
+    }
+
+    /// Micro-benchmark (ignored; run with
+    /// `cargo test -p rivus-runtime --release --lib bench_int_parse -- --ignored --nocapture`):
+    /// integer-parse throughput, std `from_str` vs the SWAR fast path. #71.
+    #[test]
+    #[ignore]
+    fn bench_int_parse() {
+        use std::time::Instant;
+        // A realistic mix: short ids, mid values, and a few wide ones.
+        let samples: Vec<String> = (0..1024)
+            .map(|i: u64| match i % 4 {
+                0 => (i % 1000).to_string(),
+                1 => (i.wrapping_mul(2_654_435_761) % 1_000_000).to_string(),
+                2 => format!("-{}", i.wrapping_mul(40_503) % 100_000),
+                _ => (i.wrapping_mul(1_000_003) as i64).to_string(),
+            })
+            .collect();
+        let total_bytes: usize = samples.iter().map(|s| s.len()).sum::<usize>();
+        let reps = 4000usize;
+
+        let t = Instant::now();
+        let mut acc = 0i64;
+        for _ in 0..reps {
+            for s in &samples {
+                acc = acc.wrapping_add(s.parse::<i64>().unwrap_or(0));
+            }
+        }
+        let std_t = t.elapsed();
+
+        let t = Instant::now();
+        let mut acc2 = 0i64;
+        for _ in 0..reps {
+            for s in &samples {
+                acc2 = acc2.wrapping_add(parse_i64_cell(s));
+            }
+        }
+        let swar_t = t.elapsed();
+        assert_eq!(acc, acc2);
+
+        let mbps = |d: std::time::Duration| (total_bytes * reps) as f64 / d.as_secs_f64() / 1e6;
+        println!(
+            "\n[#71 int-parse | short/mixed] {} samples × {reps} reps (acc={acc})",
+            samples.len()
+        );
+        println!("  std from_str: {:?}  {:.0} MB/s", std_t, mbps(std_t));
+        println!(
+            "  SWAR fast:    {:?}  {:.0} MB/s  ({:.2}x std)",
+            swar_t,
+            mbps(swar_t),
+            std_t.as_secs_f64() / swar_t.as_secs_f64()
+        );
+
+        // Wide regime (15–18 digit ids): where the 8-digit SWAR block pays off.
+        let wide: Vec<String> = (0..1024u64)
+            .map(|i| (1_000_000_000_000_000u64 + i.wrapping_mul(2_654_435_761) % 999).to_string())
+            .collect();
+        let wbytes: usize = wide.iter().map(|s| s.len()).sum();
+        let t = Instant::now();
+        let mut a3 = 0i64;
+        for _ in 0..reps {
+            for s in &wide {
+                a3 = a3.wrapping_add(s.parse::<i64>().unwrap_or(0));
+            }
+        }
+        let wstd = t.elapsed();
+        let t = Instant::now();
+        let mut a4 = 0i64;
+        for _ in 0..reps {
+            for s in &wide {
+                a4 = a4.wrapping_add(parse_i64_cell(s));
+            }
+        }
+        let wswar = t.elapsed();
+        assert_eq!(a3, a4);
+        let wmbps = |d: std::time::Duration| (wbytes * reps) as f64 / d.as_secs_f64() / 1e6;
+        println!("[#71 int-parse | wide 16-digit]");
+        println!("  std from_str: {:?}  {:.0} MB/s", wstd, wmbps(wstd));
+        println!(
+            "  SWAR fast:    {:?}  {:.0} MB/s  ({:.2}x std)",
+            wswar,
+            wmbps(wswar),
+            wstd.as_secs_f64() / wswar.as_secs_f64()
+        );
     }
 
     /// Micro-benchmark (ignored; run with
