@@ -1,15 +1,26 @@
 # セッション・ハンドオーバー（次セッションの実装担当へ）
 
-最終更新: 2026-06-02 ／ ブランチ `claude/stream-native-runtime-design-tReOj` ／
-PR #34（dev→main、唯一の開いたPR）。次セッションは**レビュアーの確認結果から**
-始まる予定。
+最終更新: 2026-06-02（夜）／ ブランチ `claude/stream-native-runtime-design-tReOj`
+／ 版数 **`1.3.0-dev`**（次の開発版）。dev→main は**常に唯一の開いた PR**（直近は
+#75）。次セッションは**レビュアーの確認結果から**始まる。
 
-> **2026-06-02 追記**: decimal レーン（リーダー/直列・並列集計/#41 解禁）に続き、
-> **日時レーン §23.1 を実装完了**（コア型→`:datetime("fmt")` リーダー→同lane比較→
-> `year/month/day/hour/minute/second/trunc/format/diff`→並列バイト範囲対応＋
-> serial/parallel×chunk-size 等価テスト）。GUIDE/GUIDE.ja/doc23 反映済み。
-> **次の本命は doc23 §23.2 list集計 → §23.3 pivot**（日時が行/列キーに乗る）。
-> 下記 4–7 節は decimal/日時着手前の文脈なので、状況は doc23・BENCHMARKS を正とする。
+> **2026-06-02（夜）追記 — 正はここ＋BENCHMARKS/CHANGELOG**:
+> - **#71 SIMD-native parse を 3 段 landed**（いずれも byte-identical・依存ゼロ・
+>   等価性テスト先行）: ①AVX2 構造文字スキャン（32B/step、ランタイム検出、SWAR
+>   フォールバック、1.72×）→②SWAR 整数 parse（exact i64、1.11–2.16×）→③SWAR 小数
+>   parse（exact i128、共有 `rivus_core::numparse`、1.49–1.97×）。
+> - **#40 columnar を再活性化し初レバー landed**: 述語カーネルの実測支配項＝
+>   selection-vector 構築を**分岐レス**化（50% 選択率で 7.31×、選択率不問で一定）。
+>   compare 自体は帯域律速で SIMD 無勝（#39 で計測済み）。
+> - **次の #40 レバー（本命）**: 生存行 materialize の `Column::gather` 分岐レス/
+>   SIMD 化（SIMD-native 経路＝#71 後で**計測してから**採否）。
+> - **リリースは私（エージェント）がコントロール**（`docs/RELEASE.md`、maintainer
+>   委任 2026-06-02）。版＝タグ。開発版は SemVer プレリリース `vX.Y.Z-dev.N`
+>   （`release.yml` が `-` 付きタグを `--prerelease` 公開）。**既存の不整合リリース
+>   `v1.2.0dev`（不正タグ・prerelease 誤フラグ・stable v1.2.0 より後に公開）は要削除
+>   — 本セッションの MCP に release 削除手段が無く未実施、maintainer 側 UI 削除待ち**。
+> - 旧 §23.1 日時レーン、decimal/#41 解禁は landed 済み。doc23 §23.2 list集計 /
+>   §23.3 pivot は未着手バックログ。下記 4–7 節は旧文脈、状況は本追記が正。
 
 ---
 
