@@ -1029,3 +1029,41 @@ helps only those runs; the per-cell `i128` `rescale` (division) still bounds the
 gain below the raw digit-loop speedup. Same width gradient as the integer lane
 (step 2). With int + decimal done, the remaining #71 lever is the fused
 scan→build into the SoA layout — tracked under the larger columnar bet (#40).
+
+---
+
+## Columnar core — branch-free selection-vector build (#40, landed)
+
+First landed step of the columnar bet (#40), aimed squarely at the **measured**
+bottleneck of the predicate kernel: the AVX2 compare experiment (#39) found the
+compare is memory-bandwidth-bound and the real cost is the **index collection**
+(mask → surviving row indices), not the compare. That collection was a branchy
+`mask.iter().filter(|m| *m != 0).collect()` — at ~50 % selectivity it mispredicts
+roughly every other row.
+
+`kernel::compact_mask` now builds the selection vector **branch-free**: write the
+current index unconditionally, advance the write cursor by the mask bit
+(`w += (m != 0) as usize`). No data-dependent branch → no mispredictions, so the
+cost is flat across selectivity.
+
+**Micro-bench** (`bench_compact_mask`, release, n = 1 000 000, 300 reps):
+
+| selectivity | branchy `filter().collect()` | branch-free | speedup |
+|---:|---:|---:|---:|
+| 1 % | 220.8 ms | 184.5 ms | 1.20× |
+| 25 % | 851.5 ms | 184.4 ms | 4.62× |
+| **50 %** | **1.37 s** | **188.1 ms** | **7.31×** |
+| 75 % | 901.7 ms | 184.5 ms | 4.89× |
+| 99 % | 354.6 ms | 195.1 ms | 1.82× |
+
+The branchy path peaks at 50 % (worst-case misprediction); the branch-free path
+is ~185 ms regardless. **Byte-identical**: same surviving indices in the same
+ascending order as the branchy reference, across every selectivity and length
+incl. loop tails (`compact_mask_matches_branchy`), and the kernel's existing
+oracle / `optimizer_equiv` / `stress` suites stay green. Dependency-zero; one
+contained `unsafe` (pre-sized write cursor, `w ≤ i < n` invariant documented).
+
+**Scope/honesty**: this speeds the selection-vector *build*, the measured hot
+part. The subsequent `Column::gather` (materializing survivors) is the next #40
+lever; whether a SIMD/branch-free gather pays is to be measured on the
+SIMD-native path (post-#71) before claiming a win.

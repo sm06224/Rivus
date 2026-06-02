@@ -29,6 +29,26 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **SIMD-native CSV parse (Epic #38 / #71, dependency-zero).** The parse path —
+  measured as the dominant cost of `open` — is rebuilt around SIMD-within-a-
+  register and `core::arch` kernels, each **byte-identical** to the scalar/std
+  reference and gated by equivalence tests written first:
+  - **AVX2 structural scan** for field splitting (`PCMPEQB` + `movemask`,
+    32 bytes/step), runtime-dispatched via `is_x86_feature_detected!`, with the
+    SWAR scan (8 bytes/step) as the std-only fallback on non-AVX2 / non-x86
+    hosts. Measured **1.72×** over SWAR.
+  - **SWAR integer parse** on the hot `i64` build + inference lanes (8 ASCII
+    digits/step via Lemire horizontal sums; exact `i64`, no `f64`). Measured
+    **1.11×** short ids / **2.16×** wide 16-digit ids.
+  - **SWAR decimal parse** for the exact `i128` lane (`Decimal::parse_scaled`),
+    sharing the digit primitives via a new `rivus_core::numparse`. Measured
+    **1.49×** short / **1.97×** wide.
+- **Columnar core: branch-free selection-vector build (Epic #38 / #40).** The
+  predicate kernel's measured bottleneck — collecting surviving row indices from
+  the mask — is now branch-free (`w += (m != 0) as usize`), so a random
+  ~50 %-selectivity mask pays no branch mispredictions. Measured **7.31×** at
+  50 % selectivity (flat across selectivity); byte-identical to the branchy
+  reference.
 - **Live observability: `rivus run … --tui` and `--serve [ADDR]` (Epic #30 /
   Pillar B — issue #32, std-only).** Built on Pillar A's `RuntimeSnapshot`.
   `--tui` repaints an ANSI dashboard on stderr each tick (rows/s, per-node bars,

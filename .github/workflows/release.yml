@@ -138,10 +138,16 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
+          # A tag with a SemVer pre-release suffix (e.g. `v1.2.0-dev.1`,
+          # `-rc.1`, `-alpha`) is a development build → flag the GitHub Release
+          # as a pre-release so it never shows up as "Latest". Stable `vX.Y.Z`
+          # tags publish as a full release.
+          prerelease=""
+          case "$tag" in *-*) prerelease="--prerelease" ;; esac
           # Idempotent + race-tolerant: matrix jobs may reach here together, so
           # creating an already-existing release must not fail the job.
           gh release view "$tag" >/dev/null 2>&1 || \
-            gh release create "$tag" \
+            gh release create "$tag" $prerelease \
               --title "Rivus $tag" \
               --notes "Pre-built binaries. macOS: Apple Silicon (M1+). Windows 11+ x64: **recommended \`windows-x64-intel-tigerlake\`** (tuned for 11th-gen Intel Core i5 / Tiger Lake, AVX-512) + portable (any Intel/AMD x64) + AMD Zen 4 / Zen 3 tuned. Each platform ships a portable (multi-arch) and CPU-tuned builds; pick the tuned build matching your CPU, else portable. Other platforms: build from source (see README → Installation)." \
             || true
