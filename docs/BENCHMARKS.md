@@ -1067,3 +1067,26 @@ contained `unsafe` (pre-sized write cursor, `w ≤ i < n` invariant documented).
 part. The subsequent `Column::gather` (materializing survivors) is the next #40
 lever; whether a SIMD/branch-free gather pays is to be measured on the
 SIMD-native path (post-#71) before claiming a win.
+
+---
+
+## End-to-end `open` baseline — post-#71, pre-fused-build (#40 next)
+
+The "before" for the #40 fused scan→build, measured **after** the SIMD-native
+parse (#71 ×3) landed. Criterion `huge` group, 2 000 000 clean rows ×
+6 columns (`id,name,age,score,country,active` → int/str/int/f64/str/bool),
+release build, AVX2 host:
+
+| bench | median | throughput |
+|---|---:|---:|
+| `huge/open_only_2M` (pure parse → SoA build) | **829 ms** | **2.41 Melem/s** |
+| `huge/filter_only_2M` (open + `age>=45`) | 865 ms | 2.31 Melem/s |
+
+The filter adds only ~4 % — `open` (line scan + per-field parse + column build)
+is the cost, as the 1 GB profile predicted. `open_only_2M` is the clean target
+for the fused scan→build: today the reader is **row-major** (per row, split then
+push each cell through the `ColBuilder` enum), so the column writes interleave.
+The next #40 step buffers a chunk's offsets and builds **column-major** (one
+contiguous SoA lane at a time, enum dispatch hoisted out of the inner loop),
+measured against this baseline — byte-identical via the `stress` chunk-size
+sweep + `optimizer_equiv`.

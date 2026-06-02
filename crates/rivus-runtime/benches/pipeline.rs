@@ -238,6 +238,14 @@ fn bench_huge(c: &mut Criterion) {
         b.iter(|| black_box(run_source(&src)));
     });
 
+    // Pure parse → SoA build (no filter/project): the cleanest end-to-end
+    // measure of `open` itself — the target of the SIMD-native parse (#71) and
+    // the fused scan→build (#40). All 6 columns (int/str/int/f64/str/bool).
+    g.bench_function("open_only_2M", |b| {
+        let src = format!("F:\n open {p}\n;");
+        b.iter(|| black_box(run_source(&src)));
+    });
+
     // With projection pushdown the reader builds only `age`.
     g.bench_function("filter_project_age_2M", |b| {
         let src = format!("F:\n open {p}\n |? age >= 45\n |> age\n;");
