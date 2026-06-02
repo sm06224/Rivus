@@ -511,6 +511,35 @@ and streams bounded — its filter/project and group-by parallelize the same way
 JSONL + binary; only genuinely non-splittable sources (compressed) need the opt-in
 `--memory unbounded` (#50).
 
+### f64 parallel aggregation — canonical reduction (measured assessment, #45)
+
+Question: should plain `f64` `sum`/`avg`/`std` parallelize in the group-by (today
+they stay serial — #41 option 1)? Measured the options on a 200k-element f64 stream
+with magnitudes large enough to actually round (`stress::f64_parallel_sum_…`):
+
+| reduction | result |
+|---|---|
+| serial naive left-fold | the reference value |
+| **naive partition→merge** | diverges by ~`5–17e6` **and varies with the partition count** → not byte-identical |
+| **canonical fixed-block fold** | a *pure function of (values, block size)* → partition-independent; but its value differs from the serial naive fold (relative ~`1e-15`) |
+
+So a canonical reduction (serial *and* parallel fold over global-row-order fixed
+blocks) **can** make f64 byte-identical — at two real costs: (a) it changes the
+serial value too (every f64 sum/avg/std shifts by ~ULPs), and (b) running it
+*bounded + parallel* for grouped aggregation needs global-row coordination (a
+row-count pre-pass to give each byte-range worker its global start row, plus a
+≤block-size carry to merge the blocks that straddle a worker boundary) — otherwise
+it degrades to O(rows-per-group) buffering, breaking the bounded-memory guarantee.
+
+**Recommendation (measured): keep f64 `sum`/`avg`/`std` serial (#41 option 1) and
+route exactness through the decimal lane**, which *already* delivers an exact,
+byte-identical, bounded, parallel `sum`/`avg` today (`:decimal` / `--exact`; i128
+is associative, so no canonical tree is needed). The canonical-tree work for plain
+f64 is deferred to a dedicated PR, justified only if a real workload needs parallel
+f64 aggregation that can't use the decimal lane — at which point the global-row
+coordination above is the design. This mirrors the #39 discipline: a clever
+mechanism is not adopted until a measurement shows it earns its complexity.
+
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
 Data generated self-hosted with `rivus gen clean --rows 5000000` (no awk).

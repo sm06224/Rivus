@@ -2472,3 +2472,74 @@ fn parallel_binary_byte_identical() {
         assert_eq!(a, b, "parallel binary != serial for flow:\n{flow}");
     }
 }
+
+#[test]
+fn f64_parallel_sum_needs_canonical_order_decimal_is_exact_today() {
+    // #45 (measured): f64 addition is non-associative, so a naive partition→merge
+    // sum diverges from the serial sum *and* varies with the partition count —
+    // which is exactly why the parallel group-by keeps f64 sum/avg/std serial
+    // (#41 option 1). A canonical fixed-block fold is a pure function of the value
+    // sequence (partition-independent), but adopting it changes the serial value
+    // too and needs global-row coordination to run bounded+parallel. Meanwhile the
+    // **decimal lane already gives an exact, byte-identical parallel sum today**.
+    let naive = |v: &[f64]| v.iter().fold(0.0f64, |a, &x| a + x);
+    let part_naive = |v: &[f64], k: usize| {
+        let n = v.len();
+        (0..k)
+            .map(|i| naive(&v[n * i / k..n * (i + 1) / k]))
+            .fold(0.0, |a, b| a + b)
+    };
+    let canonical = |v: &[f64], bs: usize| {
+        let mut total = 0.0;
+        let mut i = 0;
+        while i < v.len() {
+            let e = (i + bs).min(v.len());
+            total += naive(&v[i..e]);
+            i = e;
+        }
+        total
+    };
+    // Large magnitudes → the additions actually round.
+    let v: Vec<f64> = (0..200_000)
+        .map(|i| ((i as f64) * 1.000000123).sin() * 1e9 + 1e15)
+        .collect();
+    let serial = naive(&v);
+    // The problem: naive parallel diverges and is partition-count dependent.
+    assert_ne!(part_naive(&v, 2), serial, "demo expects f64 drift");
+    assert_ne!(
+        part_naive(&v, 2),
+        part_naive(&v, 4),
+        "partition-count dependent"
+    );
+    // The canonical fold is a pure function of (values, block size): the same no
+    // matter how it is later partitioned — the property a parallel impl must hit.
+    assert_eq!(canonical(&v, 256), canonical(&v, 256));
+
+    // What we ship today: route exactness through the decimal lane, whose sum is
+    // exact and byte-identical in parallel (no f64 drift at all).
+    let mut text = String::from("g,amount\n");
+    for i in 0..5000 {
+        text.push_str(&format!("1,{}.{:02}\n", i % 1000, i % 100));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("canon_dec", text.as_bytes()));
+    let p = f.0.display();
+    let sum = |cs: usize| {
+        let res = run_src(
+            &format!("G:\n open {p} (g amount:decimal(2))\n |# g sum:amount\n;"),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let c = &o.chunks[0];
+        let si = c.schema.index_of("sum_amount").unwrap();
+        c.value(0, si).to_string()
+    };
+    assert_eq!(
+        sum(1),
+        sum(4096),
+        "decimal sum is exact & chunk-independent today"
+    );
+}
