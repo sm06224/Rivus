@@ -995,3 +995,37 @@ parse measured cheap" note); wide integer keys/epoch-as-int gain 2.16×. No
 regression on the common case, real win on the wide one. The remaining #71 lever
 is the fused scan→build into the SoA layout (#40), where the parse result is
 written contiguously without the per-cell `trim`/dispatch.
+
+---
+
+## SIMD-native parse — SWAR decimal parse (#71 step 3, landed)
+
+Third step of #71, completing the numeric-parse stage (integer → decimal). The
+exact decimal lane's magnitude build (`Decimal::parse_scaled`, the per-digit
+`checked_mul`/`checked_add` over `i128`) now takes the same **SWAR** 8-digit
+fast path for the ≤18-digit case, skipping the per-digit checks (which can never
+overflow in that range). The SWAR digit primitives (`is_eight_digits`,
+`parse_8_digits`, `accumulate_digits_u64`) moved to a shared
+`rivus_core::numparse` module, **deduplicated** with the runtime's `i64` parser.
+**Exact i128, no f64. Dependency-zero** (pure `u64` arithmetic, no `core::arch`,
+no `unsafe`).
+
+**Byte-identical**: the fast path runs only for ≤18 total digits, where the
+magnitude fits `u64` and the scalar checked loop also never overflows — same
+unscaled value, same half-even `rescale`. Proven against an independent scalar
+checked-loop reference across signs, every int/frac width 0–20 around the
+8/18-digit boundaries, dot positions, malformed inputs, and target scales
+0/1/2/6/18 (`swar_decimal_parse_matches_scalar`, written first).
+
+**Micro-bench** (`bench_decimal_parse`, release, 1024 samples × 4000 reps):
+
+| regime | scalar checked | SWAR fast | speedup |
+|---|---:|---:|---:|
+| short (~8-digit) | 215 MB/s | 319 MB/s | **1.49×** |
+| wide (16-digit) | 286 MB/s | 562 MB/s | **1.97×** |
+
+**Honest scope**: the decimal lane is opt-in (`--exact` / `:decimal`), so this
+helps only those runs; the per-cell `i128` `rescale` (division) still bounds the
+gain below the raw digit-loop speedup. Same width gradient as the integer lane
+(step 2). With int + decimal done, the remaining #71 lever is the fused
+scan→build into the SoA layout — tracked under the larger columnar bet (#40).

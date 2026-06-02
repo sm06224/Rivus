@@ -1349,27 +1349,6 @@ fn split_offsets_swar(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> b
 // `checked_mul`/`checked_add` for the common ≤18-digit case. Exact i64, no f64.
 // ---------------------------------------------------------------------------
 
-/// True iff all 8 bytes of the little-endian `word` are ASCII `'0'..='9'`
-/// (Lemire's branch-free range check). Used to gate the SWAR digit parse.
-#[inline(always)]
-fn is_eight_digits(word: u64) -> bool {
-    ((word & 0xF0F0_F0F0_F0F0_F0F0)
-        | (((word.wrapping_add(0x0606_0606_0606_0606)) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
-        == 0x3333_3333_3333_3333
-}
-
-/// Parse exactly 8 ASCII digits (little-endian `word`, byte 0 = leftmost digit)
-/// into their value via SWAR pairwise horizontal sums — no per-digit multiply
-/// or branch. Caller guarantees [`is_eight_digits`] (else the result is junk).
-#[inline(always)]
-fn parse_8_digits_swar(word: u64) -> u64 {
-    let mut v = word - 0x3030_3030_3030_3030;
-    v = (v * 10 + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
-    v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
-    v = (v * 10000 + (v >> 32)) & 0x0000_0000_FFFF_FFFF;
-    v
-}
-
 /// Fast path for `s.parse::<i64>()`. `Some(v)` only when byte-identical to std
 /// (see the section comment); `None` defers to std for every edge case.
 #[inline]
@@ -1395,10 +1374,10 @@ fn parse_i64_fast(s: &str) -> Option<i64> {
     // SWAR 8-digit blocks (each validated; any non-digit byte → defer to std).
     while i + 8 <= n {
         let word = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
-        if !is_eight_digits(word) {
+        if !rivus_core::numparse::is_eight_digits(word) {
             return None;
         }
-        val = val * 100_000_000 + parse_8_digits_swar(word);
+        val = val * 100_000_000 + rivus_core::numparse::parse_8_digits(word);
         i += 8;
     }
     // Scalar remainder (< 8 bytes), same digit predicate.
