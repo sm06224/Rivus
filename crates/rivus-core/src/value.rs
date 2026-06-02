@@ -284,8 +284,32 @@ impl PartialOrd for DateTime {
 }
 
 impl DateTime {
+    /// Common fixed-width / ISO timestamp formats, tried in order, for
+    /// auto-inferring a bare `:datetime` column or a datetime *literal* in a
+    /// predicate (design 23). Shared by the reader and the comparison path so
+    /// the two agree on what a given text means.
+    pub const AUTO_FORMATS: &'static [&'static str] = &[
+        "yyyy-MM-ddTHH:mm:ss",
+        "yyyy-MM-dd HH:mm:ss",
+        "yyyy-MM-dd",
+        "yyyyMMddHHmmss",
+        "yyMMddHHmmss",
+        "yyyyMMdd",
+    ];
+
     pub fn new(ticks: i64, unit: TimeUnit) -> Self {
         DateTime { ticks, unit }
+    }
+
+    /// Parse `s` by trying each [`AUTO_FORMATS`] entry in order (first match
+    /// wins), at `unit`. `None` if none match (continue-first at the call site).
+    ///
+    /// [`AUTO_FORMATS`]: DateTime::AUTO_FORMATS
+    pub fn parse_auto(s: &str, unit: TimeUnit) -> Option<DateTime> {
+        let s = s.trim();
+        Self::AUTO_FORMATS
+            .iter()
+            .find_map(|f| Self::parse_with_format(s, f, unit))
     }
 
     /// `(year, month, day, hour, minute, second)` in UTC (whole-second part).

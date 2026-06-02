@@ -2692,3 +2692,69 @@ fn datetime_auto_infer_common_formats() {
         ],
     );
 }
+
+#[test]
+fn datetime_filter_by_literal_same_lane() {
+    // `|? ts >= "literal"` parses the literal into the datetime lane and compares
+    // instants exactly (design 23) — not the lossy f64 view, and not a string
+    // compare. Chunk-size independent.
+    let text = "ts,id\n\
+                260601143000,1\n\
+                260601000000,2\n\
+                991231235959,3\n\
+                700101120000,4\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_dt_filter",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    // Threshold = 2026-06-01 00:00:00. Rows: r0 2026-06-01 14:30 (>=), r1 exactly
+    // equal (>=), r2 1999-12-31 (no), r3 1970-01-01 (no).
+    let flow = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts >= \"260601000000\"\n |> id\n;"
+    );
+    for cz in [1usize, 2, 3, 4096] {
+        assert_eq!(
+            collect_i64(&run_src(&flow, cz), "D", "id"),
+            vec![1, 2],
+            "datetime >= literal changed at chunk_size {cz}"
+        );
+    }
+    // Strict `<` excludes the equal row; `==` keeps only it.
+    let lt = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts < \"260601000000\"\n |> id\n;"
+    );
+    assert_eq!(collect_i64(&run_src(&lt, 4096), "D", "id"), vec![3, 4]);
+    let eq = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts == \"260601000000\"\n |> id\n;"
+    );
+    assert_eq!(collect_i64(&run_src(&eq, 4096), "D", "id"), vec![2]);
+    // An ISO-form literal resolves to the same instant as the compact column.
+    let iso = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts >= \"2026-06-01\"\n |> id\n;"
+    );
+    assert_eq!(collect_i64(&run_src(&iso, 4096), "D", "id"), vec![1, 2]);
+    // An unparseable literal is continue-first: no instant satisfies an ordering
+    // (so `>=` keeps nothing), while `!=` keeps every row (none equals it).
+    let bad_ge = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts >= \"not-a-date\"\n |> id\n;"
+    );
+    // An all-filtered flow emits no chunks for the output node.
+    let bad = run_src(&bad_ge, 4096);
+    let kept: usize = bad
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("D"))
+        .map_or(0, |o| o.chunks.iter().map(|c| c.len).sum());
+    assert_eq!(
+        kept, 0,
+        "`>=` against an unparseable literal must keep no rows"
+    );
+    let bad_ne = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") id:int)\n |? ts != \"not-a-date\"\n |> id\n;"
+    );
+    assert_eq!(
+        collect_i64(&run_src(&bad_ne, 4096), "D", "id"),
+        vec![1, 2, 3, 4]
+    );
+}

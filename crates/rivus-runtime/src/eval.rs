@@ -842,7 +842,37 @@ fn cmp_ord(ord: Option<Ordering>, op: CmpOp) -> bool {
     )
 }
 
+/// Datetime-aware comparison: when one operand is a `DateTime`, compare on the
+/// exact integer-tick lane rather than the lossy f64 view (design 23).
+///
+/// * two datetimes → exact cross-unit instant order;
+/// * datetime vs a text literal → parse the literal into the same lane (the
+///   datetime's unit, auto-inferring its format) and compare instants
+///   (`|? ts >= "260601000000"`). A literal matching no known format is not a
+///   valid instant, so only `!=` holds (continue-first; no fatal).
+///
+/// Returns `None` when neither operand is a datetime (normal path applies), or
+/// for datetime-vs-number (handled by the raw-tick f64 view downstream).
+fn dt_cmp(l: &Value, op: CmpOp, r: &Value) -> Option<bool> {
+    let parse = |s: &str, unit| rivus_core::DateTime::parse_auto(s, unit);
+    match (l, r) {
+        (Value::DateTime(a), Value::DateTime(b)) => Some(cmp_ord(a.partial_cmp(b), op)),
+        (Value::DateTime(a), Value::Str(s)) => Some(match parse(s, a.unit) {
+            Some(b) => cmp_ord(a.partial_cmp(&b), op),
+            None => op == CmpOp::Ne,
+        }),
+        (Value::Str(s), Value::DateTime(b)) => Some(match parse(s, b.unit) {
+            Some(a) => cmp_ord(a.partial_cmp(b), op),
+            None => op == CmpOp::Ne,
+        }),
+        _ => None,
+    }
+}
+
 fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
+    if let Some(b) = dt_cmp(l, op, r) {
+        return b;
+    }
     let ord = match (l, r) {
         (Value::Str(a), Value::Str(b)) => a.partial_cmp(b),
         _ => match (l.as_f64(), r.as_f64()) {

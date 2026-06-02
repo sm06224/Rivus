@@ -1039,7 +1039,6 @@ impl Flags {
     }
 }
 
-/// A typed, pre-sized column accumulator.
 /// Parse spec for a `:datetime` column (design 23): the resolution `unit` and an
 /// ordered list of candidate strptime formats. An explicit `:datetime("fmt")`
 /// has a single format; a bare `:datetime` carries the auto-infer list, tried in
@@ -1050,17 +1049,6 @@ struct DtSpec {
     unit: TimeUnit,
     formats: Vec<String>,
 }
-
-/// Common fixed-width / ISO timestamp formats tried (in order) for a bare
-/// `:datetime` column with no explicit format (design 23).
-const AUTO_DT_FORMATS: &[&str] = &[
-    "yyyy-MM-ddTHH:mm:ss",
-    "yyyy-MM-dd HH:mm:ss",
-    "yyyy-MM-dd",
-    "yyyyMMddHHmmss",
-    "yyMMddHHmmss",
-    "yyyyMMdd",
-];
 
 /// Build the per-kept-column datetime parse specs (design 23): `Some` for each
 /// `:datetime` column (with its explicit `dt_formats` entry, or the auto list),
@@ -1093,7 +1081,12 @@ impl DtSpec {
     fn auto(unit: TimeUnit) -> Self {
         DtSpec {
             unit,
-            formats: AUTO_DT_FORMATS.iter().map(|s| s.to_string()).collect(),
+            // The canonical auto-infer list lives in core, so the reader and the
+            // predicate-literal path agree on what a given text means (design 23).
+            formats: DateTime::AUTO_FORMATS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 
@@ -1112,6 +1105,7 @@ impl DtSpec {
     }
 }
 
+/// A typed, pre-sized column accumulator.
 enum ColBuilder {
     Bool(Vec<bool>),
     I64(Vec<i64>),
