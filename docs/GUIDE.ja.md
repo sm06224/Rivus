@@ -63,7 +63,7 @@ rivus check   -c '…'               # 構文チェックのみ
 | `open PATH as FMT` | 形式を強制（`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`） |
 | `open PATH.gz` / `PATH.zst` | **gzip / zstd 圧縮**された CSV/TSV。`--features gzip` / `--features zstd` でビルドした時のみ。直列・単一パス・有界メモリ。既定（依存ゼロ）ビルドでは `--features …` を促すエラー |
 | `open PATH noheader` | ヘッダ行なし CSV。列名は `c0, c1, c2, …`、先頭行からデータ |
-| `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定。`int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点）, `datetime[("fmt")]`（厳密な時刻、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む。`open log.csv (ts:datetime("yyMMddHHmmss"))` は `ts` を時刻として読む |
+| `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定。`int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点）, `datetime[("fmt")]`（厳密な時刻）, `duration`（符号付き時間量、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む。`open log.csv (ts:datetime("yyMMddHHmmss"))` は `ts` を時刻として読む |
 | `readcsv PATH` / `readjson PATH` | 形式を明示する動詞 |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ） |
 | `open stdin` / `open -` | 標準入力から CSV（または `as FMT`）を読む |
@@ -316,8 +316,29 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   そのリテラルに対しては `!=` のみ真）。
 - **関数**：`year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)` `second(ts)`
   （整数）、`trunc(ts, "day"|"hour"|"minute"|"month"|"year")`（日時バケットキー）、
-  `format(ts, "fmt")`（文字列）、`ts2 - ts1`（秒差）。既定の整形は ISO-8601
-  `yyyy-MM-ddTHH:mm:ss`。
+  `format(ts, "fmt")`（文字列）。既定の整形は ISO-8601 `yyyy-MM-ddTHH:mm:ss`。
+
+**Duration レーン（`duration`）** — **符号付きの時間量**で、`DateTime − DateTime`
+の結果型。時刻（instant）とは別の型として扱います：両者は代数が違い、時間量の
+`sum`/`avg` は有意味で、かつ厳密な整数 tick ゆえ**結合的**なので、グループ毎の
+`sum:dur`/`avg:dur` が並列でも byte-identical（instant の sum/avg は不可）。整形済みの
+スパンは `(d:duration)`（`[-][Nd ]HH:MM:SS[.frac]` の人間可読形）で読むか、計算します：
+
+```
+open shifts.csv (emp:str start:datetime("yyMMddHHmmss") end:datetime("yyMMddHHmmss"))
+|> emp (end - start) as worked          # duration 列
+|? worked >= "08:00:00"                 # スパン比較（リテラルも同 lane へパース）
+|# emp sum:worked avg:worked max:worked # 厳密・並列 byte-identical
+```
+
+- **型代数**：`DateTime − DateTime → Duration`、`DateTime ± Duration → DateTime`、
+  `Duration ± Duration → Duration`、`Duration × 整数 → Duration`、
+  `Duration ÷ Duration → 比`（f64）。unit が異なる場合は細かい側に lift、overflow は
+  飽和（continue-first）。
+- **f64 を経由しない厳密性**：比較も `sum`/`avg`/`min`/`max` も `i64` tick で行うので、
+  ナノ秒（2^53 超）でも正確（f64 なら隣接値が潰れる）。
+- **整形**：`format(dur)` → 人間可読 `3d 02:15:00`、`format(dur, "iso")` → ISO-8601
+  `PT…H…M…S`。既定の Display は人間可読形。
 
 **条件** — `case when … then … [else …] end`：
 

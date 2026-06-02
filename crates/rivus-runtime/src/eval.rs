@@ -144,13 +144,25 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             Some(dt) => Value::DateTime(dt.truncated(arg(1).to_string().trim())),
             None => Value::Null,
         },
-        // `format(ts, "fmt")` → text rendering. A non-datetime coerces to its
-        // text form (so `format` is total / continue-first).
+        // `format(ts|dur, "fmt")` → text rendering. A duration renders human by
+        // default, or ISO-8601 with `"iso"`/`"iso8601"`. A datetime uses the
+        // strptime-style `fmt`. Anything else coerces to its text form (so
+        // `format` is total / continue-first).
         Func::Format => {
+            let a0 = arg(0);
             let fmt = arg(1).to_string();
-            match as_datetime(arg(0)) {
-                Some(dt) => Value::Str(dt.format(&fmt)),
-                None => Value::Str(arg(0).to_string()),
+            match a0 {
+                Value::Duration(d) => Value::Str(
+                    if fmt.eq_ignore_ascii_case("iso") || fmt.eq_ignore_ascii_case("iso8601") {
+                        d.to_iso8601()
+                    } else {
+                        d.to_human()
+                    },
+                ),
+                other => match as_datetime(other.clone()) {
+                    Some(dt) => Value::Str(dt.format(&fmt)),
+                    None => Value::Str(other.to_string()),
+                },
             }
         }
     }
@@ -619,6 +631,22 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
             });
         }
     }
+    // All-duration → keep the duration lane (e.g. `ts2 - ts1`). Design 23 / #57.
+    if let Some(Value::Duration(first)) = vals.first() {
+        if vals.iter().all(|v| matches!(v, Value::Duration(_))) {
+            let unit = first.unit;
+            return Column::Duration(rivus_core::DurColumn {
+                ticks: vals
+                    .iter()
+                    .map(|v| match v {
+                        Value::Duration(d) => d.ticks,
+                        _ => 0,
+                    })
+                    .collect(),
+                unit,
+            });
+        }
+    }
     if all_bool {
         Column::Bool(
             vals.iter()
@@ -670,11 +698,13 @@ fn const_column(v: &Value, n: usize) -> Column {
     }
 }
 
-/// A numeric f64 lane for an expression, plus whether it is an *integer* lane
-/// (so `int op int` can stay integer). Strings are parsed best-effort ("text is
-/// stream"): a non-numeric cell becomes NaN.
-fn num_lane(e: &Expr, chunk: &Chunk) -> (Vec<f64>, bool) {
-    match eval_column(e, chunk) {
+/// A numeric f64 lane for an already-evaluated column, plus whether it is an
+/// *integer* lane (so `int op int` can stay integer). Strings are parsed
+/// best-effort ("text is stream"): a non-numeric cell becomes NaN. The
+/// arithmetic path inspects the column's lane for typed temporal ops (#57)
+/// before falling back here.
+fn col_num_lane(col: Column) -> (Vec<f64>, bool) {
+    match col {
         Column::I64(v) => (v.iter().map(|&x| x as f64).collect(), true),
         Column::Bool(v) => (v.iter().map(|&x| if x { 1.0 } else { 0.0 }).collect(), true),
         Column::F64(v) => (v, false),
@@ -696,10 +726,105 @@ fn num_lane(e: &Expr, chunk: &Chunk) -> (Vec<f64>, bool) {
     }
 }
 
+/// Clamp an `i128` into `i64` (saturating) — used so a cross-unit lift or a
+/// `Duration × n` that overflows degrades gracefully (continue-first) rather
+/// than wrapping into a nonsense instant/span.
+fn sat_i128(x: i128) -> i64 {
+    x.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// The finer of two units (larger ticks-per-second), used as the common unit
+/// when combining two temporal values.
+fn finer_unit(a: rivus_core::TimeUnit, b: rivus_core::TimeUnit) -> rivus_core::TimeUnit {
+    if a.per_sec() >= b.per_sec() {
+        a
+    } else {
+        b
+    }
+}
+
+/// Lift `ticks` from `from` to a finer-or-equal unit `to` (exact i128, saturated
+/// back to i64).
+fn lift_ticks(ticks: i64, from: rivus_core::TimeUnit, to: rivus_core::TimeUnit) -> i128 {
+    let factor = (to.per_sec() / from.per_sec()) as i128;
+    ticks as i128 * factor
+}
+
+/// Typed datetime/duration arithmetic (design 23 / #57), exact in `i64` ticks —
+/// never the f64 lane. Returns `None` for any non-temporal combination (the
+/// caller then takes the numeric path), keeping all other arithmetic unchanged.
+///
+/// `DateTime − DateTime → Duration`; `DateTime ± Duration → DateTime`;
+/// `Duration ± Duration → Duration`; `Duration × int → Duration`;
+/// `Duration ÷ Duration → f64 ratio`. Cross-unit operands lift to the finer
+/// unit; an overflow saturates (continue-first).
+fn temporal_op(l: &Value, op: ArithOp, r: &Value) -> Option<Value> {
+    use rivus_core::{DateTime, Duration};
+    match (l, r) {
+        // instant − instant = span
+        (Value::DateTime(a), Value::DateTime(b)) if op == ArithOp::Sub => {
+            let u = finer_unit(a.unit, b.unit);
+            let d = lift_ticks(a.ticks, a.unit, u) - lift_ticks(b.ticks, b.unit, u);
+            Some(Value::Duration(Duration::new(sat_i128(d), u)))
+        }
+        // instant ± span = instant (Add is commutative with span + instant)
+        (Value::DateTime(a), Value::Duration(s)) if matches!(op, ArithOp::Add | ArithOp::Sub) => {
+            let u = finer_unit(a.unit, s.unit);
+            let at = lift_ticks(a.ticks, a.unit, u);
+            let st = lift_ticks(s.ticks, s.unit, u);
+            let t = if op == ArithOp::Add { at + st } else { at - st };
+            Some(Value::DateTime(DateTime::new(sat_i128(t), u)))
+        }
+        (Value::Duration(s), Value::DateTime(a)) if op == ArithOp::Add => {
+            let u = finer_unit(a.unit, s.unit);
+            let t = lift_ticks(a.ticks, a.unit, u) + lift_ticks(s.ticks, s.unit, u);
+            Some(Value::DateTime(DateTime::new(sat_i128(t), u)))
+        }
+        // span ± span = span
+        (Value::Duration(a), Value::Duration(b)) if matches!(op, ArithOp::Add | ArithOp::Sub) => {
+            let u = finer_unit(a.unit, b.unit);
+            let at = lift_ticks(a.ticks, a.unit, u);
+            let bt = lift_ticks(b.ticks, b.unit, u);
+            let t = if op == ArithOp::Add { at + bt } else { at - bt };
+            Some(Value::Duration(Duration::new(sat_i128(t), u)))
+        }
+        // span ÷ span = dimensionless ratio (f64, at the common unit)
+        (Value::Duration(a), Value::Duration(b)) if op == ArithOp::Div => {
+            let u = finer_unit(a.unit, b.unit);
+            let at = lift_ticks(a.ticks, a.unit, u) as f64;
+            let bt = lift_ticks(b.ticks, b.unit, u) as f64;
+            Some(Value::F64(at / bt))
+        }
+        // span × integer = span (either operand order)
+        (Value::Duration(a), Value::I64(n)) | (Value::I64(n), Value::Duration(a))
+            if op == ArithOp::Mul =>
+        {
+            Some(Value::Duration(Duration::new(
+                sat_i128(a.ticks as i128 * *n as i128),
+                a.unit,
+            )))
+        }
+        _ => None,
+    }
+}
+
 fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk) -> Column {
-    let (lf, li) = num_lane(left, chunk);
-    let (rf, ri) = num_lane(right, chunk);
+    let lc = eval_column(left, chunk);
+    let rc = eval_column(right, chunk);
     let n = chunk.len;
+    // Typed temporal arithmetic (exact i64; #57) when either side is a datetime
+    // or duration lane. Peek row 0: if the combination isn't a temporal op (e.g.
+    // datetime+datetime), fall through to the numeric path unchanged.
+    let temporal = matches!(lc, Column::DateTime(_) | Column::Duration(_))
+        || matches!(rc, Column::DateTime(_) | Column::Duration(_));
+    if temporal && (n == 0 || temporal_op(&lc.value_at(0), op, &rc.value_at(0)).is_some()) {
+        let vals: Vec<Value> = (0..n)
+            .map(|i| temporal_op(&lc.value_at(i), op, &rc.value_at(i)).unwrap_or(Value::Null))
+            .collect();
+        return column_from_values(vals);
+    }
+    let (lf, li) = col_num_lane(lc);
+    let (rf, ri) = col_num_lane(rc);
     // Integer lane only when both sides are integers and the op preserves it
     // (division always yields a float, matching pandas/SQL `/` semantics).
     if li && ri && op != ArithOp::Div {
@@ -787,6 +912,11 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
 fn arith_value(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, row: usize) -> Value {
     let lv = eval(left, chunk, row);
     let rv = eval(right, chunk, row);
+    // Typed temporal arithmetic (exact i64; #57), consistent with the columnar
+    // `eval_arith` so the two stay byte-identical.
+    if let Some(v) = temporal_op(&lv, op, &rv) {
+        return v;
+    }
     let (Some(a), Some(b)) = (lv.as_f64(), rv.as_f64()) else {
         return Value::Null;
     };
@@ -968,6 +1098,23 @@ fn dt_cmp(l: &Value, op: CmpOp, r: &Value) -> Option<bool> {
         // Integer literal = raw ticks at the column's unit → exact i64 order.
         (Value::DateTime(a), Value::I64(n)) => Some(cmp_ord(a.ticks.partial_cmp(n), op)),
         (Value::I64(n), Value::DateTime(b)) => Some(cmp_ord(n.partial_cmp(&b.ticks), op)),
+        // Duration comparisons mirror datetime: exact i128 cross-unit order;
+        // a text literal parses at the span's unit; an integer is raw ticks. #57.
+        (Value::Duration(a), Value::Duration(b)) => Some(cmp_ord(a.partial_cmp(b), op)),
+        (Value::Duration(a), Value::Str(s)) => {
+            Some(match rivus_core::Duration::parse_at(s, a.unit) {
+                Some(b) => cmp_ord(a.partial_cmp(&b), op),
+                None => op == CmpOp::Ne,
+            })
+        }
+        (Value::Str(s), Value::Duration(b)) => {
+            Some(match rivus_core::Duration::parse_at(s, b.unit) {
+                Some(a) => cmp_ord(a.partial_cmp(b), op),
+                None => op == CmpOp::Ne,
+            })
+        }
+        (Value::Duration(a), Value::I64(n)) => Some(cmp_ord(a.ticks.partial_cmp(n), op)),
+        (Value::I64(n), Value::Duration(b)) => Some(cmp_ord(n.partial_cmp(&b.ticks), op)),
         _ => None,
     }
 }
@@ -995,9 +1142,75 @@ fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
 
 #[cfg(test)]
 mod dt_cmp_tests {
-    use super::dt_cmp;
-    use rivus_core::{DateTime, TimeUnit, Value};
-    use rivus_ir::CmpOp;
+    use super::{dt_cmp, temporal_op};
+    use rivus_core::{DateTime, Duration, TimeUnit, Value};
+    use rivus_ir::{ArithOp, CmpOp};
+
+    /// `DateTime − DateTime → Duration` is exact i64 even at nanosecond ticks
+    /// past 2^53 (the #57 headline: resolves the #53 f64 caveat). Also covers
+    /// the rest of the type algebra (span ± span, instant ± span, span × int,
+    /// span ÷ span).
+    #[test]
+    fn temporal_arithmetic_is_exact_and_typed() {
+        let base = 1_700_000_000_000_000_000_i64; // ns, ≫ 2^53
+        assert!(
+            base as f64 == (base + 1) as f64,
+            "precondition: f64 loses 1ns"
+        );
+        let a = Value::DateTime(DateTime::new(base + 1, TimeUnit::Nano));
+        let b = Value::DateTime(DateTime::new(base, TimeUnit::Nano));
+        // instant − instant = 1 ns span, exact (f64 would give 0).
+        assert_eq!(
+            temporal_op(&a, ArithOp::Sub, &b),
+            Some(Value::Duration(Duration::new(1, TimeUnit::Nano)))
+        );
+        // instant + span = instant.
+        let span = Value::Duration(Duration::new(5, TimeUnit::Nano));
+        assert_eq!(
+            temporal_op(&b, ArithOp::Add, &span),
+            Some(Value::DateTime(DateTime::new(base + 5, TimeUnit::Nano)))
+        );
+        // span + span = span; span × int = span.
+        let s1 = Value::Duration(Duration::new(90, TimeUnit::Sec));
+        let s2 = Value::Duration(Duration::new(30, TimeUnit::Sec));
+        assert_eq!(
+            temporal_op(&s1, ArithOp::Add, &s2),
+            Some(Value::Duration(Duration::new(120, TimeUnit::Sec)))
+        );
+        assert_eq!(
+            temporal_op(&s1, ArithOp::Mul, &Value::I64(3)),
+            Some(Value::Duration(Duration::new(270, TimeUnit::Sec)))
+        );
+        // span ÷ span = dimensionless f64 ratio.
+        assert_eq!(temporal_op(&s1, ArithOp::Div, &s2), Some(Value::F64(3.0)));
+        // Non-temporal combos defer to the numeric path.
+        assert_eq!(temporal_op(&a, ArithOp::Add, &b), None); // instant+instant
+        assert_eq!(
+            temporal_op(&Value::I64(1), ArithOp::Add, &Value::I64(2)),
+            None
+        );
+    }
+
+    /// Duration comparison is exact at ns past 2^53 (adversarial), and a text
+    /// literal parses at the span's unit.
+    #[test]
+    fn duration_compare_is_exact() {
+        let base = 1_700_000_000_000_000_000_i64;
+        let x = Value::Duration(Duration::new(base, TimeUnit::Nano));
+        let y = Value::Duration(Duration::new(base + 1, TimeUnit::Nano));
+        assert_eq!(dt_cmp(&x, CmpOp::Lt, &y), Some(true));
+        assert_eq!(dt_cmp(&x, CmpOp::Eq, &y), Some(false));
+        // Text literal in human form parses to the same lane.
+        let h = Value::Duration(Duration::new(90, TimeUnit::Sec));
+        assert_eq!(
+            dt_cmp(&h, CmpOp::Eq, &Value::Str("00:01:30".into())),
+            Some(true)
+        );
+        assert_eq!(
+            dt_cmp(&h, CmpOp::Lt, &Value::Str("00:02:00".into())),
+            Some(true)
+        );
+    }
 
     /// Two nanosecond instants 1 ns apart, both past 2^53, where `tick as f64`
     /// collapses them — the adversarial case from #53. `dt_cmp` must order them

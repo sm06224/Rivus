@@ -76,7 +76,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
 | `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
-| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), or `datetime[("fmt")]` (exact timestamps; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
+| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), or `duration` (signed time spans; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |
@@ -417,8 +417,32 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   non-instant (continue-first; only `!=` holds against it).
 - **Functions**: `year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)`
   `second(ts)` (→ integers); `trunc(ts, "day"|"hour"|"minute"|"month"|"year")`
-  (→ datetime bucket key); `format(ts, "fmt")` (→ text); `ts2 - ts1` (→ second
-  difference). Default rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss`.
+  (→ datetime bucket key); `format(ts, "fmt")` (→ text). Default rendering is
+  ISO-8601 `yyyy-MM-ddTHH:mm:ss`.
+
+**Duration lane (`duration`)** — a **signed time span**, the result of
+`DateTime − DateTime`. A distinct type from a datetime *instant*, because their
+algebra differs: a span's `sum`/`avg` are meaningful and — being exact integer
+ticks — **associative**, so `sum:dur` / `avg:dur` over a group are
+byte-identical in parallel (an instant's are not). Read pre-formatted spans
+with `(d:duration)` (the `[-][Nd ]HH:MM:SS[.frac]` human form), or compute them:
+
+```
+open shifts.csv (emp:str start:datetime("yyMMddHHmmss") end:datetime("yyMMddHHmmss"))
+|> emp (end - start) as worked          # a duration column
+|? worked >= "08:00:00"                 # compare spans (literal parsed same-lane)
+|# emp sum:worked avg:worked max:worked # exact, parallel byte-identical
+```
+
+- **Type algebra**: `DateTime − DateTime → Duration`; `DateTime ± Duration →
+  DateTime`; `Duration ± Duration → Duration`; `Duration × int → Duration`;
+  `Duration ÷ Duration → ratio` (f64). Cross-unit operands lift to the finer
+  unit; an overflow saturates (continue-first).
+- **Exact, never f64**: all comparison and `sum`/`avg`/`min`/`max` run on `i64`
+  ticks, so they are correct even at nanosecond resolution (ticks past 2^53,
+  where `f64` would collapse adjacent values).
+- **Rendering**: `format(dur)` → human `3d 02:15:00`; `format(dur, "iso")` →
+  ISO-8601 `PT…H…M…S`. Default Display is the human form.
 
 ---
 

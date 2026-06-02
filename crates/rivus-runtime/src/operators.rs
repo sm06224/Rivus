@@ -2100,6 +2100,16 @@ struct AggAcc {
     dt_unit: Option<TimeUnit>,
     dt_min: i64,
     dt_max: i64,
+    /// Exact duration lane (design 23 / #57): set once a `Value::Duration` is
+    /// observed (a column shares one unit). Unlike an instant, a span's
+    /// `sum`/`avg` are meaningful — and, being integer, exact and associative,
+    /// so they parallelize byte-identically. `sum` accumulates in `i128`
+    /// (overflow → f64 fallback, continue-first); `min`/`max` stay `i64`.
+    dur_unit: Option<TimeUnit>,
+    dur_sum: i128,
+    dur_min: i64,
+    dur_max: i64,
+    dur_overflow: bool,
 }
 
 /// Extra fractional digits an exact decimal `avg` carries beyond the input scale
@@ -2146,6 +2156,11 @@ impl AggAcc {
             dt_unit: None,
             dt_min: i64::MAX,
             dt_max: i64::MIN,
+            dur_unit: None,
+            dur_sum: 0,
+            dur_min: i64::MAX,
+            dur_max: i64::MIN,
+            dur_overflow: false,
         }
     }
 
@@ -2188,6 +2203,18 @@ impl AggAcc {
                         self.dt_unit.get_or_insert(t.unit);
                         self.dt_min = self.dt_min.min(t.ticks);
                         self.dt_max = self.dt_max.max(t.ticks);
+                    }
+                    // Exact duration lane: sum (i128), min/max (i64). A column
+                    // shares one unit. All associative → parallel byte-identical
+                    // (and, unlike instants, sum/avg are meaningful). #57.
+                    if let Value::Duration(d) = v {
+                        self.dur_unit.get_or_insert(d.unit);
+                        match self.dur_sum.checked_add(d.ticks as i128) {
+                            Some(s) => self.dur_sum = s,
+                            None => self.dur_overflow = true,
+                        }
+                        self.dur_min = self.dur_min.min(d.ticks);
+                        self.dur_max = self.dur_max.max(d.ticks);
                     }
                 }
             }
@@ -2255,6 +2282,17 @@ impl AggAcc {
             self.dt_min = self.dt_min.min(other.dt_min);
             self.dt_max = self.dt_max.max(other.dt_max);
         }
+        // Exact duration lane (associative i128 sum / i64 min/max). #57.
+        if let Some(ou) = other.dur_unit {
+            self.dur_unit.get_or_insert(ou);
+            match self.dur_sum.checked_add(other.dur_sum) {
+                Some(s) => self.dur_sum = s,
+                None => self.dur_overflow = true,
+            }
+            self.dur_min = self.dur_min.min(other.dur_min);
+            self.dur_max = self.dur_max.max(other.dur_max);
+        }
+        self.dur_overflow |= other.dur_overflow;
         for s in &other.distinct {
             self.distinct.insert(s.clone());
         }
@@ -2368,6 +2406,30 @@ impl AggAcc {
         }
     }
 
+    /// Exact duration result for `sum`/`avg`/`min`/`max` on a duration column,
+    /// or `None` otherwise (caller uses f64). `sum` is the exact i128 total,
+    /// `avg` rounds `sum/count` half-to-even (a whole tick count, like the
+    /// decimal avg), `min`/`max` are the i64 extremes — all exact and
+    /// type-preserving. An i128 sum overflow falls back to f64. #57.
+    fn dur_value(&self) -> Option<rivus_core::Duration> {
+        let unit = self.dur_unit?;
+        if self.dur_overflow {
+            return None;
+        }
+        let mk = |t: i128| {
+            rivus_core::Duration::new(t.clamp(i64::MIN as i128, i64::MAX as i128) as i64, unit)
+        };
+        match self.func {
+            AggFunc::Sum => Some(mk(self.dur_sum)),
+            AggFunc::Min if self.n > 0 => Some(rivus_core::Duration::new(self.dur_min, unit)),
+            AggFunc::Max if self.n > 0 => Some(rivus_core::Duration::new(self.dur_max, unit)),
+            AggFunc::Avg if self.n > 0 => {
+                Some(mk(div_round_half_even(self.dur_sum, self.n as i128)))
+            }
+            _ => None,
+        }
+    }
+
     fn distinct_count(&self) -> i64 {
         self.distinct.len() as i64
     }
@@ -2445,8 +2507,13 @@ pub(crate) fn group_parallel_safe(
         | AggFunc::First
         | AggFunc::Last
         | AggFunc::Pct(_) => true,
+        // Exact integer lanes (decimal i128, duration i64) make sum/avg
+        // associative → parallel byte-identical; f64 sum/avg are not. #57.
         AggFunc::Sum | AggFunc::Avg => {
-            matches!(col_type(col), Some(DataType::Decimal { .. }))
+            matches!(
+                col_type(col),
+                Some(DataType::Decimal { .. } | DataType::Duration { .. })
+            )
         }
         AggFunc::Std => false,
     })
@@ -2591,6 +2658,28 @@ impl Operator for GroupBy {
                         let ticks = dts.iter().map(|d| d.ticks).collect();
                         fields.push(Field::new(name, DataType::DateTime { unit }));
                         columns.push(Column::DateTime(DtColumn { ticks, unit }));
+                        continue;
+                    }
+                    // Exact duration sum/avg/min/max → keep the Duration lane
+                    // (i128 sum / i64 extremes), never an f64 column. #57.
+                    let dur_ok = matches!(
+                        func,
+                        AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
+                    ) && !self.groups.is_empty()
+                        && self
+                            .groups
+                            .values()
+                            .all(|s| s.accs[j].dur_value().is_some());
+                    if dur_ok {
+                        let durs: Vec<rivus_core::Duration> = self
+                            .groups
+                            .values()
+                            .map(|s| s.accs[j].dur_value().unwrap())
+                            .collect();
+                        let unit = durs[0].unit;
+                        let ticks = durs.iter().map(|d| d.ticks).collect();
+                        fields.push(Field::new(name, DataType::Duration { unit }));
+                        columns.push(Column::Duration(rivus_core::DurColumn { ticks, unit }));
                         continue;
                     }
                     let dec_ok = matches!(
@@ -3430,6 +3519,51 @@ mod agg_merge_tests {
                 s_mn.dt_value(),
                 "min merge != single @{parts}"
             );
+        }
+    }
+
+    #[test]
+    fn duration_aggregates_are_exact_and_parallel_safe() {
+        // Durations are exact i64, so sum/avg/min/max are associative → the
+        // partitioned merge equals the single pass, and the result keeps the
+        // Duration type. Nanosecond ticks past 2^53 (f64 would be wrong). #57.
+        let base = 1_700_000_000_000_000_000_i64;
+        assert!(
+            base as f64 == (base + 1) as f64,
+            "precondition: f64 loses 1ns"
+        );
+        let vals: Vec<Value> = [base, base + 2, base + 4, base + 6]
+            .into_iter()
+            .map(|t| Value::Duration(rivus_core::Duration::new(t, TimeUnit::Nano)))
+            .collect();
+        // Independent i128 oracle.
+        let oracle_sum: i128 = vals
+            .iter()
+            .map(|v| match v {
+                Value::Duration(d) => d.ticks as i128,
+                _ => 0,
+            })
+            .sum();
+        for parts in [1usize, 2, 3, 4] {
+            for (func, want) in [
+                (AggFunc::Sum, oracle_sum),
+                (AggFunc::Avg, oracle_sum / 4), // (0+2+4+6)/4 = 3 exactly, no rounding
+                (AggFunc::Min, base as i128),
+                (AggFunc::Max, (base + 6) as i128),
+            ] {
+                let m = partitioned(func, &vals, parts);
+                let s = single(func, &vals);
+                assert_eq!(
+                    m.dur_value(),
+                    s.dur_value(),
+                    "{func:?} merge != single @{parts}"
+                );
+                assert_eq!(
+                    m.dur_value(),
+                    Some(rivus_core::Duration::new(want as i64, TimeUnit::Nano)),
+                    "{func:?} not exact @{parts}"
+                );
+            }
         }
     }
 
