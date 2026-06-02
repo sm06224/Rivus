@@ -3024,7 +3024,7 @@ impl SinkJsonl {
                 }
                 json_string(&mut out, name);
                 out.push(':');
-                json_value(&mut out, &chunk.value(row, c));
+                write_json_cell(&mut out, &chunk.columns[c], row);
             }
             out.push('}');
             writeln!(w, "{out}")?;
@@ -3072,23 +3072,24 @@ impl Operator for SinkJsonl {
 /// Render `chunks` as JSON Lines (one object per row). Shared by the serial
 /// `SinkJsonl` and the parallel executor's single-write merge.
 pub fn write_jsonl_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
+    // Stream (bounded memory — one reused object buffer) and format each cell
+    // straight from its column lane (`json_object_row` → `write_json_cell`).
+    let sink: Box<dyn Write> = if path == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(std::fs::File::create(path)?)
+    };
+    let mut w = BufWriter::with_capacity(256 * 1024, sink);
     let mut out = String::new();
     for chunk in chunks {
         let names = chunk.schema.field_names();
         for row in 0..chunk.len {
-            out.push('{');
-            for (c, name) in names.iter().enumerate() {
-                if c > 0 {
-                    out.push(',');
-                }
-                json_string(&mut out, name);
-                out.push(':');
-                json_value(&mut out, &chunk.value(row, c));
-            }
-            out.push_str("}\n");
+            out.clear();
+            json_object_row(&mut out, chunk, &names, row);
+            writeln!(w, "{out}")?;
         }
     }
-    write_output(path, &out)
+    w.flush()
 }
 
 /// Append one row as a JSON object to `out`.
@@ -3100,7 +3101,7 @@ fn json_object_row(out: &mut String, chunk: &Chunk, names: &[&str], row: usize) 
         }
         json_string(out, name);
         out.push(':');
-        json_value(out, &chunk.value(row, c));
+        write_json_cell(out, &chunk.columns[c], row);
     }
     out.push('}');
 }
@@ -3211,17 +3212,32 @@ pub fn write_json_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
 }
 
 /// Encode a JSON value from a Rivus scalar.
-fn json_value(out: &mut String, v: &Value) {
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::I64(n) => out.push_str(&n.to_string()),
-        // JSON has no NaN/Infinity → emit null (continue-first).
-        Value::F64(f) if f.is_finite() => out.push_str(&f.to_string()),
-        Value::F64(_) => out.push_str("null"),
-        // Exact decimal → emit as a JSON number (its Display is a valid number).
-        Value::Dec(d) => out.push_str(&d.to_string()),
-        Value::Str(s) => json_string(out, s),
+/// Append one JSON value formatted **straight from its typed column lane** into
+/// `out` — no per-cell `Value` materialization (cloning string cells) and no temp
+/// `to_string` allocation, but identical output to the per-`Value` formatter.
+fn write_json_cell(out: &mut String, col: &Column, row: usize) {
+    use std::fmt::Write as _;
+    match col {
+        Column::I64(v) => {
+            let _ = write!(out, "{}", v[row]);
+        }
+        // JSON has no NaN/Infinity → emit null (continue-first), matching json_value.
+        Column::F64(v) => {
+            if v[row].is_finite() {
+                let _ = write!(out, "{}", v[row]);
+            } else {
+                out.push_str("null");
+            }
+        }
+        Column::Bool(v) => out.push_str(if v[row] { "true" } else { "false" }),
+        Column::Dec(d) => {
+            let _ = write!(
+                out,
+                "{}",
+                rivus_core::Decimal::new(d.unscaled[row], d.scale)
+            );
+        }
+        Column::Str(s) => json_string(out, s.get(row)),
     }
 }
 

@@ -557,6 +557,12 @@ node `busy_ms`): **~2902 ms → ~1334 ms (~2.2×)**, every pair faster. Output i
 **byte-identical** (md5-equal on the serial *and* parallel part-file paths) and the
 full equivalence/stress suites stay green; zero third-party deps unchanged.
 
+The **JSONL / JSON** sinks got the same treatment (`write_json_cell` formats from
+the column lane; `write_jsonl_file` streams through a `BufWriter`): JSONL `save`
+~2780 → ~2190 ms (~1.27× — smaller than CSV because the per-cell cost was already
+one allocation, and `json_string` escaping dominates string-heavy output),
+byte-identical (md5-equal).
+
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
 Data generated self-hosted with `rivus gen clean --rows 5000000` (no awk).
