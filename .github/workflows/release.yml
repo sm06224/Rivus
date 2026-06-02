@@ -10,7 +10,8 @@ name: Release
 #
 # Platforms (everything else builds from source — see README → Installation):
 #   * macOS  : Apple Silicon (M1 and later) only — no legacy Intel Mac.
-#   * Windows: 11+ x64 — portable (Intel & older AMD) + AMD Zen 4 / Zen 3 tuned.
+#   * Windows: 11+ x64 — portable (Intel & older AMD) + **Intel 11th-gen Core
+#              (Tiger Lake) featured** + AMD Zen 4 / Zen 3 tuned.
 #
 # Triggered by pushing a `v*` tag, or manually via the Actions tab.
 
@@ -48,6 +49,14 @@ jobs:
             rustflags: "-C target-cpu=apple-m1"   # tuned, runs on all M1+
 
           # ---- Windows 11+ x64 --------------------------------------------
+          # ★ FEATURED: Intel 11th-gen Core i5 (Tiger Lake, 4C/8T) on Win11 —
+          #   the maintainer's primary machine. `tigerlake` enables AVX2 +
+          #   AVX-512 + BMI2, which the SWAR/SIMD CSV scan and exact integer
+          #   lanes exploit. Runs only on Tiger Lake or newer.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64-intel-tigerlake
+            rustflags: "-C target-cpu=tigerlake"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: windows-x64-portable   # baseline x64: Intel & older AMD too
@@ -134,6 +143,6 @@ jobs:
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" \
               --title "Rivus $tag" \
-              --notes "Pre-built binaries. macOS: Apple Silicon (M1+). Windows 11+ x64: portable (Intel & AMD) + AMD Zen 4 / Zen 3 tuned. Each platform ships a portable (multi-arch) and a CPU-tuned build. Other platforms: build from source (see README → Installation)." \
+              --notes "Pre-built binaries. macOS: Apple Silicon (M1+). Windows 11+ x64: **recommended \`windows-x64-intel-tigerlake\`** (tuned for 11th-gen Intel Core i5 / Tiger Lake, AVX-512) + portable (any Intel/AMD x64) + AMD Zen 4 / Zen 3 tuned. Each platform ships a portable (multi-arch) and CPU-tuned builds; pick the tuned build matching your CPU, else portable. Other platforms: build from source (see README → Installation)." \
             || true
           gh release upload "$tag" "$ASSET" "$ASSET_SHA" --clobber
