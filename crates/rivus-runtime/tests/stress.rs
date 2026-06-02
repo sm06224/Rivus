@@ -2758,3 +2758,69 @@ fn datetime_filter_by_literal_same_lane() {
         vec![1, 2, 3, 4]
     );
 }
+
+#[test]
+fn datetime_functions_and_daily_groupby() {
+    // Field extractors, `trunc`, `format`, and a time-series daily group-by
+    // (design 23) — all integer math, so chunk-size independent.
+    let text = "ts,v\n\
+                260601143000,10\n\
+                260601090000,5\n\
+                260602120000,7\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_dt_funcs",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+
+    // Extractors over row 0 (2026-06-01 14:30:00).
+    let ext = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") v:int)\n \
+         |> (year(ts)) as y (month(ts)) as mo (day(ts)) as d (hour(ts)) as h (minute(ts)) as mi (second(ts)) as se\n;"
+    );
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&ext, cz);
+        assert_eq!(collect_i64(&res, "D", "y")[0], 2026, "year (cz={cz})");
+        assert_eq!(collect_i64(&res, "D", "mo")[0], 6);
+        assert_eq!(collect_i64(&res, "D", "d")[0], 1);
+        assert_eq!(collect_i64(&res, "D", "h")[0], 14);
+        assert_eq!(collect_i64(&res, "D", "mi")[0], 30);
+        assert_eq!(collect_i64(&res, "D", "se")[0], 0);
+    }
+
+    // `trunc(ts,"day")` stays on the datetime lane; `format` renders it.
+    let tr = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") v:int)\n \
+         |> (format(trunc(ts, \"day\"), \"yyyy-MM-dd\")) as day v\n;"
+    );
+    assert_eq!(
+        collect_strings(&run_src(&tr, 4096), "D", "day"),
+        vec![
+            "2026-06-01".to_string(),
+            "2026-06-01".to_string(),
+            "2026-06-02".to_string(),
+        ],
+    );
+
+    // Daily aggregation: sum(v) grouped by the truncated day.
+    let grp = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") v:int)\n \
+         |> (format(trunc(ts, \"day\"), \"yyyy-MM-dd\")) as day v\n \
+         |# day sum:v\n;"
+    );
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&grp, cz);
+        let days = collect_strings(&res, "D", "day");
+        let sums = collect_i64(&res, "D", "sum_v");
+        let mut pairs: Vec<(String, i64)> = days.into_iter().zip(sums).collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("2026-06-01".to_string(), 15), // 10 + 5
+                ("2026-06-02".to_string(), 7),
+            ],
+            "daily sum changed at chunk_size {cz}"
+        );
+    }
+}

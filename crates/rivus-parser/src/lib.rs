@@ -1467,6 +1467,28 @@ mod tests {
     }
 
     #[test]
+    fn datetime_functions_parse_and_are_reversible() {
+        // The design-23 datetime functions survive `to_source` round-trips.
+        let src = "F:\n open log.csv\n |> (year(ts)) as y (month(ts)) as mo (day(ts)) as d (hour(ts)) as h (minute(ts)) as mi (second(ts)) as se (trunc(ts, \"day\")) as bucket (format(ts, \"yyyy-MM-dd\")) as f\n;";
+        let s = parse(src).unwrap().to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        for needle in [
+            "year(",
+            "month(",
+            "day(",
+            "hour(",
+            "minute(",
+            "second(",
+            "trunc(",
+            "format(",
+            "\"day\"",
+            "\"yyyy-MM-dd\"",
+        ] {
+            assert!(s.contains(needle), "missing {needle} in {s}");
+        }
+    }
+
+    #[test]
     fn stdio_paths_normalize() {
         // `stdin`/`stdout` (and `-`) map to the "-" sentinel for source & sink.
         let g = parse("F:\n open stdin\n save stdout\n;").unwrap();

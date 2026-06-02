@@ -313,12 +313,30 @@ impl DateTime {
     }
 
     /// `(year, month, day, hour, minute, second)` in UTC (whole-second part).
-    fn fields(&self) -> (i64, i64, i64, i64, i64, i64) {
+    pub fn fields(&self) -> (i64, i64, i64, i64, i64, i64) {
         let secs = self.ticks.div_euclid(self.unit.per_sec());
         let day = secs.div_euclid(86400);
         let sod = secs.rem_euclid(86400);
         let (y, m, d) = civil_from_days(day);
         (y, m, d, sod / 3600, (sod / 60) % 60, sod % 60)
+    }
+
+    /// Truncate to a calendar/clock boundary (`year`/`month`/`day`/`hour`/
+    /// `minute`/`second`), returning a `DateTime` at the same `unit` — the
+    /// time-series group-by key (design 23). Integer math, so byte-identical
+    /// across execution strategies. An unknown field truncates to the second.
+    pub fn truncated(&self, field: &str) -> DateTime {
+        let (y, mo, d, h, mi, se) = self.fields();
+        let (y, mo, d, h, mi, se) = match field {
+            "year" => (y, 1, 1, 0, 0, 0),
+            "month" => (y, mo, 1, 0, 0, 0),
+            "day" => (y, mo, d, 0, 0, 0),
+            "hour" => (y, mo, d, h, 0, 0),
+            "minute" => (y, mo, d, h, mi, 0),
+            _ => (y, mo, d, h, mi, se), // "second" / unknown → whole second
+        };
+        let secs = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+        DateTime::new(secs * self.unit.per_sec(), self.unit)
     }
 
     /// Parse `s` with a `strptime`-style `fmt` (tokens `yyyy`/`yy`/`MM`/`dd`/`HH`

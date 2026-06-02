@@ -120,6 +120,52 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             }
             Value::Str(String::new())
         }
+        // Datetime field extractors (design 23). The argument is coerced to a
+        // `DateTime` (a datetime cell as-is, or a text/epoch value parsed into
+        // the lane); a non-datetime that won't coerce yields `Null`.
+        Func::Year | Func::Month | Func::Day | Func::Hour | Func::Minute | Func::Second => {
+            match as_datetime(arg(0)) {
+                Some(dt) => {
+                    let (y, mo, d, h, mi, se) = dt.fields();
+                    Value::I64(match func {
+                        Func::Year => y,
+                        Func::Month => mo,
+                        Func::Day => d,
+                        Func::Hour => h,
+                        Func::Minute => mi,
+                        _ => se,
+                    })
+                }
+                None => Value::Null,
+            }
+        }
+        // `trunc(ts, "day")` → datetime truncated to the boundary (same unit).
+        Func::Trunc => match as_datetime(arg(0)) {
+            Some(dt) => Value::DateTime(dt.truncated(arg(1).to_string().trim())),
+            None => Value::Null,
+        },
+        // `format(ts, "fmt")` → text rendering. A non-datetime coerces to its
+        // text form (so `format` is total / continue-first).
+        Func::Format => {
+            let fmt = arg(1).to_string();
+            match as_datetime(arg(0)) {
+                Some(dt) => Value::Str(dt.format(&fmt)),
+                None => Value::Str(arg(0).to_string()),
+            }
+        }
+    }
+}
+
+/// Coerce a value to a [`DateTime`] for the datetime functions (design 23): a
+/// datetime cell is taken as-is; a text value is auto-parsed (second unit); an
+/// integer is read as epoch seconds. Anything else → `None` (continue-first).
+fn as_datetime(v: Value) -> Option<rivus_core::DateTime> {
+    use rivus_core::{DateTime, TimeUnit};
+    match v {
+        Value::DateTime(dt) => Some(dt),
+        Value::Str(s) => DateTime::parse_auto(&s, TimeUnit::Sec),
+        Value::I64(n) => Some(DateTime::new(n, TimeUnit::Sec)),
+        _ => None,
     }
 }
 
@@ -470,11 +516,25 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
         Expr::Func { func, args } => {
             let n = chunk.len;
             match func {
-                Func::Len => Column::I64(
+                // Integer-valued funcs: `len` and the datetime field extractors
+                // (design 23) all yield an i64 lane.
+                Func::Len
+                | Func::Year
+                | Func::Month
+                | Func::Day
+                | Func::Hour
+                | Func::Minute
+                | Func::Second => Column::I64(
                     (0..n)
                         .map(|r| to_i64(call_func(*func, args, chunk, r)))
                         .collect(),
                 ),
+                // `trunc` stays on the datetime lane (truncated ticks, same unit).
+                Func::Trunc => {
+                    let vals: Vec<Value> =
+                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    column_from_values(vals)
+                }
                 // `regexp(col, "literal")` compiles the pattern once for the
                 // whole chunk (per-row compilation is catastrophic — ~10× slower).
                 Func::Regexp if regex_literal(args).is_some() => regexp_column(args, chunk),
@@ -533,6 +593,23 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
         .iter()
         .all(|v| matches!(v, Value::I64(_) | Value::F64(_) | Value::Bool(_)));
     let all_bool = !vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Bool(_)));
+    // All-datetime → keep the datetime lane (e.g. `trunc(ts, "day")`), carrying
+    // the first cell's unit (every cell shares it). Design 23.
+    if let Some(Value::DateTime(first)) = vals.first() {
+        if vals.iter().all(|v| matches!(v, Value::DateTime(_))) {
+            let unit = first.unit;
+            return Column::DateTime(rivus_core::DtColumn {
+                ticks: vals
+                    .iter()
+                    .map(|v| match v {
+                        Value::DateTime(t) => t.ticks,
+                        _ => 0,
+                    })
+                    .collect(),
+                unit,
+            });
+        }
+    }
     if all_bool {
         Column::Bool(
             vals.iter()
