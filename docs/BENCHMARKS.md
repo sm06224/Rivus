@@ -477,9 +477,22 @@ a large architectural change with **near-zero measured payoff for these
 workloads**, so per the measure-before-adopting rule it is **deferred** until a
 gather-dominated workload appears (e.g. very wide projections, repeated
 re-gathering, or an alternate execution backend where the row-wise gather is the
-bottleneck). The real remaining costs are **parse** (at its scalar two-pass floor)
-and **save** (already ~2.2× via columnar formatting); closing the DuckDB gap needs
-SIMD value parsing, not gather reduction.
+bottleneck).
+
+**Where parse time actually goes (measured).** Interleaved `open` over 5 M rows is
+**~1430 ms whether it builds all 6 columns (no projection) or 1 (`|> id`)** — i.e.
+per-column value building (parse + string copy) is *not* the dominant cost (an
+earlier note guessing it was is corrected here). The cost is the per-row work done
+regardless of projection: the **read + full-line split, run in both passes** of the
+two-pass reader (the split scans every field to find record boundaries even for
+unkept columns; the split itself is already SWAR-optimized). So **SIMD value
+parsing is also low-payoff**, and gather (#40) is negligible. The one lever that
+would meaningfully cut parse is **eliminating the second pass** (split once, not
+twice) — but that trades either chunk-size-independent typing (sampled/single-pass
+inference) or memory (buffer the parsed values), and was measured no-win in
+warm-cache earlier; it is a deliberate design trade-off for the maintainer, not an
+autonomous change. Net: parse is at its **floor for the bounded, chunk-size-
+independent two-pass design**; save is optimized; the DuckDB gap is structural.
 
 ### Exact decimal filter — no silent rounding, faster *and* correct (#44)
 
