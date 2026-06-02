@@ -451,11 +451,20 @@ rivus run sessions.riv --telemetry-addr 127.0.0.1:9000   # メトリクスをラ
   **~10 MiB** の RAM（ファイルを丸読みしない）、**DuckDB より ~1.45 倍速く
   ~40 倍少ないメモリ**（3.0 秒 vs 4.4 秒 / 407 MiB）、awk の ~3.8 倍、Python の
   ~10 倍——詳細は [`docs/BENCHMARKS.md`](BENCHMARKS.md)。
-- **既定で並列。** `save` シンク付きの単一 CSV が **8 MiB** 以上なら、自動で CPU
-  コア横断のストリーム処理（改行境界のバイト範囲ワーカー → 順序付き出力）。
+- **既定で並列。** `save` シンク付きの単一 CSV **または JSONL** が **8 MiB** 以上なら、
+  自動で CPU コア横断のストリーム処理（改行境界のバイト範囲ワーカー → 順序付き出力）。
+  JSONL も有界メモリでストリーム（全文読み込みを廃止）、**group-by も並列化**。
   171 MiB のフィルタで直列 ~1.6 秒 → 並列 **~0.4 秒**。`RIVUS_PARALLEL_MIN_BYTES`
   （バイト、`0` で常時）で調整、`RIVUS_NO_PARALLEL=1` で直列強制。圧縮入力
   （`.gz`/`.zst`）はシーク不可なので直列。
+- **`--memory low|auto|fast|unbounded`。** メモリ/速度の knob。`low`＝直列強制
+  （最小資源）、`auto`（既定）＝CPU数・入力サイズで自律調律、`fast`＝より積極的に
+  並列（閾値を下げる）— **この3つは有界メモリのまま**。`unbounded` は**明示的に**
+  有界を犠牲に速度を取るオプトイン: 分割不可ソース（圧縮/JSONL/binary）も入力を
+  materialize して並列化（peak メモリ O(入力)）。4 つとも結果は **byte-identical**で、
+  違うのはメモリ/速度だけ。**group-by** も並列化: byte-identical な集計
+  （`min`/`max`/`count`/`count_distinct`/`first`/`last`/percentile と exact-`decimal`
+  の `sum`/`avg`）は `auto`/`fast` で有界並列、`unbounded` で分割不可ソースにも拡張。
 - **ライブ進捗。** 対話的な `rivus run` は長いジョブ中、stderr に
   `… N rows  T s  R rows/s` を表示。
 - **機械可読テレメトリ。** `rivus run … --json` でノードごとの JSONL

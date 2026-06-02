@@ -2245,3 +2245,301 @@ fn f64_sum_group_stays_serial_but_correct() {
         collect(rivus_runtime::MemoryPref::Low)
     );
 }
+
+#[test]
+fn unbounded_group_parallelizes_non_csv_byte_identical() {
+    // #50: a non-splittable source (JSONL) can't use the bounded streaming group
+    // path, so it stays serial under auto/fast. With the opt-in `Unbounded` tier
+    // the engine materializes + partitions to parallelize it — still byte-identical
+    // to serial; only memory differs.
+    let rows = 60_000usize;
+    let countries = ["JP", "US", "DE", "FR"];
+    let mut text = String::new();
+    for i in 0..rows {
+        text.push_str(&format!(
+            "{{\"country\":\"{}\",\"amount\":{}}}\n",
+            countries[i % countries.len()],
+            i % 1000
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_unbounded_jsonl",
+        text.as_bytes(),
+    ));
+    // Rename so the reader picks JSONL from the extension.
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+    let flow = format!("G:\n open {p}\n |# country min:amount max:amount count_distinct:amount\n;");
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join(","));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+    let (serial, serial_par) = collect(rivus_runtime::MemoryPref::Low);
+    let (auto, auto_par) = collect(rivus_runtime::MemoryPref::Auto);
+    let (unbounded, unbounded_par) = collect(rivus_runtime::MemoryPref::Unbounded);
+    // auto/low never materialize a non-splittable group → serial (bounded).
+    assert!(!serial_par, "low must be serial");
+    assert!(
+        !auto_par,
+        "auto must NOT silently go unbounded on a JSONL group"
+    );
+    // unbounded parallelizes it, byte-identical.
+    assert!(
+        unbounded_par,
+        "unbounded should parallelize the JSONL group"
+    );
+    assert_eq!(unbounded, serial, "unbounded group != serial");
+    assert_eq!(auto, serial, "auto group != serial");
+}
+
+#[test]
+fn parallel_jsonl_group_bounded_byte_identical() {
+    // #49: JSONL is now a splittable source — its group-by parallelizes in the
+    // bounded byte-range path (no whole-file materialize), byte-identical to
+    // serial. Forced with a >1 MiB file + MemoryPref::Fast (no env races).
+    let rows = 120_000usize;
+    let countries = ["JP", "US", "DE", "FR"];
+    let mut text = String::new();
+    for i in 0..rows {
+        text.push_str(&format!(
+            "{{\"country\":\"{}\",\"amount\":{}}}\n",
+            countries[i % countries.len()],
+            i % 1000
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_jsonl_group",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+    let flow = format!("G:\n open {p}\n |# country min:amount max:amount count_distinct:amount\n;");
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join(","));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+    let (serial, serial_par) = collect(rivus_runtime::MemoryPref::Low);
+    let (parallel, par) = collect(rivus_runtime::MemoryPref::Fast);
+    assert!(!serial_par, "low must be serial");
+    assert!(
+        par,
+        "fast should engage the bounded JSONL byte-range group path"
+    );
+    assert_eq!(parallel, serial, "parallel JSONL group != serial");
+}
+
+#[test]
+fn parallel_jsonl_stateless_byte_identical() {
+    // #49: a JSONL filter+project+save flow parallelizes in the bounded
+    // streaming-parallel path (part files → ordered concat), byte-identical to
+    // serial. Compares the saved output files.
+    let rows = 120_000usize;
+    let mut text = String::new();
+    for i in 0..rows {
+        text.push_str(&format!("{{\"id\":{},\"amount\":{}}}\n", i, i % 1000));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_jsonl_sl",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+    let run_to = |pref: rivus_runtime::MemoryPref, out: &std::path::Path| -> bool {
+        let src = format!(
+            "F:\n open {p}\n |? amount >= 500\n |> id amount\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        !res.workers.is_empty()
+    };
+    let ser = TempCsv(gendata::write_temp_bytes("jsonl_sl_serial", b""));
+    let par = TempCsv(gendata::write_temp_bytes("jsonl_sl_par", b""));
+    assert!(
+        !run_to(rivus_runtime::MemoryPref::Low, &ser.0),
+        "low must be serial"
+    );
+    assert!(
+        run_to(rivus_runtime::MemoryPref::Fast, &par.0),
+        "fast should engage the JSONL streaming-parallel path"
+    );
+    let a = std::fs::read_to_string(&ser.0).unwrap();
+    let b = std::fs::read_to_string(&par.0).unwrap();
+    assert_eq!(a, b, "parallel JSONL stateless != serial");
+    assert!(a.lines().count() > 1000);
+}
+
+#[test]
+fn parallel_binary_byte_identical() {
+    // #49: fixed-width binary is splittable (record-aligned) — its filter and
+    // group-by parallelize in the bounded byte-range path, byte-identical to
+    // serial. ~150k records (17 B packed) > 1 MiB so MemoryPref::Fast engages it.
+    let rows = 150_000;
+    let bytes = gendata::bin_clean(rows, 7);
+    let f = TempCsv(gendata::write_temp_bytes("stress_bin_par", &bytes));
+    let p = f.0.display();
+    // Stateless filter+project to a file, and a group-by — both parallel paths.
+    for flow in [
+        format!(
+            "F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n |> id age\n save {{OUT}}\n;"
+        ),
+        format!(
+            "F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |# active min:age max:age count_distinct:age\n save {{OUT}}\n;"
+        ),
+    ] {
+        let ser = TempCsv(gendata::write_temp_bytes("bin_ser", b""));
+        let par = TempCsv(gendata::write_temp_bytes("bin_par", b""));
+        let run_to = |pref: rivus_runtime::MemoryPref, out: &std::path::Path| -> bool {
+            let src = flow.replace("{OUT}", &out.display().to_string());
+            let g = rivus_parser::parse(&src).expect("parse");
+            let res = run(
+                &g,
+                RunOptions {
+                    chunk_size: 4096,
+                    memory: pref,
+                    ..Default::default()
+                },
+            )
+            .expect("run");
+            !res.workers.is_empty()
+        };
+        assert!(!run_to(rivus_runtime::MemoryPref::Low, &ser.0), "low serial");
+        assert!(run_to(rivus_runtime::MemoryPref::Fast, &par.0), "fast should parallelize binary");
+        let a = std::fs::read_to_string(&ser.0).unwrap();
+        let b = std::fs::read_to_string(&par.0).unwrap();
+        assert_eq!(a, b, "parallel binary != serial for flow:\n{flow}");
+    }
+}
+
+#[test]
+fn f64_parallel_sum_needs_canonical_order_decimal_is_exact_today() {
+    // #45 (measured): f64 addition is non-associative, so a naive partition→merge
+    // sum diverges from the serial sum *and* varies with the partition count —
+    // which is exactly why the parallel group-by keeps f64 sum/avg/std serial
+    // (#41 option 1). A canonical fixed-block fold is a pure function of the value
+    // sequence (partition-independent), but adopting it changes the serial value
+    // too and needs global-row coordination to run bounded+parallel. Meanwhile the
+    // **decimal lane already gives an exact, byte-identical parallel sum today**.
+    let naive = |v: &[f64]| v.iter().fold(0.0f64, |a, &x| a + x);
+    let part_naive = |v: &[f64], k: usize| {
+        let n = v.len();
+        (0..k)
+            .map(|i| naive(&v[n * i / k..n * (i + 1) / k]))
+            .fold(0.0, |a, b| a + b)
+    };
+    let canonical = |v: &[f64], bs: usize| {
+        let mut total = 0.0;
+        let mut i = 0;
+        while i < v.len() {
+            let e = (i + bs).min(v.len());
+            total += naive(&v[i..e]);
+            i = e;
+        }
+        total
+    };
+    // Large magnitudes → the additions actually round.
+    let v: Vec<f64> = (0..200_000)
+        .map(|i| ((i as f64) * 1.000000123).sin() * 1e9 + 1e15)
+        .collect();
+    let serial = naive(&v);
+    // The problem: naive parallel diverges and is partition-count dependent.
+    assert_ne!(part_naive(&v, 2), serial, "demo expects f64 drift");
+    assert_ne!(
+        part_naive(&v, 2),
+        part_naive(&v, 4),
+        "partition-count dependent"
+    );
+    // The canonical fold is a pure function of (values, block size): the same no
+    // matter how it is later partitioned — the property a parallel impl must hit.
+    assert_eq!(canonical(&v, 256), canonical(&v, 256));
+
+    // What we ship today: route exactness through the decimal lane, whose sum is
+    // exact and byte-identical in parallel (no f64 drift at all).
+    let mut text = String::from("g,amount\n");
+    for i in 0..5000 {
+        text.push_str(&format!("1,{}.{:02}\n", i % 1000, i % 100));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("canon_dec", text.as_bytes()));
+    let p = f.0.display();
+    let sum = |cs: usize| {
+        let res = run_src(
+            &format!("G:\n open {p} (g amount:decimal(2))\n |# g sum:amount\n;"),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let c = &o.chunks[0];
+        let si = c.schema.index_of("sum_amount").unwrap();
+        c.value(0, si).to_string()
+    };
+    assert_eq!(
+        sum(1),
+        sum(4096),
+        "decimal sum is exact & chunk-independent today"
+    );
+}

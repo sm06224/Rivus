@@ -58,7 +58,7 @@ fn main() -> ExitCode {
     let mut serve_addr: Option<String> = None;
     // `--tui`: repaint a live ANSI dashboard on stderr as the run streams.
     let mut tui = false;
-    // `--memory low|auto|fast` (Pillar C): reader memory/speed strategy.
+    // `--memory low|auto|fast|unbounded` (Pillar C): reader memory/speed strategy.
     let mut memory = MemoryPref::default();
     let mut i = 2;
     while i < args.len() {
@@ -102,7 +102,7 @@ fn main() -> ExitCode {
                 match args.get(i).and_then(|s| MemoryPref::parse(s)) {
                     Some(m) => memory = m,
                     None => {
-                        eprintln!("error: --memory expects low|auto|fast");
+                        eprintln!("error: --memory expects low|auto|fast|unbounded");
                         return ExitCode::from(2);
                     }
                 }
@@ -496,7 +496,7 @@ fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
-         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--memory low|auto|fast] [--json|--telemetry-addr HOST:PORT|--tui|--serve [ADDR]]  run a flow\n\
+         \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--memory low|auto|fast|unbounded] [--json|--telemetry-addr HOST:PORT|--tui|--serve [ADDR]]  run a flow\n\
          \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
          \x20 rivus check   <program>                                parse only\n\
          \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\

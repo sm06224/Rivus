@@ -433,6 +433,29 @@ parse — measured to be cheap here (building 2 vs 6 columns barely moved the ti
 the **scan**, not the per-cell parse, was the cost), so it is *not* pursued without a
 profile that shows parse as hot.
 
+### Parse read method — measured negative result (`fill_buf` not adopted)
+
+After the SWAR split landed, checked whether the line *read* itself is worth
+optimizing. Microbenchmark over the 5 M-row / 171 MiB file (warm cache, read only,
+no parsing):
+
+| read method | time |
+|---|---:|
+| `read_line` (copy + UTF-8 validate) | ~195 ms |
+| `read_until` (copy, no validate) | ~147 ms |
+| `fill_buf` (no copy, scan in place) | ~137 ms |
+
+So the whole *read* is only ~195 ms — roughly **10 % of one parse pass** (`open` is
+~1.9 s for this file). Switching the reader to `fill_buf` would save the ~48 ms
+UTF-8 validation + ~10 ms copy, i.e. **~6 % of `open`** — not worth rewriting the
+hot streaming loop (with its byte-range/limit, BOM, and straddling-line edge
+cases) for. `open` is dominated by the **two-pass split + per-cell value
+parse/build** (already split-optimized by SWAR), which is inherent to the
+bounded-memory, chunk-size-independent two-pass design. Per the "measure before
+adopting" rule (cf. #39, #45), `fill_buf` is **not adopted**; a real parse win now
+needs either breaking the two-pass (a memory trade-off) or SIMD value parsing — a
+dedicated, measured effort.
+
 ### Exact decimal filter — no silent rounding, faster *and* correct (#44)
 
 The decimal lane's filter comparison used the f64 view (`u as f64 / 10^scale`),
@@ -499,6 +522,69 @@ the materialized first cut — O(input)), with no loss of speed. Output is
 (parallel == serial across the safe set, workers engaged),
 `f64_sum_group_stays_serial_but_correct` (unsafe path stays serial), and
 `operators::agg_merge_tests` (partition→merge == single-pass).
+
+**JSONL too (#49).** JSON Lines is now a splittable, bounded-streaming source: it
+reads in O(1)-per-chunk memory (no whole-file slurp) and its group-by takes the
+same bounded byte-range parallel path. On a 48 MiB / 2 M-row JSONL group-by (2
+groups) peak RSS is **6 MiB serial and 6 MiB parallel** (input-size independent),
+byte-identical to serial (`stress::parallel_jsonl_group_bounded_byte_identical`).
+Fixed-width **binary** is splittable too (record-aligned ranges, no boundary scan)
+and streams bounded — its filter/project and group-by parallelize the same way
+(`stress::parallel_binary_byte_identical`). The bounded path now covers CSV +
+JSONL + binary; only genuinely non-splittable sources (compressed) need the opt-in
+`--memory unbounded` (#50).
+
+### f64 parallel aggregation — canonical reduction (measured assessment, #45)
+
+Question: should plain `f64` `sum`/`avg`/`std` parallelize in the group-by (today
+they stay serial — #41 option 1)? Measured the options on a 200k-element f64 stream
+with magnitudes large enough to actually round (`stress::f64_parallel_sum_…`):
+
+| reduction | result |
+|---|---|
+| serial naive left-fold | the reference value |
+| **naive partition→merge** | diverges by ~`5–17e6` **and varies with the partition count** → not byte-identical |
+| **canonical fixed-block fold** | a *pure function of (values, block size)* → partition-independent; but its value differs from the serial naive fold (relative ~`1e-15`) |
+
+So a canonical reduction (serial *and* parallel fold over global-row-order fixed
+blocks) **can** make f64 byte-identical — at two real costs: (a) it changes the
+serial value too (every f64 sum/avg/std shifts by ~ULPs), and (b) running it
+*bounded + parallel* for grouped aggregation needs global-row coordination (a
+row-count pre-pass to give each byte-range worker its global start row, plus a
+≤block-size carry to merge the blocks that straddle a worker boundary) — otherwise
+it degrades to O(rows-per-group) buffering, breaking the bounded-memory guarantee.
+
+**Recommendation (measured): keep f64 `sum`/`avg`/`std` serial (#41 option 1) and
+route exactness through the decimal lane**, which *already* delivers an exact,
+byte-identical, bounded, parallel `sum`/`avg` today (`:decimal` / `--exact`; i128
+is associative, so no canonical tree is needed). The canonical-tree work for plain
+f64 is deferred to a dedicated PR, justified only if a real workload needs parallel
+f64 aggregation that can't use the decimal lane — at which point the global-row
+coordination above is the design. This mirrors the #39 discipline: a clever
+mechanism is not adopted until a measurement shows it earns its complexity.
+
+### Columnar CSV write — format from the lane, stream the output (save ~2.2×)
+
+Output writing was the **second cost** in the 1 GB profile (save 6.9 s vs parse
+12.6 s). The hot loop allocated **twice per cell** — `chunk.value(row, c)` (an owned
+`Value`, copying every string cell) then `csv_escape(..)` (a fresh `String`) — and
+`write_csv_file` built the *entire* output in one `String` before writing. Replace
+both with `write_cell`, which formats each cell **straight from its typed column
+lane** into one reused line buffer (numeric/bool/decimal lanes never need quoting,
+so they go verbatim; only a string cell containing the delimiter/`"`/newline is
+quoted), and stream `write_csv_file` through a `BufWriter` (bounded memory, no
+whole-output `String`).
+
+Measured on `open … save` (5 M rows, serial, interleaved old/new pairs, the `save`
+node `busy_ms`): **~2902 ms → ~1334 ms (~2.2×)**, every pair faster. Output is
+**byte-identical** (md5-equal on the serial *and* parallel part-file paths) and the
+full equivalence/stress suites stay green; zero third-party deps unchanged.
+
+The **JSONL / JSON** sinks got the same treatment (`write_json_cell` formats from
+the column lane; `write_jsonl_file` streams through a `BufWriter`): JSONL `save`
+~2780 → ~2190 ms (~1.27× — smaller than CSV because the per-cell cost was already
+one allocation, and `json_string` escaping dominates string-heavy output),
+byte-identical (md5-equal).
 
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
