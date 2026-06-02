@@ -1226,12 +1226,78 @@ fn swar_eq_mask(word: u64, splat: u64) -> u64 {
     nonzero ^ SWAR_HI
 }
 
+/// Split an unquoted record into field byte-ranges. Dispatches to a SIMD
+/// (AVX2, 32 bytes/step) scan when the host supports it, else the SWAR
+/// (8 bytes/step, std-only) scan — both byte-identical to a scalar split:
+/// identical delimiter offsets and the identical quote-bail decision (returns
+/// `false`, `out` partially filled, when the line contains a `"`). #71.
+#[inline]
+fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `is_x86_feature_detected!` memoizes, so this is a cheap cached branch.
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: only called after confirming the CPU supports AVX2.
+            return unsafe { split_offsets_avx2(line, out, delim) };
+        }
+    }
+    split_offsets_swar(line, out, delim)
+}
+
+/// AVX2 structural-character scan (`PCMPEQB` + `movemask`, 32 bytes/step):
+/// build a quote/delimiter bitmask per 32-byte block, bail on any `"`, and
+/// extract every delimiter offset branch-free via `trailing_zeros`. Byte-
+/// identical to [`split_offsets_swar`] (same offsets, same quote-bail). #71.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn split_offsets_avx2(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
+    use std::arch::x86_64::*;
+    out.clear();
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+    let dvec = _mm256_set1_epi8(delim as i8);
+    let qvec = _mm256_set1_epi8(b'"' as i8);
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + 32 <= n {
+        let chunk = _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i);
+        // Any `"` in this block → quoted record, take the slow path (matches the
+        // SWAR scan's "bail on first quote"; the return value depends only on
+        // whether the whole line contains a quote, so the two always agree).
+        if _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, qvec)) != 0 {
+            return false;
+        }
+        let mut dmask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, dvec)) as u32;
+        while dmask != 0 {
+            let j = i + dmask.trailing_zeros() as usize;
+            out.push((start, j));
+            start = j + 1;
+            dmask &= dmask - 1;
+        }
+        i += 32;
+    }
+    // Scalar tail (< 32 bytes), same predicate as the SIMD body.
+    while i < n {
+        let b = bytes[i];
+        if b == b'"' {
+            return false;
+        }
+        if b == delim {
+            out.push((start, i));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push((start, n));
+    true
+}
+
 /// Split an unquoted record into field byte-ranges. Scans 8 bytes at a time
 /// (SWAR), recording every `delim` position; bails to the owned slow path
 /// (returns `false`, leaving `out` partially filled — callers re-split and
 /// ignore it) the moment a `"` appears. Byte-identical to a scalar scan: it
 /// finds the exact same delimiter offsets and the exact same quote condition.
-fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
+fn split_offsets_swar(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
     out.clear();
     let bytes = line.as_bytes();
     let n = bytes.len();
@@ -1736,6 +1802,104 @@ mod tests {
                 assert_eq!(ra, rb, "quote-bail mismatch on {case:?} delim={delim}");
                 if ra {
                     assert_eq!(a, b, "offset mismatch on {case:?} delim={delim}");
+                }
+            }
+        }
+    }
+
+    /// Micro-benchmark (ignored; run with
+    /// `cargo test -p rivus-runtime --release --lib bench_split_scan -- --ignored --nocapture`):
+    /// structural-scan throughput, SWAR (8B/step) vs AVX2 (32B/step). #71.
+    #[test]
+    #[ignore]
+    fn bench_split_scan() {
+        use std::time::Instant;
+        // ~12-field numeric rows, ~64 bytes each (a realistic CSV line width).
+        let line = "12345,-67.89,2026-06-01T14:30:00,abc,42,7,100,250,3,9,foo,barbaz";
+        let bytes_per: usize = line.len();
+        let iters = 2_000_000usize;
+        let mut out = Vec::with_capacity(16);
+
+        let t = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..iters {
+            let _ = split_offsets_swar(line, &mut out, b',');
+            acc += out.len();
+        }
+        let swar = t.elapsed();
+
+        let avx = if cfg!(target_arch = "x86_64") && std::is_x86_feature_detected!("avx2") {
+            let t = Instant::now();
+            for _ in 0..iters {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: guarded by runtime AVX2 detection.
+                let _ = unsafe { split_offsets_avx2(line, &mut out, b',') };
+                acc += out.len();
+            }
+            Some(t.elapsed())
+        } else {
+            None
+        };
+
+        let mbps = |d: std::time::Duration| (bytes_per * iters) as f64 / d.as_secs_f64() / 1e6;
+        println!("\n[#71 split-scan] line={bytes_per}B iters={iters} (acc={acc})");
+        println!("  SWAR: {:?}  {:.0} MB/s", swar, mbps(swar));
+        if let Some(a) = avx {
+            println!(
+                "  AVX2: {:?}  {:.0} MB/s  ({:.2}x SWAR)",
+                a,
+                mbps(a),
+                swar.as_secs_f64() / a.as_secs_f64()
+            );
+        }
+    }
+
+    /// Both backends (SWAR always, AVX2 when the host supports it) must match the
+    /// scalar reference across every length that crosses the 8/32/64-byte block
+    /// boundaries, with delimiters and quotes at varied offsets. #71.
+    #[test]
+    fn simd_split_backends_match_scalar() {
+        let mut cases: Vec<String> = Vec::new();
+        // Lengths 0..80 of pure data, then with a delimiter / quote injected at
+        // each position — exercises every block boundary and tail remainder.
+        for len in 0..80usize {
+            let base: String = (0..len).map(|k| (b'a' + (k % 26) as u8) as char).collect();
+            cases.push(base.clone());
+            for pos in 0..len {
+                let mut d = base.clone().into_bytes();
+                d[pos] = b',';
+                cases.push(String::from_utf8(d).unwrap());
+                let mut q = base.clone().into_bytes();
+                q[pos] = b'"';
+                cases.push(String::from_utf8(q).unwrap());
+            }
+        }
+        // A few multibyte-UTF8 lines (continuation bytes are ≥0x80, never a
+        // delim/quote false-match).
+        cases.push("日本語,café,naïve,x".to_string());
+        cases.push("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,日本語".to_string()); // 32B then comma
+
+        for case in &cases {
+            for &delim in b",\t" {
+                let mut want = Vec::new();
+                let rw = split_offsets_scalar(case, &mut want, delim);
+
+                let mut s = Vec::new();
+                let rs = split_offsets_swar(case, &mut s, delim);
+                assert_eq!(rs, rw, "SWAR bail mismatch on {case:?} delim={delim}");
+                if rw {
+                    assert_eq!(s, want, "SWAR offset mismatch on {case:?} delim={delim}");
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                if std::is_x86_feature_detected!("avx2") {
+                    let mut v = Vec::new();
+                    // SAFETY: guarded by runtime AVX2 detection.
+                    let rv = unsafe { split_offsets_avx2(case, &mut v, delim) };
+                    assert_eq!(rv, rw, "AVX2 bail mismatch on {case:?} delim={delim}");
+                    if rw {
+                        assert_eq!(v, want, "AVX2 offset mismatch on {case:?} delim={delim}");
+                    }
                 }
             }
         }

@@ -931,3 +931,33 @@ Two honest findings:
 
 (Also tracked: UTF-8 **BOM** at the start of a file is not yet stripped — the
 first header cell keeps the `﻿`; see ROADMAP "Ingestion".)
+
+---
+
+## SIMD-native structural scan — AVX2 delimiter/quote scan (#71, landed)
+
+First step of the SIMD-native parse bet (#71): an **AVX2** structural-character
+scan (`PCMPEQB` + `movemask`, 32 bytes/step) for `split_offsets`, runtime-
+dispatched (`is_x86_feature_detected!("avx2")`) with the **SWAR** scan (8 B/step)
+as the std-only fallback on non-AVX2 / non-x86 hosts. `core::arch`, `unsafe`
+only under the feature-detection guard; **dependency-zero** preserved.
+
+**Micro-bench** (`bench_split_scan`, release, 64-byte 12-field line, 2 M iters):
+
+| scan | time | throughput | vs SWAR |
+|---|---:|---:|---:|
+| SWAR (8 B/step) | 59.6 ms | 2 148 MB/s | 1.00× |
+| **AVX2 (32 B/step)** | **34.6 ms** | **3 699 MB/s** | **1.72×** |
+
+Byte-identical to the scalar reference (and to SWAR) across every length that
+crosses the 8/32/64-byte boundaries, with delimiters/quotes at every offset and
+multibyte UTF-8 (`simd_split_backends_match_scalar`); the quote-bail decision is
+identical (return value depends only on whether the line contains a `"`).
+
+**Honest scope**: this accelerates *field splitting* only — one of the three
+parse costs. Per the profile above, `open` is split **plus** per-field numeric
+parse **plus** column build; the latter two are still scalar. The next #71
+sub-PRs (vectorized integer/decimal/epoch parse → fused scan→build into the SoA
+layout #40) are where the remaining parse throughput is expected. End-to-end
+`open` improvement from this step alone is bounded by the scan's share of parse;
+measured separately as those land.
