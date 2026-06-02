@@ -433,6 +433,29 @@ parse — measured to be cheap here (building 2 vs 6 columns barely moved the ti
 the **scan**, not the per-cell parse, was the cost), so it is *not* pursued without a
 profile that shows parse as hot.
 
+### Parse read method — measured negative result (`fill_buf` not adopted)
+
+After the SWAR split landed, checked whether the line *read* itself is worth
+optimizing. Microbenchmark over the 5 M-row / 171 MiB file (warm cache, read only,
+no parsing):
+
+| read method | time |
+|---|---:|
+| `read_line` (copy + UTF-8 validate) | ~195 ms |
+| `read_until` (copy, no validate) | ~147 ms |
+| `fill_buf` (no copy, scan in place) | ~137 ms |
+
+So the whole *read* is only ~195 ms — roughly **10 % of one parse pass** (`open` is
+~1.9 s for this file). Switching the reader to `fill_buf` would save the ~48 ms
+UTF-8 validation + ~10 ms copy, i.e. **~6 % of `open`** — not worth rewriting the
+hot streaming loop (with its byte-range/limit, BOM, and straddling-line edge
+cases) for. `open` is dominated by the **two-pass split + per-cell value
+parse/build** (already split-optimized by SWAR), which is inherent to the
+bounded-memory, chunk-size-independent two-pass design. Per the "measure before
+adopting" rule (cf. #39, #45), `fill_buf` is **not adopted**; a real parse win now
+needs either breaking the two-pass (a memory trade-off) or SIMD value parsing — a
+dedicated, measured effort.
+
 ### Exact decimal filter — no silent rounding, faster *and* correct (#44)
 
 The decimal lane's filter comparison used the f64 view (`u as f64 / 10^scale`),
