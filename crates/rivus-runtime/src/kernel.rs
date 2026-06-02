@@ -22,9 +22,13 @@
 //! speedup over this auto-vectorized form because the compare is
 //! memory-bandwidth-bound (~40 MB read for 5 M `f64`), and the run-time cost is
 //! dominated by *index collection*, not the compare. Per "faster is never
-//! asserted without a measured number", the `unsafe` intrinsic path was dropped;
-//! the real lever is the gather (a columnar selection vector — Epic #38 lever 2,
-//! #40). See `docs/BENCHMARKS.md`.
+//! asserted without a measured number", the `unsafe` intrinsic path was dropped.
+//!
+//! That measured bottleneck — index collection — is what [`compact_mask`]
+//! targets (Epic #38 lever 2, #40): the mask → selection-vector build is now
+//! **branch-free**, so a random ~50 %-selectivity mask pays no branch
+//! mispredictions (measured 7.3× over the branchy `filter().collect()` at 50 %,
+//! constant regardless of selectivity). See `docs/BENCHMARKS.md`.
 
 use rivus_core::{Chunk, Column, Decimal, Value};
 use rivus_ir::{Access, CmpOp, Expr};
@@ -162,12 +166,33 @@ pub fn run(preds: &[NumCmp], chunk: &Chunk) -> Vec<usize> {
     for p in &preds[1..] {
         and_mask(p, chunk, &mut mask);
     }
-    // Single pass: surviving mask → row indices.
-    let mut keep = Vec::with_capacity(n);
+    // Single pass: surviving mask → the selection vector of row indices.
+    compact_mask(&mask)
+}
+
+/// Build the **selection vector** (surviving row indices, ascending) from a
+/// byte mask. Branch-free (#40): each step writes the current index and advances
+/// the write cursor by the mask bit, so a random ~50 %-selectivity mask costs no
+/// branch mispredictions — the measured bottleneck was this index collection,
+/// not the compare (kernel.rs header / BENCHMARKS). Identical output to the
+/// branchy `filter(..).collect()`: the same indices in the same order.
+#[inline]
+fn compact_mask(mask: &[u8]) -> Vec<usize> {
+    let n = mask.len();
+    let mut keep: Vec<usize> = Vec::with_capacity(n);
+    // SAFETY: `w` advances by at most 1 per iteration and starts at 0, so before
+    // the write at iteration `i` we have `w ≤ i < n ≤ capacity` — every write is
+    // in-bounds. The final `w` (≤ n) is the count of set bytes, a valid length.
+    let ptr = keep.as_mut_ptr();
+    let mut w = 0usize;
     for (i, &m) in mask.iter().enumerate() {
-        if m != 0 {
-            keep.push(i);
+        unsafe {
+            *ptr.add(w) = i;
         }
+        w += (m != 0) as usize;
+    }
+    unsafe {
+        keep.set_len(w);
     }
     keep
 }
@@ -354,6 +379,73 @@ mod tests {
     fn f64_chunk(v: Vec<f64>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::F64)]));
         Chunk::new(1, schema, vec![Column::F64(v)])
+    }
+
+    /// `compact_mask` must produce exactly the branchy `filter(..).collect()`
+    /// reference — the same surviving indices in ascending order — for every
+    /// selectivity and length (incl. empty, all-set, all-clear, loop tails). #40.
+    #[test]
+    fn compact_mask_matches_branchy() {
+        let branchy =
+            |mask: &[u8]| -> Vec<usize> { (0..mask.len()).filter(|&i| mask[i] != 0).collect() };
+        let mut rng = Rng(0xABCD_1234);
+        for &n in &[0usize, 1, 2, 3, 7, 8, 31, 64, 1000, 4096, 4097] {
+            for &density in &[0u64, 1, 13, 50, 87, 100] {
+                let mask: Vec<u8> = (0..n)
+                    .map(|_| ((rng.next() % 100) < density) as u8)
+                    .collect();
+                assert_eq!(
+                    compact_mask(&mask),
+                    branchy(&mask),
+                    "compact_mask != branchy (n={n}, density={density})"
+                );
+                // Also exercise non-1 truthy byte values (mask uses 0/1, but the
+                // contract is "non-zero survives").
+                let mask2: Vec<u8> = mask.iter().map(|&m| m.wrapping_mul(255)).collect();
+                assert_eq!(compact_mask(&mask2), branchy(&mask2));
+            }
+        }
+    }
+
+    /// Micro-benchmark (ignored; run with
+    /// `cargo test -p rivus-runtime --release --lib bench_compact_mask -- --ignored --nocapture`):
+    /// selection-vector build, branchy `filter().collect()` vs branch-free. #40.
+    #[test]
+    #[ignore]
+    fn bench_compact_mask() {
+        use std::time::Instant;
+        let n = 1_000_000usize;
+        let reps = 300usize;
+        println!("\n[#40 compact-mask] n={n} reps={reps}");
+        for density in [1u64, 25, 50, 75, 99] {
+            let mut rng = Rng(0x5EED ^ density);
+            let mask: Vec<u8> = (0..n)
+                .map(|_| ((rng.next() % 100) < density) as u8)
+                .collect();
+
+            let t = Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..reps {
+                let v: Vec<usize> = (0..n).filter(|&i| mask[i] != 0).collect();
+                sink ^= v.len();
+            }
+            let branchy = t.elapsed();
+
+            let t = Instant::now();
+            for _ in 0..reps {
+                let v = compact_mask(&mask);
+                sink ^= v.len();
+            }
+            let bfree = t.elapsed();
+            std::hint::black_box(sink);
+
+            println!(
+                "  sel {density:>2}% | branchy {:>8.2?}  branch-free {:>8.2?}  ({:.2}x)",
+                branchy,
+                bfree,
+                branchy.as_secs_f64() / bfree.as_secs_f64()
+            );
+        }
     }
 
     /// The mask kernel must return exactly the scalar oracle's survivors —
