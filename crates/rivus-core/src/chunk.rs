@@ -169,6 +169,16 @@ pub struct DtColumn {
     pub unit: crate::value::TimeUnit,
 }
 
+/// A duration column: contiguous signed tick spans (i64) sharing one `unit`
+/// (design 23 / #57). Integer representation → exact and **associative**, so
+/// `sum`/`avg`/`min`/`max` parallelize byte-identically (unlike a datetime
+/// instant, a duration's sum/avg are meaningful).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DurColumn {
+    pub ticks: Vec<i64>,
+    pub unit: crate::value::TimeUnit,
+}
+
 /// A columnar buffer. One variant per execution lane (MVP subset).
 #[derive(Debug, Clone)]
 pub enum Column {
@@ -179,6 +189,8 @@ pub enum Column {
     Dec(DecColumn),
     /// Datetime lane (epoch ticks; design doc 23).
     DateTime(DtColumn),
+    /// Duration lane (signed tick span; design 23 / #57).
+    Duration(DurColumn),
     Str(StrColumn),
 }
 
@@ -190,6 +202,7 @@ impl Column {
             Column::F64(v) => v.len(),
             Column::Dec(v) => v.unscaled.len(),
             Column::DateTime(v) => v.ticks.len(),
+            Column::Duration(v) => v.ticks.len(),
             Column::Str(v) => v.len(),
         }
     }
@@ -205,6 +218,7 @@ impl Column {
             Column::F64(_) => DataType::F64,
             Column::Dec(v) => DataType::Decimal { scale: v.scale },
             Column::DateTime(v) => DataType::DateTime { unit: v.unit },
+            Column::Duration(v) => DataType::Duration { unit: v.unit },
             Column::Str(_) => DataType::Str,
         }
     }
@@ -217,6 +231,9 @@ impl Column {
             Column::Dec(v) => Value::Dec(crate::value::Decimal::new(v.unscaled[row], v.scale)),
             Column::DateTime(v) => {
                 Value::DateTime(crate::value::DateTime::new(v.ticks[row], v.unit))
+            }
+            Column::Duration(v) => {
+                Value::Duration(crate::value::Duration::new(v.ticks[row], v.unit))
             }
             Column::Str(v) => Value::Str(v.get(row).to_string()),
         }
@@ -232,6 +249,7 @@ impl Column {
             (Column::F64(a), Column::F64(b)) => a.extend_from_slice(b),
             (Column::Dec(a), Column::Dec(b)) => a.unscaled.extend_from_slice(&b.unscaled),
             (Column::DateTime(a), Column::DateTime(b)) => a.ticks.extend_from_slice(&b.ticks),
+            (Column::Duration(a), Column::Duration(b)) => a.ticks.extend_from_slice(&b.ticks),
             (Column::Str(a), Column::Str(b)) => a.append(b),
             _ => {}
         }
@@ -263,6 +281,13 @@ impl Column {
                     .collect(),
                 unit: v.unit,
             }),
+            Column::Duration(v) => Column::Duration(DurColumn {
+                ticks: indices
+                    .iter()
+                    .map(|o| o.map_or(0, |i| v.ticks[i]))
+                    .collect(),
+                unit: v.unit,
+            }),
             Column::Str(v) => {
                 let mut out = StrColumn::with_capacity(indices.len(), 0);
                 for o in indices {
@@ -284,6 +309,10 @@ impl Column {
                 scale: v.scale,
             }),
             Column::DateTime(v) => Column::DateTime(DtColumn {
+                ticks: indices.iter().map(|&i| v.ticks[i]).collect(),
+                unit: v.unit,
+            }),
+            Column::Duration(v) => Column::Duration(DurColumn {
                 ticks: indices.iter().map(|&i| v.ticks[i]).collect(),
                 unit: v.unit,
             }),

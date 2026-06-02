@@ -103,7 +103,10 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
                 // Datetime stays off the f64 kernel (ns ticks > 2^53 lose
                 // precision as f64); it routes to the interpreter's exact i64
                 // `dt_cmp` instead, so kernel and interpreter agree. Design 23 / #53.
-                Column::DateTime(_) => None,
+                // Datetime/duration stay off the f64 kernel (ns ticks > 2^53 lose
+                // precision as f64); they route to the interpreter's exact i64
+                // path instead, so kernel and interpreter agree. Design 23 / #53/#57.
+                Column::DateTime(_) | Column::Duration(_) => None,
                 Column::Str(_) => None,
             }
         }
@@ -183,10 +186,10 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         // the two scales — never rounding the literal (accounting contract;
         // shared with the interpreter so the two stay byte-identical). #44 / doc 21.
         Column::Dec(d) => dec_write(d, p, mask),
-        // Datetime is never compiled into the kernel (`num_col` returns `None`
-        // for it) — it routes to the interpreter's exact i64 `dt_cmp`. This arm
-        // is unreachable; it exists only for match exhaustiveness. #53.
-        Column::DateTime(_) | Column::Str(_) => mask.fill(0),
+        // Datetime/duration are never compiled into the kernel (`num_col` returns
+        // `None`) — they route to the interpreter's exact i64 path. Unreachable;
+        // here only for match exhaustiveness. #53/#57.
+        Column::DateTime(_) | Column::Duration(_) | Column::Str(_) => mask.fill(0),
     }
 }
 
@@ -281,8 +284,8 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
             }
         }
         Column::Dec(d) => dec_mask(d, p, mask, false),
-        // Unreachable: `num_col` excludes datetime (routed to `dt_cmp`). #53.
-        Column::DateTime(_) | Column::Str(_) => mask.fill(0),
+        // Unreachable: `num_col` excludes datetime/duration (exact i64 path). #53/#57.
+        Column::DateTime(_) | Column::Duration(_) | Column::Str(_) => mask.fill(0),
     }
 }
 
