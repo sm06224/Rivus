@@ -2873,7 +2873,7 @@ impl SinkCsv {
                     if c > 0 {
                         line.push(sep);
                     }
-                    line.push_str(&csv_escape(&chunk.value(row, c), delim));
+                    write_cell(&mut line, &chunk.columns[c], row, delim);
                 }
                 writeln!(w, "{line}")?;
             }
@@ -2922,30 +2922,76 @@ impl Operator for SinkCsv {
 /// Render `chunks` (sharing a schema) to a CSV file: a header line then rows.
 /// Shared by the serial `SinkCsv` and the parallel executor's single-write merge.
 pub fn write_csv_file(path: &str, chunks: &[Chunk], delim: u8) -> std::io::Result<()> {
-    let sep = (delim as char).to_string();
-    let mut out = String::new();
-    if let Some(first) = chunks.first() {
-        out.push_str(&first.schema.field_names().join(&sep));
-        out.push('\n');
-        for chunk in chunks {
-            for row in 0..chunk.len {
-                let cells: Vec<String> = (0..chunk.columns.len())
-                    .map(|c| csv_escape(&chunk.value(row, c), delim))
-                    .collect();
-                out.push_str(&cells.join(&sep));
-                out.push('\n');
+    let Some(first) = chunks.first() else {
+        return write_output(path, "");
+    };
+    // Stream to the writer (bounded memory — only one reused line buffer), instead
+    // of building the whole output in one String, and format each cell straight
+    // from its column lane (`write_cell`).
+    let sink: Box<dyn Write> = if path == "-" {
+        Box::new(std::io::stdout())
+    } else {
+        Box::new(std::fs::File::create(path)?)
+    };
+    let mut w = BufWriter::with_capacity(256 * 1024, sink);
+    let sep = delim as char;
+    writeln!(w, "{}", first.schema.field_names().join(&sep.to_string()))?;
+    let mut line = String::new();
+    for chunk in chunks {
+        for row in 0..chunk.len {
+            line.clear();
+            for c in 0..chunk.columns.len() {
+                if c > 0 {
+                    line.push(sep);
+                }
+                write_cell(&mut line, &chunk.columns[c], row, delim);
             }
+            writeln!(w, "{line}")?;
         }
     }
-    write_output(path, &out)
+    w.flush()
 }
 
-fn csv_escape(v: &Value, delim: u8) -> String {
-    let s = v.to_string();
-    if s.bytes().any(|b| b == delim) || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s
+/// Append one CSV cell, formatted **directly from its typed column lane** into
+/// `line` — no per-cell `Value`/`String` allocation (the hot path on a wide write
+/// previously did two allocations per cell: `value()` then an escaped `String`).
+/// Byte-identical
+/// to that: numeric/bool/decimal lanes never contain the delimiter, `"`, or a
+/// newline so they are written verbatim; only a string cell that does is quoted
+/// with `"` doubled.
+fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
+    use std::fmt::Write as _;
+    match col {
+        Column::I64(v) => {
+            let _ = write!(line, "{}", v[row]);
+        }
+        Column::F64(v) => {
+            let _ = write!(line, "{}", v[row]);
+        }
+        Column::Bool(v) => line.push_str(if v[row] { "true" } else { "false" }),
+        Column::Dec(d) => {
+            let _ = write!(
+                line,
+                "{}",
+                rivus_core::Decimal::new(d.unscaled[row], d.scale)
+            );
+        }
+        Column::Str(s) => {
+            let cell = s.get(row);
+            if cell.bytes().any(|b| b == delim) || cell.contains('"') || cell.contains('\n') {
+                line.push('"');
+                for ch in cell.chars() {
+                    if ch == '"' {
+                        line.push_str("\"\"");
+                    } else {
+                        line.push(ch);
+                    }
+                }
+                line.push('"');
+            } else {
+                line.push_str(cell);
+            }
+        }
     }
 }
 

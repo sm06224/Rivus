@@ -540,6 +540,23 @@ f64 aggregation that can't use the decimal lane — at which point the global-ro
 coordination above is the design. This mirrors the #39 discipline: a clever
 mechanism is not adopted until a measurement shows it earns its complexity.
 
+### Columnar CSV write — format from the lane, stream the output (save ~2.2×)
+
+Output writing was the **second cost** in the 1 GB profile (save 6.9 s vs parse
+12.6 s). The hot loop allocated **twice per cell** — `chunk.value(row, c)` (an owned
+`Value`, copying every string cell) then `csv_escape(..)` (a fresh `String`) — and
+`write_csv_file` built the *entire* output in one `String` before writing. Replace
+both with `write_cell`, which formats each cell **straight from its typed column
+lane** into one reused line buffer (numeric/bool/decimal lanes never need quoting,
+so they go verbatim; only a string cell containing the delimiter/`"`/newline is
+quoted), and stream `write_csv_file` through a `BufWriter` (bounded memory, no
+whole-output `String`).
+
+Measured on `open … save` (5 M rows, serial, interleaved old/new pairs, the `save`
+node `busy_ms`): **~2902 ms → ~1334 ms (~2.2×)**, every pair faster. Output is
+**byte-identical** (md5-equal on the serial *and* parallel part-file paths) and the
+full equivalence/stress suites stay green; zero third-party deps unchanged.
+
 ### vs grep — literal line-match vs semantic filter (5 M rows, 171 MiB)
 
 Data generated self-hosted with `rivus gen clean --rows 5000000` (no awk).
