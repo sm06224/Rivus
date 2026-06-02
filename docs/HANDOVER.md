@@ -1,8 +1,15 @@
 # セッション・ハンドオーバー（次セッションの実装担当へ）
 
-最終更新: 2026-06-01 ／ ブランチ `claude/stream-native-runtime-design-tReOj` ／
+最終更新: 2026-06-02 ／ ブランチ `claude/stream-native-runtime-design-tReOj` ／
 PR #34（dev→main、唯一の開いたPR）。次セッションは**レビュアーの確認結果から**
 始まる予定。
+
+> **2026-06-02 追記**: decimal レーン（リーダー/直列・並列集計/#41 解禁）に続き、
+> **日時レーン §23.1 を実装完了**（コア型→`:datetime("fmt")` リーダー→同lane比較→
+> `year/month/day/hour/minute/second/trunc/format/diff`→並列バイト範囲対応＋
+> serial/parallel×chunk-size 等価テスト）。GUIDE/GUIDE.ja/doc23 反映済み。
+> **次の本命は doc23 §23.2 list集計 → §23.3 pivot**（日時が行/列キーに乗る）。
+> 下記 4–7 節は decimal/日時着手前の文脈なので、状況は doc23・BENCHMARKS を正とする。
 
 ---
 
@@ -72,7 +79,7 @@ GitHub Issue #41 にコメント済み（要返答）:
 |---|---|---|
 | 21 exact-decimal | i128 固定小数点。`--exact`/`:decimal[(n)]`。avg/std は高精度で割って round-half-even | **コア型 landed**。リーダー/集計/並列は未着手 |
 | 22 gpu-backend | feature-gate任意・CPU fallback・既定依存ゼロ。`--accel`。転送込みで測ってから採用 | 設計のみ |
-| 23 datetime-and-reshape | 日時レーン（epoch整数、`yyMMddhhmmss`）/ list・set・join集計（配列化）/ pivot・unpivot | 設計のみ |
+| 23 datetime-and-reshape | 日時レーン（epoch整数、`yyMMddhhmmss`）/ list・set・join集計（配列化）/ pivot・unpivot | **日時レーン §23.1 landed**（コア型/リーダー/比較/関数/並列等価、`unit=Sec`・naive UTC）。list集計・pivot は未着手 |
 
 ---
 
@@ -80,8 +87,10 @@ GitHub Issue #41 にコメント済み（要返答）:
 
 1. **SIMD CSV スキャナ**（速度の本命。3節の計測が指す）— ROADMAP §E
 2. **decimal リーダー対応**（`(price:decimal)`/`--exact`）→ **並列集計#41を解禁** — §A, §G, doc21 §21.8
-3. **日時レーンのリーダー対応**（`(ts:datetime("yyMMddhhmmss"))`/`--dates`）— §A, doc23
-4. **list集計 → pivot/unpivot** — §D, doc23
+3. ~~**日時レーンのリーダー対応**~~ ✅ **landed**（`(ts:datetime("fmt"))`、比較・
+   `year/month/day/hour/minute/second/trunc/format/diff`、直列＋並列、等価テスト）。
+   残: `--dates` 自動推論フラグ、sub-second `unit`、`tz`、専用ベンチ — doc23 §23.1
+4. **list集計 → pivot/unpivot** — §D, doc23（**次の本命**：日時レーンが行/列キーに乗る）
 5. **構文**（後方互換不要）: 任意の先頭`|`／フロー接頭辞`@Label`／**列生成+cast+rename を同一`|>`ブロックで** — §C
 6. **書き出し高速化**（buffered formatting）— §E
 7. GPU backend 骨組み — §F, doc22

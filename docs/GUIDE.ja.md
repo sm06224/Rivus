@@ -63,7 +63,7 @@ rivus check   -c '…'               # 構文チェックのみ
 | `open PATH as FMT` | 形式を強制（`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`） |
 | `open PATH.gz` / `PATH.zst` | **gzip / zstd 圧縮**された CSV/TSV。`--features gzip` / `--features zstd` でビルドした時のみ。直列・単一パス・有界メモリ。既定（依存ゼロ）ビルドでは `--features …` を促すエラー |
 | `open PATH noheader` | ヘッダ行なし CSV。列名は `c0, c1, c2, …`、先頭行からデータ |
-| `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定。`int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む |
+| `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定。`int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点）, `datetime[("fmt")]`（厳密な時刻、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む。`open log.csv (ts:datetime("yyMMddHHmmss"))` は `ts` を時刻として読む |
 | `readcsv PATH` / `readjson PATH` | 形式を明示する動詞 |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ） |
 | `open stdin` / `open -` | 標準入力から CSV（または `as FMT`）を読む |
@@ -292,6 +292,32 @@ open sales.csv (id amount:decimal(2))   # "12.5" を 12.50 として厳密に読
 **round-half-even** で決定的に丸め、不足は 0 詰め、解釈不能セルは `0`（continue-first）。
 既定は従来どおり `i64`/`f64` の高速レーン — `decimal` は「速度より正確性」を
 *選ぶ* ときだけのオプトインです。
+
+**日時レーン（`datetime[("fmt")]`）** — 固定幅 / ISO のタイムスタンプを、文字列でも
+近似 float でもなく**厳密な時刻**（Unix epoch からの秒数 `i64`、UTC）として読みます。
+`decimal` と同じく整数表現ゆえ厳密・**結合的**なので、日時の `min`/`max`/`count` や
+日付バケットの group-by は並列でも byte-identical。書式を宣言するか、よくある形を
+自動推論します：
+
+```
+open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパース
+|? ts >= "2026-06-01"                            # リテラルも同じレーンへパース
+|> (format(trunc(ts, "day"), "yyyy-MM-dd")) as day msg
+|# day count:msg                                 # 日次の件数（時系列集計）
+```
+
+- **書式トークン**（`strptime` の最小部分集合、std のみ）：`yyyy` `yy` `MM` `dd`
+  `HH`/`hh` `mm` `ss`。それ以外の文字は一致必須のリテラル。2 桁年は
+  `00–68 → 20xx`・`69–99 → 19xx` で決定的にピボット。bare `:datetime`（書式なし）は
+  `yyyy-MM-ddTHH:mm:ss` → `yyyy-MM-dd HH:mm:ss` → `yyyy-MM-dd` → `yyyyMMddHHmmss`
+  → `yyMMddHHmmss` → `yyyyMMdd` の順で自動推論。
+- **比較**はリテラルを同じレーンへパースして時刻同士で比較（`ts >= "260601000000"`）。
+  どの書式にも一致しないセル/リテラルは epoch `0` / 非時刻として継続（continue-first。
+  そのリテラルに対しては `!=` のみ真）。
+- **関数**：`year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)` `second(ts)`
+  （整数）、`trunc(ts, "day"|"hour"|"minute"|"month"|"year")`（日時バケットキー）、
+  `format(ts, "fmt")`（文字列）、`ts2 - ts1`（秒差）。既定の整形は ISO-8601
+  `yyyy-MM-ddTHH:mm:ss`。
 
 **条件** — `case when … then … [else …] end`：
 

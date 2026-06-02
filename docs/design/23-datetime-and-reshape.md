@@ -51,13 +51,21 @@ Tz       = Naive | Utc | FixedOffset(i32 sec)  // MVP は Naive/Utc
 これらは整数演算なので並列集計が byte-identical。
 
 ### 段階実装
-1. コア型 `DataType::DateTime{unit,tz}` / `Column::DateTime` / `Value::DateTime`、
-   `value_at`/`gather`/`Display`（既定 ISO8601 整形）。等価ユニットテスト。
-2. パーサ：`:datetime[("fmt")]` 注釈 ＋ `--dates`。std-only な strptime/strftime
-   最小実装。書式往復（`to_source` 可逆・原則5）。不正値 continue-first テスト。
-3. 演算子：比較（リテラル同 lane 化）、`trunc`/`year`/`month`/`day`/`hour`/`diff`、
-   `format`。`optimizer_equiv` 等価ゲート、chunk-size 非依存。
-4. 時系列 group-by の例とベンチ（日次/時間帯別集計）。
+1. ✅ **landed** コア型 `DataType::DateTime{unit}` / `Column::DateTime` /
+   `Value::DateTime`、`value_at`/`gather`/`Display`（既定 ISO8601 整形）、
+   厳密な i128 跨ぎ比較。等価ユニットテスト。（MVP は `unit=Sec`・naive UTC、
+   `tz` は未導入。）
+2. ✅ **landed** パーサ：`:datetime[("fmt")]` 注釈。std-only な strptime/strftime
+   最小実装（`yyyy yy MM dd HH/hh mm ss`、2桁年ピボット 00–68→20xx）。書式は
+   `OpenCsv.dt_formats` に載せて `to_source` 往復（原則5）。直列 CSV リーダー
+   （圧縮含む）で `ColBuilder::DateTime`。不正値→epoch 0（continue-first）。
+   （`--dates` フラグは未実装＝列注釈で代替。）
+3. ✅ **landed** 演算子：比較（リテラルを同 lane へ auto-parse）、`year`/`month`/
+   `day`/`hour`/`minute`/`second`、`trunc`、`format`、`diff`（`ts2-ts1`）。
+   並列バイト範囲リーダーも `DtSpec` を `Arc` 共有して対応 → serial/parallel ×
+   chunk-size sweep の等価テスト（`tests/stress.rs`）。
+4. ⏳ 時系列 group-by の例は GUIDE と stress テストに収録済み。専用ベンチ（日次/
+   時間帯別の大規模集計）は **未追加**（機能であり最適化ではないため後回し）。
 
 ---
 
