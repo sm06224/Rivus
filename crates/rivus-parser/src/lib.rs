@@ -556,6 +556,13 @@ impl Parser {
                 unit: TimeUnit::Sec,
             });
         }
+        if word.eq_ignore_ascii_case("duration") {
+            // Signed tick span, read from the human `HH:MM:SS[.frac]` form
+            // (design 23 / #57). Unit is `Sec` in the MVP.
+            return Ok(DataType::Duration {
+                unit: TimeUnit::Sec,
+            });
+        }
         if word.eq_ignore_ascii_case("decimal") {
             if !self.eat(&Tok::LParen) {
                 return Err(self.err("decimal needs a scale: write decimal(N), e.g. decimal(2)"));
@@ -1464,6 +1471,19 @@ mod tests {
         }
         // A non-string format argument is a clear error, not a silent default.
         assert!(parse("F:\n open s.csv (a:datetime(123))\n;").is_err());
+    }
+
+    #[test]
+    fn duration_type_parses_and_is_reversible() {
+        // `:duration` in a declared schema and as a cast (design 23 / #57).
+        for src in [
+            "F:\n open log.csv (id:int elapsed:duration)\n |> elapsed\n;",
+            "F:\n open log.csv\n cast elapsed:duration\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(s.contains("duration"), "duration type lost in {s}");
+        }
     }
 
     #[test]

@@ -452,6 +452,167 @@ impl fmt::Display for DateTime {
     }
 }
 
+/// A signed time span (design 23 / #57): an integer count of `ticks` at a
+/// `TimeUnit` — the result of `DateTime − DateTime`. Kept distinct from
+/// `DateTime` (an instant) because their algebra differs: a duration's
+/// `sum`/`avg` are meaningful and, being integer, **exact and associative**
+/// (parallel byte-identical), whereas an instant's are not. Never routed
+/// through f64 (ns ticks exceed 2^53; #53).
+#[derive(Debug, Clone, Copy)]
+pub struct Duration {
+    pub ticks: i64,
+    pub unit: TimeUnit,
+}
+
+impl PartialEq for Duration {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for Duration {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Compare magnitudes regardless of unit (cross-multiply in i128, exact).
+        let a = self.ticks as i128 * other.unit.per_sec() as i128;
+        let b = other.ticks as i128 * self.unit.per_sec() as i128;
+        a.partial_cmp(&b)
+    }
+}
+
+impl Duration {
+    pub fn new(ticks: i64, unit: TimeUnit) -> Self {
+        Duration { ticks, unit }
+    }
+
+    /// `(negative, days, hours, minutes, seconds, sub)` — the broken-down
+    /// components for rendering, where `sub` is the leftover sub-second ticks at
+    /// this unit. Uses i128 magnitude so `i64::MIN` doesn't overflow on negate.
+    fn parts(&self) -> (bool, i64, i64, i64, i64, i64) {
+        let per = self.unit.per_sec() as i128;
+        let total = self.ticks as i128;
+        let neg = total < 0;
+        let mag = total.unsigned_abs();
+        let sub = (mag % per as u128) as i64;
+        let secs = (mag / per as u128) as i64;
+        let days = secs / 86_400;
+        let rem = secs % 86_400;
+        (neg, days, rem / 3600, (rem % 3600) / 60, rem % 60, sub)
+    }
+
+    /// Number of fractional digits this unit renders (`0` for seconds).
+    fn sub_digits(unit: TimeUnit) -> usize {
+        match unit {
+            TimeUnit::Sec => 0,
+            TimeUnit::Milli => 3,
+            TimeUnit::Micro => 6,
+            TimeUnit::Nano => 9,
+        }
+    }
+
+    /// Human-readable form `[-][Nd ]HH:MM:SS[.frac]` (the `Display` form, and
+    /// what [`parse_at`] round-trips). `frac` width matches the unit.
+    ///
+    /// [`parse_at`]: Duration::parse_at
+    pub fn to_human(&self) -> String {
+        use std::fmt::Write as _;
+        let (neg, days, h, m, s, sub) = self.parts();
+        let mut out = String::new();
+        if neg {
+            out.push('-');
+        }
+        if days > 0 {
+            let _ = write!(out, "{days}d ");
+        }
+        let _ = write!(out, "{h:02}:{m:02}:{s:02}");
+        let w = Self::sub_digits(self.unit);
+        if w > 0 && sub > 0 {
+            let _ = write!(out, ".{sub:0w$}");
+        }
+        out
+    }
+
+    /// ISO-8601 duration form `PT#H#M#S` (days folded into hours; seconds carry
+    /// the sub-second fraction). Sign-prefixed for negative spans.
+    pub fn to_iso8601(&self) -> String {
+        use std::fmt::Write as _;
+        let (neg, days, h, m, s, sub) = self.parts();
+        let mut out = String::new();
+        if neg {
+            out.push('-');
+        }
+        out.push_str("PT");
+        let hours = days * 24 + h;
+        if hours != 0 {
+            let _ = write!(out, "{hours}H");
+        }
+        if m != 0 {
+            let _ = write!(out, "{m}M");
+        }
+        // Always emit seconds when nothing else was written (so `PT0S` is valid).
+        let w = Self::sub_digits(self.unit);
+        if s != 0 || sub != 0 || (hours == 0 && m == 0) {
+            if w > 0 && sub > 0 {
+                let frac = format!("{sub:0w$}");
+                let _ = write!(out, "{s}.{}S", frac.trim_end_matches('0'));
+            } else {
+                let _ = write!(out, "{s}S");
+            }
+        }
+        out
+    }
+
+    /// Parse the human form `[-][Nd ]HH:MM:SS[.frac]` at `unit` into exact ticks.
+    /// `None` on any malformed field (continue-first at the call site).
+    pub fn parse_at(s: &str, unit: TimeUnit) -> Option<Duration> {
+        let s = s.trim();
+        let (neg, rest) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        // Optional `Nd ` day prefix.
+        let (days, hms) = match rest.split_once("d ") {
+            Some((d, r)) => (d.trim().parse::<i64>().ok()?, r),
+            None => (0, rest),
+        };
+        let (clock, frac) = match hms.split_once('.') {
+            Some((c, f)) => (c, Some(f)),
+            None => (hms, None),
+        };
+        let mut it = clock.split(':');
+        let h: i64 = it.next()?.parse().ok()?;
+        let m: i64 = it.next()?.parse().ok()?;
+        let sec: i64 = it.next()?.parse().ok()?;
+        if it.next().is_some() || !(0..60).contains(&m) || !(0..60).contains(&sec) {
+            return None;
+        }
+        let per = unit.per_sec();
+        let whole = (((days * 24 + h) * 60 + m) * 60 + sec).checked_mul(per)?;
+        // Fractional sub-second: pad/truncate to the unit's digit count.
+        let sub = match frac {
+            None => 0,
+            Some(f) => {
+                if !f.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let w = Self::sub_digits(unit);
+                let mut digits = String::with_capacity(w);
+                for i in 0..w {
+                    digits.push(f.as_bytes().get(i).map_or('0', |&b| b as char));
+                }
+                digits.parse::<i64>().unwrap_or(0)
+            }
+        };
+        let ticks = whole.checked_add(sub)?;
+        Some(Duration::new(if neg { -ticks } else { ticks }, unit))
+    }
+}
+
+impl fmt::Display for Duration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_human())
+    }
+}
+
 /// A single scalar value. Used for literals, predicate evaluation and the
 /// "current object" (`$_`) field access. Bulk data lives in [`crate::Column`].
 #[derive(Debug, Clone, PartialEq)]
@@ -466,6 +627,8 @@ pub enum Value {
     Dec(Decimal),
     /// Datetime lane (epoch ticks; design doc 23).
     DateTime(DateTime),
+    /// Duration lane (signed tick span; design 23 / #57).
+    Duration(Duration),
     Str(String),
 }
 
@@ -478,6 +641,7 @@ impl Value {
             Value::F64(_) => DataType::F64,
             Value::Dec(d) => DataType::Decimal { scale: d.scale },
             Value::DateTime(t) => DataType::DateTime { unit: t.unit },
+            Value::Duration(d) => DataType::Duration { unit: d.unit },
             Value::Str(_) => DataType::Str,
         }
     }
@@ -489,6 +653,7 @@ impl Value {
             Value::F64(v) => Some(*v),
             Value::Dec(d) => Some(d.to_f64()),
             Value::DateTime(t) => Some(t.ticks as f64),
+            Value::Duration(d) => Some(d.ticks as f64),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             _ => None,
         }
@@ -508,6 +673,7 @@ impl fmt::Display for Value {
             Value::F64(v) => write!(f, "{v}"),
             Value::Dec(d) => write!(f, "{d}"),
             Value::DateTime(t) => write!(f, "{t}"),
+            Value::Duration(d) => write!(f, "{d}"),
             Value::Str(s) => write!(f, "{s}"),
         }
     }
@@ -530,6 +696,10 @@ pub enum DataType {
     DateTime {
         unit: TimeUnit,
     },
+    /// Duration lane: signed tick span at a fixed `unit` (design 23 / #57).
+    Duration {
+        unit: TimeUnit,
+    },
     /// Stream-based text (see design doc 09 "Text is stream").
     Str,
 }
@@ -546,6 +716,8 @@ impl fmt::Display for DataType {
             // round-trips as the bare `datetime` the parser accepts; an explicit
             // `:datetime("fmt")` is rendered from `OpenCsv.dt_formats`, not here.
             DataType::DateTime { .. } => f.write_str("datetime"),
+            // Unit omitted (Sec in the MVP) so `:duration` round-trips bare.
+            DataType::Duration { .. } => f.write_str("duration"),
             DataType::Str => f.write_str("str"),
         }
     }
@@ -767,5 +939,45 @@ mod decimal_tests {
         // Sub-second resolution preserved in ticks but truncated in Display.
         let m = DateTime::new(1_500, TimeUnit::Milli);
         assert_eq!(m.to_string(), "1970-01-01T00:00:01");
+    }
+
+    #[test]
+    fn duration_human_format_and_roundtrip() {
+        // 3d 02:15:00 in seconds = 3*86400 + 2*3600 + 15*60 = 267300 s.
+        let d = Duration::new(267_300, TimeUnit::Sec);
+        assert_eq!(d.to_string(), "3d 02:15:00");
+        assert_eq!(d.to_iso8601(), "PT74H15M");
+        // Round-trips back to the same ticks (and a sub-day span has no `Nd `).
+        assert_eq!(Duration::parse_at("3d 02:15:00", TimeUnit::Sec), Some(d));
+        let hms = Duration::new(2 * 3600 + 15 * 60, TimeUnit::Sec);
+        assert_eq!(hms.to_string(), "02:15:00");
+        assert_eq!(Duration::parse_at("02:15:00", TimeUnit::Sec), Some(hms));
+
+        // Negative span keeps the sign through Display ↔ parse.
+        let neg = Duration::new(-90, TimeUnit::Sec);
+        assert_eq!(neg.to_string(), "-00:01:30");
+        assert_eq!(Duration::parse_at("-00:01:30", TimeUnit::Sec), Some(neg));
+
+        // Sub-second fraction at the unit's precision (millis → 3 digits).
+        let ms = Duration::new(1_500, TimeUnit::Milli);
+        assert_eq!(ms.to_string(), "00:00:01.500");
+        assert_eq!(
+            Duration::parse_at("00:00:01.500", TimeUnit::Milli),
+            Some(ms)
+        );
+    }
+
+    #[test]
+    fn duration_compares_across_units_exactly() {
+        // 1000 ms == 1 s as durations; ordering is exact (i128 lift).
+        assert_eq!(
+            Duration::new(1_000, TimeUnit::Milli),
+            Duration::new(1, TimeUnit::Sec)
+        );
+        assert!(Duration::new(999, TimeUnit::Milli) < Duration::new(1, TimeUnit::Sec));
+        // Nanosecond ticks past 2^53 stay distinct (f64 would collapse them).
+        let base = 1_700_000_000_000_000_000_i64;
+        assert!(base as f64 == (base + 1) as f64);
+        assert!(Duration::new(base, TimeUnit::Nano) < Duration::new(base + 1, TimeUnit::Nano));
     }
 }

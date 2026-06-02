@@ -2960,3 +2960,114 @@ fn datetime_min_max_groupby_keeps_datetime_type() {
         );
     }
 }
+
+#[test]
+fn duration_read_roundtrip_and_diff() {
+    // A `:duration` column reads the human form exactly; `end - start` yields a
+    // duration; both render back. Chunk-size independent.
+    let text = "label,start,end\n\
+                a,260601090000,260601103000\n\
+                b,260601120000,260601121530\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_dur_diff",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!(
+        "D:\n open {p} (label:str start:datetime(\"yyMMddHHmmss\") end:datetime(\"yyMMddHHmmss\"))\n \
+         |> label (end - start) as dur\n;"
+    );
+    for cz in [1usize, 2, 4096] {
+        assert_eq!(
+            collect_strings(&run_src(&flow, cz), "D", "dur"),
+            vec!["01:30:00".to_string(), "00:15:30".to_string()],
+            "ts2-ts1 duration changed at chunk_size {cz}"
+        );
+    }
+    // A declared `:duration` column round-trips its human text.
+    let dt = "d\n01:30:00\n00:15:30\n2d 00:00:01\n";
+    let g = TempCsv(gendata::write_temp_bytes("stress_dur_read", dt.as_bytes()));
+    let gp = g.0.display();
+    let rd = format!("D:\n open {gp} (d:duration)\n |> d\n;");
+    assert_eq!(
+        collect_strings(&run_src(&rd, 4096), "D", "d"),
+        vec![
+            "01:30:00".to_string(),
+            "00:15:30".to_string(),
+            "2d 00:00:01".to_string()
+        ],
+    );
+}
+
+#[test]
+fn duration_groupby_parallel_matches_serial() {
+    // `sum`/`avg`/`min`/`max` of a duration (from `end - start`) are exact i64
+    // and associative → identical across serial/parallel and chunk size. #57.
+    let rows = 20_000;
+    let mut rng = Rng::new(13);
+    let mut text = String::from("g,start,end\n");
+    let groups = ["a", "b", "c"];
+    for _ in 0..rows {
+        let g = groups[rng.below(groups.len() as u64) as usize];
+        // start somewhere in the day, end = start + [1..3600] seconds.
+        let sh = rng.below(20);
+        let sm = rng.below(60);
+        let dsec = 1 + rng.below(3600) as i64;
+        let start_s = sh as i64 * 3600 + sm as i64 * 60;
+        let end_s = start_s + dsec;
+        // yyMMddHHmmss on 2026-06-01, HH:MM:SS derived from the second count.
+        let stamp = |s: i64| format!("260601{:02}{:02}{:02}", s / 3600, (s % 3600) / 60, s % 60);
+        text.push_str(&format!("{g},{},{}\n", stamp(start_s), stamp(end_s)));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_dur_par", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "D:\n open {p} (g:str start:datetime(\"yyMMddHHmmss\") end:datetime(\"yyMMddHHmmss\"))\n \
+         |> g (end - start) as dur\n \
+         |# g sum:dur avg:dur min:dur max:dur\n;"
+    );
+    let snapshot = |pref: rivus_runtime::MemoryPref, cz: usize| {
+        let gph = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &gph,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let g = collect_strings(&res, "D", "g");
+        let cols: Vec<Vec<String>> = ["sum_dur", "avg_dur", "min_dur", "max_dur"]
+            .iter()
+            .map(|c| collect_strings(&res, "D", c))
+            .collect();
+        let mut rows: Vec<(String, String, String, String, String)> = (0..g.len())
+            .map(|i| {
+                (
+                    g[i].clone(),
+                    cols[0][i].clone(),
+                    cols[1][i].clone(),
+                    cols[2][i].clone(),
+                    cols[3][i].clone(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let reference = snapshot(rivus_runtime::MemoryPref::Low, 4096);
+    assert_eq!(reference.len(), 3, "three groups");
+    for pref in [
+        rivus_runtime::MemoryPref::Low,
+        rivus_runtime::MemoryPref::Fast,
+    ] {
+        for cz in [1usize, 7, 256, 4096] {
+            assert_eq!(
+                snapshot(pref, cz),
+                reference,
+                "duration agg diverged @pref={pref:?} cz={cz}"
+            );
+        }
+    }
+}

@@ -1117,6 +1117,9 @@ enum ColBuilder {
     /// Datetime lane: epoch ticks at the spec's unit, parsed via the spec's
     /// candidate formats (design 23).
     DateTime(Vec<i64>, Arc<DtSpec>),
+    /// Duration lane: signed tick spans at a fixed unit, parsed from the human
+    /// `[-][Nd ]HH:MM:SS[.frac]` form (design 23 / #57).
+    Duration(Vec<i64>, TimeUnit),
     Str(StrColumn),
 }
 
@@ -1137,6 +1140,7 @@ impl ColBuilder {
                 Vec::with_capacity(cap),
                 dt_spec.unwrap_or_else(|| Arc::new(DtSpec::auto(unit))),
             ),
+            DataType::Duration { unit } => ColBuilder::Duration(Vec::with_capacity(cap), unit),
             // Estimate ~8 bytes per string cell for the backing byte buffer.
             _ => ColBuilder::Str(StrColumn::with_capacity(cap, cap * 8)),
         }
@@ -1155,6 +1159,11 @@ impl ColBuilder {
                 v.push(Decimal::parse_scaled(cell.trim(), *scale).map_or(0, |d| d.unscaled))
             }
             ColBuilder::DateTime(v, spec) => v.push(spec.parse(cell)),
+            // Duration text → exact i64 ticks; a malformed cell yields 0
+            // (continue-first), matching the other lanes. #57.
+            ColBuilder::Duration(v, unit) => {
+                v.push(rivus_core::Duration::parse_at(cell, *unit).map_or(0, |d| d.ticks))
+            }
             ColBuilder::Str(v) => v.push(cell),
         }
     }
@@ -1171,6 +1180,10 @@ impl ColBuilder {
             ColBuilder::DateTime(v, spec) => Column::DateTime(DtColumn {
                 ticks: std::mem::take(v),
                 unit: spec.unit,
+            }),
+            ColBuilder::Duration(v, unit) => Column::Duration(rivus_core::DurColumn {
+                ticks: std::mem::take(v),
+                unit: *unit,
             }),
             ColBuilder::Str(v) => Column::Str(std::mem::take(v)),
         }
