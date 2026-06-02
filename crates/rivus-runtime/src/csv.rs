@@ -349,6 +349,7 @@ impl CsvChunker {
     pub fn for_range(
         path: &str,
         dtypes: Vec<DataType>,
+        dt_specs: Vec<Option<Arc<DtSpec>>>,
         keep: Vec<usize>,
         ncols: usize,
         start: u64,
@@ -360,10 +361,6 @@ impl CsvChunker {
     ) -> Result<CsvChunker, String> {
         let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-        // The parallel planner does not partition datetime-bearing reads (it
-        // bails to the serial path), so any datetime column here falls back to
-        // the auto spec (`None`).
-        let dt_specs = vec![None; dtypes.len()];
         Ok(CsvChunker {
             reader: BufReader::with_capacity(READ_BUF, f),
             ncols,
@@ -477,6 +474,8 @@ impl CsvChunker {
 pub struct CsvParallelPlan {
     pub schema: Schema,
     pub dtypes: Vec<DataType>,
+    /// Per-kept-column datetime parse spec (design 23); shared with workers.
+    pub dt_specs: Vec<Option<Arc<DtSpec>>>,
     pub keep: Vec<usize>,
     pub ncols: usize,
     pub ranges: Vec<(u64, u64)>,
@@ -501,6 +500,7 @@ pub fn plan_parallel(
     str_prefilter: &[String],
     header: bool,
     declared: Option<&[(String, Option<DataType>)]>,
+    dt_formats: &[(String, String)],
     delim: u8,
 ) -> Result<CsvParallelPlan, String> {
     let file_len = std::fs::metadata(path)
@@ -547,6 +547,7 @@ pub fn plan_parallel(
     }
     let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
     apply_declared_types(&mut dtypes, &keep, declared);
+    let dt_specs = build_dt_specs(&names, &keep, &dtypes, dt_formats);
     let mut fields = Vec::with_capacity(keep.len());
     for (k, &ci) in keep.iter().enumerate() {
         fields.push(Field::new(names[ci].clone(), dtypes[k]));
@@ -556,6 +557,7 @@ pub fn plan_parallel(
     Ok(CsvParallelPlan {
         schema: Schema::new(fields),
         dtypes,
+        dt_specs,
         keep,
         ncols,
         ranges,
@@ -1045,7 +1047,7 @@ impl Flags {
 /// order per cell (first match wins). Shared across chunks via `Arc` so the
 /// per-chunk builders don't re-clone the format strings.
 #[derive(Debug)]
-struct DtSpec {
+pub struct DtSpec {
     unit: TimeUnit,
     formats: Vec<String>,
 }

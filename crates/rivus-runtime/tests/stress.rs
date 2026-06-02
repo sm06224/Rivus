@@ -2824,3 +2824,76 @@ fn datetime_functions_and_daily_groupby() {
         );
     }
 }
+
+#[test]
+fn datetime_parallel_matches_serial_and_chunk_size() {
+    // The byte-range parallel reader builds datetime columns with the same
+    // `DtSpec` as the serial reader, so a datetime read + filter + daily
+    // group-by must be byte-identical across serial/parallel and chunk size
+    // (design 23 step 3c; integer ticks are exact + associative).
+    let rows = 20_000;
+    let mut rng = Rng::new(11);
+    let mut text = String::from("ts,v\n");
+    // Three days in 2026-06; a compact yyMMddHHmmss timestamp per row.
+    let days = ["260601", "260602", "260603"];
+    for _ in 0..rows {
+        let day = days[rng.below(days.len() as u64) as usize];
+        let hh = rng.below(24);
+        let mm = rng.below(60);
+        let ss = rng.below(60);
+        let v = rng.below(1000) as i64;
+        text.push_str(&format!("{day}{hh:02}{mm:02}{ss:02},{v}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_dt_par", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "D:\n open {p} (ts:datetime(\"yyMMddHHmmss\") v:int)\n \
+         |? ts >= \"260602000000\"\n \
+         |> (format(trunc(ts, \"day\"), \"yyyy-MM-dd\")) as day v\n \
+         |# day sum:v max:v\n;"
+    );
+
+    // Collect (day, sum_v, max_v) as a sorted, chunk/strategy-independent key.
+    let snapshot = |pref: rivus_runtime::MemoryPref, cz: usize| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let days = collect_strings(&res, "D", "day");
+        let sums = collect_i64(&res, "D", "sum_v");
+        let maxs = collect_i64(&res, "D", "max_v");
+        let mut rows: Vec<(String, i64, i64)> = days
+            .into_iter()
+            .zip(sums)
+            .zip(maxs)
+            .map(|((d, s), m)| (d, s, m))
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let reference = snapshot(rivus_runtime::MemoryPref::Low, 4096);
+    // Only the days >= 2026-06-02 survive the filter.
+    assert_eq!(
+        reference.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        vec!["2026-06-02".to_string(), "2026-06-03".to_string()],
+    );
+    for pref in [
+        rivus_runtime::MemoryPref::Low,
+        rivus_runtime::MemoryPref::Fast,
+    ] {
+        for cz in [1usize, 7, 256, 4096] {
+            assert_eq!(
+                snapshot(pref, cz),
+                reference,
+                "datetime group-by diverged at pref={pref:?} chunk_size={cz}"
+            );
+        }
+    }
+}

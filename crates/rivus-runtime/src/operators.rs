@@ -178,6 +178,7 @@ pub fn jsonl_range_source(
 pub fn csv_range_source(
     path: &str,
     dtypes: Vec<rivus_core::DataType>,
+    dt_specs: Vec<Option<Arc<csv::DtSpec>>>,
     keep: Vec<usize>,
     ncols: usize,
     schema: Arc<Schema>,
@@ -191,6 +192,7 @@ pub fn csv_range_source(
     match csv::CsvChunker::for_range(
         path,
         dtypes,
+        dt_specs,
         keep,
         ncols,
         start,

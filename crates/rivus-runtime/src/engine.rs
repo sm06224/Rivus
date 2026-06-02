@@ -1324,6 +1324,7 @@ struct ParPlan {
 enum ParSource {
     Csv {
         dtypes: Vec<DataType>,
+        dt_specs: Vec<Option<std::sync::Arc<crate::csv::DtSpec>>>,
         keep: Vec<usize>,
         ncols: usize,
         prefilter: Vec<(usize, rivus_ir::CmpOp, f64)>,
@@ -1348,6 +1349,7 @@ impl ParPlan {
         match &self.src {
             ParSource::Csv {
                 dtypes,
+                dt_specs,
                 keep,
                 ncols,
                 prefilter,
@@ -1356,6 +1358,7 @@ impl ParPlan {
             } => operators::csv_range_source(
                 &self.path,
                 dtypes.clone(),
+                dt_specs.clone(),
                 keep.clone(),
                 *ncols,
                 self.schema.clone(),
@@ -1406,19 +1409,10 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             str_prefilter,
             header,
             declared,
+            dt_formats,
             delim,
             ..
         } => {
-            // A declared `:datetime` column carries an explicit parse format that
-            // the byte-range workers don't thread through yet, so keep such reads
-            // on the serial path (the reference). Design 23 step 2.
-            if let Some(d) = declared {
-                if d.iter()
-                    .any(|(_, t)| matches!(t, Some(DataType::DateTime { .. })))
-                {
-                    return None;
-                }
-            }
             let path = source_path(op).filter(|p| *p != "-" && !is_compressed_source(p))?;
             let plan = crate::csv::plan_parallel(
                 path,
@@ -1428,6 +1422,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 str_prefilter,
                 *header,
                 declared.as_deref(),
+                dt_formats,
                 *delim,
             )
             .ok()?;
@@ -1441,6 +1436,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 bad_rows: plan.bad_rows,
                 src: ParSource::Csv {
                     dtypes: plan.dtypes,
+                    dt_specs: plan.dt_specs,
                     keep: plan.keep,
                     ncols: plan.ncols,
                     prefilter: plan.prefilter,
