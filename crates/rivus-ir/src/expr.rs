@@ -108,6 +108,14 @@ pub enum Func {
     Trunc,
     /// `format(ts, "yyyy-MM-dd")` — render a datetime as text. Design 23.
     Format,
+    /// `weekday(x)` — ISO day-of-week of a date/datetime: `0 = Mon … 6 = Sun`
+    /// (returns `i64`). #58.
+    Weekday,
+    /// `is_weekend(x)` — whether a date/datetime falls on Sat/Sun (`bool`). #58.
+    IsWeekend,
+    /// `date(x)` — the calendar `date` of a datetime (drops the time-of-day),
+    /// returning the exact `date` lane. #58.
+    Date,
 }
 
 impl Func {
@@ -140,6 +148,9 @@ impl Func {
             "second" => Func::Second,
             "trunc" => Func::Trunc,
             "format" => Func::Format,
+            "weekday" => Func::Weekday,
+            "is_weekend" => Func::IsWeekend,
+            "date" => Func::Date,
             _ => return None,
         })
     }
@@ -172,6 +183,9 @@ impl Func {
             Func::Second => "second",
             Func::Trunc => "trunc",
             Func::Format => "format",
+            Func::Weekday => "weekday",
+            Func::IsWeekend => "is_weekend",
+            Func::Date => "date",
         }
     }
 }

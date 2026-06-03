@@ -164,6 +164,42 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
                 },
             }
         }
+        // Date extractors (#58): coerce to a calendar date (a date cell as-is, a
+        // datetime's date part, or a parsed text), then derive. A value that
+        // won't coerce yields `Null` (continue-first).
+        Func::Weekday => match as_date(arg(0)) {
+            Some(d) => Value::I64(d.weekday() as i64),
+            None => Value::Null,
+        },
+        Func::IsWeekend => match as_date(arg(0)) {
+            Some(d) => Value::Bool(d.weekday() >= 5),
+            None => Value::Null,
+        },
+        Func::Date => match as_date(arg(0)) {
+            Some(d) => Value::Date(d),
+            None => Value::Null,
+        },
+    }
+}
+
+/// Coerce a value to a calendar [`Date`] for the date functions (#58): a date
+/// cell as-is; a datetime → its date part; ISO `yyyy-MM-dd` text → parsed; else
+/// a text/epoch value is read through the datetime auto-parse and reduced to its
+/// date. Anything else → `None` (continue-first).
+fn as_date(v: Value) -> Option<rivus_core::Date> {
+    match v {
+        Value::Date(d) => Some(d),
+        Value::DateTime(dt) => {
+            let (y, mo, d, ..) = dt.fields();
+            Some(rivus_core::Date::from_ymd(y, mo, d))
+        }
+        Value::Str(s) => rivus_core::Date::parse(&s).or_else(|| {
+            as_datetime(Value::Str(s)).map(|dt| {
+                let (y, mo, d, ..) = dt.fields();
+                rivus_core::Date::from_ymd(y, mo, d)
+            })
+        }),
+        _ => None,
     }
 }
 
@@ -564,7 +600,8 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 | Func::Day
                 | Func::Hour
                 | Func::Minute
-                | Func::Second => Column::I64(
+                | Func::Second
+                | Func::Weekday => Column::I64(
                     (0..n)
                         .map(|r| to_i64(call_func(*func, args, chunk, r)))
                         .collect(),
@@ -583,7 +620,8 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 | Func::EndsWith
                 | Func::Like
                 | Func::Glob
-                | Func::Regexp => Column::Bool(
+                | Func::Regexp
+                | Func::IsWeekend => Column::Bool(
                     (0..n)
                         .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
                         .collect(),
@@ -592,6 +630,13 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 // the data (e.g. `round` is integral, `coalesce` may be text),
                 // so pick the narrowest fitting lane per chunk.
                 Func::Abs | Func::Round | Func::Floor | Func::Ceil | Func::Coalesce => {
+                    let vals: Vec<Value> =
+                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    column_from_values(vals)
+                }
+                // `date(x)` → the exact date lane (column_from_values keeps the
+                // all-Date result as Column::Date). #58.
+                Func::Date => {
                     let vals: Vec<Value> =
                         (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
                     column_from_values(vals)

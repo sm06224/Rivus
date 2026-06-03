@@ -464,10 +464,24 @@ open events.csv (id:int day:date)   # parse "2024-06-03" into the date lane
   not a failure (never counted), so clean data stays quiet.
 - **Exact, never f64**: comparison ordering and `min`/`max`/`count` run on the
   integer epoch-day.
-- _Coming next (#58):_ `DateTime → date`; `weekday` / `is_weekend` / `date` /
-  `time` extraction; **date-typed `min`/`max`** (today they aggregate exactly but
-  surface the raw epoch-day — they'll render as dates, mirroring datetime); and
-  the `TimeOfDay` / `Weekday` subtypes.
+
+**Date / datetime extractors** — usable anywhere an expression is (computed
+columns, filters). Each accepts a `date`, a `datetime`, or parseable text:
+
+```
+open events.csv (ts:datetime)
+|> (date(ts)) as day              # DateTime → date (drops the time-of-day)
+   (weekday(ts)) as wd            # 0=Mon … 6=Sun  (i64)
+   (is_weekend(ts)) as we         # Sat/Sun → true (bool)
+|? is_weekend(day)                # …and they compose / filter
+```
+
+- `date(x)` → the **date** lane (renders `yyyy-MM-dd`); `weekday(x)` → `i64`
+  `0=Mon … 6=Sun`; `is_weekend(x)` → `bool` (weekday ≥ 5). A value that won't
+  coerce to a date yields null (continue-first).
+- _Coming next (#58):_ `time(x)` + the `TimeOfDay` (`HH:mm:ss`) and `Weekday`
+  subtypes; and **date-typed `min`/`max`** (today they aggregate exactly but
+  surface the raw epoch-day — they'll render as dates, mirroring datetime).
 
 ---
 

@@ -2789,6 +2789,55 @@ fn date_groupby_parallel_matches_serial() {
 }
 
 #[test]
+fn date_extractors_chunk_size_independent() {
+    // weekday (Mon=0..Sun=6), is_weekend, and date(ts) (DateTime→date) are
+    // row-wise and chunk-size independent (#58).
+    let text = "d\n2024-06-03\n2024-06-08\n2024-06-09\n2023-12-25\n"; // Mon, Sat, Sun, Mon
+    let f = TempCsv(gendata::write_temp_bytes("stress_date_fn", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("W:\n open {p} (d:date)\n |> (weekday(d)) as wd (is_weekend(d)) as we\n;");
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_i64(&res, "W", "wd"),
+            vec![0, 5, 6, 0],
+            "weekday @cz={cz}"
+        );
+        assert_eq!(
+            collect_strings(&res, "W", "we"),
+            vec!["false", "true", "true", "false"],
+            "is_weekend @cz={cz}"
+        );
+    }
+    // date(ts) drops the time-of-day and keeps the exact date lane.
+    let t2 = "ts\n2024-06-03 14:30:00\n2023-12-25 00:00:00\n";
+    let f2 = TempCsv(gendata::write_temp_bytes("stress_date_fn2", t2.as_bytes()));
+    let p2 = f2.0.display();
+    let flow2 = format!("D:\n open {p2} (ts:datetime)\n |> (date(ts)) as day\n;");
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow2, cz);
+        assert_eq!(
+            collect_strings(&res, "D", "day"),
+            vec!["2024-06-03", "2023-12-25"],
+            "date(ts) @cz={cz}"
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        let ci = o.chunks[0].schema.index_of("day").unwrap();
+        assert!(
+            matches!(
+                o.chunks[0].schema.fields[ci].dtype,
+                rivus_core::DataType::Date
+            ),
+            "date(ts) must yield the date lane @cz={cz}"
+        );
+    }
+}
+
+#[test]
 fn datetime_auto_infer_common_formats() {
     // A bare `:datetime` (no explicit format) auto-infers common shapes per cell:
     // ISO-with-T, ISO-with-space, and bare date all resolve; junk → epoch 0.

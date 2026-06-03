@@ -1504,6 +1504,17 @@ mod tests {
     }
 
     #[test]
+    fn date_functions_parse_and_are_reversible() {
+        // The #58 date extractors survive `to_source` round-trips.
+        let src = "F:\n open log.csv\n |> (weekday(ts)) as wd (is_weekend(ts)) as we (date(ts)) as day\n;";
+        let s = parse(src).unwrap().to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        for needle in ["weekday(", "is_weekend(", "date("] {
+            assert!(s.contains(needle), "missing {needle} in {s}");
+        }
+    }
+
+    #[test]
     fn datetime_functions_parse_and_are_reversible() {
         // The design-23 datetime functions survive `to_source` round-trips.
         let src = "F:\n open log.csv\n |> (year(ts)) as y (month(ts)) as mo (day(ts)) as d (hour(ts)) as h (minute(ts)) as mi (second(ts)) as se (trunc(ts, \"day\")) as bucket (format(ts, \"yyyy-MM-dd\")) as f\n;";
