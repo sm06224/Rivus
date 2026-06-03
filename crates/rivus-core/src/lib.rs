@@ -18,7 +18,7 @@ pub mod value;
 pub use chunk::{Chunk, ChunkMeta, Column, DecColumn, DtColumn, DurColumn, Mode, StrColumn};
 pub use error::{ErrorEvent, ErrorScope, Result, RivusError, Severity};
 pub use schema::{Field, Schema};
-pub use value::{DataType, DateTime, Decimal, Duration, TimeUnit, Value};
+pub use value::{DataType, Date, DateTime, Decimal, Duration, TimeUnit, Value};
 
 #[cfg(test)]
 mod tests {

@@ -2670,6 +2670,121 @@ fn datetime_column_parses_and_is_chunk_size_independent() {
 }
 
 #[test]
+fn date_column_parses_chunk_size_independent_and_surfaces_bad() {
+    // `:date` reads ISO yyyy-MM-dd into the exact i32 epoch-day lane (#58). An
+    // invalid date (2024-02-30) is continue-first (epoch 0) AND surfaced on the
+    // error stream; an empty cell is "missing" (not counted). Result must not
+    // depend on chunk size.
+    let text = "id,d\n\
+                1,2024-06-03\n\
+                2,2024-02-30\n\
+                3,\n\
+                4,2023-12-25\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_date", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (id:int d:date)\n |> id d\n;");
+    let want_d = vec![
+        "2024-06-03".to_string(),
+        "1970-01-01".to_string(), // invalid → epoch 0 (continue-first)
+        "1970-01-01".to_string(), // empty → epoch 0 (missing, not a failure)
+        "2023-12-25".to_string(),
+    ];
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert!(
+            !res.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+            "date parse must never raise a fatal (cz={cz})"
+        );
+        assert_eq!(
+            collect_strings(&res, "D", "d"),
+            want_d,
+            "date ISO rendering changed at chunk_size {cz}"
+        );
+        assert_eq!(
+            collect_i64(&res, "D", "id"),
+            vec![1, 2, 3, 4],
+            "alignment @cz={cz}"
+        );
+        // Exactly one parse failure surfaced (the invalid date; empty not counted).
+        let fails = res
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("could not be parsed") && e.message.contains("'d'"))
+            .count();
+        assert_eq!(
+            fails, 1,
+            "one date parse failure surfaced @cz={cz}: {:?}",
+            res.errors
+        );
+        // The declared lane is Date, not a string fallback.
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        let ci = o.chunks[0].schema.index_of("d").unwrap();
+        assert!(
+            matches!(
+                o.chunks[0].schema.fields[ci].dtype,
+                rivus_core::DataType::Date
+            ),
+            "d must be the date lane at chunk_size {cz}"
+        );
+    }
+}
+
+#[test]
+fn date_groupby_parallel_matches_serial() {
+    // The byte-range parallel reader builds Date columns with the same parse as
+    // the serial reader; a group-by count per date is exact + associative, so it
+    // is byte-identical across serial/parallel and chunk size (#58).
+    let rows = 6_000;
+    let mut rng = Rng::new(58);
+    let mut text = String::from("d,v\n");
+    let days = ["2024-06-01", "2024-06-02", "2024-06-03", "2023-12-25"];
+    for _ in 0..rows {
+        let d = days[rng.below(days.len() as u64) as usize];
+        text.push_str(&format!("{d},{}\n", rng.below(1000) as i64));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_date_par",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (d:date v:int)\n |# d count max:v\n;");
+
+    let snapshot = |pref: rivus_runtime::MemoryPref| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 512,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        let mut rows: Vec<(String, i64, i64)> = {
+            let days = collect_strings(&res, "D", "d");
+            let cnt = collect_i64(&res, "D", "count");
+            let mx = collect_i64(&res, "D", "max_v");
+            (0..days.len())
+                .map(|i| (days[i].clone(), cnt[i], mx[i]))
+                .collect()
+        };
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        snapshot(rivus_runtime::MemoryPref::Low),
+        snapshot(rivus_runtime::MemoryPref::Fast),
+        "date group-by must be byte-identical serial vs parallel"
+    );
+}
+
+#[test]
 fn datetime_auto_infer_common_formats() {
     // A bare `:datetime` (no explicit format) auto-infers common shapes per cell:
     // ISO-with-T, ISO-with-space, and bare date all resolve; junk → epoch 0.

@@ -398,6 +398,7 @@ fn to_i64(v: Value) -> i64 {
         Value::Dec(d) => d.to_f64() as i64,
         Value::DateTime(t) => t.ticks,
         Value::Duration(d) => d.ticks,
+        Value::Date(d) => d.epoch_day as i64,
         Value::Bool(b) => b as i64,
         Value::Str(s) => s
             .trim()
@@ -416,6 +417,7 @@ fn to_f64(v: Value) -> f64 {
         Value::Dec(d) => d.to_f64(),
         Value::DateTime(t) => t.ticks as f64,
         Value::Duration(d) => d.ticks as f64,
+        Value::Date(d) => d.epoch_day as f64,
         Value::Bool(b) => b as i64 as f64,
         Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
         Value::Null => f64::NAN,
@@ -431,6 +433,7 @@ fn to_bool(v: Value) -> bool {
         Value::Dec(d) => d.unscaled != 0,
         Value::DateTime(t) => t.ticks != 0,
         Value::Duration(d) => d.ticks != 0,
+        Value::Date(d) => d.epoch_day != 0,
         Value::Str(s) => s.trim().eq_ignore_ascii_case("true") || s.trim() == "1",
         Value::Null => false,
     }
@@ -450,6 +453,8 @@ fn cast_value(v: Value, ty: DataType) -> Value {
         DataType::DateTime { unit } => Value::DateTime(rivus_core::DateTime::new(to_i64(v), unit)),
         // Cast to duration treats the value as a raw tick span at the unit.
         DataType::Duration { unit } => Value::Duration(rivus_core::Duration::new(to_i64(v), unit)),
+        // Cast to date treats the value as an epoch-day (i32).
+        DataType::Date => Value::Date(rivus_core::Date::new(to_i64(v) as i32)),
         DataType::Bool => Value::Bool(to_bool(v)),
         DataType::Str => Value::Str(v.to_string()),
         DataType::Null => Value::Null,
@@ -521,6 +526,7 @@ pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
             let ticks = (0..n).map(|i| to_i64(col.value_at(i))).collect();
             Column::Duration(rivus_core::DurColumn { ticks, unit })
         }
+        DataType::Date => Column::Date((0..n).map(|i| to_i64(col.value_at(i)) as i32).collect()),
         DataType::Bool => Column::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
         DataType::Str => {
             let mut s = StrColumn::with_capacity(n, n * 8);
@@ -660,6 +666,19 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
             });
         }
     }
+    // All-date → keep the date lane (e.g. `date(ts)`). Integer epoch-day, #58.
+    if vals.first().is_some_and(|v| matches!(v, Value::Date(_)))
+        && vals.iter().all(|v| matches!(v, Value::Date(_)))
+    {
+        return Column::Date(
+            vals.iter()
+                .map(|v| match v {
+                    Value::Date(d) => d.epoch_day,
+                    _ => 0,
+                })
+                .collect(),
+        );
+    }
     if all_bool {
         Column::Bool(
             vals.iter()
@@ -699,6 +718,7 @@ fn const_column(v: &Value, n: usize) -> Column {
             ticks: vec![d.ticks; n],
             unit: d.unit,
         }),
+        Value::Date(d) => Column::Date(vec![d.epoch_day; n]),
         Value::Bool(x) => Column::Bool(vec![*x; n]),
         Value::Str(s) => {
             let mut c = StrColumn::with_capacity(n, s.len() * n);
@@ -730,6 +750,9 @@ fn col_num_lane(col: Column) -> (Vec<f64>, bool) {
         Column::DateTime(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
         // Duration likewise rides the integer tick lane (#57).
         Column::Duration(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
+        // Date arithmetic operates on the integer epoch-day lane (#58); diffs /
+        // day-offsets stay integer.
+        Column::Date(v) => (v.iter().map(|&x| x as f64).collect(), true),
         Column::Str(s) => {
             let lane = (0..s.len())
                 .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
@@ -1066,6 +1089,9 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
             Column::DateTime(_) => None,
             // Duration likewise stays off the f64 lane (exact i64; #57).
             Column::Duration(_) => None,
+            // Date routes to the exact Value path too (epoch-day compared as a
+            // date, not a coerced float); #58.
+            Column::Date(_) => None,
             Column::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
             Column::Str(_) => None,
         },

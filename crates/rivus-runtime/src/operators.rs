@@ -1222,6 +1222,8 @@ fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
         Column::DateTime(d) => d.ticks[a].cmp(&d.ticks[b]),
         // Duration shares a unit too → exact i64 magnitude order (#57).
         Column::Duration(d) => d.ticks[a].cmp(&d.ticks[b]),
+        // Date: epoch-day order is exact chronological order (#58).
+        Column::Date(v) => v[a].cmp(&v[b]),
         Column::Str(v) => v.get(a).cmp(v.get(b)),
     }
 }
@@ -3166,6 +3168,9 @@ fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
         Column::Duration(d) => {
             let _ = write!(line, "{}", rivus_core::Duration::new(d.ticks[row], d.unit));
         }
+        Column::Date(v) => {
+            let _ = write!(line, "{}", rivus_core::Date::new(v[row]));
+        }
         Column::Str(s) => {
             let cell = s.get(row);
             if cell.bytes().any(|b| b == delim) || cell.contains('"') || cell.contains('\n') {
@@ -3437,6 +3442,8 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
             out,
             &rivus_core::Duration::new(d.ticks[row], d.unit).to_string(),
         ),
+        // Date → quoted ISO yyyy-MM-dd string (#58).
+        Column::Date(v) => json_string(out, &rivus_core::Date::new(v[row]).to_string()),
         Column::Str(s) => json_string(out, s.get(row)),
     }
 }

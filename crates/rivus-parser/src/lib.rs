@@ -563,6 +563,10 @@ impl Parser {
                 unit: TimeUnit::Sec,
             });
         }
+        if word.eq_ignore_ascii_case("date") {
+            // Calendar date, read from ISO `yyyy-MM-dd` (i32 epoch-day; #58).
+            return Ok(DataType::Date);
+        }
         if word.eq_ignore_ascii_case("decimal") {
             if !self.eat(&Tok::LParen) {
                 return Err(self.err("decimal needs a scale: write decimal(N), e.g. decimal(2)"));
@@ -1483,6 +1487,19 @@ mod tests {
             let s = parse(src).unwrap().to_source();
             assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
             assert!(s.contains("duration"), "duration type lost in {s}");
+        }
+    }
+
+    #[test]
+    fn date_type_parses_and_is_reversible() {
+        // `:date` in a declared schema and as a cast (#58, ISO yyyy-MM-dd lane).
+        for src in [
+            "F:\n open events.csv (id:int day:date)\n |> day\n;",
+            "F:\n open events.csv\n cast day:date\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(s.contains("date"), "date type lost in {s}");
         }
     }
 

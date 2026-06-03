@@ -762,6 +762,8 @@ pub enum Value {
     DateTime(DateTime),
     /// Duration lane (signed tick span; design 23 / #57).
     Duration(Duration),
+    /// Calendar date lane (i32 epoch-day, no time-of-day; #58).
+    Date(Date),
     Str(String),
 }
 
@@ -775,6 +777,7 @@ impl Value {
             Value::Dec(d) => DataType::Decimal { scale: d.scale },
             Value::DateTime(t) => DataType::DateTime { unit: t.unit },
             Value::Duration(d) => DataType::Duration { unit: d.unit },
+            Value::Date(_) => DataType::Date,
             Value::Str(_) => DataType::Str,
         }
     }
@@ -787,6 +790,7 @@ impl Value {
             Value::Dec(d) => Some(d.to_f64()),
             Value::DateTime(t) => Some(t.ticks as f64),
             Value::Duration(d) => Some(d.ticks as f64),
+            Value::Date(d) => Some(d.epoch_day as f64),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             _ => None,
         }
@@ -807,6 +811,7 @@ impl fmt::Display for Value {
             Value::Dec(d) => write!(f, "{d}"),
             Value::DateTime(t) => write!(f, "{t}"),
             Value::Duration(d) => write!(f, "{d}"),
+            Value::Date(d) => write!(f, "{d}"),
             Value::Str(s) => write!(f, "{s}"),
         }
     }
@@ -833,6 +838,8 @@ pub enum DataType {
     Duration {
         unit: TimeUnit,
     },
+    /// Calendar date lane: i32 epoch-day, no time-of-day (#58).
+    Date,
     /// Stream-based text (see design doc 09 "Text is stream").
     Str,
 }
@@ -851,6 +858,7 @@ impl fmt::Display for DataType {
             DataType::DateTime { .. } => f.write_str("datetime"),
             // Unit omitted (Sec in the MVP) so `:duration` round-trips bare.
             DataType::Duration { .. } => f.write_str("duration"),
+            DataType::Date => f.write_str("date"),
             DataType::Str => f.write_str("str"),
         }
     }
