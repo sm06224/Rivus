@@ -76,7 +76,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
 | `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
-| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), `duration` (signed time spans), or `date` (ISO `yyyy-MM-dd` calendar dates; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
+| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), `duration` (signed time spans), `date` (ISO `yyyy-MM-dd` calendar dates), or `time` (`HH:mm:ss` time-of-day; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |
@@ -466,22 +466,38 @@ open events.csv (id:int day:date)   # parse "2024-06-03" into the date lane
 - **Exact, never f64**: comparison ordering and `min`/`max`/`count` run on the
   integer epoch-day.
 
-**Date / datetime extractors** — usable anywhere an expression is (computed
+**Time-of-day lane (`time`)** — a wall-clock **time of day** with no calendar
+date, stored as exact `i64` ticks since midnight (MVP second resolution). Reads
+and renders `HH:mm:ss`; like the date lane, `min`/`max`/`count` and group-by are
+exact and **byte-identical in parallel** (min/max keep the time type):
+
+```
+open log.csv (start:time end:time)   # parse "09:05:00" into the time lane
+|# start min:start max:start          # exact, parallel byte-identical (HH:mm:ss)
+```
+
+- **`HH:mm:ss` only** (hour `0..23`, minute/second `0..59`); a bad time like
+  `25:00:00` is kept as `00:00:00` (continue-first) **and** surfaced on the error
+  stream (`N value(s) in column '…' (as time) could not be parsed`); an empty
+  cell is "missing", not counted. Non-zero-padded input (`9:5:0`) parses and
+  canonicalizes to `HH:mm:ss`.
+
+**Date / time extractors** — usable anywhere an expression is (computed
 columns, filters). Each accepts a `date`, a `datetime`, or parseable text:
 
 ```
 open events.csv (ts:datetime)
 |> (date(ts)) as day              # DateTime → date (drops the time-of-day)
+   (time(ts)) as tod             # DateTime → time-of-day (drops the date)
    (weekday(ts)) as wd            # 0=Mon … 6=Sun  (i64)
    (is_weekend(ts)) as we         # Sat/Sun → true (bool)
 |? is_weekend(day)                # …and they compose / filter
 ```
 
-- `date(x)` → the **date** lane (renders `yyyy-MM-dd`); `weekday(x)` → `i64`
-  `0=Mon … 6=Sun`; `is_weekend(x)` → `bool` (weekday ≥ 5). A value that won't
-  coerce to a date yields null (continue-first).
-- _Coming next (#58):_ `time(x)` + the `TimeOfDay` (`HH:mm:ss`) and `Weekday`
-  subtypes.
+- `date(x)` → the **date** lane (`yyyy-MM-dd`); `time(x)` → the **time** lane
+  (`HH:mm:ss`); `weekday(x)` → `i64` `0=Mon … 6=Sun`; `is_weekend(x)` → `bool`
+  (weekday ≥ 5). A value that won't coerce yields null (continue-first).
+- _Coming next (#58):_ a dedicated `Weekday` subtype (renders `Mon`…`Sun`).
 
 ---
 

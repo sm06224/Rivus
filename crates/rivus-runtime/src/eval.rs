@@ -179,6 +179,28 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
             Some(d) => Value::Date(d),
             None => Value::Null,
         },
+        Func::Time => match as_time(arg(0)) {
+            Some(t) => Value::Time(t),
+            None => Value::Null,
+        },
+    }
+}
+
+/// Coerce a value to a [`TimeOfDay`] for `time(x)` (#58): a time cell as-is; a
+/// datetime → its time-of-day part (ticks mod one day); `HH:mm:ss` text →
+/// parsed; else a datetime auto-parse reduced to its time. Else `None`.
+fn as_time(v: Value) -> Option<rivus_core::TimeOfDay> {
+    use rivus_core::{TimeOfDay, TimeUnit};
+    let from_dt = |dt: rivus_core::DateTime| {
+        let per_day = dt.unit.per_sec() * 86_400;
+        TimeOfDay::new(dt.ticks.rem_euclid(per_day), dt.unit)
+    };
+    match v {
+        Value::Time(t) => Some(t),
+        Value::DateTime(dt) => Some(from_dt(dt)),
+        Value::Str(s) => TimeOfDay::parse_at(&s, TimeUnit::Sec)
+            .or_else(|| as_datetime(Value::Str(s)).map(from_dt)),
+        _ => None,
     }
 }
 
@@ -435,6 +457,7 @@ fn to_i64(v: Value) -> i64 {
         Value::DateTime(t) => t.ticks,
         Value::Duration(d) => d.ticks,
         Value::Date(d) => d.epoch_day as i64,
+        Value::Time(t) => t.ticks,
         Value::Bool(b) => b as i64,
         Value::Str(s) => s
             .trim()
@@ -454,6 +477,7 @@ fn to_f64(v: Value) -> f64 {
         Value::DateTime(t) => t.ticks as f64,
         Value::Duration(d) => d.ticks as f64,
         Value::Date(d) => d.epoch_day as f64,
+        Value::Time(t) => t.ticks as f64,
         Value::Bool(b) => b as i64 as f64,
         Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
         Value::Null => f64::NAN,
@@ -470,6 +494,7 @@ fn to_bool(v: Value) -> bool {
         Value::DateTime(t) => t.ticks != 0,
         Value::Duration(d) => d.ticks != 0,
         Value::Date(d) => d.epoch_day != 0,
+        Value::Time(t) => t.ticks != 0,
         Value::Str(s) => s.trim().eq_ignore_ascii_case("true") || s.trim() == "1",
         Value::Null => false,
     }
@@ -491,6 +516,11 @@ fn cast_value(v: Value, ty: DataType) -> Value {
         DataType::Duration { unit } => Value::Duration(rivus_core::Duration::new(to_i64(v), unit)),
         // Cast to date treats the value as an epoch-day (i32).
         DataType::Date => Value::Date(rivus_core::Date::new(to_i64(v) as i32)),
+        // Cast to time treats the value as ticks-since-midnight (MVP Sec).
+        DataType::Time => Value::Time(rivus_core::TimeOfDay::new(
+            to_i64(v),
+            rivus_core::TimeUnit::Sec,
+        )),
         DataType::Bool => Value::Bool(to_bool(v)),
         DataType::Str => Value::Str(v.to_string()),
         DataType::Null => Value::Null,
@@ -563,6 +593,7 @@ pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
             Column::Duration(rivus_core::DurColumn { ticks, unit })
         }
         DataType::Date => Column::Date((0..n).map(|i| to_i64(col.value_at(i)) as i32).collect()),
+        DataType::Time => Column::Time((0..n).map(|i| to_i64(col.value_at(i))).collect()),
         DataType::Bool => Column::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
         DataType::Str => {
             let mut s = StrColumn::with_capacity(n, n * 8);
@@ -634,9 +665,9 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                         (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
                     column_from_values(vals)
                 }
-                // `date(x)` → the exact date lane (column_from_values keeps the
-                // all-Date result as Column::Date). #58.
-                Func::Date => {
+                // `date(x)`/`time(x)` → the exact date/time lane
+                // (column_from_values keeps the all-Date / all-Time result). #58.
+                Func::Date | Func::Time => {
                     let vals: Vec<Value> =
                         (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
                     column_from_values(vals)
@@ -724,6 +755,19 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
                 .collect(),
         );
     }
+    // All-time → keep the time-of-day lane (e.g. `time(ts)`). Integer ticks, #58.
+    if vals.first().is_some_and(|v| matches!(v, Value::Time(_)))
+        && vals.iter().all(|v| matches!(v, Value::Time(_)))
+    {
+        return Column::Time(
+            vals.iter()
+                .map(|v| match v {
+                    Value::Time(t) => t.ticks,
+                    _ => 0,
+                })
+                .collect(),
+        );
+    }
     if all_bool {
         Column::Bool(
             vals.iter()
@@ -764,6 +808,7 @@ fn const_column(v: &Value, n: usize) -> Column {
             unit: d.unit,
         }),
         Value::Date(d) => Column::Date(vec![d.epoch_day; n]),
+        Value::Time(t) => Column::Time(vec![t.ticks; n]),
         Value::Bool(x) => Column::Bool(vec![*x; n]),
         Value::Str(s) => {
             let mut c = StrColumn::with_capacity(n, s.len() * n);
@@ -798,6 +843,8 @@ fn col_num_lane(col: Column) -> (Vec<f64>, bool) {
         // Date arithmetic operates on the integer epoch-day lane (#58); diffs /
         // day-offsets stay integer.
         Column::Date(v) => (v.iter().map(|&x| x as f64).collect(), true),
+        // Time-of-day rides the integer tick lane too (#58).
+        Column::Time(v) => (v.iter().map(|&x| x as f64).collect(), true),
         Column::Str(s) => {
             let lane = (0..s.len())
                 .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
@@ -1137,6 +1184,8 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
             // Date routes to the exact Value path too (epoch-day compared as a
             // date, not a coerced float); #58.
             Column::Date(_) => None,
+            // Time-of-day routes to the exact Value path too (#58).
+            Column::Time(_) => None,
             Column::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
             Column::Str(_) => None,
         },

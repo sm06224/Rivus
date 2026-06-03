@@ -2870,6 +2870,94 @@ fn date_minmax_keeps_date_type_and_parallel_matches_serial() {
 }
 
 #[test]
+fn time_column_reads_minmax_and_surfaces_bad() {
+    // :time reads HH:mm:ss into the exact i64 tick lane; a bad cell is
+    // continue-first (00:00:00) AND surfaced; an empty cell is not counted;
+    // min/max keep the Time lane (render HH:mm:ss) and are chunk-size
+    // independent + parallel byte-identical (#58).
+    let text = "k,t\n\
+                a,09:05:00\n\
+                a,23:59:59\n\
+                a,nope\n\
+                a,\n\
+                b,00:00:01\n\
+                b,12:30:00\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_time", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("T:\n open {p} (k:str t:time)\n |# k min:t max:t\n;");
+    let snapshot = |pref: rivus_runtime::MemoryPref, cz: usize| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        // The bad cell (a) is surfaced verbatim; empty is not counted.
+        let fails = res
+            .errors
+            .iter()
+            .filter(|e| {
+                e.message
+                    .contains("in column 't' (as time) could not be parsed; kept as default 0")
+            })
+            .count();
+        assert_eq!(
+            fails, 1,
+            "one time parse failure surfaced: {:?}",
+            res.errors
+        );
+        let lo = collect_strings(&res, "T", "min_t");
+        for s in lo.iter().chain(collect_strings(&res, "T", "max_t").iter()) {
+            assert_eq!(
+                s.len(),
+                8,
+                "min/max must render HH:mm:ss (Time lane), got {s:?}"
+            );
+        }
+        let mut rows: Vec<(String, String, String)> = {
+            let k = collect_strings(&res, "T", "k");
+            let hi = collect_strings(&res, "T", "max_t");
+            (0..k.len())
+                .map(|i| (k[i].clone(), lo[i].clone(), hi[i].clone()))
+                .collect()
+        };
+        rows.sort();
+        rows
+    };
+    for cz in [1usize, 2, 4096] {
+        assert_eq!(
+            snapshot(rivus_runtime::MemoryPref::Low, cz),
+            snapshot(rivus_runtime::MemoryPref::Fast, cz),
+            "time min/max byte-identical serial vs parallel @cz={cz}"
+        );
+    }
+    // Oracle: key b spans 00:00:01..12:30:00; key a's bad/empty default to
+    // 00:00:00 so its min is midnight, max 23:59:59.
+    assert_eq!(
+        snapshot(rivus_runtime::MemoryPref::Low, 4096),
+        vec![
+            (
+                "a".to_string(),
+                "00:00:00".to_string(),
+                "23:59:59".to_string()
+            ),
+            (
+                "b".to_string(),
+                "00:00:01".to_string(),
+                "12:30:00".to_string()
+            ),
+        ],
+        "time min/max extreme values"
+    );
+}
+
+#[test]
 fn date_extractors_chunk_size_independent() {
     // weekday (Mon=0..Sun=6), is_weekend, and date(ts) (DateTime→date) are
     // row-wise and chunk-size independent (#58).

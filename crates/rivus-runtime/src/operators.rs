@@ -1224,6 +1224,8 @@ fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
         Column::Duration(d) => d.ticks[a].cmp(&d.ticks[b]),
         // Date: epoch-day order is exact chronological order (#58).
         Column::Date(v) => v[a].cmp(&v[b]),
+        // Time-of-day: tick order is exact chronological order (#58).
+        Column::Time(v) => v[a].cmp(&v[b]),
         Column::Str(v) => v.get(a).cmp(v.get(b)),
     }
 }
@@ -2141,6 +2143,10 @@ struct AggAcc {
     has_date: bool,
     date_min: i32,
     date_max: i32,
+    /// Exact time-of-day lane (#58): i64 ticks-since-midnight min/max.
+    has_time: bool,
+    time_min: i64,
+    time_max: i64,
 }
 
 /// Extra fractional digits an exact decimal `avg` carries beyond the input scale
@@ -2195,6 +2201,9 @@ impl AggAcc {
             has_date: false,
             date_min: i32::MAX,
             date_max: i32::MIN,
+            has_time: false,
+            time_min: i64::MAX,
+            time_max: i64::MIN,
         }
     }
 
@@ -2257,6 +2266,12 @@ impl AggAcc {
                         self.has_date = true;
                         self.date_min = self.date_min.min(d.epoch_day);
                         self.date_max = self.date_max.max(d.epoch_day);
+                    }
+                    // Exact time-of-day lane: i64 tick min/max (#58).
+                    if let Value::Time(t) = v {
+                        self.has_time = true;
+                        self.time_min = self.time_min.min(t.ticks);
+                        self.time_max = self.time_max.max(t.ticks);
                     }
                 }
             }
@@ -2340,6 +2355,12 @@ impl AggAcc {
             self.has_date = true;
             self.date_min = self.date_min.min(other.date_min);
             self.date_max = self.date_max.max(other.date_max);
+        }
+        // Exact time-of-day lane (associative i64 min/max). #58.
+        if other.has_time {
+            self.has_time = true;
+            self.time_min = self.time_min.min(other.time_min);
+            self.time_max = self.time_max.max(other.time_max);
         }
         for s in &other.distinct {
             self.distinct.insert(s.clone());
@@ -2464,6 +2485,25 @@ impl AggAcc {
         match self.func {
             AggFunc::Min if self.n > 0 => Some(rivus_core::Date::new(self.date_min)),
             AggFunc::Max if self.n > 0 => Some(rivus_core::Date::new(self.date_max)),
+            _ => None,
+        }
+    }
+
+    /// Exact time-of-day result for `min`/`max` on a time column, keeping the
+    /// i64 ticks so the result stays the `Time` type (renders HH:mm:ss). #58.
+    fn time_value(&self) -> Option<rivus_core::TimeOfDay> {
+        if !self.has_time {
+            return None;
+        }
+        match self.func {
+            AggFunc::Min if self.n > 0 => Some(rivus_core::TimeOfDay::new(
+                self.time_min,
+                rivus_core::TimeUnit::Sec,
+            )),
+            AggFunc::Max if self.n > 0 => Some(rivus_core::TimeOfDay::new(
+                self.time_max,
+                rivus_core::TimeUnit::Sec,
+            )),
             _ => None,
         }
     }
@@ -2721,6 +2761,24 @@ impl Operator for GroupBy {
                             .collect();
                         fields.push(Field::new(name, DataType::Date));
                         columns.push(Column::Date(epoch_days));
+                        continue;
+                    }
+                    // Exact time-of-day min/max → keep the Time lane (i64 ticks),
+                    // never a raw int. #58.
+                    let time_ok = matches!(func, AggFunc::Min | AggFunc::Max)
+                        && !self.groups.is_empty()
+                        && self
+                            .groups
+                            .values()
+                            .all(|s| s.accs[j].time_value().is_some());
+                    if time_ok {
+                        let ticks = self
+                            .groups
+                            .values()
+                            .map(|s| s.accs[j].time_value().unwrap().ticks)
+                            .collect();
+                        fields.push(Field::new(name, DataType::Time));
+                        columns.push(Column::Time(ticks));
                         continue;
                     }
                     // Exact datetime min/max → keep the DateTime lane (i64 ticks,
@@ -3226,6 +3284,13 @@ fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
         Column::Date(v) => {
             let _ = write!(line, "{}", rivus_core::Date::new(v[row]));
         }
+        Column::Time(v) => {
+            let _ = write!(
+                line,
+                "{}",
+                rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec)
+            );
+        }
         Column::Str(s) => {
             let cell = s.get(row);
             if cell.bytes().any(|b| b == delim) || cell.contains('"') || cell.contains('\n') {
@@ -3499,6 +3564,11 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
         ),
         // Date → quoted ISO yyyy-MM-dd string (#58).
         Column::Date(v) => json_string(out, &rivus_core::Date::new(v[row]).to_string()),
+        // Time → quoted HH:mm:ss string (#58).
+        Column::Time(v) => json_string(
+            out,
+            &rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec).to_string(),
+        ),
         Column::Str(s) => json_string(out, s.get(row)),
     }
 }

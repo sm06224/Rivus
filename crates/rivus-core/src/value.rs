@@ -898,6 +898,8 @@ pub enum Value {
     Duration(Duration),
     /// Calendar date lane (i32 epoch-day, no time-of-day; #58).
     Date(Date),
+    /// Time-of-day lane (i64 ticks since midnight; #58).
+    Time(TimeOfDay),
     Str(String),
 }
 
@@ -912,6 +914,7 @@ impl Value {
             Value::DateTime(t) => DataType::DateTime { unit: t.unit },
             Value::Duration(d) => DataType::Duration { unit: d.unit },
             Value::Date(_) => DataType::Date,
+            Value::Time(_) => DataType::Time,
             Value::Str(_) => DataType::Str,
         }
     }
@@ -925,6 +928,7 @@ impl Value {
             Value::DateTime(t) => Some(t.ticks as f64),
             Value::Duration(d) => Some(d.ticks as f64),
             Value::Date(d) => Some(d.epoch_day as f64),
+            Value::Time(t) => Some(t.ticks as f64),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             _ => None,
         }
@@ -946,6 +950,7 @@ impl fmt::Display for Value {
             Value::DateTime(t) => write!(f, "{t}"),
             Value::Duration(d) => write!(f, "{d}"),
             Value::Date(d) => write!(f, "{d}"),
+            Value::Time(t) => write!(f, "{t}"),
             Value::Str(s) => write!(f, "{s}"),
         }
     }
@@ -974,6 +979,8 @@ pub enum DataType {
     },
     /// Calendar date lane: i32 epoch-day, no time-of-day (#58).
     Date,
+    /// Time-of-day lane: i64 ticks since midnight, no date (#58, MVP `Sec`).
+    Time,
     /// Stream-based text (see design doc 09 "Text is stream").
     Str,
 }
@@ -993,6 +1000,7 @@ impl fmt::Display for DataType {
             // Unit omitted (Sec in the MVP) so `:duration` round-trips bare.
             DataType::Duration { .. } => f.write_str("duration"),
             DataType::Date => f.write_str("date"),
+            DataType::Time => f.write_str("time"),
             DataType::Str => f.write_str("str"),
         }
     }

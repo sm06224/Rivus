@@ -1138,6 +1138,9 @@ enum ColBuilder {
     Duration(Vec<i64>, TimeUnit),
     /// Date lane: i32 epoch-day, parsed from ISO `yyyy-MM-dd` (#58).
     Date(Vec<i32>),
+    /// Time-of-day lane: i64 ticks since midnight, parsed from `HH:mm:ss[.frac]`
+    /// (#58, MVP `Sec`).
+    Time(Vec<i64>),
     Str(StrColumn),
 }
 
@@ -1160,6 +1163,7 @@ impl ColBuilder {
             ),
             DataType::Duration { unit } => ColBuilder::Duration(Vec::with_capacity(cap), unit),
             DataType::Date => ColBuilder::Date(Vec::with_capacity(cap)),
+            DataType::Time => ColBuilder::Time(Vec::with_capacity(cap)),
             // Estimate ~8 bytes per string cell for the backing byte buffer.
             _ => ColBuilder::Str(StrColumn::with_capacity(cap, cap * 8)),
         }
@@ -1250,6 +1254,21 @@ impl ColBuilder {
                     !t.is_empty()
                 }
             },
+            // Time-of-day text → i64 ticks; a malformed non-empty cell yields 0
+            // (midnight) and is reported on the error stream, like the other
+            // lanes (continue-first + never-silent; #58).
+            ColBuilder::Time(v) => {
+                match rivus_core::TimeOfDay::parse_at(cell, rivus_core::TimeUnit::Sec) {
+                    Some(tod) => {
+                        v.push(tod.ticks);
+                        false
+                    }
+                    None => {
+                        v.push(0);
+                        !t.is_empty()
+                    }
+                }
+            }
             ColBuilder::Str(v) => {
                 v.push(cell);
                 false
@@ -1275,6 +1294,7 @@ impl ColBuilder {
                 unit: *unit,
             }),
             ColBuilder::Date(v) => Column::Date(std::mem::take(v)),
+            ColBuilder::Time(v) => Column::Time(std::mem::take(v)),
             ColBuilder::Str(v) => Column::Str(std::mem::take(v)),
         }
     }

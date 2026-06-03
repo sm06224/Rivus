@@ -116,6 +116,9 @@ pub enum Func {
     /// `date(x)` — the calendar `date` of a datetime (drops the time-of-day),
     /// returning the exact `date` lane. #58.
     Date,
+    /// `time(x)` — the `time`-of-day of a datetime (drops the calendar date),
+    /// returning the exact `time` lane. #58.
+    Time,
 }
 
 impl Func {
@@ -151,6 +154,7 @@ impl Func {
             "weekday" => Func::Weekday,
             "is_weekend" => Func::IsWeekend,
             "date" => Func::Date,
+            "time" => Func::Time,
             _ => return None,
         })
     }
@@ -186,6 +190,7 @@ impl Func {
             Func::Weekday => "weekday",
             Func::IsWeekend => "is_weekend",
             Func::Date => "date",
+            Func::Time => "time",
         }
     }
 }
