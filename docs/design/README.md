@@ -62,6 +62,7 @@ hidden serialization / opaque optimizer / runtime magic without observability。
 | 21 | [exact-decimal](21-exact-decimal.md) | 10進固定小数点レーン（COBOL的・厳密/並列安全）。`--exact`・`:decimal` でオプトイン |
 | 22 | [gpu-backend](22-gpu-backend.md) | GPU backend（feature-gate任意・CPU fallback・既定は依存ゼロ）。`--accel` |
 | 23 | [datetime-and-reshape](23-datetime-and-reshape.md) | 日時レーン（`yyMMddhhmmss`等）・list/set/join 集計（配列化）・pivot/unpivot |
+| 24 | [validation](24-validation.md) | バリデーション層（validator≠filter・reject/warn/quarantine・行内/行間/窓内・ingress/egress）。`\|!`。`#80`/`#81` を収斂 |
 
 ## 段階設計（MVP → 最適化 → JIT/分散）
 
