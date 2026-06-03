@@ -191,6 +191,11 @@ pub enum Column {
     DateTime(DtColumn),
     /// Duration lane (signed tick span; design 23 / #57).
     Duration(DurColumn),
+    /// Calendar date lane (i32 epoch-day, no time-of-day; #58). Integer → exact
+    /// and associative, like the datetime/duration lanes.
+    Date(Vec<i32>),
+    /// Time-of-day lane (i64 ticks since midnight; #58, MVP `Sec`).
+    Time(Vec<i64>),
     Str(StrColumn),
 }
 
@@ -203,6 +208,8 @@ impl Column {
             Column::Dec(v) => v.unscaled.len(),
             Column::DateTime(v) => v.ticks.len(),
             Column::Duration(v) => v.ticks.len(),
+            Column::Date(v) => v.len(),
+            Column::Time(v) => v.len(),
             Column::Str(v) => v.len(),
         }
     }
@@ -219,6 +226,8 @@ impl Column {
             Column::Dec(v) => DataType::Decimal { scale: v.scale },
             Column::DateTime(v) => DataType::DateTime { unit: v.unit },
             Column::Duration(v) => DataType::Duration { unit: v.unit },
+            Column::Date(_) => DataType::Date,
+            Column::Time(_) => DataType::Time,
             Column::Str(_) => DataType::Str,
         }
     }
@@ -235,6 +244,11 @@ impl Column {
             Column::Duration(v) => {
                 Value::Duration(crate::value::Duration::new(v.ticks[row], v.unit))
             }
+            Column::Date(v) => Value::Date(crate::value::Date::new(v[row])),
+            Column::Time(v) => Value::Time(crate::value::TimeOfDay::new(
+                v[row],
+                crate::value::TimeUnit::Sec,
+            )),
             Column::Str(v) => Value::Str(v.get(row).to_string()),
         }
     }
@@ -250,6 +264,8 @@ impl Column {
             (Column::Dec(a), Column::Dec(b)) => a.unscaled.extend_from_slice(&b.unscaled),
             (Column::DateTime(a), Column::DateTime(b)) => a.ticks.extend_from_slice(&b.ticks),
             (Column::Duration(a), Column::Duration(b)) => a.ticks.extend_from_slice(&b.ticks),
+            (Column::Date(a), Column::Date(b)) => a.extend_from_slice(b),
+            (Column::Time(a), Column::Time(b)) => a.extend_from_slice(b),
             (Column::Str(a), Column::Str(b)) => a.append(b),
             _ => {}
         }
@@ -288,6 +304,12 @@ impl Column {
                     .collect(),
                 unit: v.unit,
             }),
+            Column::Date(v) => {
+                Column::Date(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect())
+            }
+            Column::Time(v) => {
+                Column::Time(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect())
+            }
             Column::Str(v) => {
                 let mut out = StrColumn::with_capacity(indices.len(), 0);
                 for o in indices {
@@ -316,6 +338,8 @@ impl Column {
                 ticks: indices.iter().map(|&i| v.ticks[i]).collect(),
                 unit: v.unit,
             }),
+            Column::Date(v) => Column::Date(indices.iter().map(|&i| v[i]).collect()),
+            Column::Time(v) => Column::Time(indices.iter().map(|&i| v[i]).collect()),
             Column::Str(v) => Column::Str(v.gather(indices)),
         }
     }

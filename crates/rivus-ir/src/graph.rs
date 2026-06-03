@@ -67,6 +67,37 @@ pub enum FillMethod {
     Median,
 }
 
+/// What a `|!` validator does with a row that fails its contract (#83, §24.2).
+/// Every disposition surfaces the failure on the error stream (never silent);
+/// they differ only in what happens to the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Keep the row, surface the violation (`Recoverable`).
+    Warn,
+    /// Drop the row, surface the violation (`Recoverable`).
+    Reject,
+    /// Halt the run (`Fatal`, mode = Halted) on the first violation (strict).
+    Halt,
+}
+
+impl Disposition {
+    pub fn parse(s: &str) -> Option<Disposition> {
+        Some(match s {
+            "warn" => Disposition::Warn,
+            "reject" => Disposition::Reject,
+            "halt" => Disposition::Halt,
+            _ => return None,
+        })
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Disposition::Warn => "warn",
+            Disposition::Reject => "reject",
+            Disposition::Halt => "halt",
+        }
+    }
+}
+
 /// Aggregate functions for `|# key agg:col` (count is always emitted implicitly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
@@ -270,6 +301,13 @@ pub enum Op {
     StreamRef { name: String },
     /// `|? <pred>`
     Filter { pred: Expr },
+    /// `|! <pred> warn|reject|halt` — declare a row contract: a row where `pred`
+    /// is false is non-conforming and disposed of per `disposition`, always
+    /// surfaced on the error stream (never silent). Stateless (row-wise). #83 §24.
+    Validate {
+        pred: Expr,
+        disposition: Disposition,
+    },
     /// `|> field [field ...]` — pure column selection.
     Project { fields: Vec<String> },
     /// `|> field (expr) as alias ...` — projection with computed columns. Each
@@ -443,6 +481,7 @@ impl Op {
             Op::OpenJsonl { .. } => "open",
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
+            Op::Validate { .. } => "validate",
             Op::Project { .. } => "project",
             Op::ProjectExpr { .. } => "project",
             Op::Take { .. } => "take",
@@ -544,6 +583,7 @@ impl Op {
             Op::OpenJsonl { path } => format!("open {path}"),
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
+            Op::Validate { pred, disposition } => format!("|! {pred} {}", disposition.as_str()),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
             Op::ProjectExpr { items } => {
                 let parts: Vec<String> = items

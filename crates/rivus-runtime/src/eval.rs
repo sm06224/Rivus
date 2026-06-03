@@ -164,6 +164,64 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
                 },
             }
         }
+        // Date extractors (#58): coerce to a calendar date (a date cell as-is, a
+        // datetime's date part, or a parsed text), then derive. A value that
+        // won't coerce yields `Null` (continue-first).
+        Func::Weekday => match as_date(arg(0)) {
+            Some(d) => Value::I64(d.weekday() as i64),
+            None => Value::Null,
+        },
+        Func::IsWeekend => match as_date(arg(0)) {
+            Some(d) => Value::Bool(d.weekday() >= 5),
+            None => Value::Null,
+        },
+        Func::Date => match as_date(arg(0)) {
+            Some(d) => Value::Date(d),
+            None => Value::Null,
+        },
+        Func::Time => match as_time(arg(0)) {
+            Some(t) => Value::Time(t),
+            None => Value::Null,
+        },
+    }
+}
+
+/// Coerce a value to a [`TimeOfDay`] for `time(x)` (#58): a time cell as-is; a
+/// datetime → its time-of-day part (ticks mod one day); `HH:mm:ss` text →
+/// parsed; else a datetime auto-parse reduced to its time. Else `None`.
+fn as_time(v: Value) -> Option<rivus_core::TimeOfDay> {
+    use rivus_core::{TimeOfDay, TimeUnit};
+    let from_dt = |dt: rivus_core::DateTime| {
+        let per_day = dt.unit.per_sec() * 86_400;
+        TimeOfDay::new(dt.ticks.rem_euclid(per_day), dt.unit)
+    };
+    match v {
+        Value::Time(t) => Some(t),
+        Value::DateTime(dt) => Some(from_dt(dt)),
+        Value::Str(s) => TimeOfDay::parse_at(&s, TimeUnit::Sec)
+            .or_else(|| as_datetime(Value::Str(s)).map(from_dt)),
+        _ => None,
+    }
+}
+
+/// Coerce a value to a calendar [`Date`] for the date functions (#58): a date
+/// cell as-is; a datetime → its date part; ISO `yyyy-MM-dd` text → parsed; else
+/// a text/epoch value is read through the datetime auto-parse and reduced to its
+/// date. Anything else → `None` (continue-first).
+fn as_date(v: Value) -> Option<rivus_core::Date> {
+    match v {
+        Value::Date(d) => Some(d),
+        Value::DateTime(dt) => {
+            let (y, mo, d, ..) = dt.fields();
+            Some(rivus_core::Date::from_ymd(y, mo, d))
+        }
+        Value::Str(s) => rivus_core::Date::parse(&s).or_else(|| {
+            as_datetime(Value::Str(s)).map(|dt| {
+                let (y, mo, d, ..) = dt.fields();
+                rivus_core::Date::from_ymd(y, mo, d)
+            })
+        }),
+        _ => None,
     }
 }
 
@@ -398,6 +456,8 @@ fn to_i64(v: Value) -> i64 {
         Value::Dec(d) => d.to_f64() as i64,
         Value::DateTime(t) => t.ticks,
         Value::Duration(d) => d.ticks,
+        Value::Date(d) => d.epoch_day as i64,
+        Value::Time(t) => t.ticks,
         Value::Bool(b) => b as i64,
         Value::Str(s) => s
             .trim()
@@ -416,6 +476,8 @@ fn to_f64(v: Value) -> f64 {
         Value::Dec(d) => d.to_f64(),
         Value::DateTime(t) => t.ticks as f64,
         Value::Duration(d) => d.ticks as f64,
+        Value::Date(d) => d.epoch_day as f64,
+        Value::Time(t) => t.ticks as f64,
         Value::Bool(b) => b as i64 as f64,
         Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
         Value::Null => f64::NAN,
@@ -431,6 +493,8 @@ fn to_bool(v: Value) -> bool {
         Value::Dec(d) => d.unscaled != 0,
         Value::DateTime(t) => t.ticks != 0,
         Value::Duration(d) => d.ticks != 0,
+        Value::Date(d) => d.epoch_day != 0,
+        Value::Time(t) => t.ticks != 0,
         Value::Str(s) => s.trim().eq_ignore_ascii_case("true") || s.trim() == "1",
         Value::Null => false,
     }
@@ -450,6 +514,13 @@ fn cast_value(v: Value, ty: DataType) -> Value {
         DataType::DateTime { unit } => Value::DateTime(rivus_core::DateTime::new(to_i64(v), unit)),
         // Cast to duration treats the value as a raw tick span at the unit.
         DataType::Duration { unit } => Value::Duration(rivus_core::Duration::new(to_i64(v), unit)),
+        // Cast to date treats the value as an epoch-day (i32).
+        DataType::Date => Value::Date(rivus_core::Date::new(to_i64(v) as i32)),
+        // Cast to time treats the value as ticks-since-midnight (MVP Sec).
+        DataType::Time => Value::Time(rivus_core::TimeOfDay::new(
+            to_i64(v),
+            rivus_core::TimeUnit::Sec,
+        )),
         DataType::Bool => Value::Bool(to_bool(v)),
         DataType::Str => Value::Str(v.to_string()),
         DataType::Null => Value::Null,
@@ -521,6 +592,8 @@ pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
             let ticks = (0..n).map(|i| to_i64(col.value_at(i))).collect();
             Column::Duration(rivus_core::DurColumn { ticks, unit })
         }
+        DataType::Date => Column::Date((0..n).map(|i| to_i64(col.value_at(i)) as i32).collect()),
+        DataType::Time => Column::Time((0..n).map(|i| to_i64(col.value_at(i))).collect()),
         DataType::Bool => Column::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
         DataType::Str => {
             let mut s = StrColumn::with_capacity(n, n * 8);
@@ -558,7 +631,8 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 | Func::Day
                 | Func::Hour
                 | Func::Minute
-                | Func::Second => Column::I64(
+                | Func::Second
+                | Func::Weekday => Column::I64(
                     (0..n)
                         .map(|r| to_i64(call_func(*func, args, chunk, r)))
                         .collect(),
@@ -577,7 +651,8 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 | Func::EndsWith
                 | Func::Like
                 | Func::Glob
-                | Func::Regexp => Column::Bool(
+                | Func::Regexp
+                | Func::IsWeekend => Column::Bool(
                     (0..n)
                         .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
                         .collect(),
@@ -586,6 +661,13 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 // the data (e.g. `round` is integral, `coalesce` may be text),
                 // so pick the narrowest fitting lane per chunk.
                 Func::Abs | Func::Round | Func::Floor | Func::Ceil | Func::Coalesce => {
+                    let vals: Vec<Value> =
+                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    column_from_values(vals)
+                }
+                // `date(x)`/`time(x)` → the exact date/time lane
+                // (column_from_values keeps the all-Date / all-Time result). #58.
+                Func::Date | Func::Time => {
                     let vals: Vec<Value> =
                         (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
                     column_from_values(vals)
@@ -660,6 +742,32 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
             });
         }
     }
+    // All-date → keep the date lane (e.g. `date(ts)`). Integer epoch-day, #58.
+    if vals.first().is_some_and(|v| matches!(v, Value::Date(_)))
+        && vals.iter().all(|v| matches!(v, Value::Date(_)))
+    {
+        return Column::Date(
+            vals.iter()
+                .map(|v| match v {
+                    Value::Date(d) => d.epoch_day,
+                    _ => 0,
+                })
+                .collect(),
+        );
+    }
+    // All-time → keep the time-of-day lane (e.g. `time(ts)`). Integer ticks, #58.
+    if vals.first().is_some_and(|v| matches!(v, Value::Time(_)))
+        && vals.iter().all(|v| matches!(v, Value::Time(_)))
+    {
+        return Column::Time(
+            vals.iter()
+                .map(|v| match v {
+                    Value::Time(t) => t.ticks,
+                    _ => 0,
+                })
+                .collect(),
+        );
+    }
     if all_bool {
         Column::Bool(
             vals.iter()
@@ -699,6 +807,8 @@ fn const_column(v: &Value, n: usize) -> Column {
             ticks: vec![d.ticks; n],
             unit: d.unit,
         }),
+        Value::Date(d) => Column::Date(vec![d.epoch_day; n]),
+        Value::Time(t) => Column::Time(vec![t.ticks; n]),
         Value::Bool(x) => Column::Bool(vec![*x; n]),
         Value::Str(s) => {
             let mut c = StrColumn::with_capacity(n, s.len() * n);
@@ -730,6 +840,11 @@ fn col_num_lane(col: Column) -> (Vec<f64>, bool) {
         Column::DateTime(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
         // Duration likewise rides the integer tick lane (#57).
         Column::Duration(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
+        // Date arithmetic operates on the integer epoch-day lane (#58); diffs /
+        // day-offsets stay integer.
+        Column::Date(v) => (v.iter().map(|&x| x as f64).collect(), true),
+        // Time-of-day rides the integer tick lane too (#58).
+        Column::Time(v) => (v.iter().map(|&x| x as f64).collect(), true),
         Column::Str(s) => {
             let lane = (0..s.len())
                 .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
@@ -1066,6 +1181,11 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
             Column::DateTime(_) => None,
             // Duration likewise stays off the f64 lane (exact i64; #57).
             Column::Duration(_) => None,
+            // Date routes to the exact Value path too (epoch-day compared as a
+            // date, not a coerced float); #58.
+            Column::Date(_) => None,
+            // Time-of-day routes to the exact Value path too (#58).
+            Column::Time(_) => None,
             Column::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
             Column::Str(_) => None,
         },

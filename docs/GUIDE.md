@@ -76,7 +76,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
 | `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
-| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), or `duration` (signed time spans; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
+| `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), `duration` (signed time spans), `date` (ISO `yyyy-MM-dd` calendar dates), or `time` (`HH:mm:ss` time-of-day; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |
@@ -120,6 +120,36 @@ where age >= 20, country == "JP"      # comma = AND (same as `and`)
 |? score > 90 or age < 18
 |? (score / age) > 3          # arithmetic in parens (see §6)
 ```
+
+### `|!` — validate (declare a row contract)
+
+A **validator is not a filter.** `|?` quietly drops the rows it doesn't want;
+`|!` declares a *contract* — a row that fails it is disposed of **explicitly and
+always reported** on the error stream (never silent). Same predicate syntax as
+`|?` (commas = AND), followed by a **required disposition**:
+
+```
+|! age >= 0, age <= 120 warn         # keep every row, but report the violations
+|! email contains "@" reject         # drop the failing rows, and report them
+|! id >= 1 halt                      # stop the run on the first violation (strict)
+```
+
+| disposition | the failing row | reported |
+|---|---|---|
+| `warn` | kept (passes through) | yes — `N row(s) failed … (warn)` |
+| `reject` | dropped | yes — `… (reject); dropped` |
+| `halt` | — (run halts) | yes — a **fatal** event |
+
+- The disposition is **mandatory** — there is no implicit default, so a silent
+  drop policy is impossible. Every disposition surfaces the **count, the rule,
+  and a sample** of an offending row (e.g. `e.g. id=2, age=-5`).
+- `warn`/`reject` report **one summary on completion** (the count is chunk-size
+  independent); `reject` is byte-identical serial vs parallel. `halt` raises a
+  `Fatal` (the run stops, continue-first §13). The CSV reader's parse-failure
+  reporting (§6) is the same idea applied at ingest — the first row-level
+  validator.
+- _Coming next (§24):_ declarative rules (`in 0..120`, `matches "…"`, `required`,
+  `in {…}`), `quarantine(sink)` (dead-letter), and inter-row / windowed checks.
 
 ### `|>` — project / compute columns
 
@@ -444,6 +474,61 @@ open shifts.csv (emp:str start:datetime("yyMMddHHmmss") end:datetime("yyMMddHHmm
   where `f64` would collapse adjacent values).
 - **Rendering**: `format(dur)` → human `3d 02:15:00`; `format(dur, "iso")` →
   ISO-8601 `PT…H…M…S`. Default Display is the human form.
+
+**Date lane (`date`)** — a **calendar date** with no time-of-day, stored as an
+exact `i32` epoch-day (days since `1970-01-01`). Like the datetime/duration
+lanes it is integer → exact and *associative*, so `min`/`max`/`count` and a
+group-by on a date column are **byte-identical in parallel** (and `min`/`max`
+keep the date type, rendering `yyyy-MM-dd`). Read (and render) ISO `yyyy-MM-dd`:
+
+```
+open events.csv (id:int day:date)   # parse "2024-06-03" into the date lane
+|# day count                         # group by date — exact, parallel byte-identical
+```
+
+- **ISO `yyyy-MM-dd` only**, and it renders back as `yyyy-MM-dd` (round-trips
+  through `save`, JSON emits a quoted `"2024-06-03"`).
+- **Never-silent on a bad date**: an impossible date like `2024-02-30` (or any
+  malformed cell) is kept as the default `1970-01-01` (continue-first) **and**
+  the loss is reported on the error stream — `N value(s) in column 'day' (as
+  date) could not be parsed; kept as default 0`. An **empty** cell is "missing",
+  not a failure (never counted), so clean data stays quiet.
+- **Exact, never f64**: comparison ordering and `min`/`max`/`count` run on the
+  integer epoch-day.
+
+**Time-of-day lane (`time`)** — a wall-clock **time of day** with no calendar
+date, stored as exact `i64` ticks since midnight (MVP second resolution). Reads
+and renders `HH:mm:ss`; like the date lane, `min`/`max`/`count` and group-by are
+exact and **byte-identical in parallel** (min/max keep the time type):
+
+```
+open log.csv (start:time end:time)   # parse "09:05:00" into the time lane
+|# start min:start max:start          # exact, parallel byte-identical (HH:mm:ss)
+```
+
+- **`HH:mm:ss` only** (hour `0..23`, minute/second `0..59`); a bad time like
+  `25:00:00` is kept as `00:00:00` (continue-first) **and** surfaced on the error
+  stream (`N value(s) in column '…' (as time) could not be parsed`); an empty
+  cell is "missing", not counted. Non-zero-padded input (`9:5:0`) parses and
+  canonicalizes to `HH:mm:ss`. Sub-second input is truncated to second
+  resolution (`12:30:00.5` → `12:30:00`; `:time` is a second-resolution type).
+
+**Date / time extractors** — usable anywhere an expression is (computed
+columns, filters). Each accepts a `date`, a `datetime`, or parseable text:
+
+```
+open events.csv (ts:datetime)
+|> (date(ts)) as day              # DateTime → date (drops the time-of-day)
+   (time(ts)) as tod             # DateTime → time-of-day (drops the date)
+   (weekday(ts)) as wd            # 0=Mon … 6=Sun  (i64)
+   (is_weekend(ts)) as we         # Sat/Sun → true (bool)
+|? is_weekend(day)                # …and they compose / filter
+```
+
+- `date(x)` → the **date** lane (`yyyy-MM-dd`); `time(x)` → the **time** lane
+  (`HH:mm:ss`); `weekday(x)` → `i64` `0=Mon … 6=Sun`; `is_weekend(x)` → `bool`
+  (weekday ≥ 5). A value that won't coerce yields null (continue-first).
+- _Coming next (#58):_ a dedicated `Weekday` subtype (renders `Mon`…`Sun`).
 
 ---
 

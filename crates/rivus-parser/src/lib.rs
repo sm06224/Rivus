@@ -27,8 +27,8 @@ mod lexer;
 use lexer::{Lexer, Tok};
 use rivus_core::{DataType, Mode, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
-    Access, AggFunc, ArithOp, BinType, CmpOp, EdgeKind, Endian, Expr, FillMethod, Func, Hook,
-    HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
+    Access, AggFunc, ArithOp, BinType, CmpOp, Disposition, EdgeKind, Endian, Expr, FillMethod,
+    Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -187,6 +187,26 @@ impl Parser {
                     self.bump();
                     let pred = self.parse_filter_preds()?;
                     let n = self.g.add_node(Op::Filter { pred });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
+                // `|! pred warn|reject|halt` — a row contract; the disposition is
+                // required (no implicit default, so a silent policy is impossible).
+                Tok::PipeValidate => {
+                    self.bump();
+                    let pred = self.parse_filter_preds()?;
+                    let disposition = match self.tok().clone() {
+                        Tok::Word(w) if Disposition::parse(&w).is_some() => {
+                            self.bump();
+                            Disposition::parse(&w).unwrap()
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "`|!` needs a disposition (warn|reject|halt), found {other:?}"
+                            )))
+                        }
+                    };
+                    let n = self.g.add_node(Op::Validate { pred, disposition });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -562,6 +582,14 @@ impl Parser {
             return Ok(DataType::Duration {
                 unit: TimeUnit::Sec,
             });
+        }
+        if word.eq_ignore_ascii_case("date") {
+            // Calendar date, read from ISO `yyyy-MM-dd` (i32 epoch-day; #58).
+            return Ok(DataType::Date);
+        }
+        if word.eq_ignore_ascii_case("time") {
+            // Time-of-day, read from `HH:mm:ss[.frac]` (i64 ticks; #58, MVP Sec).
+            return Ok(DataType::Time);
         }
         if word.eq_ignore_ascii_case("decimal") {
             if !self.eat(&Tok::LParen) {
@@ -1483,6 +1511,65 @@ mod tests {
             let s = parse(src).unwrap().to_source();
             assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
             assert!(s.contains("duration"), "duration type lost in {s}");
+        }
+    }
+
+    #[test]
+    fn date_type_parses_and_is_reversible() {
+        // `:date` in a declared schema and as a cast (#58, ISO yyyy-MM-dd lane).
+        for src in [
+            "F:\n open events.csv (id:int day:date)\n |> day\n;",
+            "F:\n open events.csv\n cast day:date\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(s.contains("date"), "date type lost in {s}");
+        }
+    }
+
+    #[test]
+    fn validate_op_round_trips_and_requires_disposition() {
+        // `|! pred warn|reject|halt` round-trips; the disposition is required so
+        // a silent policy is impossible (#83 §24).
+        for (src, disp) in [
+            ("F:\n open d.csv\n |! age >= 0 warn\n;", "warn"),
+            (
+                "F:\n open d.csv\n |! age >= 0, age <= 120 reject\n;",
+                "reject",
+            ),
+            ("F:\n open d.csv\n |! id == 1 halt\n;", "halt"),
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(s.contains("|!") && s.contains(disp), "validate lost in {s}");
+        }
+        assert!(
+            parse("F:\n open d.csv\n |! age >= 0\n;").is_err(),
+            "validate must require an explicit disposition"
+        );
+    }
+
+    #[test]
+    fn time_type_and_function_parse_and_are_reversible() {
+        // `:time` type + the `time(x)` extractor round-trip through to_source (#58).
+        for src in [
+            "F:\n open log.csv (start:time)\n |> start\n;",
+            "F:\n open log.csv\n |> (time(ts)) as tod\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(s.contains("time"), "time lost in {s}");
+        }
+    }
+
+    #[test]
+    fn date_functions_parse_and_are_reversible() {
+        // The #58 date extractors survive `to_source` round-trips.
+        let src = "F:\n open log.csv\n |> (weekday(ts)) as wd (is_weekend(ts)) as we (date(ts)) as day\n;";
+        let s = parse(src).unwrap().to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        for needle in ["weekday(", "is_weekend(", "date("] {
+            assert!(s.contains(needle), "missing {needle} in {s}");
         }
     }
 

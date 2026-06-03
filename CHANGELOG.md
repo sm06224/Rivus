@@ -61,6 +61,28 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **`|!` validate — declare a row contract (Epic #82 / #83, §24, std-only).** A
+  validator is not a filter: `|! <pred> warn|reject|halt` declares a contract and
+  disposes of a non-conforming row **explicitly and always reports it** on the
+  error stream (never silent). The disposition is **required** (no implicit
+  default → no silent policy): `warn` keeps the row, `reject` drops it, `halt`
+  raises a `Fatal` (the run stops). `warn`/`reject` emit one summary on
+  completion (count + rule + a sample offending row; the count is chunk-size
+  independent), and `reject` is byte-identical serial vs parallel. `Op::Validate`
+  round-trips through `to_source`; the optimizer treats it as a barrier
+  (optimized == `--no-opt`). The CSV reader's parse-failure reporting is the same
+  idea at ingest. Declarative rules / `quarantine(sink)` / inter-row checks are
+  on the roadmap (§24).
+- **Time-series subtypes `date` & `time` (Epic #56 / #58, std-only).** Two exact,
+  dependency-zero temporal lanes built on the Hinnant civil↔days math: `date`
+  (i32 epoch-day, ISO `yyyy-MM-dd`) and `time` (i64 ticks-since-midnight,
+  `HH:mm:ss`; second resolution). Declare them in a schema (`(d:date t:time)`) or
+  `cast`; reads count parse failures and surface them like the other lanes (an
+  impossible date `2024-02-30` / bad time `25:00:00` is reported, empty cells are
+  "missing", never-silent). Both round-trip through `to_source` and are exact +
+  associative, so `min`/`max`/`count` and group-by keep the type and are
+  **byte-identical in parallel**. New extractors usable anywhere an expression
+  is: `date(x)`, `time(x)`, `weekday(x)` (`0=Mon…6=Sun`), `is_weekend(x)`.
 - **Animated SVG flow dashboard + `--open` (Epic #30 / Pillar B, std-only).**
   `--serve`'s dashboard was a near-static table (hard to tell from `--tui`); it
   now renders the flow as a left→right layered **SVG DAG and animates the live

@@ -624,6 +624,262 @@ impl fmt::Display for Duration {
     }
 }
 
+/// A calendar date with **no** time-of-day: exact `i32` days since the Unix
+/// epoch (1970-01-01 = day 0). Integer representation → exact and associative
+/// (like the decimal/datetime lanes), and it carries no `unit` (a date has no
+/// sub-day resolution). Renders / parses as ISO `yyyy-MM-dd`.
+/// (#58, Epic #56 — building the time-series subtypes on `DateTime`/`Duration`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Date {
+    /// Days since 1970-01-01 (proleptic Gregorian).
+    pub epoch_day: i32,
+}
+
+impl Date {
+    pub fn new(epoch_day: i32) -> Date {
+        Date { epoch_day }
+    }
+
+    /// Build from a civil `(year, month, day)`. The epoch-day is held in `i32`,
+    /// which spans roughly years ±5.8 million around 1970 — far beyond any real
+    /// calendar use. A date outside that range would truncate; debug builds
+    /// assert against it so a silent wrap never slips through unnoticed.
+    pub fn from_ymd(y: i64, m: i64, d: i64) -> Date {
+        let ed = days_from_civil(y, m, d);
+        debug_assert!(
+            i32::try_from(ed).is_ok(),
+            "Date epoch-day {ed} out of i32 range (year {y})"
+        );
+        Date {
+            epoch_day: ed as i32,
+        }
+    }
+
+    /// The civil `(year, month, day)`.
+    pub fn ymd(&self) -> (i64, i64, i64) {
+        civil_from_days(self.epoch_day as i64)
+    }
+
+    /// Day of week, `0 = Monday … 6 = Sunday` (ISO). Exact integer arithmetic.
+    pub fn weekday(&self) -> u8 {
+        // 1970-01-01 was a Thursday (=3 in Mon..Sun). rem_euclid keeps it in 0..6
+        // for negative epoch-days too.
+        (((self.epoch_day as i64) + 3).rem_euclid(7)) as u8
+    }
+
+    /// Parse a strict ISO `yyyy-MM-dd` date. `None` for any malformed or
+    /// out-of-range date (e.g. `2024-02-30`), validated by a civil round-trip so
+    /// a nonexistent day never silently maps to a nearby one (never-silent).
+    pub fn parse(s: &str) -> Option<Date> {
+        let b = s.trim().as_bytes();
+        if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+            return None;
+        }
+        let num = |lo: usize, hi: usize| -> Option<i64> {
+            let mut n = 0i64;
+            for &c in &b[lo..hi] {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                n = n * 10 + (c - b'0') as i64;
+            }
+            Some(n)
+        };
+        let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            return None;
+        }
+        let date = Date::from_ymd(y, m, d);
+        if date.ymd() != (y, m, d) {
+            return None; // impossible civil date (e.g. 2024-02-30)
+        }
+        Some(date)
+    }
+}
+
+impl fmt::Display for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (y, m, d) = self.ymd();
+        write!(f, "{y:04}-{m:02}-{d:02}")
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::Date;
+
+    #[test]
+    fn parse_format_roundtrips_and_is_exact() {
+        for s in ["1970-01-01", "2000-02-29", "2024-06-03", "1999-12-31"] {
+            let d = Date::parse(s).expect("valid date");
+            assert_eq!(d.to_string(), s, "round-trip {s}");
+            // from_ymd ⇄ ymd is exact
+            let (y, m, dd) = d.ymd();
+            assert_eq!(Date::from_ymd(y, m, dd), d);
+        }
+        // epoch anchor
+        assert_eq!(Date::parse("1970-01-01").unwrap().epoch_day, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_and_partial() {
+        for s in [
+            "2024-02-30", // nonexistent day
+            "2023-02-29", // not a leap year
+            "2024-13-01", // bad month
+            "2024-00-10", // zero month
+            "2024-6-3",   // not zero-padded / wrong length
+            "2024/06/03", // wrong separator
+            "notadate",
+            "",
+        ] {
+            assert!(Date::parse(s).is_none(), "must reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn weekday_is_correct() {
+        // 2024-06-03 is a Monday (=0), 2024-06-09 is a Sunday (=6).
+        assert_eq!(Date::parse("2024-06-03").unwrap().weekday(), 0);
+        assert_eq!(Date::parse("2024-06-09").unwrap().weekday(), 6);
+        assert_eq!(Date::parse("1970-01-01").unwrap().weekday(), 3); // Thursday
+    }
+}
+
+/// A **time-of-day** with no calendar date: exact `i64` ticks since midnight at
+/// a fixed `unit` (`Sec` in the MVP). Renders / parses as `HH:mm:ss[.frac]`,
+/// bounded to a single day. Integer → exact and associative like the other
+/// temporal lanes. (#58, Epic #56.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeOfDay {
+    /// Ticks since midnight at `unit` resolution (`0 .. ticks_per_day`).
+    pub ticks: i64,
+    pub unit: TimeUnit,
+}
+
+/// Sub-second decimal digits carried by a `unit` (`Sec`→0 … `Nano`→9).
+fn unit_sub_digits(unit: TimeUnit) -> usize {
+    match unit {
+        TimeUnit::Sec => 0,
+        TimeUnit::Milli => 3,
+        TimeUnit::Micro => 6,
+        TimeUnit::Nano => 9,
+    }
+}
+
+impl TimeOfDay {
+    pub fn new(ticks: i64, unit: TimeUnit) -> TimeOfDay {
+        TimeOfDay { ticks, unit }
+    }
+
+    /// `(hour, minute, second, sub_second_ticks)`.
+    pub fn parts(&self) -> (i64, i64, i64, i64) {
+        let per = self.unit.per_sec();
+        let total_s = self.ticks.div_euclid(per);
+        let sub = self.ticks.rem_euclid(per);
+        (total_s / 3600, (total_s / 60) % 60, total_s % 60, sub)
+    }
+
+    /// Parse `HH:mm:ss[.frac]` at `unit`. `None` for a malformed or out-of-range
+    /// time (hour `0..23`, minute/second `0..59`) — never-silent, so a bad time
+    /// never silently maps to a nearby one.
+    pub fn parse_at(s: &str, unit: TimeUnit) -> Option<TimeOfDay> {
+        let s = s.trim();
+        let (clock, frac) = match s.split_once('.') {
+            Some((c, f)) => (c, Some(f)),
+            None => (s, None),
+        };
+        let mut it = clock.split(':');
+        let h: i64 = it.next()?.parse().ok()?;
+        let m: i64 = it.next()?.parse().ok()?;
+        let sec: i64 = it.next()?.parse().ok()?;
+        if it.next().is_some()
+            || !(0..24).contains(&h)
+            || !(0..60).contains(&m)
+            || !(0..60).contains(&sec)
+        {
+            return None;
+        }
+        let per = unit.per_sec();
+        let whole = ((h * 60 + m) * 60 + sec) * per;
+        let sub = match frac {
+            None => 0,
+            Some(f) => {
+                if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                // Pad / truncate the fraction to the unit's digit width.
+                let w = unit_sub_digits(unit);
+                let mut digits = String::with_capacity(w);
+                for i in 0..w {
+                    digits.push(f.as_bytes().get(i).map_or('0', |&b| b as char));
+                }
+                digits.parse::<i64>().unwrap_or(0)
+            }
+        };
+        Some(TimeOfDay::new(whole + sub, unit))
+    }
+}
+
+impl fmt::Display for TimeOfDay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (h, m, s, sub) = self.parts();
+        write!(f, "{h:02}:{m:02}:{s:02}")?;
+        let w = unit_sub_digits(self.unit);
+        if w > 0 && sub != 0 {
+            write!(f, ".{sub:0w$}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod timeofday_tests {
+    use super::{TimeOfDay, TimeUnit};
+
+    #[test]
+    fn parse_format_roundtrips_and_is_exact() {
+        for s in ["00:00:00", "09:05:07", "23:59:59", "12:30:00"] {
+            let t = TimeOfDay::parse_at(s, TimeUnit::Sec).expect("valid time");
+            assert_eq!(t.to_string(), s, "round-trip {s}");
+        }
+        assert_eq!(
+            TimeOfDay::parse_at("01:02:03", TimeUnit::Sec)
+                .unwrap()
+                .ticks,
+            3723
+        );
+    }
+
+    #[test]
+    fn rejects_invalid() {
+        // Out-of-range fields and structurally-wrong text are rejected;
+        // non-zero-padded fields (`1:2:3`) are valid and canonicalize on Display.
+        for s in [
+            "24:00:00", "12:60:00", "12:00:60", "12:00", "noon", "12:00:0x", "",
+        ] {
+            assert!(
+                TimeOfDay::parse_at(s, TimeUnit::Sec).is_none(),
+                "must reject {s:?}"
+            );
+        }
+        assert_eq!(
+            TimeOfDay::parse_at("1:2:3", TimeUnit::Sec)
+                .unwrap()
+                .to_string(),
+            "01:02:03",
+            "lenient parse canonicalizes on Display"
+        );
+    }
+
+    #[test]
+    fn sub_second_milli_roundtrips() {
+        let t = TimeOfDay::parse_at("00:00:01.250", TimeUnit::Milli).unwrap();
+        assert_eq!(t.ticks, 1_250);
+        assert_eq!(t.to_string(), "00:00:01.250");
+    }
+}
+
 /// A single scalar value. Used for literals, predicate evaluation and the
 /// "current object" (`$_`) field access. Bulk data lives in [`crate::Column`].
 #[derive(Debug, Clone, PartialEq)]
@@ -640,6 +896,10 @@ pub enum Value {
     DateTime(DateTime),
     /// Duration lane (signed tick span; design 23 / #57).
     Duration(Duration),
+    /// Calendar date lane (i32 epoch-day, no time-of-day; #58).
+    Date(Date),
+    /// Time-of-day lane (i64 ticks since midnight; #58).
+    Time(TimeOfDay),
     Str(String),
 }
 
@@ -653,6 +913,8 @@ impl Value {
             Value::Dec(d) => DataType::Decimal { scale: d.scale },
             Value::DateTime(t) => DataType::DateTime { unit: t.unit },
             Value::Duration(d) => DataType::Duration { unit: d.unit },
+            Value::Date(_) => DataType::Date,
+            Value::Time(_) => DataType::Time,
             Value::Str(_) => DataType::Str,
         }
     }
@@ -665,6 +927,8 @@ impl Value {
             Value::Dec(d) => Some(d.to_f64()),
             Value::DateTime(t) => Some(t.ticks as f64),
             Value::Duration(d) => Some(d.ticks as f64),
+            Value::Date(d) => Some(d.epoch_day as f64),
+            Value::Time(t) => Some(t.ticks as f64),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             _ => None,
         }
@@ -685,6 +949,8 @@ impl fmt::Display for Value {
             Value::Dec(d) => write!(f, "{d}"),
             Value::DateTime(t) => write!(f, "{t}"),
             Value::Duration(d) => write!(f, "{d}"),
+            Value::Date(d) => write!(f, "{d}"),
+            Value::Time(t) => write!(f, "{t}"),
             Value::Str(s) => write!(f, "{s}"),
         }
     }
@@ -711,6 +977,10 @@ pub enum DataType {
     Duration {
         unit: TimeUnit,
     },
+    /// Calendar date lane: i32 epoch-day, no time-of-day (#58).
+    Date,
+    /// Time-of-day lane: i64 ticks since midnight, no date (#58, MVP `Sec`).
+    Time,
     /// Stream-based text (see design doc 09 "Text is stream").
     Str,
 }
@@ -729,6 +999,8 @@ impl fmt::Display for DataType {
             DataType::DateTime { .. } => f.write_str("datetime"),
             // Unit omitted (Sec in the MVP) so `:duration` round-trips bare.
             DataType::Duration { .. } => f.write_str("duration"),
+            DataType::Date => f.write_str("date"),
+            DataType::Time => f.write_str("time"),
             DataType::Str => f.write_str("str"),
         }
     }

@@ -1136,6 +1136,11 @@ enum ColBuilder {
     /// Duration lane: signed tick spans at a fixed unit, parsed from the human
     /// `[-][Nd ]HH:MM:SS[.frac]` form (design 23 / #57).
     Duration(Vec<i64>, TimeUnit),
+    /// Date lane: i32 epoch-day, parsed from ISO `yyyy-MM-dd` (#58).
+    Date(Vec<i32>),
+    /// Time-of-day lane: i64 ticks since midnight, parsed from `HH:mm:ss[.frac]`
+    /// (#58, MVP `Sec`).
+    Time(Vec<i64>),
     Str(StrColumn),
 }
 
@@ -1157,6 +1162,8 @@ impl ColBuilder {
                 dt_spec.unwrap_or_else(|| Arc::new(DtSpec::auto(unit))),
             ),
             DataType::Duration { unit } => ColBuilder::Duration(Vec::with_capacity(cap), unit),
+            DataType::Date => ColBuilder::Date(Vec::with_capacity(cap)),
+            DataType::Time => ColBuilder::Time(Vec::with_capacity(cap)),
             // Estimate ~8 bytes per string cell for the backing byte buffer.
             _ => ColBuilder::Str(StrColumn::with_capacity(cap, cap * 8)),
         }
@@ -1234,6 +1241,34 @@ impl ColBuilder {
                     !t.is_empty()
                 }
             },
+            // Date text → i32 epoch-day; a malformed non-empty cell yields 0
+            // (1970-01-01) and is reported on the error stream, matching the
+            // other lanes (continue-first + never-silent; #58).
+            ColBuilder::Date(v) => match rivus_core::Date::parse(cell) {
+                Some(d) => {
+                    v.push(d.epoch_day);
+                    false
+                }
+                None => {
+                    v.push(0);
+                    !t.is_empty()
+                }
+            },
+            // Time-of-day text → i64 ticks; a malformed non-empty cell yields 0
+            // (midnight) and is reported on the error stream, like the other
+            // lanes (continue-first + never-silent; #58).
+            ColBuilder::Time(v) => {
+                match rivus_core::TimeOfDay::parse_at(cell, rivus_core::TimeUnit::Sec) {
+                    Some(tod) => {
+                        v.push(tod.ticks);
+                        false
+                    }
+                    None => {
+                        v.push(0);
+                        !t.is_empty()
+                    }
+                }
+            }
             ColBuilder::Str(v) => {
                 v.push(cell);
                 false
@@ -1258,6 +1293,8 @@ impl ColBuilder {
                 ticks: std::mem::take(v),
                 unit: *unit,
             }),
+            ColBuilder::Date(v) => Column::Date(std::mem::take(v)),
+            ColBuilder::Time(v) => Column::Time(std::mem::take(v)),
             ColBuilder::Str(v) => Column::Str(std::mem::take(v)),
         }
     }

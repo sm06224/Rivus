@@ -2670,6 +2670,426 @@ fn datetime_column_parses_and_is_chunk_size_independent() {
 }
 
 #[test]
+fn date_column_parses_chunk_size_independent_and_surfaces_bad() {
+    // `:date` reads ISO yyyy-MM-dd into the exact i32 epoch-day lane (#58). An
+    // invalid date (2024-02-30) is continue-first (epoch 0) AND surfaced on the
+    // error stream; an empty cell is "missing" (not counted). Result must not
+    // depend on chunk size.
+    let text = "id,d\n\
+                1,2024-06-03\n\
+                2,2024-02-30\n\
+                3,\n\
+                4,2023-12-25\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_date", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (id:int d:date)\n |> id d\n;");
+    let want_d = vec![
+        "2024-06-03".to_string(),
+        "1970-01-01".to_string(), // invalid → epoch 0 (continue-first)
+        "1970-01-01".to_string(), // empty → epoch 0 (missing, not a failure)
+        "2023-12-25".to_string(),
+    ];
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert!(
+            !res.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+            "date parse must never raise a fatal (cz={cz})"
+        );
+        assert_eq!(
+            collect_strings(&res, "D", "d"),
+            want_d,
+            "date ISO rendering changed at chunk_size {cz}"
+        );
+        assert_eq!(
+            collect_i64(&res, "D", "id"),
+            vec![1, 2, 3, 4],
+            "alignment @cz={cz}"
+        );
+        // Exactly one parse failure surfaced (the invalid date; empty not counted).
+        // Verbatim phrasing (incl. the "(as date)" lane tag the GUIDE quotes).
+        let fails = res
+            .errors
+            .iter()
+            .filter(|e| {
+                e.message
+                    .contains("in column 'd' (as date) could not be parsed; kept as default 0")
+            })
+            .count();
+        assert_eq!(
+            fails, 1,
+            "one date parse failure surfaced @cz={cz}: {:?}",
+            res.errors
+        );
+        // The declared lane is Date, not a string fallback.
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        let ci = o.chunks[0].schema.index_of("d").unwrap();
+        assert!(
+            matches!(
+                o.chunks[0].schema.fields[ci].dtype,
+                rivus_core::DataType::Date
+            ),
+            "d must be the date lane at chunk_size {cz}"
+        );
+    }
+}
+
+#[test]
+fn date_groupby_parallel_matches_serial() {
+    // The byte-range parallel reader builds Date columns with the same parse as
+    // the serial reader; a group-by count per date is exact + associative, so it
+    // is byte-identical across serial/parallel and chunk size (#58).
+    let rows = 6_000;
+    let mut rng = Rng::new(58);
+    let mut text = String::from("d,v\n");
+    let days = ["2024-06-01", "2024-06-02", "2024-06-03", "2023-12-25"];
+    for _ in 0..rows {
+        let d = days[rng.below(days.len() as u64) as usize];
+        text.push_str(&format!("{d},{}\n", rng.below(1000) as i64));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_date_par",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (d:date v:int)\n |# d count max:v\n;");
+
+    let snapshot = |pref: rivus_runtime::MemoryPref| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 512,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        let mut rows: Vec<(String, i64, i64)> = {
+            let days = collect_strings(&res, "D", "d");
+            let cnt = collect_i64(&res, "D", "count");
+            let mx = collect_i64(&res, "D", "max_v");
+            (0..days.len())
+                .map(|i| (days[i].clone(), cnt[i], mx[i]))
+                .collect()
+        };
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        snapshot(rivus_runtime::MemoryPref::Low),
+        snapshot(rivus_runtime::MemoryPref::Fast),
+        "date group-by must be byte-identical serial vs parallel"
+    );
+}
+
+#[test]
+fn date_minmax_keeps_date_type_and_parallel_matches_serial() {
+    // min/max on a date column keep the Date lane (render yyyy-MM-dd, not the
+    // raw epoch-day) and — being exact integer extremes — are byte-identical
+    // serial vs parallel and across chunk size (#58).
+    let rows = 6_000;
+    let mut rng = Rng::new(581);
+    let mut text = String::from("k,d\n");
+    let days = ["2024-06-01", "2024-01-15", "2023-12-25", "2024-02-29"];
+    // Guarantee both keys contain the extremes so the oracle is deterministic
+    // (min = 2023-12-25, max = 2024-06-01) regardless of the random fill.
+    for k in ["a", "b"] {
+        text.push_str(&format!("{k},2023-12-25\n{k},2024-06-01\n"));
+    }
+    for _ in 0..rows {
+        let k = if rng.below(2) == 0 { "a" } else { "b" };
+        let d = days[rng.below(days.len() as u64) as usize];
+        text.push_str(&format!("{k},{d}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_date_mm", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("M:\n open {p} (k:str d:date)\n |# k min:d max:d\n;");
+
+    let snapshot = |pref: rivus_runtime::MemoryPref| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 512,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        // The min/max columns must render as ISO dates (Date lane preserved).
+        for col in ["min_d", "max_d"] {
+            for s in collect_strings(&res, "M", col) {
+                assert!(
+                    s.len() == 10 && s.as_bytes()[4] == b'-',
+                    "{col} must render as yyyy-MM-dd (Date lane), got {s:?}"
+                );
+            }
+        }
+        let mut rows: Vec<(String, String, String)> = {
+            let k = collect_strings(&res, "M", "k");
+            let lo = collect_strings(&res, "M", "min_d");
+            let hi = collect_strings(&res, "M", "max_d");
+            (0..k.len())
+                .map(|i| (k[i].clone(), lo[i].clone(), hi[i].clone()))
+                .collect()
+        };
+        rows.sort();
+        rows
+    };
+    let serial = snapshot(rivus_runtime::MemoryPref::Low);
+    assert_eq!(
+        serial,
+        snapshot(rivus_runtime::MemoryPref::Fast),
+        "date min/max must be byte-identical serial vs parallel"
+    );
+    // Oracle: both keys span the full date set, so min/max are the true extremes.
+    assert_eq!(
+        serial,
+        vec![
+            (
+                "a".to_string(),
+                "2023-12-25".to_string(),
+                "2024-06-01".to_string()
+            ),
+            (
+                "b".to_string(),
+                "2023-12-25".to_string(),
+                "2024-06-01".to_string()
+            ),
+        ],
+        "date min/max extreme values"
+    );
+}
+
+#[test]
+fn time_column_reads_minmax_and_surfaces_bad() {
+    // :time reads HH:mm:ss into the exact i64 tick lane; a bad cell is
+    // continue-first (00:00:00) AND surfaced; an empty cell is not counted;
+    // min/max keep the Time lane (render HH:mm:ss) and are chunk-size
+    // independent + parallel byte-identical (#58).
+    let text = "k,t\n\
+                a,09:05:00\n\
+                a,23:59:59\n\
+                a,nope\n\
+                a,\n\
+                b,00:00:01\n\
+                b,12:30:00\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_time", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("T:\n open {p} (k:str t:time)\n |# k min:t max:t\n;");
+    let snapshot = |pref: rivus_runtime::MemoryPref, cz: usize| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        // The bad cell (a) is surfaced verbatim; empty is not counted.
+        let fails = res
+            .errors
+            .iter()
+            .filter(|e| {
+                e.message
+                    .contains("in column 't' (as time) could not be parsed; kept as default 0")
+            })
+            .count();
+        assert_eq!(
+            fails, 1,
+            "one time parse failure surfaced: {:?}",
+            res.errors
+        );
+        let lo = collect_strings(&res, "T", "min_t");
+        for s in lo.iter().chain(collect_strings(&res, "T", "max_t").iter()) {
+            assert_eq!(
+                s.len(),
+                8,
+                "min/max must render HH:mm:ss (Time lane), got {s:?}"
+            );
+        }
+        let mut rows: Vec<(String, String, String)> = {
+            let k = collect_strings(&res, "T", "k");
+            let hi = collect_strings(&res, "T", "max_t");
+            (0..k.len())
+                .map(|i| (k[i].clone(), lo[i].clone(), hi[i].clone()))
+                .collect()
+        };
+        rows.sort();
+        rows
+    };
+    for cz in [1usize, 2, 4096] {
+        assert_eq!(
+            snapshot(rivus_runtime::MemoryPref::Low, cz),
+            snapshot(rivus_runtime::MemoryPref::Fast, cz),
+            "time min/max byte-identical serial vs parallel @cz={cz}"
+        );
+    }
+    // Oracle: key b spans 00:00:01..12:30:00; key a's bad/empty default to
+    // 00:00:00 so its min is midnight, max 23:59:59.
+    assert_eq!(
+        snapshot(rivus_runtime::MemoryPref::Low, 4096),
+        vec![
+            (
+                "a".to_string(),
+                "00:00:00".to_string(),
+                "23:59:59".to_string()
+            ),
+            (
+                "b".to_string(),
+                "00:00:01".to_string(),
+                "12:30:00".to_string()
+            ),
+        ],
+        "time min/max extreme values"
+    );
+}
+
+#[test]
+fn validate_dispositions_surface_and_dispose_chunk_size_independent() {
+    // `|! pred warn|reject|halt` (#83 §24): a row failing `pred` is disposed of
+    // per the disposition and ALWAYS surfaced (never silent). warn keeps every
+    // row, reject drops the failing rows; the failure count is chunk-size
+    // independent and reject is byte-identical serial vs parallel; halt is fatal.
+    let text = "id,age\n1,25\n2,-5\n3,40\n4,200\n5,18\n"; // ages -5 and 200 fail
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_validate",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let warn = format!("V:\n open {p} (id:int age:int)\n |! age >= 0, age <= 120 warn\n |> id\n;");
+    let reject =
+        format!("V:\n open {p} (id:int age:int)\n |! age >= 0, age <= 120 reject\n |> id\n;");
+    for cz in [1usize, 2, 4096] {
+        // warn: all 5 rows survive; exactly one summary counting the 2 failures.
+        let res = run_src(&warn, cz);
+        assert_eq!(res.total_rows_out(), 5, "warn keeps every row @cz={cz}");
+        let warned = res
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("2 row(s) failed") && e.message.contains("(warn)"))
+            .count();
+        assert_eq!(
+            warned, 1,
+            "one warn summary of 2 @cz={cz}: {:?}",
+            res.errors
+        );
+
+        // reject: the 2 failing rows are dropped (id 1,3,5 survive) and surfaced.
+        let res2 = run_src(&reject, cz);
+        assert_eq!(
+            collect_i64(&res2, "V", "id"),
+            vec![1, 3, 5],
+            "reject drops failing @cz={cz}"
+        );
+        assert!(
+            res2.errors
+                .iter()
+                .any(|e| e.message.contains("2 row(s) failed") && e.message.contains("(reject)")),
+            "reject must surface the drop @cz={cz}: {:?}",
+            res2.errors
+        );
+    }
+
+    // reject is byte-identical serial vs parallel (row-wise predicate).
+    let rows_for = |pref: rivus_runtime::MemoryPref| {
+        let g = rivus_parser::parse(&reject).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 2,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        collect_i64(&res, "V", "id")
+    };
+    assert_eq!(
+        rows_for(rivus_runtime::MemoryPref::Low),
+        rows_for(rivus_runtime::MemoryPref::Fast),
+        "reject byte-identical serial vs parallel"
+    );
+
+    // halt: a failing row halts the run (fatal on the error stream).
+    let halt = format!("V:\n open {p} (id:int age:int)\n |! age <= 120 halt\n |> id\n;");
+    let res3 = run_src(&halt, 4096);
+    assert_eq!(
+        res3.final_mode,
+        rivus_core::Mode::Halted,
+        "halt must halt the run"
+    );
+    assert!(
+        res3.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+        "halt must raise a fatal: {:?}",
+        res3.errors
+    );
+}
+
+#[test]
+fn date_extractors_chunk_size_independent() {
+    // weekday (Mon=0..Sun=6), is_weekend, and date(ts) (DateTime→date) are
+    // row-wise and chunk-size independent (#58).
+    let text = "d\n2024-06-03\n2024-06-08\n2024-06-09\n2023-12-25\n"; // Mon, Sat, Sun, Mon
+    let f = TempCsv(gendata::write_temp_bytes("stress_date_fn", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("W:\n open {p} (d:date)\n |> (weekday(d)) as wd (is_weekend(d)) as we\n;");
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_i64(&res, "W", "wd"),
+            vec![0, 5, 6, 0],
+            "weekday @cz={cz}"
+        );
+        assert_eq!(
+            collect_strings(&res, "W", "we"),
+            vec!["false", "true", "true", "false"],
+            "is_weekend @cz={cz}"
+        );
+    }
+    // date(ts) drops the time-of-day and keeps the exact date lane.
+    let t2 = "ts\n2024-06-03 14:30:00\n2023-12-25 00:00:00\n";
+    let f2 = TempCsv(gendata::write_temp_bytes("stress_date_fn2", t2.as_bytes()));
+    let p2 = f2.0.display();
+    let flow2 = format!("D:\n open {p2} (ts:datetime)\n |> (date(ts)) as day\n;");
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow2, cz);
+        assert_eq!(
+            collect_strings(&res, "D", "day"),
+            vec!["2024-06-03", "2023-12-25"],
+            "date(ts) @cz={cz}"
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        let ci = o.chunks[0].schema.index_of("day").unwrap();
+        assert!(
+            matches!(
+                o.chunks[0].schema.fields[ci].dtype,
+                rivus_core::DataType::Date
+            ),
+            "date(ts) must yield the date lane @cz={cz}"
+        );
+    }
+}
+
+#[test]
 fn datetime_auto_infer_common_formats() {
     // A bare `:datetime` (no explicit format) auto-infers common shapes per cell:
     // ISO-with-T, ISO-with-space, and bare date all resolve; junk → epoch 0.

@@ -110,7 +110,9 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
                 // Datetime/duration stay off the f64 kernel (ns ticks > 2^53 lose
                 // precision as f64); they route to the interpreter's exact i64
                 // path instead, so kernel and interpreter agree. Design 23 / #53/#57.
-                Column::DateTime(_) | Column::Duration(_) => None,
+                Column::DateTime(_) | Column::Duration(_) | Column::Date(_) | Column::Time(_) => {
+                    None
+                }
                 Column::Str(_) => None,
             }
         }
@@ -214,7 +216,11 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         // Datetime/duration are never compiled into the kernel (`num_col` returns
         // `None`) — they route to the interpreter's exact i64 path. Unreachable;
         // here only for match exhaustiveness. #53/#57.
-        Column::DateTime(_) | Column::Duration(_) | Column::Str(_) => mask.fill(0),
+        Column::DateTime(_)
+        | Column::Duration(_)
+        | Column::Date(_)
+        | Column::Time(_)
+        | Column::Str(_) => mask.fill(0),
     }
 }
 
@@ -310,7 +316,11 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         }
         Column::Dec(d) => dec_mask(d, p, mask, false),
         // Unreachable: `num_col` excludes datetime/duration (exact i64 path). #53/#57.
-        Column::DateTime(_) | Column::Duration(_) | Column::Str(_) => mask.fill(0),
+        Column::DateTime(_)
+        | Column::Duration(_)
+        | Column::Date(_)
+        | Column::Time(_)
+        | Column::Str(_) => mask.fill(0),
     }
 }
 
