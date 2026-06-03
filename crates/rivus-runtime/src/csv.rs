@@ -1690,7 +1690,6 @@ impl CompressedCsvReader {
             CompressedCsvReader {
                 reader,
                 ncols,
-                parse_failures: vec![0; dtypes.len()],
                 keep,
                 dtypes,
                 dt_specs,
