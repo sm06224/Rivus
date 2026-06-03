@@ -63,6 +63,7 @@ hidden serialization / opaque optimizer / runtime magic without observability。
 | 22 | [gpu-backend](22-gpu-backend.md) | GPU backend（feature-gate任意・CPU fallback・既定は依存ゼロ）。`--accel` |
 | 23 | [datetime-and-reshape](23-datetime-and-reshape.md) | 日時レーン（`yyMMddhhmmss`等）・list/set/join 集計（配列化）・pivot/unpivot |
 | 24 | [validation](24-validation.md) | バリデーション層（validator≠filter・reject/warn/quarantine・行内/行間/窓内・ingress/egress）。`\|!`。`#80`/`#81` を収斂 |
+| 25 | [syntax-v2](25-syntax-v2.md) | 構文 v2（記号最小・`$x` 値ホール・名前付きフロー再利用・スコープ継続・署名=意味契約・コメント trivia・IR ベース fmt/tidy）。Epic `#86`/`#87` |
 
 ## 段階設計（MVP → 最適化 → JIT/分散）
 
