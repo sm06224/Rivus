@@ -5,7 +5,7 @@
 //! `rivus live` Markdown renderer will read (Observability spec §13).
 
 use rivus_core::Chunk;
-use rivus_ir::PlanGraph;
+use rivus_ir::{EdgeKind, PlanGraph};
 use rivus_optimizer::OptReport;
 use rivus_runtime::{Output, RunResult, RuntimeSnapshot};
 
@@ -103,6 +103,46 @@ pub fn render_snapshot_json(snap: &RuntimeSnapshot) -> String {
         ));
         json_escape_into(&mut s, &n.mode.to_string());
         s.push_str(&format!(",\"finished\":{}}}", n.finished));
+    }
+    s.push_str("]}");
+    s
+}
+
+/// The **static** DAG topology as JSON for the live dashboard's SVG:
+/// `{"nodes":[{"node_id","label","kind"}],"edges":[{"from","to","kind"}]}`.
+/// Unlike the per-tick snapshot this never changes during a run, so the
+/// dashboard fetches it once to lay out the graph and then animates the flow
+/// from the snapshot row counts. `kind` is `"stream"` (data) or `"error"` (the
+/// continue-first error side-channel), so the two are drawn differently.
+pub fn render_graph_json(graph: &PlanGraph) -> String {
+    let mut s = String::from("{\"nodes\":[");
+    for (i, n) in graph.nodes.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{{\"node_id\":{},\"label\":", n.id));
+        let label = n
+            .label
+            .clone()
+            .unwrap_or_else(|| n.op.kind_str().to_string());
+        json_escape_into(&mut s, &label);
+        s.push_str(",\"kind\":");
+        json_escape_into(&mut s, n.op.kind_str());
+        s.push('}');
+    }
+    s.push_str("],\"edges\":[");
+    for (i, e) in graph.edges.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let kind = match e.kind {
+            EdgeKind::Stream => "stream",
+            EdgeKind::Error => "error",
+        };
+        s.push_str(&format!(
+            "{{\"from\":{},\"to\":{},\"kind\":\"{kind}\"}}",
+            e.from, e.to
+        ));
     }
     s.push_str("]}");
     s

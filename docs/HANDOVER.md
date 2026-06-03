@@ -12,8 +12,12 @@
 > - **#40 columnar を再活性化し初レバー landed**: 述語カーネルの実測支配項＝
 >   selection-vector 構築を**分岐レス**化（50% 選択率で 7.31×、選択率不問で一定）。
 >   compare 自体は帯域律速で SIMD 無勝（#39 で計測済み）。
+> - **#40 column-major fused build は measured-negative（+7.8%）→ revert 済み**
+>   （`open` は parse 律速で dispatch/copy 律速でない。BENCHMARKS 参照）。再挑戦
+>   するなら「1コピー版（read_line を chunk バッファへ直結）」だが期待は薄。
 > - **次の #40 レバー（本命）**: 生存行 materialize の `Column::gather` 分岐レス/
->   SIMD 化（SIMD-native 経路＝#71 後で**計測してから**採否）。
+>   SIMD 化を、**gather 律速のワークロード**（cached 入力への多段重述語）で計測して
+>   から採否。parse 律速の `open` では columnar は効かない（#40 当初結論を再確認）。
 > - **リリースは私（エージェント）がコントロール**（`docs/RELEASE.md`、maintainer
 >   委任 2026-06-02）。版＝タグ。開発版は SemVer プレリリース `vX.Y.Z-dev.N`
 >   （`release.yml` が `-` 付きタグを `--prerelease` 公開）。**既存の不整合リリース

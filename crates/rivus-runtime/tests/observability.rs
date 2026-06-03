@@ -476,15 +476,16 @@ fn string_prefilter_engages_on_parallel_path() {
     );
 }
 
-/// #36: a live progress hook (TUI / --serve) forces the serial path so the
-/// dashboard sees one coherent stream. When the autotuner would otherwise pick
-/// parallel, the surfaced rationale must say so ("live observation → serial")
-/// rather than mislabel the run "parallel", and no per-worker telemetry appears.
+/// Observable First: a live progress hook (TUI / --serve) must NOT force the
+/// serial path — observing a run must not throttle it. With the autotuner set to
+/// parallel, a hooked run stays parallel (per-worker breakdown present) and the
+/// hook still observes aggregate snapshots; the run is never relabelled "live
+/// observation → serial". (Supersedes the old #36 force-serial contract.)
 #[test]
-fn live_hook_forces_serial_and_says_so() {
-    let rows = 50_000usize;
+fn live_hook_stays_parallel() {
+    let rows = 200_000usize;
     let csv = TempCsv(gendata::write_temp(
-        "obs_live_serial",
+        "obs_live_parallel",
         &gendata::clean(rows, 5),
     ));
     let mut out = csv.0.clone();
@@ -499,7 +500,7 @@ fn live_hook_forces_serial_and_says_so() {
     let (graph, _r) = rivus_optimizer::optimize(graph);
 
     // Push the autotuner toward parallel (multicore + zero threshold), then
-    // attach a hook — the engine must still run serial and label it honestly.
+    // attach a hook — the engine must still run parallel and observe it.
     std::env::remove_var("RIVUS_NO_PARALLEL");
     std::env::set_var("RIVUS_CPUS", "4");
     std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
@@ -520,14 +521,24 @@ fn live_hook_forces_serial_and_says_so() {
     std::env::remove_var("RIVUS_CPUS");
     std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
 
-    assert!(
-        res.workers.is_empty(),
-        "a live (hooked) run must be serial, with no worker breakdown"
-    );
+    // The hook observes the run (at least the terminal aggregate snapshot),
+    // regardless of strategy.
     assert!(frames > 0, "the hook must observe at least one snapshot");
     let note = res.strategy.unwrap_or_default();
     assert!(
-        note.contains("live observation → serial"),
-        "live run must label its serial fallback honestly, got: {note}"
+        !note.contains("serial"),
+        "observation must not downgrade processing to serial, got: {note}"
     );
+    // On a real multicore host the parallel path actually engages under the
+    // hook (the whole point): a per-worker breakdown is present.
+    if std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        >= 2
+    {
+        assert!(
+            !res.workers.is_empty(),
+            "a hooked, parallel-eligible run must still run parallel (got no workers)"
+        );
+    }
 }

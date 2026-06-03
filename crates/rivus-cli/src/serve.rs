@@ -33,6 +33,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Default)]
 pub struct Hub {
     inner: Mutex<HubState>,
+    /// The static DAG topology JSON (`viz::render_graph_json`), served once at
+    /// `/graph` so the dashboard can lay out the SVG before any snapshot.
+    graph: String,
 }
 
 #[derive(Default)]
@@ -46,8 +49,11 @@ struct HubState {
 }
 
 impl Hub {
-    pub fn new() -> Arc<Hub> {
-        Arc::new(Hub::default())
+    pub fn new(graph: String) -> Arc<Hub> {
+        Arc::new(Hub {
+            graph,
+            ..Hub::default()
+        })
     }
 
     /// Publish a new snapshot JSON (called from the run's progress hook).
@@ -70,43 +76,105 @@ impl Hub {
     }
 }
 
-/// The embedded dashboard. Pure HTML/JS/SVG (no CDN, no framework): it opens an
-/// SSE connection to `/events`, parses each snapshot, and redraws a simple bar
-/// chart + table that auto-configures from the node list. Kept deliberately
-/// small and dependency-free.
+/// The embedded dashboard. Pure HTML/JS/SVG (no CDN, no framework): it fetches
+/// the static DAG topology from `/graph` once, lays it out as a left→right
+/// layered flow diagram, then opens an SSE connection to `/events` and
+/// **animates** the live run — particles stream along each data edge at a rate
+/// set by that node's throughput, nodes pulse blue while active, turn green when
+/// finished and red on errors (error side-channel edges flow red). Kept
+/// dependency-free; all heavy rendering is in the browser.
 pub const DASHBOARD_HTML: &str = r##"<!doctype html>
-<html><head><meta charset="utf-8"><title>Rivus live</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rivus live</title>
 <style>
- body{font:14px/1.4 system-ui,monospace;margin:1.5rem;background:#0b0e14;color:#cdd6f4}
- h1{font-size:1.1rem;color:#89b4fa} .meta{color:#a6adc8;margin-bottom:1rem}
- .bar{height:14px;background:#89b4fa;border-radius:2px}
- table{border-collapse:collapse;width:100%} td,th{text-align:left;padding:3px 8px}
- th{color:#a6adc8;border-bottom:1px solid #313244} tr.done td{color:#a6e3a1}
- .track{background:#313244;border-radius:2px;width:200px}
+ :root{--bg:#0b0e14;--fg:#cdd6f4;--mut:#a6adc8;--blue:#89b4fa;--grn:#a6e3a1;--red:#f38ba8;--pan:#11151f;--brd:#313244}
+ *{box-sizing:border-box} body{font:13px/1.4 ui-sans-serif,system-ui,sans-serif;margin:0;background:var(--bg);color:var(--fg)}
+ header{display:flex;align-items:baseline;gap:1rem;padding:.7rem 1rem;border-bottom:1px solid var(--brd);position:sticky;top:0;background:var(--bg);z-index:2}
+ h1{font-size:1rem;color:var(--blue);margin:0;font-weight:700;letter-spacing:.03em}
+ #meta{color:var(--mut)} #meta b{color:var(--fg);font-weight:600}
+ #status{margin-left:auto;font-size:11px;color:var(--mut);border:1px solid var(--brd);border-radius:999px;padding:2px 10px}
+ #wrap{padding:1rem;overflow:auto} svg{display:block;max-width:100%;height:auto}
+ .node text{font-family:ui-sans-serif,system-ui,sans-serif}
+ .lab{fill:var(--fg);font-weight:600;font-size:12.5px} .knd{fill:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.07em}
+ .num{fill:var(--blue);font-size:12px;font-variant-numeric:tabular-nums}
+ .estream{fill:none;stroke:#2a3147;stroke-width:2} .eerror{fill:none;stroke:#5a2a37;stroke-width:1.5;stroke-dasharray:4 5}
+ .part{fill:var(--blue)}
+ .legend{padding:.45rem 1rem;color:var(--mut);font-size:11px;display:flex;flex-wrap:wrap;gap:1.2rem;border-top:1px solid var(--brd)}
+ .legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px}
 </style></head><body>
-<h1>Rivus — live execution</h1>
-<div class="meta" id="meta">connecting…</div>
-<table><thead><tr><th>node</th><th>kind</th><th>rows</th><th></th><th>state</th></tr></thead>
-<tbody id="rows"></tbody></table>
+<header><h1>RIVUS</h1><span id="meta">connecting…</span><span id="status">● live</span></header>
+<div id="wrap"><svg id="cv" xmlns="http://www.w3.org/2000/svg"></svg></div>
+<div class="legend">
+ <span><i style="background:#89b4fa"></i>flowing</span>
+ <span><i style="background:#a6e3a1"></i>done</span>
+ <span><i style="background:#f38ba8"></i>errors</span>
+ <span>moving dots = live throughput</span>
+</div>
 <script>
-const fmt=n=>n.toLocaleString();
-function draw(s){
- const max=Math.max(1,...s.nodes.map(n=>n.rows_out));
- document.getElementById('meta').textContent=
-   `${fmt(s.rows_seen)} rows · ${(s.elapsed_ms/1000).toFixed(1)}s · mode ${s.mode}`;
- const tb=document.getElementById('rows'); tb.innerHTML='';
- for(const n of s.nodes){
-   const tr=document.createElement('tr'); if(n.finished)tr.className='done';
-   const w=Math.round(n.rows_out/max*200);
-   tr.innerHTML=`<td>${n.label}</td><td>${n.kind}</td><td>${fmt(n.rows_out)}</td>`+
-     `<td><div class="track"><div class="bar" style="width:${w}px"></div></div></td>`+
-     `<td>${n.finished?'done':'live'}${n.errors?' !'+n.errors:''}</td>`;
-   tb.appendChild(tr);
- }
+const NS='http://www.w3.org/2000/svg';
+const NW=164,NH=52,COLW=236,ROWH=80,MX=24,MY=24;
+const fmt=n=>(n||0).toLocaleString();
+const cv=document.getElementById('cv');
+let N={},E=[];
+const mk=(t,a)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;};
+const cut=s=>{s=s||'';return s.length>22?s.slice(0,21)+'…':s;};
+
+function layout(g){
+ N={};(g.nodes||[]).forEach(n=>N[n.node_id]={id:n.node_id,label:n.label,kind:n.kind,ro:0,err:0,fin:false,prev:0,act:0});
+ const adj={},indeg={};Object.keys(N).forEach(i=>{adj[i]=[];indeg[i]=0;});
+ (g.edges||[]).forEach(e=>{if(N[e.from]!=null&&N[e.to]!=null){adj[e.from].push(e.to);indeg[e.to]++;}});
+ const depth={},din=Object.assign({},indeg);let q=Object.keys(N).filter(i=>indeg[i]===0);q.forEach(i=>depth[i]=0);
+ while(q.length){const u=q.shift();for(const v of adj[u]){depth[v]=Math.max(depth[v]||0,(depth[u]||0)+1);if(--din[v]===0)q.push(v);}}
+ const cols={};let maxd=0;Object.keys(N).forEach(i=>{const d=depth[i]||0;(cols[d]=cols[d]||[]).push(+i);maxd=Math.max(maxd,d);});
+ let maxr=1;for(const d in cols){cols[d].sort((a,b)=>a-b);maxr=Math.max(maxr,cols[d].length);}
+ const W=MX*2+maxd*COLW+NW,H=MY*2+maxr*ROWH;
+ cv.setAttribute('viewBox',`0 0 ${W} ${H}`);cv.setAttribute('width',W);cv.setAttribute('height',H);
+ for(const d in cols){const c=cols[d],off=(maxr-c.length)/2;c.forEach((id,i)=>{N[id].x=MX+d*COLW;N[id].y=MY+(off+i)*ROWH;});}
+ const gE=mk('g'),gP=mk('g'),gN=mk('g');E=[];
+ (g.edges||[]).forEach(e=>{const a=N[e.from],b=N[e.to];if(!a||!b)return;
+  const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2,dx=Math.max(40,(x2-x1)*0.5);
+  const p=mk('path',{d:`M${x1},${y1} C${x1+dx},${y1} ${x2-dx},${y2} ${x2},${y2}`,class:e.kind==='error'?'eerror':'estream'});
+  gE.appendChild(p);const parts=[];
+  if(e.kind!=='error')for(let k=0;k<3;k++){const c=mk('circle',{r:3,class:'part'});c.style.opacity=0;gP.appendChild(c);parts.push({c,t:k/3});}
+  E.push({src:e.from,dst:e.to,kind:e.kind,path:p,len:1,parts});});
+ Object.values(N).forEach(o=>{const grp=mk('g',{class:'node',transform:`translate(${o.x},${o.y})`});
+  o.rect=mk('rect',{width:NW,height:NH,rx:9,fill:'#11151f',stroke:'#313244','stroke-width':1.5});
+  const lab=mk('text',{x:12,y:21,class:'lab'});lab.textContent=cut(o.label);
+  const knd=mk('text',{x:12,y:38,class:'knd'});knd.textContent=o.kind;
+  o.num=mk('text',{x:NW-12,y:38,'text-anchor':'end',class:'num'});o.num.textContent='0';
+  grp.append(o.rect,lab,knd,o.num);gN.appendChild(grp);});
+ cv.replaceChildren(gE,gP,gN);
+ E.forEach(e=>{try{e.len=e.path.getTotalLength()||1;}catch(_){}});
 }
-const es=new EventSource('/events');
-es.onmessage=e=>{try{draw(JSON.parse(e.data))}catch(_){}};
-es.onerror=()=>{document.getElementById('meta').textContent+=' (stream closed)';es.close()};
+
+function onSnap(s){
+ document.getElementById('meta').innerHTML=`<b>${fmt(s.rows_seen)}</b> rows · <b>${(s.elapsed_ms/1000).toFixed(1)}s</b> · ${s.mode}`;
+ for(const n of (s.nodes||[])){const o=N[n.node_id];if(!o)continue;
+  if(n.rows_out>o.prev)o.act=1;o.prev=n.rows_out;o.ro=n.rows_out;o.err=n.errors;o.fin=n.finished;
+  o.num.textContent=fmt(n.rows_out);}
+}
+
+let last=performance.now();
+function frame(now){const dt=Math.min(64,now-last);last=now;
+ for(const id in N){const o=N[id];o.act*=Math.pow(0.94,dt/16);
+  let st='#313244',sw=1.5,fl='#11151f';
+  if(o.act>0.05){st='#89b4fa';sw=1.5+o.act*1.8;fl='#1a2335';}
+  else if(o.fin){st='#a6e3a1';}
+  if(o.err>0)st='#f38ba8';
+  o.rect.setAttribute('stroke',st);o.rect.setAttribute('stroke-width',sw.toFixed(2));o.rect.setAttribute('fill',fl);}
+ for(const e of E){const src=N[e.src],a=src?src.act:0;
+  if(e.kind==='error'){const on=(src&&src.err>0)||(N[e.dst]&&N[e.dst].err>0);
+   e.path.style.strokeDashoffset=on?((-now*0.04)%18):0;e.path.setAttribute('stroke',on?'#f38ba8':'#5a2a37');continue;}
+  const spd=dt*0.00016*(0.4+a);
+  for(const pt of e.parts){pt.t=(pt.t+spd)%1;const P=e.path.getPointAtLength(pt.t*e.len);
+   pt.c.setAttribute('cx',P.x);pt.c.setAttribute('cy',P.y);pt.c.style.opacity=a>0.04?Math.min(1,a+0.15):0;}}
+ requestAnimationFrame(frame);
+}
+
+fetch('/graph').then(r=>r.json()).then(g=>{layout(g);requestAnimationFrame(frame);
+ const es=new EventSource('/events');
+ es.onmessage=e=>{try{onSnap(JSON.parse(e.data))}catch(_){}};
+ es.onerror=()=>{const st=document.getElementById('status');st.textContent='● finished';st.style.color='#a6e3a1';es.close();};
+}).catch(()=>{document.getElementById('meta').textContent='failed to load /graph';});
 </script></body></html>"##;
 
 /// Bind a server on `addr` (e.g. `127.0.0.1:0` for an ephemeral port). Returns
@@ -175,6 +243,14 @@ fn handle(mut stream: TcpStream, hub: Arc<Hub>) {
             "text/html; charset=utf-8",
             DASHBOARD_HTML,
         ),
+        "/graph" => {
+            let body = if hub.graph.is_empty() {
+                "{\"nodes\":[],\"edges\":[]}"
+            } else {
+                hub.graph.as_str()
+            };
+            respond(&mut stream, "200 OK", "application/json", body);
+        }
         "/snapshot" => {
             let body = hub.read().0.unwrap_or_else(|| "{}".to_string());
             respond(&mut stream, "200 OK", "application/json", &body);
