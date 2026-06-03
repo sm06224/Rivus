@@ -624,6 +624,120 @@ impl fmt::Display for Duration {
     }
 }
 
+/// A calendar date with **no** time-of-day: exact `i32` days since the Unix
+/// epoch (1970-01-01 = day 0). Integer representation → exact and associative
+/// (like the decimal/datetime lanes), and it carries no `unit` (a date has no
+/// sub-day resolution). Renders / parses as ISO `yyyy-MM-dd`.
+/// (#58, Epic #56 — building the time-series subtypes on `DateTime`/`Duration`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Date {
+    /// Days since 1970-01-01 (proleptic Gregorian).
+    pub epoch_day: i32,
+}
+
+impl Date {
+    pub fn new(epoch_day: i32) -> Date {
+        Date { epoch_day }
+    }
+
+    /// Build from a civil `(year, month, day)`.
+    pub fn from_ymd(y: i64, m: i64, d: i64) -> Date {
+        Date {
+            epoch_day: days_from_civil(y, m, d) as i32,
+        }
+    }
+
+    /// The civil `(year, month, day)`.
+    pub fn ymd(&self) -> (i64, i64, i64) {
+        civil_from_days(self.epoch_day as i64)
+    }
+
+    /// Day of week, `0 = Monday … 6 = Sunday` (ISO). Exact integer arithmetic.
+    pub fn weekday(&self) -> u8 {
+        // 1970-01-01 was a Thursday (=3 in Mon..Sun). rem_euclid keeps it in 0..6
+        // for negative epoch-days too.
+        (((self.epoch_day as i64) + 3).rem_euclid(7)) as u8
+    }
+
+    /// Parse a strict ISO `yyyy-MM-dd` date. `None` for any malformed or
+    /// out-of-range date (e.g. `2024-02-30`), validated by a civil round-trip so
+    /// a nonexistent day never silently maps to a nearby one (never-silent).
+    pub fn parse(s: &str) -> Option<Date> {
+        let b = s.trim().as_bytes();
+        if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+            return None;
+        }
+        let num = |lo: usize, hi: usize| -> Option<i64> {
+            let mut n = 0i64;
+            for &c in &b[lo..hi] {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                n = n * 10 + (c - b'0') as i64;
+            }
+            Some(n)
+        };
+        let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            return None;
+        }
+        let date = Date::from_ymd(y, m, d);
+        if date.ymd() != (y, m, d) {
+            return None; // impossible civil date (e.g. 2024-02-30)
+        }
+        Some(date)
+    }
+}
+
+impl fmt::Display for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (y, m, d) = self.ymd();
+        write!(f, "{y:04}-{m:02}-{d:02}")
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::Date;
+
+    #[test]
+    fn parse_format_roundtrips_and_is_exact() {
+        for s in ["1970-01-01", "2000-02-29", "2024-06-03", "1999-12-31"] {
+            let d = Date::parse(s).expect("valid date");
+            assert_eq!(d.to_string(), s, "round-trip {s}");
+            // from_ymd ⇄ ymd is exact
+            let (y, m, dd) = d.ymd();
+            assert_eq!(Date::from_ymd(y, m, dd), d);
+        }
+        // epoch anchor
+        assert_eq!(Date::parse("1970-01-01").unwrap().epoch_day, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_and_partial() {
+        for s in [
+            "2024-02-30", // nonexistent day
+            "2023-02-29", // not a leap year
+            "2024-13-01", // bad month
+            "2024-00-10", // zero month
+            "2024-6-3",   // not zero-padded / wrong length
+            "2024/06/03", // wrong separator
+            "notadate",
+            "",
+        ] {
+            assert!(Date::parse(s).is_none(), "must reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn weekday_is_correct() {
+        // 2024-06-03 is a Monday (=0), 2024-06-09 is a Sunday (=6).
+        assert_eq!(Date::parse("2024-06-03").unwrap().weekday(), 0);
+        assert_eq!(Date::parse("2024-06-09").unwrap().weekday(), 6);
+        assert_eq!(Date::parse("1970-01-01").unwrap().weekday(), 3); // Thursday
+    }
+}
+
 /// A single scalar value. Used for literals, predicate evaluation and the
 /// "current object" (`$_`) field access. Bulk data lives in [`crate::Column`].
 #[derive(Debug, Clone, PartialEq)]
