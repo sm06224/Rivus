@@ -25,6 +25,10 @@ The maintainer squash-merges and wants near-zero merge effort. So:
 - **Exactly ONE open PR** (`dev` → `main`), kept updated by pushes. Do not open
   a second PR. After the maintainer squash-merges it, `git fetch origin main`
   then `git reset --hard origin/main` on `dev` and keep committing.
+- **On every merge to `main`, surface the release tag.** Cutting a release is the
+  maintainer's alone (`docs/RELEASE.md`), so after a merge tell them the suggested
+  next tag — version + the `git tag … && git push origin <tag>` command — they
+  decide when to cut it (standing request, 2026-06-03).
 - **GitHub API is the scarce resource** (secondary rate limit on PR/comment
   creation). So: never poll CI via API — rely on the `<github-webhook-activity>`
   events; don't open/close PRs in bursts; don't repeatedly edit PR bodies.

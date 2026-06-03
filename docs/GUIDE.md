@@ -143,11 +143,12 @@ always reported** on the error stream (never silent). Same predicate syntax as
 - The disposition is **mandatory** — there is no implicit default, so a silent
   drop policy is impossible. Every disposition surfaces the **count, the rule,
   and a sample** of an offending row (e.g. `e.g. id=2, age=-5`).
-- `warn`/`reject` report **one summary on completion** (the count is chunk-size
-  independent); `reject` is byte-identical serial vs parallel. `halt` raises a
-  `Fatal` (the run stops, continue-first §13). The CSV reader's parse-failure
-  reporting (§6) is the same idea applied at ingest — the first row-level
-  validator.
+- `warn`/`reject` report a summary **on completion** (count + rule + a sample);
+  the count is chunk-size independent. On the byte-range **parallel** path each
+  worker reports its own summary (the counts **sum** to the total — never-silent
+  either way), while `reject`'s dropped rows stay **byte-identical** to serial. A
+  single coordinator-merged count is a validation-layer follow-up (§24). `halt`
+  raises a `Fatal` (the run stops, continue-first §13).
 - _Coming next (§24):_ declarative rules (`in 0..120`, `matches "…"`, `required`,
   `in {…}`), `quarantine(sink)` (dead-letter), and inter-row / windowed checks.
 
