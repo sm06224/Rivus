@@ -480,7 +480,8 @@ open log.csv (start:time end:time)   # parse "09:05:00" into the time lane
   `25:00:00` is kept as `00:00:00` (continue-first) **and** surfaced on the error
   stream (`N value(s) in column '…' (as time) could not be parsed`); an empty
   cell is "missing", not counted. Non-zero-padded input (`9:5:0`) parses and
-  canonicalizes to `HH:mm:ss`.
+  canonicalizes to `HH:mm:ss`. Sub-second input is truncated to second
+  resolution (`12:30:00.5` → `12:30:00`; `:time` is a second-resolution type).
 
 **Date / time extractors** — usable anywhere an expression is (computed
 columns, filters). Each accepts a `date`, a `datetime`, or parseable text:
