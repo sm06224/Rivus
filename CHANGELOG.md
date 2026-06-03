@@ -7,6 +7,18 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **Live observation no longer throttles processing (Observable First).** A live
+  progress hook (`--tui` / `--serve`) previously forced the **serial** path so
+  the dashboard saw one coherent stream — i.e. *observing* a run downgraded it to
+  one core (the view changing the computation). Now observation keeps the run
+  **fully parallel**: each worker mirrors its partition's per-node counters into
+  per-worker atomic slots, and the coordinator thread samples them (~every
+  100 ms) into one aggregate `RuntimeSnapshot` for the hook. The live view is
+  coarser (node totals summed across workers, not a per-worker breakdown) — the
+  acceptable *display* limitation — while the processing stays parallel. Serial
+  now happens only when genuinely chosen (small input / `--memory low`) or
+  non-partitionable (preview, multi-source). Byte-identical (observation only;
+  stress sweep + `optimizer_equiv` green). Zero new dependencies.
 - **Parallel reads now cover `stdout` sinks too.** The byte-range parallel CSV
   reader previously bailed to serial whenever the sink was `save -` (stdout);
   it now assembles the ordered part files to stdout, so the Unix-filter form
@@ -29,6 +41,19 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **Animated SVG flow dashboard + `--open` (Epic #30 / Pillar B, std-only).**
+  `--serve`'s dashboard was a near-static table (hard to tell from `--tui`); it
+  now renders the flow as a left→right layered **SVG DAG and animates the live
+  run**: particles stream along each data edge at the node's throughput, nodes
+  pulse blue while active, turn green when finished and red on errors, and the
+  continue-first error side-channel edges are drawn dashed and flow red. A new
+  `GET /graph` endpoint (`render_graph_json`) ships the static topology
+  (nodes + edges) once; the browser lays out the DAG (longest-path layering) and
+  animates from the existing `/events` SSE row counts (per-tick snapshot
+  unchanged). New `--open` flag launches the dashboard URL in the system browser
+  (`xdg-open` / `open` / `cmd start`; shell-free arg passing, detached,
+  non-fatal, opt-in). Dependency-free inline HTML/JS/SVG; heavy rendering stays
+  in the browser.
 - **SIMD-native CSV parse (Epic #38 / #71, dependency-zero).** The parse path —
   measured as the dominant cost of `open` — is rebuilt around SIMD-within-a-
   register and `core::arch` kernels, each **byte-identical** to the scalar/std
@@ -86,9 +111,11 @@ All notable changes to Rivus. Format loosely follows
   every few source chunks and once at the end. The base for live TUI / HTTP
   dashboards (Pillar B / §14.4 `RuntimeHandle::subscribe`). `run` is unchanged
   (calls it with no hook); with no subscriber nothing is built, so the cost is
-  ~0. A subscriber forces the serial path for a coherent live stream; results
-  are identical. Oracle-tested (≥1 snapshot, monotonic rows_seen, final snapshot
-  sees every row, result invariant). No new dependencies.
+  ~0. A subscriber **no longer forces the serial path** — parallel runs feed it
+  an aggregate cross-worker snapshot (see "Live observation no longer throttles
+  processing" above); results are identical. Oracle-tested (≥1 snapshot,
+  monotonic rows_seen, final snapshot sees every row, result invariant). No new
+  dependencies.
 - **First-row latency & parse phase in `--json` summary (Epic #30 / Pillar A —
   issue #31, A3).** `RunResult` gains `first_row_latency: Option<Duration>` (wall
   to the first produced chunk; min across workers in parallel), and the JSONL
