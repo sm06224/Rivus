@@ -2135,6 +2135,12 @@ struct AggAcc {
     dur_min: i64,
     dur_max: i64,
     dur_overflow: bool,
+    /// Exact date lane (#58): set once a `Value::Date` is observed. `min`/`max`
+    /// are kept as the i32 epoch-day, so they are exact + associative (parallel
+    /// byte-identical) and the result keeps the `Date` type (renders yyyy-MM-dd).
+    has_date: bool,
+    date_min: i32,
+    date_max: i32,
 }
 
 /// Extra fractional digits an exact decimal `avg` carries beyond the input scale
@@ -2186,6 +2192,9 @@ impl AggAcc {
             dur_min: i64::MAX,
             dur_max: i64::MIN,
             dur_overflow: false,
+            has_date: false,
+            date_min: i32::MAX,
+            date_max: i32::MIN,
         }
     }
 
@@ -2240,6 +2249,14 @@ impl AggAcc {
                         }
                         self.dur_min = self.dur_min.min(d.ticks);
                         self.dur_max = self.dur_max.max(d.ticks);
+                    }
+                    // Exact date lane: keep min/max as the i32 epoch-day (#58).
+                    // Associative → byte-identical in parallel; the result keeps
+                    // the Date type instead of degrading to a raw f64/int.
+                    if let Value::Date(d) = v {
+                        self.has_date = true;
+                        self.date_min = self.date_min.min(d.epoch_day);
+                        self.date_max = self.date_max.max(d.epoch_day);
                     }
                 }
             }
@@ -2318,6 +2335,12 @@ impl AggAcc {
             self.dur_max = self.dur_max.max(other.dur_max);
         }
         self.dur_overflow |= other.dur_overflow;
+        // Exact date lane (associative i32 min/max). #58.
+        if other.has_date {
+            self.has_date = true;
+            self.date_min = self.date_min.min(other.date_min);
+            self.date_max = self.date_max.max(other.date_max);
+        }
         for s in &other.distinct {
             self.distinct.insert(s.clone());
         }
@@ -2427,6 +2450,20 @@ impl AggAcc {
         match self.func {
             AggFunc::Min if self.n > 0 => Some(DateTime::new(self.dt_min, unit)),
             AggFunc::Max if self.n > 0 => Some(DateTime::new(self.dt_max, unit)),
+            _ => None,
+        }
+    }
+
+    /// Exact date result for `min`/`max` on a date column, or `None` otherwise.
+    /// Keeps the i32 epoch-day so the result is exact and stays the `Date` type
+    /// (renders `yyyy-MM-dd` instead of a raw integer). #58.
+    fn date_value(&self) -> Option<rivus_core::Date> {
+        if !self.has_date {
+            return None;
+        }
+        match self.func {
+            AggFunc::Min if self.n > 0 => Some(rivus_core::Date::new(self.date_min)),
+            AggFunc::Max if self.n > 0 => Some(rivus_core::Date::new(self.date_max)),
             _ => None,
         }
     }
@@ -2668,6 +2705,24 @@ impl Operator for GroupBy {
                 // overflowed i128 the whole column degrades to f64 (continue-first,
                 // §21.7) so the column stays one uniform type.
                 _ => {
+                    // Exact date min/max → keep the Date lane (i32 epoch-day),
+                    // never a raw f64/int column. #58.
+                    let date_ok = matches!(func, AggFunc::Min | AggFunc::Max)
+                        && !self.groups.is_empty()
+                        && self
+                            .groups
+                            .values()
+                            .all(|s| s.accs[j].date_value().is_some());
+                    if date_ok {
+                        let epoch_days = self
+                            .groups
+                            .values()
+                            .map(|s| s.accs[j].date_value().unwrap().epoch_day)
+                            .collect();
+                        fields.push(Field::new(name, DataType::Date));
+                        columns.push(Column::Date(epoch_days));
+                        continue;
+                    }
                     // Exact datetime min/max → keep the DateTime lane (i64 ticks,
                     // same unit), never an f64 column. #53.
                     let dt_ok = matches!(func, AggFunc::Min | AggFunc::Max)

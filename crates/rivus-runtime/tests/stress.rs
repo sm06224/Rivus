@@ -2789,6 +2789,64 @@ fn date_groupby_parallel_matches_serial() {
 }
 
 #[test]
+fn date_minmax_keeps_date_type_and_parallel_matches_serial() {
+    // min/max on a date column keep the Date lane (render yyyy-MM-dd, not the
+    // raw epoch-day) and — being exact integer extremes — are byte-identical
+    // serial vs parallel and across chunk size (#58).
+    let rows = 6_000;
+    let mut rng = Rng::new(581);
+    let mut text = String::from("k,d\n");
+    let days = ["2024-06-01", "2024-01-15", "2023-12-25", "2024-02-29"];
+    for _ in 0..rows {
+        let k = if rng.below(2) == 0 { "a" } else { "b" };
+        let d = days[rng.below(days.len() as u64) as usize];
+        text.push_str(&format!("{k},{d}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_date_mm", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("M:\n open {p} (k:str d:date)\n |# k min:d max:d\n;");
+
+    let snapshot = |pref: rivus_runtime::MemoryPref| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 512,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        // The min/max columns must render as ISO dates (Date lane preserved).
+        for col in ["min_d", "max_d"] {
+            for s in collect_strings(&res, "M", col) {
+                assert!(
+                    s.len() == 10 && s.as_bytes()[4] == b'-',
+                    "{col} must render as yyyy-MM-dd (Date lane), got {s:?}"
+                );
+            }
+        }
+        let mut rows: Vec<(String, String, String)> = {
+            let k = collect_strings(&res, "M", "k");
+            let lo = collect_strings(&res, "M", "min_d");
+            let hi = collect_strings(&res, "M", "max_d");
+            (0..k.len())
+                .map(|i| (k[i].clone(), lo[i].clone(), hi[i].clone()))
+                .collect()
+        };
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        snapshot(rivus_runtime::MemoryPref::Low),
+        snapshot(rivus_runtime::MemoryPref::Fast),
+        "date min/max must be byte-identical serial vs parallel"
+    );
+}
+
+#[test]
 fn date_extractors_chunk_size_independent() {
     // weekday (Mon=0..Sun=6), is_weekend, and date(ts) (DateTime→date) are
     // row-wise and chunk-size independent (#58).
