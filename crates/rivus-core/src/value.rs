@@ -746,6 +746,140 @@ mod date_tests {
     }
 }
 
+/// A **time-of-day** with no calendar date: exact `i64` ticks since midnight at
+/// a fixed `unit` (`Sec` in the MVP). Renders / parses as `HH:mm:ss[.frac]`,
+/// bounded to a single day. Integer → exact and associative like the other
+/// temporal lanes. (#58, Epic #56.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeOfDay {
+    /// Ticks since midnight at `unit` resolution (`0 .. ticks_per_day`).
+    pub ticks: i64,
+    pub unit: TimeUnit,
+}
+
+/// Sub-second decimal digits carried by a `unit` (`Sec`→0 … `Nano`→9).
+fn unit_sub_digits(unit: TimeUnit) -> usize {
+    match unit {
+        TimeUnit::Sec => 0,
+        TimeUnit::Milli => 3,
+        TimeUnit::Micro => 6,
+        TimeUnit::Nano => 9,
+    }
+}
+
+impl TimeOfDay {
+    pub fn new(ticks: i64, unit: TimeUnit) -> TimeOfDay {
+        TimeOfDay { ticks, unit }
+    }
+
+    /// `(hour, minute, second, sub_second_ticks)`.
+    pub fn parts(&self) -> (i64, i64, i64, i64) {
+        let per = self.unit.per_sec();
+        let total_s = self.ticks.div_euclid(per);
+        let sub = self.ticks.rem_euclid(per);
+        (total_s / 3600, (total_s / 60) % 60, total_s % 60, sub)
+    }
+
+    /// Parse `HH:mm:ss[.frac]` at `unit`. `None` for a malformed or out-of-range
+    /// time (hour `0..23`, minute/second `0..59`) — never-silent, so a bad time
+    /// never silently maps to a nearby one.
+    pub fn parse_at(s: &str, unit: TimeUnit) -> Option<TimeOfDay> {
+        let s = s.trim();
+        let (clock, frac) = match s.split_once('.') {
+            Some((c, f)) => (c, Some(f)),
+            None => (s, None),
+        };
+        let mut it = clock.split(':');
+        let h: i64 = it.next()?.parse().ok()?;
+        let m: i64 = it.next()?.parse().ok()?;
+        let sec: i64 = it.next()?.parse().ok()?;
+        if it.next().is_some()
+            || !(0..24).contains(&h)
+            || !(0..60).contains(&m)
+            || !(0..60).contains(&sec)
+        {
+            return None;
+        }
+        let per = unit.per_sec();
+        let whole = ((h * 60 + m) * 60 + sec) * per;
+        let sub = match frac {
+            None => 0,
+            Some(f) => {
+                if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                // Pad / truncate the fraction to the unit's digit width.
+                let w = unit_sub_digits(unit);
+                let mut digits = String::with_capacity(w);
+                for i in 0..w {
+                    digits.push(f.as_bytes().get(i).map_or('0', |&b| b as char));
+                }
+                digits.parse::<i64>().unwrap_or(0)
+            }
+        };
+        Some(TimeOfDay::new(whole + sub, unit))
+    }
+}
+
+impl fmt::Display for TimeOfDay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (h, m, s, sub) = self.parts();
+        write!(f, "{h:02}:{m:02}:{s:02}")?;
+        let w = unit_sub_digits(self.unit);
+        if w > 0 && sub != 0 {
+            write!(f, ".{sub:0w$}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod timeofday_tests {
+    use super::{TimeOfDay, TimeUnit};
+
+    #[test]
+    fn parse_format_roundtrips_and_is_exact() {
+        for s in ["00:00:00", "09:05:07", "23:59:59", "12:30:00"] {
+            let t = TimeOfDay::parse_at(s, TimeUnit::Sec).expect("valid time");
+            assert_eq!(t.to_string(), s, "round-trip {s}");
+        }
+        assert_eq!(
+            TimeOfDay::parse_at("01:02:03", TimeUnit::Sec)
+                .unwrap()
+                .ticks,
+            3723
+        );
+    }
+
+    #[test]
+    fn rejects_invalid() {
+        // Out-of-range fields and structurally-wrong text are rejected;
+        // non-zero-padded fields (`1:2:3`) are valid and canonicalize on Display.
+        for s in [
+            "24:00:00", "12:60:00", "12:00:60", "12:00", "noon", "12:00:0x", "",
+        ] {
+            assert!(
+                TimeOfDay::parse_at(s, TimeUnit::Sec).is_none(),
+                "must reject {s:?}"
+            );
+        }
+        assert_eq!(
+            TimeOfDay::parse_at("1:2:3", TimeUnit::Sec)
+                .unwrap()
+                .to_string(),
+            "01:02:03",
+            "lenient parse canonicalizes on Display"
+        );
+    }
+
+    #[test]
+    fn sub_second_milli_roundtrips() {
+        let t = TimeOfDay::parse_at("00:00:01.250", TimeUnit::Milli).unwrap();
+        assert_eq!(t.ticks, 1_250);
+        assert_eq!(t.to_string(), "00:00:01.250");
+    }
+}
+
 /// A single scalar value. Used for literals, predicate evaluation and the
 /// "current object" (`$_`) field access. Bulk data lives in [`crate::Column`].
 #[derive(Debug, Clone, PartialEq)]
