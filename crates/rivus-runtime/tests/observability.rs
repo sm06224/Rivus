@@ -87,6 +87,58 @@ fn prefilter_skip_count_is_exact_and_result_invariant() {
     }
 }
 
+/// #bugreport ②④: a non-empty cell that can't be parsed into its column's lane
+/// (malformed, or an `i128` overflow in the decimal lane) is defaulted to 0
+/// (continue-first) AND the loss is surfaced on the error stream — one summary
+/// per affected column, count exact and chunk-size independent. Empty cells are
+/// "missing", not failures, so they're never counted (no false positives).
+#[test]
+fn parse_failures_are_reported_and_defaulted() {
+    // amount: a valid decimal, a malformed cell, a valid int, and an i128 overflow.
+    let body = "id,amount\n1,12.34\n2,abc\n3,7\n\
+                4,999999999999999999999999999999999999999999999\n";
+    let csv = TempCsv(gendata::write_temp("obs_parsefail", body));
+    let p = csv.0.display();
+    for cs in [1usize, 2, 4096] {
+        let res = run_src(
+            &format!("F:\n open {p} (id:int amount:decimal(2))\n |> id amount\n;"),
+            cs,
+        );
+        // Continue-first: all four rows survive (bad cells kept as 0).
+        assert_eq!(res.total_rows_out(), 4, "rows out @cs={cs}");
+        // Exactly one summary for `amount`, counting the 2 unparseable cells.
+        let msg = res
+            .errors
+            .iter()
+            .find(|e| e.message.contains("could not be parsed"))
+            .unwrap_or_else(|| panic!("no parse-failure telemetry @cs={cs}: {:?}", res.errors));
+        assert!(
+            msg.message.starts_with("2 value(s) in column 'amount'"),
+            "@cs={cs} got: {}",
+            msg.message
+        );
+    }
+    // Clean data raises no parse-failure telemetry.
+    let clean = TempCsv(gendata::write_temp(
+        "obs_parsefail_clean",
+        "id,n\n1,5\n2,6\n",
+    ));
+    let res = run_src(
+        &format!(
+            "F:\n open {} (id:int n:int)\n |> id n\n;",
+            clean.0.display()
+        ),
+        4096,
+    );
+    assert!(
+        !res.errors
+            .iter()
+            .any(|e| e.message.contains("could not be parsed")),
+        "clean data must not raise parse-failure telemetry: {:?}",
+        res.errors
+    );
+}
+
 /// Without a pushed-down prefilter (a non-numeric / no filter), no prefilter
 /// telemetry is emitted — the counter only reflects genuine reader-side skips.
 #[test]

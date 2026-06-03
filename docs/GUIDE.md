@@ -322,8 +322,9 @@ Used in `|?` predicates and `(…)` computed columns.
 **Functions**
 
 - *string* — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
-  `substr(s, start, len)`, `replace(s, from, to)`, `split_part(s, sep, n)`
-  (1-based field), `concat(a, b, …)`.
+  `substr(s, start, len)` (1-based start, SQL convention),
+  `replace(s, from, to)`, `split_part(s, sep, n)` (1-based field),
+  `concat(a, b, …)`.
 - *predicates* (→ bool) — `contains(s, sub)`, `starts_with(s, p)`,
   `ends_with(s, p)`, `like(s, pat)`, `glob(s, pat)`, and (with `--features
   regex`) `regexp(s, re)`.
@@ -334,7 +335,7 @@ Used in `|?` predicates and `(…)` computed columns.
 
 ```
 |? contains(email, "@gmail")
-|> (upper(name)) as NAME (len(name)) as nlen (substr(zip, 0, 3)) as area
+|> (upper(name)) as NAME (len(name)) as nlen (substr(zip, 1, 3)) as area
 |> (round(price * 1.1)) as gross (coalesce(nick, name)) as display
 ```
 

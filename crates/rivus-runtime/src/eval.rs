@@ -45,13 +45,12 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
         }
         Func::Substr => {
             let s = arg(0).to_string();
-            let start = arg(1).as_f64().unwrap_or(0.0) as usize;
+            let start = arg(1).as_f64().unwrap_or(1.0);
             let take = args
                 .get(2)
                 .map(|e| eval(e, chunk, row).as_f64().unwrap_or(0.0) as usize)
                 .unwrap_or(usize::MAX);
-            let out: String = s.chars().skip(start).take(take).collect();
-            Value::Str(out)
+            Value::Str(substr_1based(&s, start, take))
         }
         Func::Like => {
             let hay = arg(0).to_string();
@@ -268,6 +267,20 @@ fn regexp_column(args: &[Expr], chunk: &Chunk) -> Column {
 #[cfg(not(feature = "regex"))]
 fn regexp_column(_args: &[Expr], chunk: &Chunk) -> Column {
     Column::Bool(vec![false; chunk.len])
+}
+
+/// `substr(s, start, len)` with a **1-based** start (SQL / DuckDB convention):
+/// `start == 1` is the first char and `start <= 1` clamps to the beginning
+/// (lenient, so the old 0-based call `substr(s, 0, n)` still returns the prefix).
+/// `#bugreport ③`. `take == usize::MAX` means "to the end" (no length given).
+fn substr_1based(s: &str, start: f64, take: usize) -> String {
+    let start1 = start as i64;
+    let skip = if start1 <= 1 {
+        0
+    } else {
+        (start1 - 1) as usize
+    };
+    s.chars().skip(skip).take(take).collect()
 }
 
 /// SQL `LIKE`: `%` matches any run (including empty), `_` matches exactly one
@@ -1253,7 +1266,7 @@ mod dt_cmp_tests {
 
 #[cfg(test)]
 mod match_tests {
-    use super::{glob_match, like_match};
+    use super::{glob_match, like_match, substr_1based};
 
     #[test]
     fn like_wildcards() {
@@ -1267,6 +1280,20 @@ mod match_tests {
         assert!(!like_match("JP-1234", "US-%"));
         assert!(!like_match("ab", "abc"));
         assert!(like_match("abc", "ab_")); // `_` matches exactly the trailing c
+    }
+
+    #[test]
+    fn substr_is_one_based() {
+        // 1-based: substr(s,1) is the first char (SQL/DuckDB). #bugreport ③.
+        assert_eq!(substr_1based("hello", 1.0, 3), "hel");
+        assert_eq!(substr_1based("hello", 2.0, 3), "ell");
+        assert_eq!(substr_1based("hello", 3.0, usize::MAX), "llo");
+        // Lenient: start <= 1 clamps to the beginning (old 0-based call survives).
+        assert_eq!(substr_1based("hello", 0.0, 3), "hel");
+        assert_eq!(substr_1based("hello", -5.0, 3), "hel");
+        // Past the end → empty; full string with no length.
+        assert_eq!(substr_1based("hello", 99.0, 3), "");
+        assert_eq!(substr_1based("hello", 1.0, usize::MAX), "hello");
     }
 
     #[test]

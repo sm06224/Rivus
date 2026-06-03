@@ -7,6 +7,24 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **`substr` is now 1-based (SQL/DuckDB convention) — breaking.** `substr(s, 1)`
+  is the first char (was 0-based, which was misleading). The mapping is lenient
+  — `start <= 1` clamps to the beginning — so an old `substr(s, 0, n)` call still
+  returns the same prefix; only calls with an explicit start `≥ 2` shift by one.
+  (#bugreport ③)
+- **CSV parse failures are surfaced on the error stream (continue-first
+  observability).** A non-empty cell that can't be parsed into its column's lane
+  is still defaulted to `0` (continue-first), but the loss is no longer silent:
+  the reader counts the failures per column and the source raises one
+  `Recoverable` summary on exhaustion — e.g. `2 value(s) in column 'amount' (as
+  decimal(2)) could not be parsed; kept as default 0`. This includes **decimal
+  `i128` overflow** (#bugreport ②④). Empty cells are "missing", not failures, so
+  they never count (no false positives on clean data); the count is exact and
+  chunk-size independent. Covers the serial and byte-range-parallel streaming
+  readers; the result is unchanged. (The compressed and in-memory build paths
+  don't count yet — follow-up. Distinguishing null/empty/0 and making `dropna`
+  see a defaulted numeric blank — #bugreport ①⑤ — needs the nullable-column model,
+  tracked separately.)
 - **Live observation no longer throttles processing (Observable First).** A live
   progress hook (`--tui` / `--serve`) previously forced the **serial** path so
   the dashboard saw one coherent stream — i.e. *observing* a run downgraded it to

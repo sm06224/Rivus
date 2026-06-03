@@ -116,6 +116,11 @@ pub struct CsvChunker {
     /// Pure accounting for telemetry — the result is unchanged, since the
     /// downstream `FilterProject` would have dropped exactly these rows anyway.
     pub rows_prefiltered: u64,
+    /// Per-kept-column count of non-empty cells that failed to parse into the
+    /// column's lane and were defaulted to 0 (malformed, or an `i128` overflow
+    /// in the decimal lane) — #bugreport ②④. Aligned to `keep`/`dtypes`/the
+    /// output schema; surfaced once on exhaustion by the source operator.
+    pub parse_failures: Vec<u64>,
     eof: bool,
     /// Current byte offset and an optional end (for streaming one byte range of
     /// the file in a parallel worker). `limit == None` streams to EOF.
@@ -241,6 +246,7 @@ impl CsvChunker {
             CsvChunker {
                 reader,
                 ncols,
+                parse_failures: vec![0; dtypes.len()],
                 keep,
                 dtypes,
                 dt_specs,
@@ -324,6 +330,7 @@ impl CsvChunker {
             CsvChunker {
                 reader,
                 ncols,
+                parse_failures: vec![0; dtypes.len()],
                 keep,
                 dtypes,
                 dt_specs,
@@ -364,6 +371,7 @@ impl CsvChunker {
         Ok(CsvChunker {
             reader: BufReader::with_capacity(READ_BUF, f),
             ncols,
+            parse_failures: vec![0; dtypes.len()],
             keep,
             dtypes,
             dt_specs,
@@ -446,7 +454,9 @@ impl CsvChunker {
                 }
                 for (k, &ci) in self.keep.iter().enumerate() {
                     let (s, e) = offsets[ci];
-                    builders[k].push(&l[s..e]);
+                    if builders[k].push(&l[s..e]) {
+                        self.parse_failures[k] += 1;
+                    }
                 }
             } else {
                 // Quoted records take the owned slow path and skip the prefilter
@@ -456,7 +466,9 @@ impl CsvChunker {
                     continue;
                 }
                 for (k, &ci) in self.keep.iter().enumerate() {
-                    builders[k].push(&fields[ci]);
+                    if builders[k].push(&fields[ci]) {
+                        self.parse_failures[k] += 1;
+                    }
                 }
             }
             got += 1;
@@ -1148,25 +1160,67 @@ impl ColBuilder {
         }
     }
 
+    /// Parse one cell into the lane, returning `true` if a **non-empty** cell
+    /// could not be parsed and was defaulted (a malformed value or, for the
+    /// decimal lane, an `i128` overflow — #bugreport ②④). An empty cell is
+    /// "missing", not a parse failure, so it never counts (the null/empty/0
+    /// distinction is the separate null-model work). Bool/Str are lenient and
+    /// never report a failure.
     #[inline]
-    fn push(&mut self, cell: &str) {
+    fn push(&mut self, cell: &str) -> bool {
+        let t = cell.trim();
         match self {
-            ColBuilder::Bool(v) => v.push(cell.trim() == "true"),
-            ColBuilder::I64(v) => v.push(parse_i64_cell(cell.trim())),
-            ColBuilder::F64(v) => v.push(cell.trim().parse().unwrap_or(0.0)),
-            // Exact decimal text → unscaled i128 (no f64). A malformed cell or
-            // i128 overflow yields 0, matching the int/float lanes' default-on-
-            // parse-failure (continue-first; §21.7).
-            ColBuilder::Dec(v, scale) => {
-                v.push(Decimal::parse_scaled(cell.trim(), *scale).map_or(0, |d| d.unscaled))
+            ColBuilder::Bool(v) => {
+                v.push(t == "true");
+                false
             }
-            ColBuilder::DateTime(v, spec) => v.push(spec.parse(cell)),
+            ColBuilder::I64(v) => match parse_i64_fast(t).or_else(|| t.parse::<i64>().ok()) {
+                Some(n) => {
+                    v.push(n);
+                    false
+                }
+                None => {
+                    v.push(0);
+                    !t.is_empty()
+                }
+            },
+            ColBuilder::F64(v) => match t.parse::<f64>() {
+                Ok(n) => {
+                    v.push(n);
+                    false
+                }
+                Err(_) => {
+                    v.push(0.0);
+                    !t.is_empty()
+                }
+            },
+            // Exact decimal text → unscaled i128 (no f64). A malformed cell or
+            // i128 overflow yields 0 (continue-first; §21.7) and is reported on
+            // the error stream (#bugreport ②④).
+            ColBuilder::Dec(v, scale) => match Decimal::parse_scaled(t, *scale) {
+                Some(d) => {
+                    v.push(d.unscaled);
+                    false
+                }
+                None => {
+                    v.push(0);
+                    !t.is_empty()
+                }
+            },
+            ColBuilder::DateTime(v, spec) => {
+                v.push(spec.parse(cell));
+                false
+            }
             // Duration text → exact i64 ticks; a malformed cell yields 0
             // (continue-first), matching the other lanes. #57.
             ColBuilder::Duration(v, unit) => {
-                v.push(rivus_core::Duration::parse_at(cell, *unit).map_or(0, |d| d.ticks))
+                v.push(rivus_core::Duration::parse_at(cell, *unit).map_or(0, |d| d.ticks));
+                false
             }
-            ColBuilder::Str(v) => v.push(cell),
+            ColBuilder::Str(v) => {
+                v.push(cell);
+                false
+            }
         }
     }
 
@@ -1395,6 +1449,9 @@ fn parse_i64_fast(s: &str) -> Option<i64> {
 
 /// `s.parse::<i64>().unwrap_or(0)` on the continue-first default, via the SWAR
 /// fast path when it applies (byte-identical) else std. `s` must be pre-trimmed.
+// Now only exercised by tests (the I64 lane build inlines the checked form);
+// kept as the reference the equivalence tests assert against.
+#[cfg(test)]
 #[inline]
 fn parse_i64_cell(s: &str) -> i64 {
     match parse_i64_fast(s) {
@@ -1633,6 +1690,7 @@ impl CompressedCsvReader {
             CompressedCsvReader {
                 reader,
                 ncols,
+                parse_failures: vec![0; dtypes.len()],
                 keep,
                 dtypes,
                 dt_specs,

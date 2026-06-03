@@ -594,6 +594,29 @@ impl Operator for SourceCsv {
                             .at_node(ctx.label.clone()),
                         );
                     }
+                    // Per-column parse failures: non-empty cells that couldn't be
+                    // parsed into the column's lane (malformed, or an i128 overflow
+                    // in the decimal lane) and were defaulted to 0 — surfaced once
+                    // on exhaustion so the loss is visible (continue-first; #②④).
+                    // `parse_failures` is aligned to the output schema's fields.
+                    for (k, &n) in chunker.parse_failures.iter().enumerate() {
+                        if n > 0 {
+                            let col = match self.schema.fields.get(k) {
+                                Some(f) => format!("'{}' (as {})", f.name, f.dtype),
+                                None => format!("#{k}"),
+                            };
+                            ctx.raise(
+                                ErrorEvent::new(
+                                    Severity::Recoverable,
+                                    ErrorScope::Item,
+                                    format!(
+                                        "{n} value(s) in column {col} could not be parsed; kept as default 0"
+                                    ),
+                                )
+                                .at_node(ctx.label.clone()),
+                            );
+                        }
+                    }
                     return None;
                 }
             }
