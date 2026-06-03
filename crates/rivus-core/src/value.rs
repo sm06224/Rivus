@@ -640,10 +640,18 @@ impl Date {
         Date { epoch_day }
     }
 
-    /// Build from a civil `(year, month, day)`.
+    /// Build from a civil `(year, month, day)`. The epoch-day is held in `i32`,
+    /// which spans roughly years ±5.8 million around 1970 — far beyond any real
+    /// calendar use. A date outside that range would truncate; debug builds
+    /// assert against it so a silent wrap never slips through unnoticed.
     pub fn from_ymd(y: i64, m: i64, d: i64) -> Date {
+        let ed = days_from_civil(y, m, d);
+        debug_assert!(
+            i32::try_from(ed).is_ok(),
+            "Date epoch-day {ed} out of i32 range (year {y})"
+        );
         Date {
-            epoch_day: days_from_civil(y, m, d) as i32,
+            epoch_day: ed as i32,
         }
     }
 
