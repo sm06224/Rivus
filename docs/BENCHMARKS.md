@@ -1090,3 +1090,36 @@ The next #40 step buffers a chunk's offsets and builds **column-major** (one
 contiguous SoA lane at a time, enum dispatch hoisted out of the inner loop),
 measured against this baseline — byte-identical via the `stress` chunk-size
 sweep + `optimizer_equiv`.
+
+---
+
+## #40 column-major fused build — measured negative, reverted
+
+Tried the column-major build the forward note proposed: phase 1 buffers each
+accepted row's kept-field bytes into one reused `cell_bytes` buffer + a flat span
+array; phase 2 fills one SoA lane at a time with the `ColBuilder` enum dispatch
+hoisted out of the inner loop. Byte-identical (stress chunk-size sweep,
+`optimizer_equiv`, and a `push` vs `extend_cells` pin test all green).
+
+**Result: ~7.8 % slower**, so it was **reverted** (faster is never asserted, and
+never *shipped*, without a measured win).
+
+| `huge/open_only_2M` | median | vs baseline |
+|---|---:|---:|
+| baseline (row-major) | 829 ms | — |
+| column-major (this attempt) | 894 ms | **+7.8 % (regress)** |
+
+**Why**: this regime is **parse-bound**, not dispatch- or gather-bound. The
+per-cell int/f64/str parse dominates; hoisting the enum dispatch saved nothing
+(LLVM already predicts the row-major dispatch well), while buffering the chunk
+added a second `memcpy` per line (file→`line`→`cell_bytes`) the streaming
+row-major path avoids. This matches #40's original finding and the kernel.rs
+note (the AVX2 compare gave no win for the same bandwidth/parse-bound reason).
+
+**Untried variant** (next, if revisited): read each line **directly** into the
+chunk buffer (`read_line` appending into `cell_bytes`, truncate-on-reject) to
+drop the second copy — column-major at *one* copy. Expected marginal at best
+since parsing, not copying/dispatch, is the cost; measure before any further
+work. The real remaining lever stays the **selection-vector gather** on a
+genuinely gather-bound workload (multi-stage heavy predicates on cached input),
+not the parse-bound `open`.
