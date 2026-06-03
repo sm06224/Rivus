@@ -34,6 +34,12 @@ The maintainer squash-merges and wants near-zero merge effort. So:
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets   # (CI uses -D warnings; keep zero)
   cargo test --workspace
+  # Feature-gated code (compression: gzip/zstd, regex) is NOT in the default
+  # zero-dep build, so a feature-only break (a struct field, a signature) is
+  # INVISIBLE to the two lines above. CI compiles it, so the gate must too —
+  # this is exactly how #79's gzip break should have been caught before push.
+  RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features
+  cargo test --workspace --all-features    # runs the gzip/zstd oracle tests
   gitleaks detect --no-git --source .
   cargo deny check bans sources licenses    # advisories needs network → CI
   ```
