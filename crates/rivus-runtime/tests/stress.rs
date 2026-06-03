@@ -3041,6 +3041,61 @@ fn validate_dispositions_surface_and_dispose_chunk_size_independent() {
 }
 
 #[test]
+fn validate_reject_parallel_summary_counts_sum_to_total() {
+    // In parallel each byte-range/partition worker emits its own validate
+    // summary; the counts must SUM to the true total (never-silent), while the
+    // dropped rows stay byte-identical to serial (#83). A single coordinator-
+    // merged count is a §24 follow-up; this pins the current contract.
+    let n = 4_000usize;
+    let mut text = String::from("id,age\n");
+    let mut fails = 0u64;
+    for i in 0..n {
+        let age: i64 = if i % 5 == 0 { -1 } else { 30 }; // every 5th row fails
+        if age < 0 {
+            fails += 1;
+        }
+        text.push_str(&format!("{i},{age}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_validate_par",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("V:\n open {p} (id:int age:int)\n |! age >= 0 reject\n |> id\n;");
+    let run_pref = |pref| {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 256,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        res
+    };
+    let par = run_pref(rivus_runtime::MemoryPref::Fast);
+    // Sum the per-worker reject summaries — the total must be exact.
+    let total: u64 = par
+        .errors
+        .iter()
+        .filter(|e| e.message.contains("failed") && e.message.contains("(reject)"))
+        .filter_map(|e| e.message.split_whitespace().next()?.parse::<u64>().ok())
+        .sum();
+    assert_eq!(total, fails, "parallel reject counts must sum to the total");
+    // Dropped rows are byte-identical to serial.
+    let ser = run_pref(rivus_runtime::MemoryPref::Low);
+    assert_eq!(
+        collect_i64(&par, "V", "id"),
+        collect_i64(&ser, "V", "id"),
+        "reject rows identical serial vs parallel"
+    );
+}
+
+#[test]
 fn date_extractors_chunk_size_independent() {
     // weekday (Mon=0..Sun=6), is_weekend, and date(ts) (DateTime→date) are
     // row-wise and chunk-size independent (#58).
