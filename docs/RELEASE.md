@@ -1,8 +1,10 @@
 # Releasing Rivus
 
-Releases (and the `gitleaks` secret scan) are owned by the autonomous agent
-(delegated by the maintainer, 2026-06-02). Cut a release by pushing a `v*` tag
-(or running the **Release** workflow manually); `.github/workflows/release.yml`
+Merging PRs and the pre-release gate (incl. the `gitleaks` secret scan) are
+delegated to the autonomous agent; **cutting a release is the maintainer's alone**
+(delegation updated 2026-06-03). The agent merges `dev → main` and guarantees the
+gate is green; the **maintainer** then cuts the release by pushing a `v*` tag (or
+running the **Release** workflow manually), and `.github/workflows/release.yml`
 builds and publishes the binaries.
 
 ## Pre-release gate (must be green first)
