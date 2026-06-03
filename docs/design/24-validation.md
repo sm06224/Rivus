@@ -88,9 +88,15 @@ Rivus 哲学との整合: **Observable First**（観測が一級・§14）、**c
 
 - **検証は決定的**で、追加は drop と telemetry のみ → 出力は規則が同じなら同一バイト。
 - **行内・窓内（結合的検証）は分割安全**（並列パーティション間で同一規則→同一結果）。
-- **行間（順序依存: monotonic/sequential）** は `#41` と同じ判断: 分割で結果が変わる規則は
-  serial か、順序非依存に再定式化できる範囲のみ並列。`unique` は seen-set のマージが
-  集合和で結合的 → 有界なら並列安全。
+- **行間は規則ごとに分ける（`#41` と同じ判断）**:
+  - **加算的に出せるもの**: `count_distinct`（集合和＝結合的）等「集約値の検証」は
+    seen-set のマージが結合的 → 有界なら並列安全（per-partition 集合の和を取るだけ）。
+  - **加算的に*出せない*もの**: `unique` の **行単位の跨ぎ重複検出 / keep-first**
+    （後続の重複行を reject）や `reference`（参照整合）、`monotonic`/`sequential` は
+    **partition を跨ぐ source-order に依存**するため per-partition 結果の加算マージは
+    *正しくない*。`#41` と同様に **source-order 決定的マージ（直列、または協調マージ）**
+    が要る。phase-3 実装時はこの 2 系統を**明確に分けて**設計する（集約検証＝並列加算 /
+    跨ぎ重複・整合＝順序マージ）。
 - 件数・サンプルは観測（§14）であり結果不変。stress(chunk-size sweep) + optimizer_equiv +
   件数オラクルでゲート。
 
@@ -118,7 +124,7 @@ Rivus 哲学との整合: **Observable First**（観測が一級・§14）、**c
 | 0 | parse 失敗 surface（行内 ingress・`warn`） | **済（`#80`）** |
 | 1 | parse-error disposition（`warn`/`reject`/`halt`・`#81`） | 次 |
 | 2 | 宣言的行内 validator（type/range/regex/required/enum）＋ `\|!` 構文・`Op::Validate` | |
-| 3 | 行間 validator（monotonic/unique/sequential/reference・有界状態） | |
+| 3 | 行間 validator（有界状態）。**2 系統に分離**: 集約検証(`count_distinct`)=並列加算 / 跨ぎ重複・整合(`unique`/`reference`/`monotonic`)=source-order 決定的マージ（§24.7・`#41`） | |
 | 4 | 窓内 validator（`#56` と一体）＋ egress(`quarantine`/dead-letter) | |
 
 各 phase は byte-identity（stress / optimizer_equiv）と件数オラクルでゲートし、
