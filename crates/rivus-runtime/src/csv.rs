@@ -1107,17 +1107,19 @@ impl DtSpec {
     }
 
     /// Parse one cell to epoch ticks, trying each candidate format in order.
-    /// A cell matching none yields `0` (epoch) — the same default-on-parse-
-    /// failure the int/float/decimal lanes use (continue-first; design 23).
+    /// `None` when a (non-empty) cell matches no format, so the caller defaults
+    /// to `0` (epoch) *and* counts the failure for the error stream — the same
+    /// default-on-parse-failure the int/float/decimal lanes use, now equally
+    /// observable (continue-first + Observable First; design 23, #80).
     #[inline]
-    fn parse(&self, cell: &str) -> i64 {
+    fn parse_opt(&self, cell: &str) -> Option<i64> {
         let s = cell.trim();
         for fmt in &self.formats {
             if let Some(dt) = DateTime::parse_with_format(s, fmt, self.unit) {
-                return dt.ticks;
+                return Some(dt.ticks);
             }
         }
-        0
+        None
     }
 }
 
@@ -1207,16 +1209,31 @@ impl ColBuilder {
                     !t.is_empty()
                 }
             },
-            ColBuilder::DateTime(v, spec) => {
-                v.push(spec.parse(cell));
-                false
-            }
-            // Duration text → exact i64 ticks; a malformed cell yields 0
-            // (continue-first), matching the other lanes. #57.
-            ColBuilder::Duration(v, unit) => {
-                v.push(rivus_core::Duration::parse_at(cell, *unit).map_or(0, |d| d.ticks));
-                false
-            }
+            // Datetime text → epoch ticks; a malformed non-empty cell yields 0
+            // and is reported on the error stream, matching the other lanes (#80).
+            ColBuilder::DateTime(v, spec) => match spec.parse_opt(cell) {
+                Some(ticks) => {
+                    v.push(ticks);
+                    false
+                }
+                None => {
+                    v.push(0);
+                    !t.is_empty()
+                }
+            },
+            // Duration text → exact i64 ticks; a malformed non-empty cell yields 0
+            // and is reported on the error stream, matching the other lanes
+            // (continue-first; #57, surfaced in #80).
+            ColBuilder::Duration(v, unit) => match rivus_core::Duration::parse_at(cell, *unit) {
+                Some(d) => {
+                    v.push(d.ticks);
+                    false
+                }
+                None => {
+                    v.push(0);
+                    !t.is_empty()
+                }
+            },
             ColBuilder::Str(v) => {
                 v.push(cell);
                 false

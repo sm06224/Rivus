@@ -18,7 +18,9 @@ All notable changes to Rivus. Format loosely follows
   the reader counts the failures per column and the source raises one
   `Recoverable` summary on exhaustion — e.g. `2 value(s) in column 'amount' (as
   decimal(2)) could not be parsed; kept as default 0`. This includes **decimal
-  `i128` overflow** (#bugreport ②④). Empty cells are "missing", not failures, so
+  `i128` overflow** (#bugreport ②④) and the **datetime and duration lanes**
+  (#80) — every typed lane now reports a non-empty unparseable cell, so no lane
+  defaults silently. Empty cells are "missing", not failures, so
   they never count (no false positives on clean data); the count is exact and
   chunk-size independent. Covers the serial and byte-range-parallel streaming
   readers; the result is unchanged. (The compressed and in-memory build paths
