@@ -229,7 +229,55 @@ fn parallel_run_records_per_worker_telemetry() {
     );
 }
 
-/// A3: a run records a first-row latency (time to the first produced chunk).
+/// #80: the datetime and duration lanes now surface a non-empty unparseable
+/// cell on the error stream too (they previously defaulted to 0/epoch
+/// *silently*), finishing the "no silent failure" pass across every lane. Empty
+/// cells stay "missing" (never counted), rows survive (continue-first), the
+/// counts are exact and chunk-size independent, and the data is unchanged.
+#[test]
+fn datetime_duration_parse_failures_are_reported() {
+    // ts (datetime) / d (duration): valid, invalid, empty (missing), invalid.
+    let body = "ts,d\n\
+                2024-01-02,01:02:03\n\
+                notadate,nope\n\
+                ,\n\
+                zzz,9\n";
+    let csv = TempCsv(gendata::write_temp("obs_dtdur_parsefail", body));
+    let p = csv.0.display();
+    for cs in [1usize, 2, 4096] {
+        let res = run_src(
+            &format!("F:\n open {p} (ts:datetime d:duration)\n |> ts d\n;"),
+            cs,
+        );
+        // Continue-first: all four rows survive (bad cells kept as default).
+        assert_eq!(res.total_rows_out(), 4, "rows out @cs={cs}");
+        let summary = |col: &str| -> String {
+            res.errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .find(|m| m.contains("could not be parsed") && m.contains(&format!("'{col}'")))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no parse-failure telemetry for {col} @cs={cs}: {:?}",
+                        res.errors
+                    )
+                })
+                .to_string()
+        };
+        // 2 unparseable each — the empty cell is "missing", not a failure.
+        assert!(
+            summary("ts").starts_with("2 value(s) in column 'ts'"),
+            "@cs={cs}: {}",
+            summary("ts")
+        );
+        assert!(
+            summary("d").starts_with("2 value(s) in column 'd'"),
+            "@cs={cs}: {}",
+            summary("d")
+        );
+    }
+}
+
 /// It's `Some` for any run that produces rows, and `None` for an empty result.
 #[test]
 fn first_row_latency_is_recorded() {
