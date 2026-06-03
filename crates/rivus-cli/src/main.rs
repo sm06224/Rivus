@@ -56,6 +56,8 @@ fn main() -> ExitCode {
     // `--serve [ADDR]`: launch the live HTTP/SSE dashboard (Pillar B). The
     // optional address defaults to an ephemeral loopback port.
     let mut serve_addr: Option<String> = None;
+    // `--open`: also open the `--serve` dashboard URL in the system browser.
+    let mut open_browser = false;
     // `--tui`: repaint a live ANSI dashboard on stderr as the run streams.
     let mut tui = false;
     // `--memory low|auto|fast|unbounded` (Pillar C): reader memory/speed strategy.
@@ -117,6 +119,7 @@ fn main() -> ExitCode {
                 };
                 serve_addr = Some(addr);
             }
+            "--open" => open_browser = true,
             "--chunk-size" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
@@ -240,7 +243,7 @@ fn main() -> ExitCode {
             // Live dashboard: run the flow on a worker thread that publishes
             // snapshots to a Hub, and serve the embedded HTML/SSE UI here.
             if let Some(addr) = &serve_addr {
-                return run_served(&graph, addr, chunk_size, memory);
+                return run_served(&graph, addr, chunk_size, memory, open_browser);
             }
             // `--tui`: repaint a live ANSI frame on stderr each tick.
             if tui {
@@ -313,11 +316,30 @@ fn send_telemetry(addr: &str, jsonl: &str) -> std::io::Result<()> {
 /// `rivus run … --serve [ADDR]`: run the flow on a worker thread that publishes
 /// live snapshots to a [`serve::Hub`], while this thread serves the embedded
 /// HTML/SSE dashboard. Falls back to a plain run if the address can't be bound.
+/// Best-effort launch of the system browser at `url` (`--open`). Detached and
+/// non-fatal: a missing opener (e.g. headless server) just prints the URL as
+/// usual. Zero-dependency — shells out to the platform's standard opener.
+fn open_in_browser(url: &str) {
+    let (cmd, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", vec!["/C", "start", "", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    let _ = std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn run_served(
     graph: &rivus_ir::PlanGraph,
     addr: &str,
     chunk_size: usize,
     memory: MemoryPref,
+    open: bool,
 ) -> ExitCode {
     let (listener, local) = match serve::bind(addr) {
         Ok(x) => x,
@@ -342,8 +364,13 @@ fn run_served(
         }
     };
     eprintln!("\u{2550}\u{2550} Rivus live \u{2550}\u{2550}  dashboard: http://{local}/  (Ctrl-C to stop)");
+    if open {
+        // The listener is already bound, so a connection now is queued by the OS
+        // even though the accept loop starts below.
+        open_in_browser(&format!("http://{local}/"));
+    }
 
-    let hub = serve::Hub::new();
+    let hub = serve::Hub::new(viz::render_graph_json(graph));
     let worker_hub = std::sync::Arc::clone(&hub);
     // Clone the graph for the worker thread (PlanGraph: Clone).
     let g = graph.clone();
