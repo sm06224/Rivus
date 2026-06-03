@@ -2958,6 +2958,89 @@ fn time_column_reads_minmax_and_surfaces_bad() {
 }
 
 #[test]
+fn validate_dispositions_surface_and_dispose_chunk_size_independent() {
+    // `|! pred warn|reject|halt` (#83 §24): a row failing `pred` is disposed of
+    // per the disposition and ALWAYS surfaced (never silent). warn keeps every
+    // row, reject drops the failing rows; the failure count is chunk-size
+    // independent and reject is byte-identical serial vs parallel; halt is fatal.
+    let text = "id,age\n1,25\n2,-5\n3,40\n4,200\n5,18\n"; // ages -5 and 200 fail
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_validate",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let warn = format!("V:\n open {p} (id:int age:int)\n |! age >= 0, age <= 120 warn\n |> id\n;");
+    let reject =
+        format!("V:\n open {p} (id:int age:int)\n |! age >= 0, age <= 120 reject\n |> id\n;");
+    for cz in [1usize, 2, 4096] {
+        // warn: all 5 rows survive; exactly one summary counting the 2 failures.
+        let res = run_src(&warn, cz);
+        assert_eq!(res.total_rows_out(), 5, "warn keeps every row @cz={cz}");
+        let warned = res
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("2 row(s) failed") && e.message.contains("(warn)"))
+            .count();
+        assert_eq!(
+            warned, 1,
+            "one warn summary of 2 @cz={cz}: {:?}",
+            res.errors
+        );
+
+        // reject: the 2 failing rows are dropped (id 1,3,5 survive) and surfaced.
+        let res2 = run_src(&reject, cz);
+        assert_eq!(
+            collect_i64(&res2, "V", "id"),
+            vec![1, 3, 5],
+            "reject drops failing @cz={cz}"
+        );
+        assert!(
+            res2.errors
+                .iter()
+                .any(|e| e.message.contains("2 row(s) failed") && e.message.contains("(reject)")),
+            "reject must surface the drop @cz={cz}: {:?}",
+            res2.errors
+        );
+    }
+
+    // reject is byte-identical serial vs parallel (row-wise predicate).
+    let rows_for = |pref: rivus_runtime::MemoryPref| {
+        let g = rivus_parser::parse(&reject).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 2,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        collect_i64(&res, "V", "id")
+    };
+    assert_eq!(
+        rows_for(rivus_runtime::MemoryPref::Low),
+        rows_for(rivus_runtime::MemoryPref::Fast),
+        "reject byte-identical serial vs parallel"
+    );
+
+    // halt: a failing row halts the run (fatal on the error stream).
+    let halt = format!("V:\n open {p} (id:int age:int)\n |! age <= 120 halt\n |> id\n;");
+    let res3 = run_src(&halt, 4096);
+    assert_eq!(
+        res3.final_mode,
+        rivus_core::Mode::Halted,
+        "halt must halt the run"
+    );
+    assert!(
+        res3.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+        "halt must raise a fatal: {:?}",
+        res3.errors
+    );
+}
+
+#[test]
 fn date_extractors_chunk_size_independent() {
     // weekday (Mon=0..Sun=6), is_weekend, and date(ts) (DateTime→date) are
     // row-wise and chunk-size independent (#58).

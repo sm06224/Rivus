@@ -28,6 +28,7 @@ pub enum Tok {
     PipeFilter,       // |?
     PipeMap,          // |>
     PipeGroup,        // |#
+    PipeValidate,     // |!
     Pipe,             // |
     Cmp(CmpOp),       // == != < <= > >=
     DollarCur,        // $_
@@ -238,6 +239,10 @@ impl<'a> Lexer<'a> {
                         b'#' => {
                             self.bump();
                             Tok::PipeGroup
+                        }
+                        b'!' => {
+                            self.bump();
+                            Tok::PipeValidate
                         }
                         _ => Tok::Pipe,
                     }

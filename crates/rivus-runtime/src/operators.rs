@@ -13,7 +13,9 @@ use rivus_core::{
     Chunk, Column, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field, Schema, Severity,
     StrColumn, TimeUnit, Value,
 };
-use rivus_ir::{AggFunc, BinType, CmpOp, Endian, Expr, FillMethod, JoinKind, NodeId, Op};
+use rivus_ir::{
+    AggFunc, BinType, CmpOp, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -266,6 +268,12 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::OpenJsonl { path } => Box::new(SourceJsonl::new(path.clone(), chunk_size)),
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
+        Op::Validate { pred, disposition } => Box::new(Validate {
+            pred: pred.clone(),
+            disposition: *disposition,
+            fails: 0,
+            sample: None,
+        }),
         Op::Take { n } => Box::new(Take { remaining: *n }),
         Op::Sort { keys } => Box::new(Sort::new(keys.clone())),
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
@@ -1156,6 +1164,124 @@ impl Operator for Filter {
             return vec![chunk];
         }
         vec![chunk.gather(&keep)]
+    }
+}
+
+// ------------------------------------------------------------------ validate
+
+/// `|! pred warn|reject|halt` — a row contract (#83 §24). A row where `pred` is
+/// false is non-conforming and disposed of per `disposition`, **always** surfaced
+/// on the error stream (never silent). `warn`/`reject` accumulate one summary
+/// emitted on finish (so the count is chunk-size independent); `halt` raises a
+/// fatal immediately. Row disposal is stateless (selection-vector gather, #40).
+struct Validate {
+    pred: Expr,
+    disposition: Disposition,
+    fails: u64,
+    sample: Option<String>,
+}
+
+impl Validate {
+    fn passing(&self, chunk: &Chunk) -> Vec<usize> {
+        match kernel::compile(&[&self.pred], chunk) {
+            Some(plan) => kernel::run(&plan, chunk),
+            None => (0..chunk.len)
+                .filter(|&row| eval::eval_predicate(&self.pred, chunk, row))
+                .collect(),
+        }
+    }
+    /// Compact render of one row (≤4 fields) for the error-stream sample.
+    fn render_row(chunk: &Chunk, row: usize) -> String {
+        let mut s = String::new();
+        for (c, f) in chunk.schema.fields.iter().enumerate().take(4) {
+            if c > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&f.name);
+            s.push('=');
+            s.push_str(&chunk.value(row, c).to_string());
+        }
+        s
+    }
+}
+
+impl Operator for Validate {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let keep = self.passing(&chunk);
+        let n_fail = chunk.len - keep.len();
+        if n_fail == 0 {
+            return vec![chunk];
+        }
+        if self.sample.is_none() {
+            let kept: std::collections::HashSet<usize> = keep.iter().copied().collect();
+            if let Some(row) = (0..chunk.len).find(|r| !kept.contains(r)) {
+                self.sample = Some(Self::render_row(&chunk, row));
+            }
+        }
+        self.fails += n_fail as u64;
+        match self.disposition {
+            // Strict: surface a fatal now (the engine halts on it) and pass the
+            // conforming rows seen so far downstream.
+            Disposition::Halt => {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Fatal,
+                        ErrorScope::Item,
+                        format!(
+                            "{} row(s) failed `|! {}` (halt); e.g. {}",
+                            self.fails,
+                            self.pred,
+                            self.sample.as_deref().unwrap_or("")
+                        ),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+                if keep.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![chunk.gather(&keep)]
+                }
+            }
+            // Keep every row; the summary is surfaced on finish.
+            Disposition::Warn => vec![chunk],
+            // Drop the non-conforming rows; the summary is surfaced on finish.
+            Disposition::Reject => {
+                if keep.is_empty() {
+                    Vec::new()
+                } else if keep.len() == chunk.len {
+                    vec![chunk]
+                } else {
+                    vec![chunk.gather(&keep)]
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        // warn/reject surface one Recoverable summary on exhaustion (never silent;
+        // halt already raised its fatal). The count is chunk-size independent.
+        if self.fails > 0 && !matches!(self.disposition, Disposition::Halt) {
+            let verb = if matches!(self.disposition, Disposition::Reject) {
+                "dropped"
+            } else {
+                "kept"
+            };
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Recoverable,
+                    ErrorScope::Item,
+                    format!(
+                        "{} row(s) failed `|! {}` ({}); {verb}; e.g. {}",
+                        self.fails,
+                        self.pred,
+                        self.disposition.as_str(),
+                        self.sample.as_deref().unwrap_or("")
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        Vec::new()
     }
 }
 

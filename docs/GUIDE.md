@@ -121,6 +121,36 @@ where age >= 20, country == "JP"      # comma = AND (same as `and`)
 |? (score / age) > 3          # arithmetic in parens (see §6)
 ```
 
+### `|!` — validate (declare a row contract)
+
+A **validator is not a filter.** `|?` quietly drops the rows it doesn't want;
+`|!` declares a *contract* — a row that fails it is disposed of **explicitly and
+always reported** on the error stream (never silent). Same predicate syntax as
+`|?` (commas = AND), followed by a **required disposition**:
+
+```
+|! age >= 0, age <= 120 warn         # keep every row, but report the violations
+|! email contains "@" reject         # drop the failing rows, and report them
+|! id >= 1 halt                      # stop the run on the first violation (strict)
+```
+
+| disposition | the failing row | reported |
+|---|---|---|
+| `warn` | kept (passes through) | yes — `N row(s) failed … (warn)` |
+| `reject` | dropped | yes — `… (reject); dropped` |
+| `halt` | — (run halts) | yes — a **fatal** event |
+
+- The disposition is **mandatory** — there is no implicit default, so a silent
+  drop policy is impossible. Every disposition surfaces the **count, the rule,
+  and a sample** of an offending row (e.g. `e.g. id=2, age=-5`).
+- `warn`/`reject` report **one summary on completion** (the count is chunk-size
+  independent); `reject` is byte-identical serial vs parallel. `halt` raises a
+  `Fatal` (the run stops, continue-first §13). The CSV reader's parse-failure
+  reporting (§6) is the same idea applied at ingest — the first row-level
+  validator.
+- _Coming next (§24):_ declarative rules (`in 0..120`, `matches "…"`, `required`,
+  `in {…}`), `quarantine(sink)` (dead-letter), and inter-row / windowed checks.
+
 ### `|>` — project / compute columns
 
 Select columns, rename them, or compute new ones. Each item is one of:
