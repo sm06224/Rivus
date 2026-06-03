@@ -2706,10 +2706,14 @@ fn date_column_parses_chunk_size_independent_and_surfaces_bad() {
             "alignment @cz={cz}"
         );
         // Exactly one parse failure surfaced (the invalid date; empty not counted).
+        // Verbatim phrasing (incl. the "(as date)" lane tag the GUIDE quotes).
         let fails = res
             .errors
             .iter()
-            .filter(|e| e.message.contains("could not be parsed") && e.message.contains("'d'"))
+            .filter(|e| {
+                e.message
+                    .contains("in column 'd' (as date) could not be parsed; kept as default 0")
+            })
             .count();
         assert_eq!(
             fails, 1,

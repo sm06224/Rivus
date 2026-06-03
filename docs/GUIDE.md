@@ -447,9 +447,8 @@ open shifts.csv (emp:str start:datetime("yyMMddHHmmss") end:datetime("yyMMddHHmm
 
 **Date lane (`date`)** — a **calendar date** with no time-of-day, stored as an
 exact `i32` epoch-day (days since `1970-01-01`). Like the datetime/duration
-lanes it is integer → exact and *associative*, so `min`/`max`/`count` and a
-group-by on a date column are byte-identical in parallel. Read (and render) ISO
-`yyyy-MM-dd`:
+lanes it is integer → exact, so `count` and a group-by on a date column are
+**byte-identical in parallel**. Read (and render) ISO `yyyy-MM-dd`:
 
 ```
 open events.csv (id:int day:date)   # parse "2024-06-03" into the date lane
@@ -465,8 +464,10 @@ open events.csv (id:int day:date)   # parse "2024-06-03" into the date lane
   not a failure (never counted), so clean data stays quiet.
 - **Exact, never f64**: comparison ordering and `min`/`max`/`count` run on the
   integer epoch-day.
-- _Coming next (#58):_ `DateTime → date`, plus `weekday` / `is_weekend` / `date`
-  / `time` extraction, and the `TimeOfDay` / `Weekday` subtypes.
+- _Coming next (#58):_ `DateTime → date`; `weekday` / `is_weekend` / `date` /
+  `time` extraction; **date-typed `min`/`max`** (today they aggregate exactly but
+  surface the raw epoch-day — they'll render as dates, mirroring datetime); and
+  the `TimeOfDay` / `Weekday` subtypes.
 
 ---
 
