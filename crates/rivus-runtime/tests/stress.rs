@@ -2797,6 +2797,11 @@ fn date_minmax_keeps_date_type_and_parallel_matches_serial() {
     let mut rng = Rng::new(581);
     let mut text = String::from("k,d\n");
     let days = ["2024-06-01", "2024-01-15", "2023-12-25", "2024-02-29"];
+    // Guarantee both keys contain the extremes so the oracle is deterministic
+    // (min = 2023-12-25, max = 2024-06-01) regardless of the random fill.
+    for k in ["a", "b"] {
+        text.push_str(&format!("{k},2023-12-25\n{k},2024-06-01\n"));
+    }
     for _ in 0..rows {
         let k = if rng.below(2) == 0 { "a" } else { "b" };
         let d = days[rng.below(days.len() as u64) as usize];
@@ -2839,10 +2844,28 @@ fn date_minmax_keeps_date_type_and_parallel_matches_serial() {
         rows.sort();
         rows
     };
+    let serial = snapshot(rivus_runtime::MemoryPref::Low);
     assert_eq!(
-        snapshot(rivus_runtime::MemoryPref::Low),
+        serial,
         snapshot(rivus_runtime::MemoryPref::Fast),
         "date min/max must be byte-identical serial vs parallel"
+    );
+    // Oracle: both keys span the full date set, so min/max are the true extremes.
+    assert_eq!(
+        serial,
+        vec![
+            (
+                "a".to_string(),
+                "2023-12-25".to_string(),
+                "2024-06-01".to_string()
+            ),
+            (
+                "b".to_string(),
+                "2023-12-25".to_string(),
+                "2024-06-01".to_string()
+            ),
+        ],
+        "date min/max extreme values"
     );
 }
 
