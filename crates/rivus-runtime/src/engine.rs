@@ -16,6 +16,7 @@ use crate::telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelem
 use rivus_core::{Chunk, DataType, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
 use rivus_ir::{HookAction, HookEvent, NodeId, Op, PlanGraph};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -101,7 +102,7 @@ pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError>
 pub fn run_with_progress(
     graph: &PlanGraph,
     opts: RunOptions,
-    hook: Option<ProgressHook>,
+    mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
 ) -> Result<RunResult, RivusError> {
     if graph.topo_order().is_none() {
         return Err(RivusError::Build("flow graph contains a cycle".into()));
@@ -123,12 +124,19 @@ pub fn run_with_progress(
     // materialize for the parallel path).
     let preview = opts.max_capture.is_some() && !must_drain(graph);
 
-    if hook.is_none() && strat == crate::analytics::Strategy::Parallel {
+    // Observable First: a live hook (TUI / `--serve`) must NOT force the serial
+    // path — observing the run must not throttle it. The parallel paths feed the
+    // hook an aggregate cross-worker snapshot instead (see `ParProgress`), so the
+    // view is coarser but the *processing* stays fully parallel.
+    if strat == crate::analytics::Strategy::Parallel {
         // Parallel group-by (#41): a linear `source → … → group` flow whose
         // aggregates are byte-identical under partition→merge. Tried before the
         // stateless path (which bails on a group → serial).
         if let Some((src, grp, sink)) = eligible_group_flow(graph) {
-            if let Some(mut res) = try_parallel_group(graph, &opts, src, grp, sink) {
+            // Bind first so the `hook` reborrow is released at the `;` (not held
+            // across the following attempts / the serial-fallback move).
+            let attempt = try_parallel_group(graph, &opts, src, grp, sink, hook.as_deref_mut());
+            if let Some(mut res) = attempt {
                 res.strategy = has_file_source.then(|| format!("{note}; parallel group-by"));
                 return Ok(res);
             }
@@ -137,13 +145,15 @@ pub fn run_with_progress(
         // by materializing it. Only for `MemoryPref::Unbounded` (the user's
         // explicit choice to trade bounded memory for speed).
         if let Some((src, grp, sink)) = eligible_group_flow_any(graph) {
-            if let Some(mut res) = try_unbounded_group(graph, &opts, src, grp, sink) {
+            let attempt = try_unbounded_group(graph, &opts, src, grp, sink, hook.as_deref_mut());
+            if let Some(mut res) = attempt {
                 res.strategy =
                     has_file_source.then(|| format!("{note}; unbounded group-by (materialized)"));
                 return Ok(res);
             }
         }
-        if let Some(mut res) = try_parallel(graph, &opts, min_parallel) {
+        let attempt = try_parallel(graph, &opts, min_parallel, hook.as_deref_mut());
+        if let Some(mut res) = attempt {
             res.strategy = has_file_source.then(|| note.clone());
             return Ok(res);
         }
@@ -159,19 +169,11 @@ pub fn run_with_progress(
         res.strategy = has_file_source.then(|| format!("{note}; {why}"));
         return Ok(res);
     }
-    // A live hook (TUI / --serve) forces this serial path so the dashboard sees
-    // a single coherent stream. If the autotuner would otherwise have gone
-    // parallel, say so in the rationale rather than mislabel the run "parallel".
-    let live = hook.is_some();
+    // The autotuner chose serial (small input or `--memory low`); the hook
+    // streams the run as usual.
     let ops = build_ops(graph, &opts, None, preview);
     let mut res = drive(graph, ops, 0, opts.progress, opts.max_capture, hook);
-    res.strategy = has_file_source.then(|| {
-        if live && strat == crate::analytics::Strategy::Parallel {
-            format!("{note}; live observation → serial")
-        } else {
-            note.clone()
-        }
-    });
+    res.strategy = has_file_source.then(|| note.clone());
     Ok(res)
 }
 
@@ -282,7 +284,7 @@ fn drive(
     chunk_id_base: u64,
     progress: bool,
     max_capture: Option<usize>,
-    mut hook: Option<ProgressHook>,
+    mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
 ) -> RunResult {
     // (hook is mutated in place via as_mut() to publish snapshots)
     let n = graph.nodes.len();
@@ -575,6 +577,7 @@ fn try_streaming_parallel(
     opts: &RunOptions,
     src_id: NodeId,
     threads: usize,
+    mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
 ) -> Option<RunResult> {
     let plan = plan_parallel_source(&graph.nodes[src_id].op, threads)?;
 
@@ -599,9 +602,11 @@ fn try_streaming_parallel(
     let nparts = plan.ranges.len();
     let part_path = |final_path: &str, i: usize| format!("{final_path}.rivpart{i}");
 
+    let prog = ParProgress::new(nparts, graph.nodes.len(), src_id);
     let results: Vec<RunResult> = std::thread::scope(|scope| {
         let sinks = &sinks;
         let plan = &plan;
+        let prog = &prog;
         let handles: Vec<_> = plan
             .ranges
             .iter()
@@ -634,10 +639,16 @@ fn try_streaming_parallel(
                             }
                         })
                         .collect();
-                    drive(graph, ops, (i as u64) << 40, false, None, None)
+                    let mut wh = prog.worker_hook(i);
+                    let r = drive(graph, ops, (i as u64) << 40, false, None, Some(&mut wh));
+                    prog.finish_worker(i, &r.telemetry);
+                    r
                 })
             })
             .collect();
+        if let Some(h) = hook.as_mut() {
+            prog.sample_until_done(h, graph);
+        }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
@@ -664,6 +675,9 @@ fn try_streaming_parallel(
                 format!("cannot assemble '{final_path}': {e}"),
             ));
         }
+    }
+    if let Some(h) = hook.as_mut() {
+        h(&prog.snapshot(graph, res.final_mode));
     }
     Some(res)
 }
@@ -819,7 +833,139 @@ fn single_file_source_size(graph: &PlanGraph) -> Option<u64> {
 /// (its parse is already internally parallel), then contiguous chunk partitions
 /// are run through identical stateless sub-DAGs on worker threads and merged in
 /// source order. Returns `None` (→ serial) when ineligible or too small.
-fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<RunResult> {
+/// A terminal snapshot built from a finished run's per-node telemetry, for the
+/// parallel group-by paths (whose workers accumulate a partial group operator
+/// rather than streaming per-node `drive` ticks). The run was fully parallel;
+/// this just lets the live view land on the completed DAG.
+fn final_snapshot(res: &RunResult, src_id: NodeId, elapsed: Duration) -> RuntimeSnapshot {
+    let rows_seen = res
+        .telemetry
+        .iter()
+        .find(|t| t.node_id == src_id)
+        .map_or(0, |t| t.rows_out);
+    build_snapshot(elapsed, rows_seen, res.final_mode, &res.telemetry)
+}
+
+/// How often the coordinator samples cross-worker progress for the live hook.
+const PAR_SAMPLE: Duration = Duration::from_millis(100);
+
+/// Cross-worker live progress for a parallel run. Observing a run (TUI /
+/// `--serve`) must **not** force it onto the serial path — that would let the
+/// *view* change the *computation* (the opposite of Observable First). Instead,
+/// each worker mirrors its partition's latest per-node row counts into per-worker
+/// atomic slots (via a lightweight `drive` hook), and the coordinator thread
+/// periodically sums them into one aggregate snapshot for the real hook. The
+/// processing stays fully parallel; only the view is coarser (node aggregate
+/// across workers, not the per-worker breakdown a serial run can't show either).
+struct ParProgress {
+    start: Instant,
+    nodes: usize,
+    workers: usize,
+    /// Source node id — its summed `rows_out` is the run's `rows_seen`.
+    src_id: NodeId,
+    /// `[worker * nodes + node_id]` latest counts, published by workers.
+    rows_out: Vec<AtomicU64>,
+    rows_in: Vec<AtomicU64>,
+    errors: Vec<AtomicU64>,
+    /// Workers that have finished (the run is done when this reaches `workers`).
+    done: AtomicUsize,
+}
+
+impl ParProgress {
+    fn new(workers: usize, nodes: usize, src_id: NodeId) -> Self {
+        let cells = workers.max(1) * nodes.max(1);
+        ParProgress {
+            start: Instant::now(),
+            nodes,
+            workers,
+            src_id,
+            rows_out: (0..cells).map(|_| AtomicU64::new(0)).collect(),
+            rows_in: (0..cells).map(|_| AtomicU64::new(0)).collect(),
+            errors: (0..cells).map(|_| AtomicU64::new(0)).collect(),
+            done: AtomicUsize::new(0),
+        }
+    }
+
+    /// A `drive` hook for worker `w`: mirror its current per-node telemetry into
+    /// this worker's slots (store, not add — idempotent across ticks).
+    fn worker_hook(&self, w: usize) -> impl FnMut(&RuntimeSnapshot) + '_ {
+        move |s: &RuntimeSnapshot| {
+            for n in &s.nodes {
+                if n.node_id < self.nodes {
+                    let k = w * self.nodes + n.node_id;
+                    self.rows_out[k].store(n.rows_out, Ordering::Relaxed);
+                    self.rows_in[k].store(n.rows_in, Ordering::Relaxed);
+                    self.errors[k].store(n.errors, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Store a worker's *final* per-node telemetry (the last chunks may not have
+    /// landed on a hook tick), then mark it done.
+    fn finish_worker(&self, w: usize, telemetry: &[NodeTelemetry]) {
+        for t in telemetry {
+            if t.node_id < self.nodes {
+                let k = w * self.nodes + t.node_id;
+                self.rows_out[k].store(t.rows_out, Ordering::Relaxed);
+                self.rows_in[k].store(t.rows_in, Ordering::Relaxed);
+                self.errors[k].store(t.errors, Ordering::Relaxed);
+            }
+        }
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn all_done(&self) -> bool {
+        self.done.load(Ordering::Relaxed) >= self.workers
+    }
+
+    /// One aggregate snapshot: each node summed across workers.
+    fn snapshot(&self, graph: &PlanGraph, mode: Mode) -> RuntimeSnapshot {
+        let finished = self.all_done();
+        let sum = |id: NodeId, col: &[AtomicU64]| -> u64 {
+            (0..self.workers)
+                .map(|w| col[w * self.nodes + id].load(Ordering::Relaxed))
+                .sum()
+        };
+        let nodes = graph
+            .nodes
+            .iter()
+            .map(|node| NodeSnapshot {
+                node_id: node.id,
+                label: label_of(graph, node.id),
+                kind: node.op.kind_str().to_string(),
+                rows_in: sum(node.id, &self.rows_in),
+                rows_out: sum(node.id, &self.rows_out),
+                errors: sum(node.id, &self.errors),
+                mode,
+                finished,
+            })
+            .collect();
+        RuntimeSnapshot {
+            elapsed: self.start.elapsed(),
+            rows_seen: sum(self.src_id, &self.rows_out),
+            mode,
+            nodes,
+        }
+    }
+
+    /// Coordinator loop: push an aggregate snapshot to `hook` every `PAR_SAMPLE`
+    /// until every worker has finished. Runs on the coordinator thread (the hook
+    /// is not `Send`), concurrently with the workers.
+    fn sample_until_done(&self, hook: &mut dyn FnMut(&RuntimeSnapshot), graph: &PlanGraph) {
+        while !self.all_done() {
+            std::thread::sleep(PAR_SAMPLE);
+            hook(&self.snapshot(graph, Mode::Normal));
+        }
+    }
+}
+
+fn try_parallel(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    min_bytes: u64,
+    mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
+) -> Option<RunResult> {
     let threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1);
@@ -891,7 +1037,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<
         if path != "-" {
             if let Ok(meta) = std::fs::metadata(path) {
                 if meta.len() >= min_bytes {
-                    return try_streaming_parallel(graph, opts, src_id, threads);
+                    return try_streaming_parallel(graph, opts, src_id, threads, hook);
                 }
             }
         }
@@ -922,7 +1068,7 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<
             Some((src_id, operators::mem_source(all))),
             false,
         );
-        let mut res = drive(graph, ops, 0, false, None, None);
+        let mut res = drive(graph, ops, 0, false, None, hook);
         // Write any collected sink (build_ops made it a collector).
         flush_parallel_sinks(graph, &mut res);
         res.errors.splice(0..0, src_errors);
@@ -932,9 +1078,13 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<
         return Some(res);
     }
 
-    // Run partitions on worker threads.
+    // Run partitions on worker threads. A live hook observes aggregate progress
+    // without forcing serial (Observable First) via the shared `ParProgress`.
     let parts = partition(all, threads);
+    let nworkers = parts.len();
+    let prog = ParProgress::new(nworkers, graph.nodes.len(), src_id);
     let results: Vec<RunResult> = std::thread::scope(|scope| {
+        let prog = &prog;
         let handles: Vec<_> = parts
             .into_iter()
             .enumerate()
@@ -942,14 +1092,24 @@ fn try_parallel(graph: &PlanGraph, opts: &RunOptions, min_bytes: u64) -> Option<
                 scope.spawn(move || {
                     let src = operators::mem_source(chunks);
                     let ops = build_ops(graph, opts, Some((src_id, src)), false);
-                    drive(graph, ops, (i as u64) << 40, false, None, None)
+                    let mut wh = prog.worker_hook(i);
+                    let r = drive(graph, ops, (i as u64) << 40, false, None, Some(&mut wh));
+                    prog.finish_worker(i, &r.telemetry);
+                    r
                 })
             })
             .collect();
+        if let Some(h) = hook.as_mut() {
+            prog.sample_until_done(h, graph);
+        }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    Some(merge_results(graph, results, src_errors, src_fatal))
+    let res = merge_results(graph, results, src_errors, src_fatal);
+    if let Some(h) = hook.as_mut() {
+        h(&prog.snapshot(graph, res.final_mode));
+    }
+    Some(res)
 }
 
 /// Stateless ops allowed on the pre-group path (an **allowlist**, so an unknown
@@ -1256,7 +1416,9 @@ fn try_parallel_group(
     src_id: NodeId,
     group_id: NodeId,
     sink_id: Option<NodeId>,
+    mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
 ) -> Option<RunResult> {
+    let t0 = Instant::now();
     let threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1);
@@ -1305,9 +1467,11 @@ fn try_parallel_group(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    Some(finalize_group_partials(
-        graph, src_id, group_id, sink_id, partials,
-    ))
+    let res = finalize_group_partials(graph, src_id, group_id, sink_id, partials);
+    if let Some(h) = hook.as_mut() {
+        h(&final_snapshot(&res, src_id, t0.elapsed()));
+    }
+    Some(res)
 }
 
 /// A planned bounded byte-range read of a splittable source (CSV or JSONL): the
@@ -1667,7 +1831,9 @@ fn try_unbounded_group(
     src_id: NodeId,
     group_id: NodeId,
     sink_id: Option<NodeId>,
+    mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
 ) -> Option<RunResult> {
+    let t0 = Instant::now();
     if opts.memory != crate::analytics::MemoryPref::Unbounded {
         return None;
     }
@@ -1754,6 +1920,9 @@ fn try_unbounded_group(
     res.errors.splice(0..0, src_errors);
     if src_fatal {
         res.final_mode = Mode::Halted;
+    }
+    if let Some(h) = hook.as_mut() {
+        h(&final_snapshot(&res, src_id, t0.elapsed()));
     }
     Some(res)
 }
@@ -2039,7 +2208,8 @@ mod tests {
             .iter()
             .position(|nd| matches!(nd.op, Op::OpenCsv { .. }))
             .unwrap();
-        try_streaming_parallel(&gp, &opts, src_id, 4).expect("streaming-parallel should engage");
+        try_streaming_parallel(&gp, &opts, src_id, 4, None)
+            .expect("streaming-parallel should engage");
 
         let a = std::fs::read_to_string(&out_serial).unwrap();
         let b = std::fs::read_to_string(&out_par).unwrap();
