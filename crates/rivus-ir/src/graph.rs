@@ -897,13 +897,20 @@ impl PlanGraph {
         }
     }
 
-    /// Regenerate readable Rivus source from the graph (Master principle #5).
-    /// This is intentionally best-effort/canonical: the optimizer can rewrite
-    /// the graph and we can always show the user the resulting source.
+    /// Regenerate readable Rivus source from the graph (Master principle #5:
+    /// IR reversibility). Linear flows, merge/join scopes **and** `->` branch
+    /// fan-out all round-trip: `parse(to_source(g))` is the same graph. (The
+    /// optimizer can rewrite the graph first; we always render the result.)
     pub fn to_source(&self) -> String {
         let mut out = String::new();
-        // Emit one block per labeled scope, in stable id order.
-        let mut labeled: Vec<&Node> = self.nodes.iter().filter(|n| n.label.is_some()).collect();
+        // Emit one block per labeled scope, in stable id order — except scopes
+        // that are *branch children* of another scope, which are rendered inline
+        // (`-> Label: …`) by their parent (see `write_chain`).
+        let mut labeled: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|n| n.label.is_some() && self.branch_parent_fanout(n.id).is_none())
+            .collect();
         labeled.sort_by_key(|n| n.id);
 
         for node in labeled {
@@ -931,34 +938,67 @@ impl PlanGraph {
                 _ => {}
             }
 
-            // Otherwise walk the linear chain ending at this node.
-            let chain = self.linear_chain_to(node.id);
+            // Otherwise walk the linear chain ending at this node, inlining any
+            // branch children that fan out from it.
             let _ = writeln!(out, "{label}:");
-            for &nid in &chain {
-                // Inert comment trivia preceding this step (§25.7), re-emitted
-                // in source order at the step's indentation so `rivus fmt`
-                // round-trips it.
-                for c in &self.nodes[nid].leading_comments {
-                    let _ = writeln!(out, "    {c}");
-                }
-                let _ = writeln!(out, "    {}", self.nodes[nid].op.to_src_line());
-                for h in &self.nodes[nid].hooks {
-                    self.write_hook(&mut out, h);
-                }
-            }
-            // Render branch children, if any.
-            for succ in self.outputs_of(node.id) {
-                if let Some(child_label) = &self.nodes[succ].label {
-                    if matches!(self.nodes[node.id].op, Op::Branch)
-                        || self.is_branch_child(node.id, succ)
-                    {
-                        let _ = writeln!(out, "    -> {child_label}: ... ;");
-                    }
-                }
-            }
+            self.write_chain(&mut out, node.id, 1);
             let _ = writeln!(out, ";");
         }
         out
+    }
+
+    /// Write the linear chain ending at `tail`, one step per line indented
+    /// `depth` levels, inlining branch children (`-> Label: … ;`) that fan out
+    /// from any node in the chain. Recurses for nested branches.
+    fn write_chain(&self, out: &mut String, tail: NodeId, depth: usize) {
+        let pad = "    ".repeat(depth);
+        let chain = self.linear_chain_to(tail);
+        for &nid in &chain {
+            // Inert comment trivia preceding this step (§25.7), re-emitted in
+            // source order at the step's indentation so `rivus fmt` round-trips.
+            for c in &self.nodes[nid].leading_comments {
+                let _ = writeln!(out, "{pad}{c}");
+            }
+            let _ = writeln!(out, "{pad}{}", self.nodes[nid].op.to_src_line());
+            for h in &self.nodes[nid].hooks {
+                self.write_hook(out, h);
+            }
+            // Branch children fanning out from this node, rendered inline so the
+            // whole DAG round-trips (their flow continues from here).
+            for child in self.branch_children_of(nid) {
+                let clabel = self.nodes[child].label.as_ref().unwrap();
+                let _ = writeln!(out, "{pad}-> {clabel}:");
+                self.write_chain(out, child, depth + 1);
+                let _ = writeln!(out, "{pad};");
+            }
+        }
+    }
+
+    /// If the scope ending at `scope_tail` continues from a fan-out node in
+    /// another scope, return that node — i.e. this is a branch child, rendered
+    /// inline by its parent. `None` for an independent scope (its chain starts
+    /// at a source) or a merge/join scope.
+    fn branch_parent_fanout(&self, scope_tail: NodeId) -> Option<NodeId> {
+        if matches!(self.nodes[scope_tail].op, Op::Merge | Op::Join { .. }) {
+            return None;
+        }
+        let chain = self.linear_chain_to(scope_tail);
+        let root = *chain.first()?;
+        // A source-rooted chain has no input → independent scope; otherwise the
+        // single input is the parent's fan-out point.
+        self.inputs_of(root).first().copied()
+    }
+
+    /// Labeled branch-child scopes that fan out directly from `node`, id-sorted.
+    fn branch_children_of(&self, node: NodeId) -> Vec<NodeId> {
+        let mut kids: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|n| n.label.is_some() && self.branch_parent_fanout(n.id) == Some(node))
+            .map(|n| n.id)
+            .collect();
+        kids.sort_unstable();
+        kids
     }
 
     fn input_labels(&self, inputs: &[NodeId]) -> Vec<String> {
@@ -971,10 +1011,6 @@ impl PlanGraph {
                     .unwrap_or_else(|| format!("<{}>", self.nodes[i].op.kind_str()))
             })
             .collect()
-    }
-
-    fn is_branch_child(&self, parent: NodeId, _child: NodeId) -> bool {
-        self.outputs_of(parent).len() > 1
     }
 
     /// Collect the linear chain of single-input nodes leading up to `id`,
