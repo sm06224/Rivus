@@ -465,6 +465,7 @@ fn merge_fused(g: PlanGraph, a: NodeId, b: NodeId) -> PlanGraph {
             op,
             hooks: n.hooks.clone(),
             leading_comments: n.leading_comments.clone(),
+            applied_from: n.applied_from.clone(),
         });
     }
 
@@ -548,6 +549,7 @@ fn dedup_sources(graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
             op: n.op.clone(),
             hooks: n.hooks.clone(),
             leading_comments: n.leading_comments.clone(),
+            applied_from: n.applied_from.clone(),
         });
     }
 

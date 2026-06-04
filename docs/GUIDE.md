@@ -276,6 +276,33 @@ reorder name id             # move name,id to the front; rest follow in order
 pure permutation that floats the named columns to the front (unknown names
 ignored, duplicates deduped). All three round-trip through `to_source`.
 
+### `| name` — reuse a named flow
+
+Define a flow once, then **apply its transforms** to another stream by name —
+function-composition for pipelines (no macros, no copy-paste):
+
+```
+clean:                       # a reusable transform recipe (with a source of its own)
+    open raw.csv
+    |? status == "ok"
+    |! id >= 1 warn
+    |> id status
+;
+report:
+    open today.csv
+    | clean                  # apply clean's transforms here (filter, validate, project)
+    |# status
+;
+```
+
+- `| name` splices in `name`'s **transforms only** (everything after its
+  source), in order, so it behaves **byte-identically** to writing those steps
+  inline — same data, same error stream. Reuse is mechanical, not magic.
+- The flow must be **defined earlier** in the program; an undefined `| name` is
+  an error (never a silent skip). Name resolution is by column name, so it is
+  schema-version-independent.
+- It **round-trips**: `rivus fmt` re-emits `| name` (not the expanded steps).
+
 ### Composing them
 
 Transforms chain in any order:
@@ -846,6 +873,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
+           | '|' IDENT                                        (apply a named flow's transforms)
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
            | ('take'|'limit'|'head') INT

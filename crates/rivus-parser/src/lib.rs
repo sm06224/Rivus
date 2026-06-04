@@ -40,6 +40,7 @@ pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
         pos: 0,
         g: PlanGraph::new(),
         last_dt_fmt: None,
+        apply_site: 0,
     };
     p.parse_program()?;
     Ok(p.g)
@@ -59,6 +60,9 @@ struct Parser {
     /// column so the format can be carried on `OpenCsv.dt_formats`. `None` for a
     /// bare `:datetime` (auto-infer) or any non-datetime type.
     last_dt_fmt: Option<String>,
+    /// Monotonic id for each `| name` apply site (§25.4), stamped on the nodes it
+    /// splices so `to_source` can collapse the run back to `| name`.
+    apply_site: u32,
 }
 
 impl Parser {
@@ -284,12 +288,32 @@ impl Parser {
                     current = n;
                 }
                 Tok::Pipe => {
-                    // `| map { ... }` — MVP: parse and skip the block (no-op).
-                    self.bump();
-                    if self.peek_is_word("map") {
-                        self.bump();
+                    self.bump(); // `|`
+                                 // `| name` — named-flow reuse (§25.4): apply a previously
+                                 // defined flow's transforms to the current stream. Desugared
+                                 // by splicing copies of those ops (byte-identical to writing
+                                 // them inline); each spliced node is stamped with this apply
+                                 // site so `to_source` collapses the run back to `| name`.
+                    let apply = matches!(self.tok(), Tok::Word(n) if self.g.labels.contains_key(n));
+                    if apply {
+                        let name = self.word()?;
+                        let tail = self.g.labels[&name];
+                        let ops = self.g.flow_transform_ops(tail);
+                        let site = self.apply_site;
+                        self.apply_site += 1;
+                        for op in ops {
+                            let nid = self.g.add_node(op);
+                            self.g.nodes[nid].applied_from = Some((site, name.clone()));
+                            self.g.add_edge(current, nid, EdgeKind::Stream);
+                            current = nid;
+                        }
+                    } else {
+                        // `| map { ... }` / `| { ... }` — MVP: skip the block (no-op).
+                        if self.peek_is_word("map") {
+                            self.bump();
+                        }
+                        self.skip_block()?;
                     }
-                    self.skip_block()?;
                 }
                 Tok::Arrow => {
                     // Branch: `-> Child: body ;` continuing from `current`.
@@ -1891,6 +1915,67 @@ Users:
             g2.to_source(),
             "to_source not idempotent on a branch"
         );
+    }
+
+    /// The ordered op chain ending at `tail`, walked back to the source.
+    fn chain_ops(g: &PlanGraph, tail: NodeId) -> Vec<String> {
+        let mut ops = Vec::new();
+        let mut cur = tail;
+        loop {
+            ops.push(format!("{:?}", g.nodes[cur].op));
+            let ins = g.inputs_of(cur);
+            if ins.len() != 1 {
+                break;
+            }
+            cur = ins[0];
+        }
+        ops.reverse();
+        ops
+    }
+
+    #[test]
+    fn named_flow_apply_desugars_byte_identical_to_inline() {
+        // `| clean` (§25.4) splices `clean`'s transforms; the resulting op chain
+        // must be *identical* to writing those transforms inline — and an
+        // identical op sequence executes observationally identically (the engine
+        // is deterministic per op chain), which is the byte-identity contract.
+        let applied = parse(
+            "clean:\n open c.csv\n |? age >= 20\n |! id >= 1 warn\n |> id age\n;\n\
+             R:\n open d.csv\n | clean\n |# country\n;",
+        )
+        .unwrap();
+        let inline =
+            parse("R:\n open d.csv\n |? age >= 20\n |! id >= 1 warn\n |> id age\n |# country\n;")
+                .unwrap();
+        assert_eq!(
+            chain_ops(&applied, applied.labels["R"]),
+            chain_ops(&inline, inline.labels["R"]),
+            "`| clean` desugar is not op-identical to the inline transforms"
+        );
+    }
+
+    #[test]
+    fn named_flow_apply_round_trips_as_pipe_name() {
+        // `| clean` survives to_source as `| clean` (not the desugared ops), and
+        // re-parses to the same graph; idempotent.
+        let src = "clean:\n open c.csv\n |? age >= 20\n |> id age\n;\n\
+                   R:\n open d.csv\n | clean\n |# country\n;";
+        let g1 = parse(src).unwrap();
+        let rendered = g1.to_source();
+        assert!(rendered.contains("| clean"), "lost `| clean`:\n{rendered}");
+        let g2 = parse(&rendered).unwrap();
+        assert_eq!(
+            chain_ops(&g1, g1.labels["R"]),
+            chain_ops(&g2, g2.labels["R"]),
+            "graph changed across `| clean` round-trip:\n{rendered}"
+        );
+        assert_eq!(rendered, g2.to_source(), "not idempotent:\n{rendered}");
+    }
+
+    #[test]
+    fn unknown_named_flow_apply_is_an_error() {
+        // `| nope` with no such flow defined is a parse error (not a silent skip).
+        assert!(parse("R:\n open d.csv\n | nope\n;").is_err());
     }
 
     #[test]

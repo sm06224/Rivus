@@ -273,6 +273,32 @@ reorder name id             # name,id を先頭へ、残りは元の順
 （未知名は無視）、`reorder` は指定列を先頭に浮かせる純粋な並べ替え（未知名は
 無視・重複は除去）。3 つとも `to_source` で round-trip します。
 
+### `| name` — 名前付きフローの再利用
+
+一度定義したフローの**トランスフォームを名前で別の流れに適用**します。パイプラインの
+関数合成（マクロも copy-paste も不要）：
+
+```
+clean:                       # 再利用可能な変換レシピ（自身のソースを持つ）
+    open raw.csv
+    |? status == "ok"
+    |! id >= 1 warn
+    |> id status
+;
+report:
+    open today.csv
+    | clean                  # clean の変換（filter・validate・project）をここに適用
+    |# status
+;
+```
+
+- `| name` は `name` の**ソース以降の変換だけ**を順に差し込むので、それらを手書きで
+  インラインに書いたのと **byte-identical**（同じデータ・同じエラーストリーム）です。
+  再利用は機械的＝魔法ではありません。
+- フローは**先に定義**されている必要があります。未定義の `| name` はエラー（silent
+  skip にはしない）。名前解決は列名ベースでスキーマ版に非依存。
+- **round-trip**します：`rivus fmt` は展開後の手順ではなく `| name` を再出力します。
+
 ### 組み合わせる
 
 変換は任意の順で連結できます：
@@ -813,6 +839,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
+           | '|' IDENT                                        (apply a named flow's transforms)
            | '|!' expr (',' expr)* ('warn'|'reject'|'halt')   (validate / contract)
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
