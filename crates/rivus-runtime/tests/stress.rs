@@ -3060,7 +3060,6 @@ fn dropna_drops_blank_numeric_rows_bug_a() {
 }
 
 #[test]
-#[ignore = "BUG-B: datetime/date/time are not auto-inferred; docs/TEST-AUDIT.md"]
 fn datetime_auto_inferred_without_declaration_bug_b() {
     let text = "ts,v\n2024-06-03T14:30:00,1\n2024-06-04T09:00:00,2\n";
     let f = TempCsv(gendata::write_temp_bytes("bug_dtinfer", text.as_bytes()));
@@ -3082,7 +3081,6 @@ fn datetime_auto_inferred_without_declaration_bug_b() {
 }
 
 #[test]
-#[ignore = "BUG-C: AUTO_FORMATS lacks fractional-second / timezone ISO; docs/TEST-AUDIT.md"]
 fn datetime_parses_fractional_and_timezone_bug_c() {
     let text = "ts\n2024-06-03T14:30:00.5\n2024-06-03T14:30:00Z\n2024-06-03T14:30:00+09:00\n";
     let f = TempCsv(gendata::write_temp_bytes("bug_dtfmt", text.as_bytes()));

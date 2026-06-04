@@ -986,6 +986,9 @@ struct Flags {
     all_int: bool,
     all_float: bool,
     all_bool: bool,
+    all_datetime: bool,
+    all_date: bool,
+    all_time: bool,
 }
 
 impl Flags {
@@ -995,6 +998,9 @@ impl Flags {
             all_int: true,
             all_float: true,
             all_bool: true,
+            all_datetime: true,
+            all_date: true,
+            all_time: true,
         }
     }
 
@@ -1004,6 +1010,19 @@ impl Flags {
             return;
         }
         self.any = true;
+        // Temporal lanes (#92): a cell that doesn't match drops the lane. Numeric
+        // columns clear these on their first cell (a number isn't a date/time),
+        // and `resolve` gives numeric precedence, so an integer is never
+        // mis-inferred as a date. Cheap: a flag, once false, is never re-probed.
+        if self.all_datetime && rivus_core::DateTime::parse_auto(c, TimeUnit::Sec).is_none() {
+            self.all_datetime = false;
+        }
+        if self.all_date && rivus_core::Date::parse(c).is_none() {
+            self.all_date = false;
+        }
+        if self.all_time && rivus_core::TimeOfDay::parse_at(c, TimeUnit::Sec).is_none() {
+            self.all_time = false;
+        }
         // Fast path: while the column is still all-integer, an integer cell is
         // also a float, so skip the redundant f64 parse — but it is never a
         // bool, so clear that lane.
@@ -1030,6 +1049,9 @@ impl Flags {
         self.all_int &= other.all_int;
         self.all_float &= other.all_float;
         self.all_bool &= other.all_bool;
+        self.all_datetime &= other.all_datetime;
+        self.all_date &= other.all_date;
+        self.all_time &= other.all_time;
     }
 
     fn resolve(&self) -> DataType {
@@ -1041,6 +1063,16 @@ impl Flags {
             DataType::F64
         } else if self.all_bool {
             DataType::Bool
+        } else if self.all_date {
+            // Date-only `yyyy-MM-dd` columns prefer the date lane over datetime
+            // (which also matches `yyyy-MM-dd` at midnight). #92.
+            DataType::Date
+        } else if self.all_time {
+            DataType::Time
+        } else if self.all_datetime {
+            DataType::DateTime {
+                unit: TimeUnit::Sec,
+            }
         } else {
             DataType::Str
         }
@@ -1113,10 +1145,13 @@ impl DtSpec {
     /// observable (continue-first + Observable First; design 23, #80).
     #[inline]
     fn parse_opt(&self, cell: &str) -> Option<i64> {
-        let s = cell.trim();
+        // Normalise a trailing ISO timezone / fractional second (#93) so the
+        // reader accepts the same variants as `DateTime::parse_auto`. For an
+        // explicit fixed-width format the digit-only cell is unchanged.
+        let (s, offset_secs) = DateTime::normalize_iso(cell);
         for fmt in &self.formats {
             if let Some(dt) = DateTime::parse_with_format(s, fmt, self.unit) {
-                return Some(dt.ticks);
+                return Some(dt.ticks - offset_secs * self.unit.per_sec());
             }
         }
         None

@@ -24,7 +24,7 @@ This is the #bugreport ①⑤ / §24 nullable-column gap.
 validation-layer epic (§24); design doc + sign-off before code. Until then the
 GUIDE must state `dropna` only sees blanks in **text** columns (see §3).
 
-### BUG-B · datetime / date / time are never auto-inferred
+### BUG-B (RESOLVED #92) · datetime / date / time are never auto-inferred
 **Repro.** `open f.csv` over an ISO-8601 `ts` column → the column stays `Str`
 (works in a filter only by lexicographic luck); only an explicit
 `(ts:datetime)` rides the datetime lane. `Flags::resolve` (`csv.rs`) yields only
@@ -36,7 +36,7 @@ cell matches and at least one is unambiguously temporal (avoid mis-inferring a
 plain integer column as a date). Must stay sample-inference-safe and
 byte-identical to a declared read. Add A4 widening telemetry for the new lanes.
 
-### BUG-C · AUTO_FORMATS rejects fractional-second / timezone ISO datetimes
+### BUG-C (RESOLVED #93) · AUTO_FORMATS rejects fractional-second / timezone ISO datetimes
 **Repro.** `(ts:datetime)` over `2024-06-03T14:30:00.5`, `…Z`, `…+09:00` → each is
 reported as a parse failure and defaulted to epoch (the count *is* surfaced —
 never-silent works — but the value is lost).
@@ -60,8 +60,8 @@ at a sub-second `unit`; today datetime is `Sec` MVP — pair with the unit work.
 | string fns (upper/…/replace/split_part/concat/like/glob/starts/ends) | stress | ✅ |
 | numeric fns (abs/round/floor/ceil/coalesce, case) | stress | ✅ |
 | decimal lane | stress, value | ✅ |
-| datetime lane (read/fn/trunc/format/groupby/parallel) | stress | ✅ declared; ❌ **auto-infer (BUG-B)**, ❌ **frac/TZ (BUG-C)** |
-| **date / time lanes** (#58) | stress, parser, core | ✅ declared; ❌ auto-infer (BUG-B) |
+| datetime lane (read/fn/trunc/format/groupby/parallel) | stress | ✅ declared; ✅ auto-infer (#92), ✅ frac/TZ (#93) |
+| **date / time lanes** (#58) | stress, parser, core | ✅ (auto-infer #92) |
 | **dropna** | stress (str only) | ⚠️ **numeric blind (BUG-A)** — only `:str` tested |
 | fill (value/ffill/bfill/mean/median) | stress | ✅ |
 | sinks (csv/tsv/json/jsonl, stdout) | stress, cli | ✅ |
