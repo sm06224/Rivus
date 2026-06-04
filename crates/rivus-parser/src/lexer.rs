@@ -6,6 +6,13 @@
 
 use rivus_ir::CmpOp;
 
+/// A comment tagged with the index of the token it immediately precedes.
+pub type Comment = (usize, String);
+
+/// The lexer's output: the token stream (token + source line) and the comment
+/// trivia gathered alongside it (§25.7).
+pub type Tokens = (Vec<(Tok, u32)>, Vec<Comment>);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Colon,            // :
@@ -54,6 +61,12 @@ pub struct Lexer<'a> {
     /// longer absorb `- / .`. Outside parens the path-friendly tokenization is
     /// unchanged, so `open /tmp/a-b.csv` still lexes as one word.
     depth: u32,
+    /// Comment trivia gathered while skipping whitespace, not yet attached to a
+    /// token. Drained in `tokenize` onto the index of the token they precede
+    /// (`#86`/§25.7: comments are inert trivia preserved through the IR so
+    /// `rivus fmt` round-trips them). Each entry is already canonicalized to its
+    /// re-emittable form (`# line` or `#{ block }#`).
+    pending: Vec<String>,
 }
 
 impl<'a> Lexer<'a> {
@@ -63,6 +76,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             depth: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -88,28 +102,75 @@ impl<'a> Lexer<'a> {
             let c = self.peek();
             if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
                 self.bump();
+            } else if c == b'#' && self.peek2() == b'{' {
+                // Block comment `#{ ... }#` — inert trivia, preserved (§25.7).
+                // Spans lines; terminated by the first `}#` (lenient: an
+                // unterminated block runs to EOF rather than erroring).
+                self.bump(); // '#'
+                self.bump(); // '{'
+                let start = self.pos;
+                loop {
+                    let d = self.peek();
+                    if d == 0 {
+                        self.push_comment(start, self.pos, true);
+                        break;
+                    }
+                    if d == b'}' && self.peek2() == b'#' {
+                        let end = self.pos;
+                        self.bump(); // '}'
+                        self.bump(); // '#'
+                        self.push_comment(start, end, true);
+                        break;
+                    }
+                    self.bump();
+                }
             } else if c == b'#' {
-                // line comment
+                // Line comment `# ...` (v1 form) — also preserved as trivia.
+                self.bump(); // '#'
+                let start = self.pos;
                 while self.peek() != b'\n' && self.peek() != 0 {
                     self.bump();
                 }
+                self.push_comment(start, self.pos, false);
             } else {
                 break;
             }
         }
     }
 
+    /// Canonicalize a comment's inner bytes (`src[start..end]`) into its
+    /// re-emittable trivia form and buffer it. `block` chooses `#{ … }#` vs the
+    /// line form `# …`; the inner text is trimmed so `fmt` is idempotent.
+    fn push_comment(&mut self, start: usize, end: usize, block: bool) {
+        let text = std::str::from_utf8(&self.src[start..end])
+            .unwrap_or("")
+            .trim();
+        self.pending.push(if block {
+            format!("#{{ {text} }}#")
+        } else {
+            format!("# {text}")
+        });
+    }
+
     /// Tokenize the whole input. On a lexical error returns the message and the
-    /// line it occurred on.
-    pub fn tokenize(mut self) -> Result<Vec<(Tok, u32)>, String> {
+    /// line it occurred on. The second result holds comment trivia, each tagged
+    /// with the index of the token it immediately precedes (so the parser can
+    /// attach it to the node that follows — §25.7 inert-trivia preservation).
+    pub fn tokenize(mut self) -> Result<Tokens, String> {
         let mut out = Vec::new();
+        let mut comments: Vec<Comment> = Vec::new();
         loop {
             self.skip_trivia();
+            // The comments gathered during this skip precede the token we are
+            // about to push (its index is `out.len()`).
+            for c in self.pending.drain(..) {
+                comments.push((out.len(), c));
+            }
             let line = self.line;
             let c = self.peek();
             if c == 0 {
                 out.push((Tok::Eof, line));
-                return Ok(out);
+                return Ok((out, comments));
             }
             let tok = match c {
                 b':' => {
