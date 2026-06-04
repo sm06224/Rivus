@@ -104,13 +104,30 @@ fn fmt_formats_a_tee_branch() {
     assert!(!s.contains("..."), "lossy placeholder leaked:\n{s}");
 }
 
-/// fmt is still honest: a construct it cannot yet round-trip losslessly — a
-/// single `->` branch (fan-out of one, which re-renders to a different graph) —
-/// is refused with a non-zero exit and the source left untouched, rather than
-/// silently rewritten.
+/// A single `->` branch (fan-out of one) now round-trips too (the renderer no
+/// longer absorbs a single-output parent into the child chain).
+#[test]
+fn fmt_formats_a_single_branch() {
+    let prog = "U:\n open u.csv\n -> Only: |? age >= 20 ;\n;";
+    let out = Command::new(BIN)
+        .args(["fmt", "-c", prog])
+        .output()
+        .expect("spawn rivus");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("-> Only:"));
+}
+
+/// fmt stays honest: a construct the canonical renderer cannot yet reproduce
+/// losslessly — an anonymous, unlabeled scope (to_source only emits labeled
+/// scopes) — is refused with a non-zero exit and the source left untouched,
+/// rather than silently rewritten away.
 #[test]
 fn fmt_refuses_construct_it_cannot_round_trip() {
-    let prog = "U:\n open u.csv\n -> Only: |? age >= 20 ;\n;";
+    let prog = ": open d.csv |? age >= 20 ;";
     let out = Command::new(BIN)
         .args(["fmt", "-c", prog])
         .output()
