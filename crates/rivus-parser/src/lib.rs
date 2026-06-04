@@ -143,6 +143,37 @@ impl Parser {
         out
     }
 
+    /// Parse zero or more value-hole bindings `name=value …` (§25.3), as used by
+    /// `| flow min=0 max=120`. A binding is only consumed when a `name` is
+    /// followed by `=`, so a trailing transform word (no `=`) ends the list.
+    /// Values are plain literals (int / decimal / string / bool) — never source
+    /// fragments — so a binding can only ever supply a value (injection-safe).
+    fn parse_hole_bindings(&mut self) -> Result<Vec<(String, Value)>, RivusError> {
+        let mut out = Vec::new();
+        while let Tok::Word(k) = self.tok().clone() {
+            if self.toks[self.pos + 1].0 != Tok::Assign {
+                break; // a bare word with no `=` is the next transform, not a binding
+            }
+            self.bump(); // name
+            self.bump(); // `=`
+            let v = match self.bump() {
+                Tok::Int(n) => Value::I64(n),
+                Tok::Float(_, d) => Value::Dec(d),
+                Tok::Str(s) => Value::Str(s),
+                Tok::Word(w) if w == "true" => Value::Bool(true),
+                Tok::Word(w) if w == "false" => Value::Bool(false),
+                other => {
+                    return Err(self.err(format!(
+                        "binding `{k}=` expects a literal value (int/decimal/\"string\"/bool), \
+                         found {other:?}"
+                    )))
+                }
+            };
+            out.push((k, v));
+        }
+        Ok(out)
+    }
+
     // ----------------------------------------------------------------- program
 
     fn parse_program(&mut self) -> Result<(), RivusError> {
@@ -298,13 +329,22 @@ impl Parser {
                         // `| name`.
                         Tok::Word(name) if self.g.labels.contains_key(&name) => {
                             self.bump();
+                            // Optional value-hole bindings: `| clean min=0 max=120`
+                            // (§25.3). Each binds a `$x` hole to a *value* — never
+                            // to source text — so it cannot inject flow structure.
+                            let bindings = self.parse_hole_bindings()?;
+                            let bmap: std::collections::HashMap<String, Value> =
+                                bindings.iter().cloned().collect();
                             let tail = self.g.labels[&name];
                             let ops = self.g.flow_transform_ops(tail);
                             let site = self.apply_site;
                             self.apply_site += 1;
                             for op in ops {
-                                let nid = self.g.add_node(op);
-                                self.g.nodes[nid].applied_from = Some((site, name.clone()));
+                                // Bind holes structurally as we splice (desugar is
+                                // byte-identical to the inline, now-literal ops).
+                                let nid = self.g.add_node(op.bind_holes(&bmap));
+                                self.g.nodes[nid].applied_from =
+                                    Some((site, name.clone(), bindings.clone()));
                                 self.g.add_edge(current, nid, EdgeKind::Stream);
                                 current = nid;
                             }
@@ -1145,6 +1185,11 @@ impl Parser {
             Tok::DollarCur | Tok::DollarStack(_) => {
                 self.bump();
                 self.parse_field_tail()
+            }
+            // `$name` — a value hole (§25.3), filled by a binding / parameter.
+            Tok::Hole(name) => {
+                self.bump();
+                Ok(Expr::Hole(name))
             }
             Tok::Word(w) if w == "true" => {
                 self.bump();
@@ -1987,6 +2032,77 @@ Users:
         assert!(
             format!("{err:?}").contains("unknown flow 'nope'"),
             "expected an `unknown flow` diagnostic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn value_hole_parses_and_round_trips() {
+        // `$min` is a value hole that survives to_source as `$min` (§25.3).
+        let g = parse("R:\n open d.csv\n |? age >= $min\n;").unwrap();
+        let rendered = g.to_source();
+        assert!(rendered.contains("$min"), "lost the hole:\n{rendered}");
+        assert_eq!(
+            rendered,
+            parse(&rendered).unwrap().to_source(),
+            "not idempotent"
+        );
+    }
+
+    #[test]
+    fn bound_hole_desugars_byte_identical_to_an_inline_literal() {
+        // `| clean min=20` over `clean: … |? age >= $min` must produce the *same*
+        // op chain as writing `|? age >= 20` inline — the binding is structural
+        // (hole → value literal), so the desugar is byte-identical.
+        let applied =
+            parse("clean:\n open c.csv\n |? age >= $min\n;\nR:\n open d.csv\n | clean min=20\n;")
+                .unwrap();
+        let inline = parse("R:\n open d.csv\n |? age >= 20\n;").unwrap();
+        assert_eq!(
+            chain_ops(&applied, applied.labels["R"]),
+            chain_ops(&inline, inline.labels["R"]),
+            "bound-hole desugar is not identical to the inline literal"
+        );
+    }
+
+    #[test]
+    fn hole_binding_round_trips_with_its_values() {
+        // `| clean min=20 tag="vip"` round-trips the bindings (not just `| clean`).
+        let src = "clean:\n open c.csv\n |? age >= $min\n |> (concat(name, $tag)) as who\n;\n\
+                   R:\n open d.csv\n | clean min=20 tag=\"vip\"\n;";
+        let g1 = parse(src).unwrap();
+        let rendered = g1.to_source();
+        assert!(
+            rendered.contains("| clean min=20 tag=\"vip\""),
+            "bindings lost:\n{rendered}"
+        );
+        let g2 = parse(&rendered).unwrap();
+        assert_eq!(
+            chain_ops(&g1, g1.labels["R"]),
+            chain_ops(&g2, g2.labels["R"]),
+            "bound apply changed across round-trip:\n{rendered}"
+        );
+        assert_eq!(rendered, g2.to_source(), "not idempotent:\n{rendered}");
+    }
+
+    #[test]
+    fn hole_binding_is_injection_safe() {
+        // A binding value is *only* a value: text that looks like flow syntax is
+        // kept verbatim as a string literal, never parsed as structure. So the
+        // applied chain has exactly clean's transform count — no injected ops.
+        let evil = "x >= 0 |? 1 == 1 ; DROP";
+        let src = format!(
+            "clean:\n open c.csv\n |> (concat(name, $note)) as label\n;\n\
+             R:\n open d.csv\n | clean note=\"{evil}\"\n;"
+        );
+        let g = parse(&src).unwrap();
+        // R = open + exactly one spliced ProjectExpr (clean's single transform).
+        let ops = chain_ops(&g, g.labels["R"]);
+        assert_eq!(ops.len(), 2, "injection changed the op count: {ops:?}");
+        // The hole resolved to the verbatim string, not parsed tokens.
+        assert!(
+            ops[1].contains(evil),
+            "the binding value was not kept verbatim: {:?}",
+            ops[1]
         );
     }
 

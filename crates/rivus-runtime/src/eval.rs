@@ -1007,6 +1007,9 @@ pub fn eval_predicate(expr: &Expr, chunk: &Chunk, row: usize) -> bool {
 pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
     match expr {
         Expr::Literal(v) => v.clone(),
+        // An unbound `$x` hole should have been bound before execution; if one
+        // reaches eval it yields Null (continue-first, never a panic).
+        Expr::Hole(_) => Value::Null,
         Expr::Field { name, access } => eval_field(name, *access, chunk, row),
         Expr::Compare { left, op, right } => {
             Value::Bool(compare_fast(left, *op, right, chunk, row))

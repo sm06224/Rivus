@@ -18,6 +18,7 @@ pub enum Tok {
     Colon,            // :
     Semicolon,        // ;
     Comma,            // ,
+    Assign,           // =   (value-hole binding, e.g. `| clean min=0`)
     Bang,             // !
     Plus,             // +
     Minus,            // -   (expression mode only)
@@ -40,6 +41,7 @@ pub enum Tok {
     Cmp(CmpOp),       // == != < <= > >=
     DollarCur,        // $_
     DollarStack(u32), // $_:N
+    Hole(String),     // $name — a value hole (§25.3)
     Int(i64),
     /// A float literal: its `f64` value (for the f64/i64 lanes) **and** the exact
     /// decimal it was written as (natural scale = fractional-digit count). The
@@ -226,7 +228,10 @@ impl<'a> Lexer<'a> {
                         self.bump();
                         Tok::Cmp(CmpOp::Eq)
                     } else {
-                        return Err(format!("unexpected '=' (did you mean '==') at line {line}"));
+                        // A lone `=` is the binding assignment (`| clean min=0`,
+                        // §25.3). In a predicate the parser still rejects it,
+                        // pointing at `==`.
+                        Tok::Assign
                     }
                 }
                 b'<' => {
@@ -325,20 +330,31 @@ impl<'a> Lexer<'a> {
 
     fn lex_dollar(&mut self, line: u32) -> Result<Tok, String> {
         self.bump(); // '$'
-        if self.peek() != b'_' {
-            return Err(format!("expected '$_' at line {line}"));
-        }
-        self.bump(); // '_'
-        if self.peek() == b':' && self.peek2().is_ascii_digit() {
-            self.bump(); // ':'
-            let mut n = 0u32;
-            while self.peek().is_ascii_digit() {
-                n = n * 10 + (self.bump() - b'0') as u32;
+                     // `$_` / `$_:N` — current / parent-scope object accessors.
+        if self.peek() == b'_' {
+            self.bump(); // '_'
+            if self.peek() == b':' && self.peek2().is_ascii_digit() {
+                self.bump(); // ':'
+                let mut n = 0u32;
+                while self.peek().is_ascii_digit() {
+                    n = n * 10 + (self.bump() - b'0') as u32;
+                }
+                return Ok(Tok::DollarStack(n));
             }
-            Ok(Tok::DollarStack(n))
-        } else {
-            Ok(Tok::DollarCur)
+            return Ok(Tok::DollarCur);
         }
+        // `$name` — a value hole (§25.3). Name is `[A-Za-z][A-Za-z0-9_]*`.
+        if self.peek().is_ascii_alphabetic() {
+            let start = self.pos;
+            while self.peek().is_ascii_alphanumeric() || self.peek() == b'_' {
+                self.bump();
+            }
+            let name = std::str::from_utf8(&self.src[start..self.pos])
+                .unwrap()
+                .to_string();
+            return Ok(Tok::Hole(name));
+        }
+        Err(format!("expected '$_' or '$name' at line {line}"))
     }
 
     fn lex_string(&mut self, line: u32) -> Result<Tok, String> {

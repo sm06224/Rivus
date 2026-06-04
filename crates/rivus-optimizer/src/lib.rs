@@ -316,7 +316,8 @@ fn project_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
 fn collect_fields(e: &Expr, out: &mut Vec<String>) {
     match e {
         Expr::Field { name, .. } => push_unique(out, name),
-        Expr::Literal(_) => {}
+        // A value hole references no column.
+        Expr::Literal(_) | Expr::Hole(_) => {}
         Expr::Compare { left, right, .. } => {
             collect_fields(left, out);
             collect_fields(right, out);
