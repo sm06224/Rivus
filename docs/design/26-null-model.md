@@ -236,6 +236,27 @@ byte-identity**・ローカル全緑（`fmt` / `clippy -D warnings` / `test` def
 
 各段は前段に積み、null 表現が「軌道に乗る」まで構文 v2 phase-3 後半以降は保留（申し送り）。
 
+### 26.8.1 ソース分割・docs 整理を STEP 2 に織り込む（独立リオーグ PR は作らない）
+
+肥大化対策を各段に**便乗**させる。「触る所を、触るついでに、**移動だけは論理変更と混ぜず**
+緑維持で」。squash-merge・linear・1 PR 運用と擦れるため、**独立した大規模リオーグ PR は
+作らない**。
+
+- **2-① の頭でテスト分割**: `crates/rivus-runtime/tests/stress.rs`（現 ~3.8k 行）を
+  `tests/stress/` 配下へ**機械的に**分割（例 `byte_identity.rs` / `null.rs` / `bug_specs.rs`）。
+  **中身は移すだけ・ロジック不変**で diff を読みやすく。bug-spec 群（BUG-A/B/C）は
+  `bug_specs.rs` に集約。**null モデルの新規テストは最初から `null.rs` へ**（肥大化中の
+  `stress.rs` に足さない）。移動コミットと null 追加コミットは分ける。
+- **2-② に便乗して operators 分割**: null 対応で全 operator を横断で触るので、ついでに
+  `crates/rivus-runtime/src/operators.rs`（~2k 行）を `operators/` モジュール化
+  （filter/project/aggregate/join/distinct…）。「移動」コミットと「null 挙動追加」コミットを
+  分けてレビューしやすく。
+- **docs は archive しない**: `docs/design/` は 1 節 1 ファイルで十分割れている。設計文書を
+  消す/動かすと durable memory と可逆性を失うので**移動・削除しない**。代わりに
+  `docs/design/README.md` の索引に**状態列**（実装済/一部/設計中/計画）を追加済み（本 PR）。
+- **分割でも不変ゲート維持**: `fmt` / `clippy -D warnings` / `test` default＋`--all-features` /
+  `gitleaks` / `cargo deny` 緑・**依存ゼロ**。移動は論理変更と混ぜない。
+
 ---
 
 ## 26.9 既存設計との関係（レビュー確認用）

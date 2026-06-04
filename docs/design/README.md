@@ -37,34 +37,38 @@ hidden serialization / opaque optimizer / runtime magic without observability。
 
 ## ドキュメント一覧
 
-| # | ドキュメント | 内容 |
-|---|---|---|
-| 01 | [architecture](01-architecture.md) | 全体アーキテクチャとクレート構成 |
-| 02 | [execution-model](02-execution-model.md) | Flow 実行モデル（DAG + push schedule） |
-| 03 | [stream-chunk-model](03-stream-chunk-model.md) | Stream / Chunk / Column とメモリレイアウト |
-| 04 | [pipeline-ir](04-pipeline-ir.md) | DAG IR・AST・式・可逆 source |
-| 05 | [scheduler](05-scheduler.md) | chunk/mode/branch/backpressure-aware スケジューラ |
-| 06 | [type-system](06-type-system.md) | gradual + execution-lane typing |
-| 07 | [memory-model](07-memory-model.md) | arena / chunk 再利用 / ownership transfer |
-| 08 | [optimization](08-optimization.md) | DAG 変換・fusion・pushdown・semantic preservation |
-| 09 | [jit](09-jit.md) | observed-type 特化と Cranelift JIT 戦略 |
-| 10 | [shell-syntax](10-shell-syntax.md) | Unified Flow Syntax 文法 |
-| 11 | [runtime-api](11-runtime-api.md) | Runtime / 埋め込み API・query API |
-| 12 | [plugin-abi](12-plugin-abi.md) | プラグイン ABI（operator/source/sink） |
-| 13 | [error-model](13-error-model.md) | continue-first error stream・mode system |
-| 14 | [observability](14-observability.md) | telemetry・可視化・PKC Markdown |
-| 15 | [benchmark](15-benchmark.md) | ベンチ戦略と回帰検知 |
-| 16 | [mvp-scope](16-mvp-scope.md) | MVP の確定スコープと現状実装 |
-| 17 | [distributed](17-distributed.md) | 将来の分散アーキテクチャ |
-| 18 | [io-formats-and-transports](18-io-formats-and-transports.md) | 入出力フォーマット・トランスポートの拡張計画 |
-| 19 | [interactive-and-shell](19-interactive-and-shell.md) | 対話ビューア（Out-GridView 相当）・実行アナリティクス GUI・シェル統合 |
-| 20 | [computed-columns](20-computed-columns.md) | 計算列（算術式＋別名）と式モード字句解析（実装済み） |
-| 21 | [exact-decimal](21-exact-decimal.md) | 10進固定小数点レーン（COBOL的・厳密/並列安全）。`--exact`・`:decimal` でオプトイン |
-| 22 | [gpu-backend](22-gpu-backend.md) | GPU backend（feature-gate任意・CPU fallback・既定は依存ゼロ）。`--accel` |
-| 23 | [datetime-and-reshape](23-datetime-and-reshape.md) | 日時レーン（`yyMMddhhmmss`等）・list/set/join 集計（配列化）・pivot/unpivot |
-| 24 | [validation](24-validation.md) | バリデーション層（validator≠filter・reject/warn/quarantine・行内/行間/窓内・ingress/egress）。`\|!`。`#80`/`#81` を収斂 |
-| 25 | [syntax-v2](25-syntax-v2.md) | 構文 v2（記号最小・`$x` 値ホール・名前付きフロー再利用・スコープ継続・署名=意味契約・コメント trivia・IR ベース fmt/tidy）。Epic `#86`/`#87` |
-| 26 | [null-model](26-null-model.md) | null モデル（列ごと validity bitmap・null/empty/0 区別・述語/順序/伝播/集約セマンティクス・null 込み byte-identity・sink round-trip）。`#81`（BUG-A の本丸） |
+状態の凡例: **実装済** = 動作・テスト済 / **一部** = 中核は実装、残りは計画 /
+**設計中** = 本文書をレビュー中（未着手） / **計画** = 設計のみ・未実装。
+（**設計文書は archive しない** — 1 節 1 ファイルで残し、状態列で完了/置換を示す。）
+
+| # | ドキュメント | 状態 | 内容 |
+|---|---|---|---|
+| 01 | [architecture](01-architecture.md) | 実装済 | 全体アーキテクチャとクレート構成 |
+| 02 | [execution-model](02-execution-model.md) | 実装済 | Flow 実行モデル（DAG + push schedule） |
+| 03 | [stream-chunk-model](03-stream-chunk-model.md) | 実装済 | Stream / Chunk / Column とメモリレイアウト |
+| 04 | [pipeline-ir](04-pipeline-ir.md) | 実装済 | DAG IR・AST・式・可逆 source |
+| 05 | [scheduler](05-scheduler.md) | 一部 | chunk/mode/branch/backpressure-aware スケジューラ |
+| 06 | [type-system](06-type-system.md) | 実装済 | gradual + execution-lane typing |
+| 07 | [memory-model](07-memory-model.md) | 一部 | arena / chunk 再利用 / ownership transfer |
+| 08 | [optimization](08-optimization.md) | 実装済 | DAG 変換・fusion・pushdown・semantic preservation |
+| 09 | [jit](09-jit.md) | 計画 | observed-type 特化と Cranelift JIT 戦略 |
+| 10 | [shell-syntax](10-shell-syntax.md) | 実装済 | Unified Flow Syntax 文法 |
+| 11 | [runtime-api](11-runtime-api.md) | 一部 | Runtime / 埋め込み API・query API |
+| 12 | [plugin-abi](12-plugin-abi.md) | 計画 | プラグイン ABI（operator/source/sink） |
+| 13 | [error-model](13-error-model.md) | 実装済 | continue-first error stream・mode system |
+| 14 | [observability](14-observability.md) | 実装済 | telemetry・可視化・PKC Markdown |
+| 15 | [benchmark](15-benchmark.md) | 実装済 | ベンチ戦略と回帰検知 |
+| 16 | [mvp-scope](16-mvp-scope.md) | 実装済 | MVP の確定スコープと現状実装 |
+| 17 | [distributed](17-distributed.md) | 計画 | 将来の分散アーキテクチャ |
+| 18 | [io-formats-and-transports](18-io-formats-and-transports.md) | 一部 | 入出力フォーマット・トランスポートの拡張計画（csv/tsv/json/binary/gzip/zstd 実装済） |
+| 19 | [interactive-and-shell](19-interactive-and-shell.md) | 一部 | 対話ビューア・実行アナリティクス GUI・シェル統合（`--tui`/`--serve` 実装済） |
+| 20 | [computed-columns](20-computed-columns.md) | 実装済 | 計算列（算術式＋別名）と式モード字句解析 |
+| 21 | [exact-decimal](21-exact-decimal.md) | 実装済 | 10進固定小数点レーン（COBOL的・厳密/並列安全）。`--exact`・`:decimal` でオプトイン |
+| 22 | [gpu-backend](22-gpu-backend.md) | 計画 | GPU backend（feature-gate任意・CPU fallback・既定は依存ゼロ）。`--accel` |
+| 23 | [datetime-and-reshape](23-datetime-and-reshape.md) | 一部 | 日時/日付/時刻レーン（実装済）・list/set/join 集計・pivot/unpivot（計画） |
+| 24 | [validation](24-validation.md) | 一部 | バリデーション層（`\|!` warn/reject/halt 実装済・宣言ルール/quarantine 計画）。`#80`/`#81` を収斂 |
+| 25 | [syntax-v2](25-syntax-v2.md) | 一部 | 構文 v2（fmt・コメント trivia・分岐 round-trip・`\| name` 再利用・`$x` 値ホール 実装済／signature・以降 計画）。Epic `#86`/`#87` |
+| 26 | [null-model](26-null-model.md) | 設計中 | null モデル（列ごと validity bitmap・null/empty/0 区別・述語/順序/伝播/集約セマンティクス・null 込み byte-identity・sink round-trip）。`#81`（BUG-A の本丸） |
 
 ## 段階設計（MVP → 最適化 → JIT/分散）
 
