@@ -1024,8 +1024,12 @@ impl PlanGraph {
                 break;
             }
             let prev = inputs[0];
-            // Stop if the predecessor is itself a labeled scope reused elsewhere.
-            if self.nodes[prev].label.is_some() && self.outputs_of(prev).len() > 1 {
+            // Stop if the predecessor is a labeled node: a label always marks a
+            // scope output, so it is a scope boundary regardless of fan-out
+            // count. (Stopping only at fan-out >1 used to absorb a single-output
+            // parent into this chain, which broke round-trip for a fan-out-of-one
+            // `-> Child:` branch — it then re-rendered as a duplicated source.)
+            if self.nodes[prev].label.is_some() {
                 break;
             }
             chain.push(prev);

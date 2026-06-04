@@ -1894,6 +1894,30 @@ Users:
     }
 
     #[test]
+    fn to_source_round_trips_a_single_branch_and_nested_branches() {
+        // Two shapes that previously did NOT round-trip:
+        //  (a) fan-out of one (`-> Only:`) — a single-output parent was absorbed
+        //      into the child chain and re-rendered as a duplicated source;
+        //  (b) a nested branch (depth > 1) — `write_chain` recurses, so a
+        //      grandchild must round-trip too.
+        for src in [
+            "U:\n open u.csv\n -> Only: |? age >= 20 ;\n;",
+            "U:\n open u.csv\n -> A:\n   |? age >= 20\n   -> A1: |? age >= 65 ;\n ;\n -> B: |? age < 20 ;\n;",
+        ] {
+            let g1 = parse(src).unwrap();
+            let rendered = g1.to_source();
+            assert!(!rendered.contains("..."), "lossy placeholder:\n{rendered}");
+            let g2 = parse(&rendered).unwrap();
+            assert_eq!(
+                fingerprint(&g1),
+                fingerprint(&g2),
+                "graph changed across round-trip for:\n{src}\n--- rendered ---\n{rendered}"
+            );
+            assert_eq!(rendered, g2.to_source(), "not idempotent:\n{rendered}");
+        }
+    }
+
+    #[test]
     fn parses_error_hook() {
         let src = "\
 Import:

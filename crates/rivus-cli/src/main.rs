@@ -215,11 +215,12 @@ fn main() -> ExitCode {
             // Comment trivia is preserved through the IR (§25.7), so the
             // author's notes survive.
             let formatted = parsed.to_source();
-            // Honesty gate: the canonical renderer is faithful for linear flows
-            // (and merge/join scopes), but a DAG branch (`->` fan-out) still
-            // renders as a `... ;` placeholder. Re-parse the result and refuse to
-            // emit anything we can't round-trip, rather than silently rewrite a
-            // branch program into something different.
+            // Honesty gate: the canonical renderer is faithful for linear flows,
+            // merge/join scopes and `->` branch fan-out, but a few constructs
+            // (e.g. an anonymous, unlabeled scope) are not yet reproduced
+            // losslessly. Re-parse the result and refuse to emit anything we
+            // can't round-trip, rather than silently rewrite it into something
+            // different.
             let faithful = match rivus_parser::parse(&formatted) {
                 Ok(re) => {
                     re.nodes.len() == parsed.nodes.len()
@@ -234,8 +235,8 @@ fn main() -> ExitCode {
             if !faithful {
                 eprintln!(
                     "error: `rivus fmt` cannot yet faithfully round-trip this \
-                     program (a `->` branch / fan-out DAG is not rendered \
-                     losslessly yet); left the source unchanged"
+                     program (it uses a construct the canonical renderer does \
+                     not yet reproduce losslessly); left the source unchanged"
                 );
                 return ExitCode::FAILURE;
             }

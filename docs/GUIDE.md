@@ -824,10 +824,11 @@ normalized and the result is **idempotent**. Comments (`#…` and `#{ … }#`) a
 **preserved** — they ride the IR as inert trivia. `--write`/`-w` rewrites the
 file in place (needs a file path, not `-c`/stdin); otherwise the canonical
 source goes to stdout. Linear flows, merge/join scopes **and `->` branch
-(tee) fan-out** all round-trip faithfully. fmt is **honest about round-trip**:
-it re-parses its own output and, if a program still uses a construct it cannot
-yet render losslessly (a few rarer fan-out shapes), refuses with a non-zero exit
-and leaves the source untouched rather than rewrite it into something different.
+fan-out** (tee, single, and nested) all round-trip faithfully. fmt is **honest
+about round-trip**: it re-parses its own output and, if a program still uses a
+construct it cannot yet render losslessly (e.g. an anonymous, unlabeled scope),
+refuses with a non-zero exit and leaves the source untouched rather than rewrite
+it into something different.
 
 ---
 
