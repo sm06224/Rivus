@@ -429,8 +429,8 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   → `yyMMddHHmmss` → `yyyyMMdd` の順で自動推論。
 - **スキーマ自動推論**：宣言なしの `open` でも、ある列の非空セルがすべて上記
   日時形（あるいは `date` の `yyyy-MM-dd`、`time` の `HH:mm:ss`）にパースでき、
-  かつ整数列と紛れない明確な時刻形が 1 つでもあれば、その列を温度レーンに
-  自動推論します（数値は数値優先で誤推論を防止）。宣言読みと byte-identical で、
+  かつ整数列と紛れない明確な時刻形が 1 つでもあれば、その列を時系列（temporal）
+  レーンに自動推論します（数値は数値優先で誤推論を防止）。宣言読みと byte-identical で、
   サンプル推論安全。新レーンにも widening テレメトリ（A4）が出ます。
 - **ISO 拡張**：小数秒（`.f`…、列の unit に切り詰め）と末尾の `Z` / `±HH:mm`
   オフセット（UTC tick へ正規化）も `AUTO_FORMATS` でパースします（例
