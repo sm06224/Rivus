@@ -3081,6 +3081,159 @@ fn datetime_auto_inferred_without_declaration_bug_b() {
 }
 
 #[test]
+fn auto_inferred_temporal_lanes_parallel_byte_identical() {
+    // Item-1 (review #94 follow-up): pin the *inference* invariant for the
+    // UNDECLARED temporal lanes. `datetime_auto_inferred_without_declaration_bug_b`
+    // only checks a 2-row serial datetime infer; this sweeps date / time /
+    // datetime auto-inference (no schema declared) for
+    //   (a) the resolved lanes + numeric precedence (an 8-digit integer column
+    //       that *looks* date-ish — and would match the `yyyyMMdd` datetime auto
+    //       format — must stay I64, never mis-infer as a temporal lane), and
+    //   (b) byte-identity serial(Low) vs parallel(Fast) and across chunk sizes,
+    //       since the byte-range parallel reader infers via the same Flags merge.
+
+    // --- (a) lanes + numeric-precedence guard (tiny, serial, deterministic) ---
+    let types = "d,t,ts,n,v\n\
+                 2024-06-03,09:05:00,2024-06-03T14:30:00,20240601,7\n\
+                 2023-12-25,23:59:59,2023-12-25T00:00:00,20231225,8\n";
+    let tf = TempCsv(gendata::write_temp_bytes(
+        "auto_temporal_types",
+        types.as_bytes(),
+    ));
+    let tp = tf.0.display();
+    let tres = run_src(&format!("A:\n open {tp}\n |> d t ts n v\n;"), 4096); // no schema
+    let to = tres
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("A"))
+        .unwrap();
+    let dtype = |name: &str| {
+        let ci = to.chunks[0].schema.index_of(name).unwrap();
+        to.chunks[0].schema.fields[ci].dtype
+    };
+    assert!(
+        matches!(dtype("d"), rivus_core::DataType::Date),
+        "undeclared yyyy-MM-dd should infer the date lane, got {:?}",
+        dtype("d")
+    );
+    assert!(
+        matches!(dtype("t"), rivus_core::DataType::Time),
+        "undeclared HH:mm:ss should infer the time lane, got {:?}",
+        dtype("t")
+    );
+    assert!(
+        matches!(dtype("ts"), rivus_core::DataType::DateTime { .. }),
+        "undeclared ISO datetime should infer the datetime lane, got {:?}",
+        dtype("ts")
+    );
+    assert!(
+        matches!(dtype("n"), rivus_core::DataType::I64),
+        "an 8-digit integer column must stay I64 (numeric precedence), not a \
+         temporal lane — got {:?}",
+        dtype("n")
+    );
+    assert!(
+        matches!(dtype("v"), rivus_core::DataType::I64),
+        "plain integer column should infer I64, got {:?}",
+        dtype("v")
+    );
+
+    // --- (b) serial vs parallel byte-identity on auto-inferred temporal cols ---
+    // >1 MiB file + MemoryPref::Fast forces the byte-range parallel reader (no
+    // env vars → no cross-test races). Group-by on the auto-inferred date key,
+    // with min/max of the auto-inferred datetime + time columns (all exact +
+    // associative → parallel-safe).
+    let rows = 150_000usize;
+    let mut rng = Rng::new(94);
+    let dates = ["2024-06-01", "2024-06-02", "2023-12-25", "2024-02-29"];
+    let times = ["09:05:00", "00:00:00", "23:59:59", "12:30:00"];
+    let stamps = [
+        "2024-06-01T14:30:00",
+        "2024-06-02T09:00:00",
+        "2023-12-25T00:00:00",
+        "2024-02-29T23:59:59",
+    ];
+    let mut text = String::from("d,t,ts,n,v\n");
+    for _ in 0..rows {
+        let i = rng.below(dates.len() as u64) as usize;
+        let n = 20_240_000i64 + rng.below(900) as i64; // 8-digit, must stay I64
+        text.push_str(&format!(
+            "{},{},{},{n},{}\n",
+            dates[i],
+            times[i],
+            stamps[i],
+            rng.below(1000) as i64
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "auto_temporal_par",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!(
+        "G:\n open {p}\n |# d count min:ts max:ts min:t max:t\n;" // undeclared keys/aggs
+    );
+
+    let collect = |pref: rivus_runtime::MemoryPref, cz: usize| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        assert!(
+            !res.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+            "auto-infer group-by must never raise a fatal (pref={pref:?}, cz={cz})"
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join(","));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+
+    let (serial, _) = collect(rivus_runtime::MemoryPref::Low, 4096);
+    let (parallel, par_engaged) = collect(rivus_runtime::MemoryPref::Fast, 4096);
+    assert!(
+        par_engaged,
+        "parallel reader did not engage on a >1 MiB undeclared-temporal file"
+    );
+    assert_eq!(
+        parallel, serial,
+        "auto-inferred temporal group-by must be byte-identical serial vs parallel"
+    );
+    // The min/max columns render as the temporal lanes (not raw integer ticks).
+    assert!(
+        serial.iter().all(|l| l.contains('T') && l.contains(':')),
+        "min/max ts/t must render as datetime/time text, got e.g. {:?}",
+        serial.first()
+    );
+    // Chunk-size independence of the inference + aggregation (serial oracle).
+    for cz in [1usize, 7, 512] {
+        let (rows_cz, _) = collect(rivus_runtime::MemoryPref::Low, cz);
+        assert_eq!(
+            rows_cz, serial,
+            "auto-inferred temporal group-by changed @cz={cz}"
+        );
+    }
+}
+
+#[test]
 fn datetime_parses_fractional_and_timezone_bug_c() {
     let text = "ts\n2024-06-03T14:30:00.5\n2024-06-03T14:30:00Z\n2024-06-03T14:30:00+09:00\n";
     let f = TempCsv(gendata::write_temp_bytes("bug_dtfmt", text.as_bytes()));
