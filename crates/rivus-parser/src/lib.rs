@@ -1838,6 +1838,61 @@ Merged:
         assert_eq!(g.inputs_of(merged).len(), 2);
     }
 
+    /// A structural fingerprint of a graph (node ops in id order, sorted edge
+    /// endpoints, sorted label set) flattened to a string. Two graphs equal here
+    /// are the same DAG up to rendering.
+    fn fingerprint(g: &PlanGraph) -> String {
+        let ops: Vec<&str> = g.nodes.iter().map(|n| n.op.kind_str()).collect();
+        let mut edges: Vec<(NodeId, NodeId, bool)> = g
+            .edges
+            .iter()
+            .map(|e| (e.from, e.to, e.kind == EdgeKind::Stream))
+            .collect();
+        edges.sort_unstable();
+        let mut labels: Vec<String> = g.labels.keys().cloned().collect();
+        labels.sort();
+        format!("ops={ops:?} edges={edges:?} labels={labels:?}")
+    }
+
+    #[test]
+    fn to_source_round_trips_a_branch_dag() {
+        // `->` fan-out must round-trip: parse → to_source → parse is the same
+        // DAG (faithful branch rendering, not the old `... ;` placeholder), and
+        // formatting is idempotent.
+        let src = "\
+Users:
+    open users.csv
+    |? active == true
+    -> Adults:
+        |? age >= 20
+        |> name age
+    ;
+    -> Minors:
+        |? age < 20
+    ;
+;";
+        let g1 = parse(src).unwrap();
+        let rendered = g1.to_source();
+        // The faithful form is emitted (no lossy placeholder), and re-parses.
+        assert!(rendered.contains("-> Adults:"), "rendered:\n{rendered}");
+        assert!(
+            !rendered.contains("..."),
+            "lossy placeholder leaked:\n{rendered}"
+        );
+        let g2 = parse(&rendered).unwrap();
+        assert_eq!(
+            fingerprint(&g1),
+            fingerprint(&g2),
+            "branch DAG changed across to_source round-trip:\n{rendered}"
+        );
+        // Idempotent.
+        assert_eq!(
+            rendered,
+            g2.to_source(),
+            "to_source not idempotent on a branch"
+        );
+    }
+
     #[test]
     fn parses_error_hook() {
         let src = "\

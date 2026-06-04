@@ -82,11 +82,35 @@ fn fmt_preserves_comments_and_is_idempotent() {
     );
 }
 
-/// `rivus fmt` refuses (non-zero, source untouched) a program it cannot yet
-/// round-trip faithfully — a `->` branch DAG — rather than silently rewrite it.
+/// A 2-way `->` tee now formats faithfully (round-trips), emitting the inline
+/// `-> Label:` form rather than the old lossy placeholder.
 #[test]
-fn fmt_refuses_unfaithful_branch_program() {
+fn fmt_formats_a_tee_branch() {
     let prog = "U:\n open u.csv\n -> A: |? age >= 20 ;\n -> B: |? age < 20 ;\n;";
+    let out = Command::new(BIN)
+        .args(["fmt", "-c", prog])
+        .output()
+        .expect("spawn rivus");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("-> A:") && s.contains("-> B:"),
+        "branch not rendered:\n{s}"
+    );
+    assert!(!s.contains("..."), "lossy placeholder leaked:\n{s}");
+}
+
+/// fmt is still honest: a construct it cannot yet round-trip losslessly — a
+/// single `->` branch (fan-out of one, which re-renders to a different graph) —
+/// is refused with a non-zero exit and the source left untouched, rather than
+/// silently rewritten.
+#[test]
+fn fmt_refuses_construct_it_cannot_round_trip() {
+    let prog = "U:\n open u.csv\n -> Only: |? age >= 20 ;\n;";
     let out = Command::new(BIN)
         .args(["fmt", "-c", prog])
         .output()
