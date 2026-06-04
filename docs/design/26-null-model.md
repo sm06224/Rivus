@@ -2,11 +2,18 @@
 
 > 統括方針（2026-06-04, 申し送り経由）: 最優先は **#81 null モデル**。横（書き味・構文
 > v2 #86）は phase-3 前半まで進んだが、縦の核＝「**サイレントはダメ**」（§01）を支える
-> **欠損(null)の一級表現**が未着手。現に BUG-A（`dropna_drops_blank_numeric_rows_bug_a`）
-> は今も `#[ignore]` で、空欄 numeric を落とせていない。根本原因は **null / empty(空文字) /
-> 0 を区別できない**こと。本書は #81 の設計先行（docs のみ／STEP 1）。
+> **欠損(null)の一級表現**が未着手。根本原因は **null / empty(空文字) / 0 を区別できない**
+> こと。本書は #81 の設計先行（docs のみ／STEP 1）。
 > **data-model の方向を決めるため、§24/§25 同様レビュー批准必須・自己マージ禁止。批准前に
 > 実装に入らない。**
+>
+> **BUG-A の受け入れテストは既にリポジトリに実在する**（レビュー指摘②の事実確認）:
+> `crates/rivus-runtime/tests/stress.rs:3134` の `dropna_drops_blank_numeric_rows_bug_a` が
+> `#[ignore = "BUG-A: dropna blind to blank in inferred-numeric column (null model); …"]` 付きで
+> 存在（#91 で追加。`id,age\n1,25\n2,\n3,40\n4,\n` を `dropna age` が落とせず現状 fail ＝
+> ignore）。STEP 2-② で**この既存テストを un-ignore して緑**に反転させる（新規追加ではなく
+> 反転）。なお `docs/TEST-AUDIT.md` の表記は `BUG_A`（大文字）だが実テスト名は小文字 `bug_a`
+> （grep 取りこぼしの原因と思われる）。
 
 ## 26.0 なぜ今・スコープ
 
@@ -77,15 +84,32 @@ pub struct Column {
 「決定的・byte-identical・continue-first」を満たす**実務的な二値寄り**の規則を既定とする
 （完全な SQL 三値論理は非目標）。
 
-### (a) 比較・等値
-- 既定のフィルタ/比較は **`null` を「述語不成立(false)」**として扱う。すなわち `|? x > 5`
-  は `x` が null の行を**残さない**（drop）。ただし drop は §24 の dispositions / `dropna` と
-  異なり「演算の結果 false」なので surface 対象ではない（フィルタは元来 silent；§24 の通り
-  「契約 `|!`」を使えば surface される）。
-- `==` / `!=`: `null == 任意 → false`、`null != 任意 → false`（null は何とも「等しくも
-  異なりもしない」）。これにより `x != null_literal` で全行を拾う事故を防ぐ。
-- 将来構文 `is null` / `is not null`（§25 で別途）でのみ null を**明示的に**判定可能にする。
-  本 doc では述語の既定挙動のみ確定。
+### (a) 比較・等値（**文脈依存**）
+
+`null == null` の答えは**文脈で変わる**。これを取り違えると §26.2(d) の「`count_distinct`
+は null を数えない」と矛盾するので、明示する:
+
+| 文脈 | `null == null` | `null == 非null` | 効果 |
+|---|---|---|---|
+| **述語 / join**（値比較） | **false** | **false** | null 行は述語不成立。`x > 5` は null を残さない。join キーが null の行はマッチしない |
+| **group-by / distinct / dedup**（キー等価） | **true** | false | null どうしは**単一の等価キーに畳む** |
+
+- 述語側: 既定のフィルタ/比較は **`null` を「述語不成立(false)」**として扱う。`|? x > 5` は
+  `x` が null の行を**残さない**（drop）。`==`/`!=` も `null == 任意 → false`、
+  `null != 任意 → false`（null は何とも「等しくも異なりもしない」）。`x != null_literal` で
+  全行を拾う事故を防ぐ。将来 `is null` / `is not null`（§25 構文側で別途）でのみ明示判定。
+- **キー等価側**: `group-by` のキー・`distinct`/`dedup` の重複判定では **`null == null → true`**。
+  すなわち:
+  - **group-by キーが null の行は落とさず、1 つの「null グループ」に畳む**（COUNT(\*) に
+    数えられる）。
+  - `distinct`/`dedup` は複数の null 行を 1 行に畳む。
+  - これが §26.2(d) の `count_distinct`（**非 null の異なり値**を数える）と整合する: 「グループ
+    キーとしての null は 1 つ」だが「異なり値としての null は数えない」は別レイヤの規則で、
+    互いに矛盾しない。
+  - 実装: グルーピングの等価キーはこの規則で正規化する（現状の
+    `crates/rivus-runtime/src/operators.rs` のキー組み立て＝`BTreeMap` キーに、null を表す
+    決定的な番兵キーを 1 つ用意し、全 null 行を同一キーへ写す。**値の `0`/`""` とは衝突しない
+    別表現**にすること）。
 
 ### (b) 順序（sort）
 - **nulls last（昇順で末尾・降順で先頭）を既定**とする。決定的で安定ソート（§ 既存 `sort`
@@ -205,7 +229,7 @@ byte-identity**・ローカル全緑（`fmt` / `clippy -D warnings` / `test` def
 |---|---|---|
 | 1 | **本 design doc**（docs のみ） | review 批准（**現在地**） |
 | 2-① | core `Column` の validity（構築・`gather`/`append`/`value_at`・基本演算）＋ reader が parse 失敗/空欄を null 化 | null を保持・運搬・surface 整流。既存テスト緑＋null 構築/連結テスト |
-| 2-② | operators（filter/project/cast/sort/distinct/**dropna**/fill）が null を正しく扱う | **BUG-A 受け入れテスト un-ignore して緑**。null 込み chunk-size 非依存 |
+| 2-② | operators（filter/project/cast/sort/distinct/**dropna**/fill）が null を正しく扱う | **既存の `dropna_drops_blank_numeric_rows_bug_a`（stress.rs:3134, 現 `#[ignore]`）を un-ignore して緑**。group-by/distinct のキー null 等価（§26.2a）。null 込み chunk-size 非依存 |
 | 2-③ | 集約が null skip（COUNT(\*) vs COUNT(col) 区別、first/last/distinct 整流） | null skip の oracle ＋ exact レーンの結合性維持 |
 | 2-④ | sink の null 出力（CSV 空 / JSON `null`）＋ round-trip | §26.5 の対称性テスト（read→write→read） |
 | 2-⑤ | 並列マージの null 込み byte-identity | serial==parallel==chunk-size を null データで固定（stress） |
