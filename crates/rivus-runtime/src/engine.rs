@@ -102,6 +102,29 @@ pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError>
 pub fn run_with_progress(
     graph: &PlanGraph,
     opts: RunOptions,
+    hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
+) -> Result<RunResult, RivusError> {
+    let mut res = run_dispatch(graph, opts, hook)?;
+    // Never-silent: a `$x` value hole that reaches execution with no binding
+    // would evaluate to null in silence (e.g. running a template scope on its
+    // own without filling its holes). Surface each unbound hole once as a
+    // recoverable event so the loss is visible (§25.3, continue-first).
+    for name in graph.unbound_holes() {
+        res.errors.push(ErrorEvent::new(
+            Severity::Recoverable,
+            ErrorScope::Graph,
+            format!(
+                "value hole ${name} is unbound (no binding supplied) — it evaluates to null; \
+                 bind it at the call site (e.g. `| flow {name}=…`)"
+            ),
+        ));
+    }
+    Ok(res)
+}
+
+fn run_dispatch(
+    graph: &PlanGraph,
+    opts: RunOptions,
     mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
 ) -> Result<RunResult, RivusError> {
     if graph.topo_order().is_none() {

@@ -2597,6 +2597,31 @@ fn parallel_group_final_mode_matches_serial() {
 /// Collect a column's per-row `Value::to_string()` across all chunks of the
 /// output labeled `label` (used to inspect the datetime lane's ISO rendering).
 #[test]
+fn unbound_value_hole_is_surfaced_never_silent() {
+    // A `$x` hole reaching execution with no binding must be surfaced (never
+    // silent) — not just evaluate to null and drop rows quietly (§25.3).
+    let text = "name,age\nalice,30\nbob,15\n";
+    let f = TempCsv(gendata::write_temp_bytes("unbound_hole", text.as_bytes()));
+    let p = f.0.display();
+    let res = run_src(
+        &format!("T:\n open {p}\n |? age >= $min\n |> name\n;"),
+        4096,
+    );
+    let surfaced = res
+        .errors
+        .iter()
+        .filter(|e| e.message.contains("value hole $min is unbound"))
+        .count();
+    assert_eq!(
+        surfaced, 1,
+        "unbound hole not surfaced once: {:?}",
+        res.errors
+    );
+    // Continue-first: it is recoverable, not fatal.
+    assert!(!res.errors.iter().any(rivus_core::ErrorEvent::is_fatal));
+}
+
+#[test]
 fn bound_value_hole_is_observationally_identical_to_inline_literal() {
     // End-to-end (§25.3): `| clean min=20` over `clean: … |? age >= $min`
     // produces the same output as writing `|? age >= 20` inline — the bound

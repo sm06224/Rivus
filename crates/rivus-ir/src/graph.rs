@@ -506,6 +506,16 @@ impl Op {
         }
     }
 
+    /// Collect the names of every `$x` value hole in this op's expressions.
+    pub fn collect_holes(&self, out: &mut Vec<String>) {
+        match self {
+            Op::Filter { pred } | Op::Validate { pred, .. } => pred.collect_holes(out),
+            Op::ProjectExpr { items } => items.iter().for_each(|(e, _)| e.collect_holes(out)),
+            Op::FilterProject { preds, .. } => preds.iter().for_each(|p| p.collect_holes(out)),
+            _ => {}
+        }
+    }
+
     /// Is this a sink (leaf writer)? Used so `| name` reuse splices only a
     /// flow's *transforms* and never drags its sink along (§25.4).
     pub fn is_sink(&self) -> bool {
@@ -868,6 +878,21 @@ impl PlanGraph {
         PlanGraph::default()
     }
 
+    /// Names of `$x` value holes that remain **unbound** in nodes that will
+    /// execute (de-duplicated, sorted). A bound hole becomes a literal at its
+    /// apply site, so anything still here is a hole reaching evaluation with no
+    /// value — the runtime surfaces it (never-silent) instead of evaluating it
+    /// to null in silence (§25.3).
+    pub fn unbound_holes(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for node in &self.nodes {
+            node.op.collect_holes(&mut names);
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn add_node(&mut self, op: Op) -> NodeId {
         let id = self.nodes.len();
         self.nodes.push(Node {
@@ -1018,7 +1043,9 @@ impl PlanGraph {
                 let mut line = format!("| {name}");
                 for (k, v) in bindings {
                     match v {
-                        Value::Str(s) => line.push_str(&format!(" {k}=\"{s}\"")),
+                        Value::Str(s) => {
+                            line.push_str(&format!(" {k}=\"{}\"", Expr::escape_string(s)))
+                        }
                         other => line.push_str(&format!(" {k}={other}")),
                     }
                 }

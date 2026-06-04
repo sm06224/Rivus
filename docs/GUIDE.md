@@ -319,12 +319,14 @@ report:
 ;
 ```
 
-`| name k=v …` binds each `$k` hole to the **value** `v` (int, `1.5`, `"str"`,
-`true`/`false`). The binding is structural — the value is placed into the IR as a
-literal, never spliced as source text — so a call can only ever supply a *value*,
-never inject flow structure (**injection-safe**). A bound hole desugars
-byte-identically to writing the literal inline, and `| name k=v` round-trips
-through `rivus fmt`.
+`| name k=v …` binds each `$k` hole to the **value** `v` (int, `1.5`, `-5`,
+`"str"`, `true`/`false`). The binding is structural — the value is placed into
+the IR as a literal, never spliced as source text — so a call can only ever
+supply a *value*, never inject flow structure (**injection-safe**). A bound hole
+desugars byte-identically to writing the literal inline, and `| name k=v`
+round-trips through `rivus fmt`. A hole that reaches execution **unbound**
+evaluates to null and is **surfaced** on the error stream (never silent), so a
+forgotten binding can't quietly drop every row.
 
 ### Composing them
 
