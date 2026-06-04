@@ -156,12 +156,22 @@ impl Parser {
             }
             self.bump(); // name
             self.bump(); // `=`
+                         // An optional leading `-` (lexed as the bare word "-" outside parens)
+                         // makes the literal negative, e.g. `min=-5`.
+            let neg = matches!(self.tok(), Tok::Word(w) if w == "-");
+            if neg {
+                self.bump();
+            }
             let v = match self.bump() {
-                Tok::Int(n) => Value::I64(n),
-                Tok::Float(_, d) => Value::Dec(d),
-                Tok::Str(s) => Value::Str(s),
-                Tok::Word(w) if w == "true" => Value::Bool(true),
-                Tok::Word(w) if w == "false" => Value::Bool(false),
+                Tok::Int(n) => Value::I64(if neg { -n } else { n }),
+                Tok::Float(_, d) => Value::Dec(if neg {
+                    rivus_core::Decimal::new(-d.unscaled, d.scale)
+                } else {
+                    d
+                }),
+                Tok::Str(s) if !neg => Value::Str(s),
+                Tok::Word(w) if !neg && w == "true" => Value::Bool(true),
+                Tok::Word(w) if !neg && w == "false" => Value::Bool(false),
                 other => {
                     return Err(self.err(format!(
                         "binding `{k}=` expects a literal value (int/decimal/\"string\"/bool), \
@@ -1088,6 +1098,10 @@ impl Parser {
                 op,
                 right: Box::new(right),
             })
+        } else if self.at(&Tok::Assign) {
+            // A lone `=` in a predicate is almost always a `==` typo (the bare
+            // `=` is reserved for value-hole bindings, `| flow k=v`).
+            Err(self.err("unexpected '=' in a predicate (did you mean '=='?)"))
         } else {
             Ok(left)
         }
@@ -2032,6 +2046,50 @@ Users:
         assert!(
             format!("{err:?}").contains("unknown flow 'nope'"),
             "expected an `unknown flow` diagnostic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn negative_value_hole_binding() {
+        // `min=-5` binds a negative literal value (parsed, not a structure), and
+        // round-trips through to_source with its sign.
+        let g = parse("clean:\n open c.csv\n |? x >= $min\n;\nR:\n open d.csv\n | clean min=-5\n;")
+            .unwrap();
+        let ops = chain_ops(&g, g.labels["R"]);
+        assert!(
+            ops.iter().any(|o| o.contains("I64(-5)")),
+            "negative binding not bound to -5: {ops:?}"
+        );
+        assert!(
+            g.to_source().contains("min=-5"),
+            "negative sign lost in to_source"
+        );
+    }
+
+    #[test]
+    fn string_binding_with_quotes_round_trips_escaped() {
+        // A bound string containing a `"` must escape on to_source so it re-parses.
+        let src = "clean:\n open c.csv\n |> (concat(a, $s)) as b\n;\n\
+                   R:\n open d.csv\n | clean s=\"a\\\"b\"\n;";
+        let g1 = parse(src).unwrap();
+        let rendered = g1.to_source();
+        let g2 = parse(&rendered).unwrap();
+        assert_eq!(
+            chain_ops(&g1, g1.labels["R"]),
+            chain_ops(&g2, g2.labels["R"]),
+            "escaped string binding broke round-trip:\n{rendered}"
+        );
+        assert_eq!(rendered, g2.to_source(), "not idempotent:\n{rendered}");
+    }
+
+    #[test]
+    fn lone_equals_in_predicate_hints_at_double_equals() {
+        // The bare `=` (now the binding token) must still give a helpful hint when
+        // mistyped for `==` in a predicate.
+        let err = parse("R:\n open d.csv\n |? age = 5\n;").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("did you mean '=='"),
+            "expected a `did you mean ==` hint, got {err:?}"
         );
     }
 

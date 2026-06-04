@@ -217,7 +217,9 @@ pub enum Expr {
     /// a binding (`| clean min=0`) or a scope parameter. It is bound at the
     /// IR/value level — never by text interpolation — so an external binding can
     /// only ever supply a *value*, never inject flow structure (injection-safe,
-    /// prepared-statement style). An unbound hole reaching evaluation is an error.
+    /// prepared-statement style). An unbound hole that reaches evaluation yields
+    /// null and is **surfaced once** on the error stream by the runtime
+    /// (`PlanGraph::unbound_holes`) — never silently dropped (continue-first).
     Hole(String),
     Compare {
         left: Box<Expr>,
@@ -338,6 +340,23 @@ impl Expr {
         }
     }
 
+    /// Escape a string for a `"…"` source literal so `to_source` round-trips a
+    /// value containing quotes, backslashes or newlines (mirrors the lexer's
+    /// `\n \t \" \\` unescaping). Surfaced by `$x` bindings of arbitrary strings.
+    pub fn escape_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
     /// Source representation of the field accessor, for reversibility.
     fn field_src(name: &str, access: Access) -> String {
         match access {
@@ -352,7 +371,7 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Field { name, access } => write!(f, "{}", Expr::field_src(name, *access)),
-            Expr::Literal(Value::Str(s)) => write!(f, "\"{s}\""),
+            Expr::Literal(Value::Str(s)) => write!(f, "\"{}\"", Expr::escape_string(s)),
             Expr::Literal(v) => write!(f, "{v}"),
             Expr::Hole(name) => write!(f, "${name}"),
             Expr::Compare { left, op, right } => {
