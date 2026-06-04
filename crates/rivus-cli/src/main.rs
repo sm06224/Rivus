@@ -45,12 +45,15 @@ fn main() -> ExitCode {
     // it as a stdin→stdout filter. Flags still parse from arg 2.
     let mut path: Option<String> = None;
     let mut inline: Option<String> = None;
-    if !matches!(cmd, "run" | "explain" | "check") && is_transform_only(cmd) {
+    if !matches!(cmd, "run" | "explain" | "check" | "fmt") && is_transform_only(cmd) {
         inline = Some(args[1].clone());
         cmd = "run";
     }
     let mut chunk_size = RunOptions::default().chunk_size;
     let mut optimize = true;
+    // `rivus fmt … --write`/`-w`: rewrite the source file in place instead of
+    // printing the canonical form to stdout.
+    let mut fmt_write = false;
     let mut telemetry_json = false;
     let mut telemetry_addr: Option<String> = None;
     // `--serve [ADDR]`: launch the live HTTP/SSE dashboard (Pillar B). The
@@ -66,6 +69,7 @@ fn main() -> ExitCode {
     while i < args.len() {
         match args[i].as_str() {
             "--no-opt" => optimize = false,
+            "--write" | "-w" => fmt_write = true,
             // Emit machine-readable JSONL telemetry to stderr (Observability
             // spec §19: base for editor/GUI). `--telemetry json` or `--json`.
             "--json" => telemetry_json = true,
@@ -206,6 +210,50 @@ fn main() -> ExitCode {
     };
 
     match cmd {
+        "fmt" => {
+            // Format = parse → IR → canonical source (§25.8: fmt is IR-based).
+            // Comment trivia is preserved through the IR (§25.7), so the
+            // author's notes survive.
+            let formatted = parsed.to_source();
+            // Honesty gate: the canonical renderer is faithful for linear flows
+            // (and merge/join scopes), but a DAG branch (`->` fan-out) still
+            // renders as a `... ;` placeholder. Re-parse the result and refuse to
+            // emit anything we can't round-trip, rather than silently rewrite a
+            // branch program into something different.
+            let faithful = match rivus_parser::parse(&formatted) {
+                Ok(re) => {
+                    re.nodes.len() == parsed.nodes.len()
+                        && re
+                            .nodes
+                            .iter()
+                            .zip(parsed.nodes.iter())
+                            .all(|(a, b)| a.op.kind_str() == b.op.kind_str())
+                }
+                Err(_) => false,
+            };
+            if !faithful {
+                eprintln!(
+                    "error: `rivus fmt` cannot yet faithfully round-trip this \
+                     program (a `->` branch / fan-out DAG is not rendered \
+                     losslessly yet); left the source unchanged"
+                );
+                return ExitCode::FAILURE;
+            }
+            if fmt_write {
+                if label == "<command>" || label == "<stdin>" {
+                    eprintln!("error: `rivus fmt --write` needs a file path (not -c / stdin)");
+                    return ExitCode::from(2);
+                }
+                if let Err(e) = std::fs::write(&label, &formatted) {
+                    eprintln!("error: cannot write '{label}': {e}");
+                    return ExitCode::FAILURE;
+                }
+                eprintln!("formatted {label}");
+            } else {
+                print!("{formatted}");
+            }
+            ExitCode::SUCCESS
+        }
         "check" => {
             println!(
                 "ok: {} node(s), {} edge(s)",
@@ -526,6 +574,7 @@ fn usage() {
          \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--memory low|auto|fast|unbounded] [--json|--telemetry-addr HOST:PORT|--tui|--serve [ADDR]]  run a flow\n\
          \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
          \x20 rivus check   <program>                                parse only\n\
+         \x20 rivus fmt     <program> [--write|-w]                   reformat to canonical source (preserves #{{ }}# comments)\n\
          \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\
          PROGRAM (any of):\n\
          \x20 <file.riv>                 read the program from a file\n\

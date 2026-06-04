@@ -24,7 +24,7 @@
 
 mod lexer;
 
-use lexer::{Lexer, Tok};
+use lexer::{Comment, Lexer, Tok};
 use rivus_core::{DataType, Mode, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
     Access, AggFunc, ArithOp, BinType, CmpOp, Disposition, EdgeKind, Endian, Expr, FillMethod,
@@ -32,9 +32,11 @@ use rivus_ir::{
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
-    let toks = Lexer::new(src).tokenize().map_err(RivusError::Parse)?;
+    let (toks, comments) = Lexer::new(src).tokenize().map_err(RivusError::Parse)?;
     let mut p = Parser {
         toks,
+        comments,
+        comment_cursor: 0,
         pos: 0,
         g: PlanGraph::new(),
         last_dt_fmt: None,
@@ -45,6 +47,11 @@ pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
 
 struct Parser {
     toks: Vec<(Tok, u32)>,
+    /// Comment trivia from the lexer, each tagged with the token index it
+    /// precedes (§25.7). Consumed in order via `comment_cursor` as the parser
+    /// advances, and attached to the node whose statement they lead.
+    comments: Vec<Comment>,
+    comment_cursor: usize,
     pos: usize,
     g: PlanGraph,
     /// Scratch: the `:datetime("fmt")` format captured by the most recent
@@ -118,6 +125,20 @@ impl Parser {
         matches!(self.tok(), Tok::Word(x) if x == w)
     }
 
+    /// Take all pending comment trivia that precede the current token position,
+    /// in source order (§25.7). Called at each statement boundary so the run of
+    /// comments leading a step is attached to that step's node.
+    fn take_leading_comments(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        while self.comment_cursor < self.comments.len()
+            && self.comments[self.comment_cursor].0 <= self.pos
+        {
+            out.push(self.comments[self.comment_cursor].1.clone());
+            self.comment_cursor += 1;
+        }
+        out
+    }
+
     // ----------------------------------------------------------------- program
 
     fn parse_program(&mut self) -> Result<(), RivusError> {
@@ -171,9 +192,16 @@ impl Parser {
     /// `input` is the upstream node for branch children (which continue an
     /// existing flow rather than starting a new source).
     fn parse_body(&mut self, input: Option<NodeId>) -> Result<NodeId, RivusError> {
+        // Comments between `Label:` and the source lead the head node.
+        let head_lead = self.take_leading_comments();
         let mut current = self.parse_body_head(input)?;
+        self.g.nodes[current].leading_comments = head_lead;
 
         loop {
+            // Snapshot the comments leading this step and the next node id, so
+            // whatever node the matched transform creates first carries them.
+            let lead = self.take_leading_comments();
+            let mark = self.g.nodes.len();
             match self.tok().clone() {
                 // `|? pred` / `|? a, b` (comma = AND). `where` is a readable alias.
                 Tok::PipeFilter => {
@@ -508,6 +536,13 @@ impl Parser {
                 }
                 Tok::Semicolon | Tok::Eof => break,
                 other => return Err(self.err(format!("unexpected token in flow: {other:?}"))),
+            }
+            // Attach the step's leading comments to the first node it created.
+            // Node-creating arms fall through here; `break`/hook arms do not
+            // (so trailing comments before `;` and comments before a hook are
+            // not preserved in this phase — a documented MVP limit).
+            if self.g.nodes.len() > mark && !lead.is_empty() {
+                self.g.nodes[mark].leading_comments = lead;
             }
         }
         Ok(current)
@@ -1347,6 +1382,54 @@ mod tests {
     fn nth_op(src: &str, n: usize) -> Op {
         let g = parse(src).unwrap();
         g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn block_comments_are_inert_trivia_and_dont_change_the_graph() {
+        // `#{ ... }#` (and `# ...`) are comments: removing them leaves the same
+        // ops. The comment must not be absorbed into any token (e.g. a path).
+        let with = parse(
+            "F:\n #{ scope note }#\n open d.csv\n # keep adults\n |? age >= 20\n |> name age\n;",
+        )
+        .unwrap();
+        let without = parse("F:\n open d.csv\n |? age >= 20\n |> name age\n;").unwrap();
+        assert_eq!(with.nodes.len(), without.nodes.len());
+        for (a, b) in with.nodes.iter().zip(without.nodes.iter()) {
+            assert_eq!(a.op.kind_str(), b.op.kind_str());
+        }
+    }
+
+    #[test]
+    fn comments_attach_as_leading_trivia_to_the_following_step() {
+        let g =
+            parse("F:\n #{ source }#\n open d.csv\n # adults only\n |? age >= 20\n |> name age\n;")
+                .unwrap();
+        // head (open) carries the scope-leading block comment
+        assert_eq!(
+            g.nodes[0].leading_comments,
+            vec!["#{ source }#".to_string()]
+        );
+        // the filter carries the line comment that preceded it
+        assert_eq!(
+            g.nodes[1].leading_comments,
+            vec!["# adults only".to_string()]
+        );
+        // the project had no comment
+        assert!(g.nodes[2].leading_comments.is_empty());
+    }
+
+    #[test]
+    fn comment_trivia_round_trips_through_to_source_and_is_idempotent() {
+        let src = "F:\n #{ note }#\n open d.csv\n # adults\n |? age >= 20\n |> name age\n;";
+        let once = parse(src).unwrap().to_source();
+        // The comments survive the IR round-trip.
+        assert!(once.contains("#{ note }#"), "block comment lost: {once}");
+        assert!(once.contains("# adults"), "line comment lost: {once}");
+        // fmt is idempotent: formatting the formatted source is a fixed point,
+        // and the comments are still there.
+        let twice = parse(&once).unwrap().to_source();
+        assert_eq!(once, twice, "to_source is not idempotent");
+        assert!(twice.contains("#{ note }#") && twice.contains("# adults"));
     }
 
     #[test]

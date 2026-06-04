@@ -29,7 +29,10 @@ Scope:                 # a named node in the execution graph
 - `|?` `|>` `|#` are pipe operators; `->` `+` `&` build the DAG (branch / merge /
   join). Scopes can reference each other by name.
 - Whitespace and newlines are insignificant — a scope can be one line or many.
-  `#` starts a line comment (but `|#` is the group operator).
+  `#` starts a line comment (but `|#` is the group operator); `#{ … }#` is a
+  block comment. Comments are **inert trivia** — no execution meaning — but they
+  are preserved through the IR, so `rivus fmt` round-trips them (formatting never
+  erases your notes).
 
 ---
 
@@ -39,6 +42,7 @@ Scope:                 # a named node in the execution graph
 rivus run     <program>     # execute + visualize (graph, errors, output preview)
 rivus explain <program>     # show the DAG IR, optimizer report, regenerated source
 rivus check   <program>     # parse only (report syntax errors)
+rivus fmt     <program>     # reformat to canonical source (preserves comments)
 ```
 
 `<program>` is **one of**:
@@ -794,6 +798,7 @@ Ids:
 rivus run     <program> [--chunk-size N] [--no-opt] [--json]  run a flow
 rivus explain <program> [--no-opt]                    show DAG IR + optimizer report
 rivus check   <program>                               parse only
+rivus fmt     <program> [--write|-w]                  reformat to canonical source
 rivus gen     <shape>   [--rows N --seed S --ratio R] write seeded data to stdout
 
 PROGRAM:
@@ -812,6 +817,17 @@ GEN SHAPES (deterministic, seeded — for benches/demos, no awk needed):
 # self-hosted bench: generate, then filter — no external tools
 rivus gen clean --rows 1000000 | rivus '|? age >= 50 |> name age'
 ```
+
+**`rivus fmt`** parses the program and re-prints it in canonical form *from the
+IR* (the same renderer `explain` uses), so spacing and field forms are
+normalized and the result is **idempotent**. Comments (`#…` and `#{ … }#`) are
+**preserved** — they ride the IR as inert trivia. `--write`/`-w` rewrites the
+file in place (needs a file path, not `-c`/stdin); otherwise the canonical
+source goes to stdout. fmt is **honest about round-trip**: if a program uses a
+construct it cannot yet render losslessly — today a `->` branch / fan-out DAG —
+it refuses with a non-zero exit and leaves the source untouched rather than
+rewrite it into something different. (Linear flows and merge/join scopes format
+fully; faithful branch rendering is the next step.)
 
 ---
 

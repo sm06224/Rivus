@@ -52,6 +52,50 @@ fn check_from_stdin() {
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("ok:"));
 }
 
+/// `rivus fmt -c …` reformats to canonical source on stdout and preserves the
+/// `#{ … }#` / `# …` comment trivia (§25.7). Formatting is idempotent.
+#[test]
+fn fmt_preserves_comments_and_is_idempotent() {
+    let prog = "F:\n #{ note }#\n open d.csv\n # adults\n |? age >= 20\n |> name age\n;";
+    let out = Command::new(BIN)
+        .args(["fmt", "-c", prog])
+        .output()
+        .expect("spawn rivus");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let once = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(once.contains("#{ note }#"), "block comment lost:\n{once}");
+    assert!(once.contains("# adults"), "line comment lost:\n{once}");
+    // Re-formatting the formatted output is a fixed point.
+    let out2 = Command::new(BIN)
+        .args(["fmt", "-c", once.trim_end()])
+        .output()
+        .expect("spawn rivus");
+    assert!(out2.status.success());
+    assert_eq!(
+        once,
+        String::from_utf8_lossy(&out2.stdout),
+        "fmt not idempotent"
+    );
+}
+
+/// `rivus fmt` refuses (non-zero, source untouched) a program it cannot yet
+/// round-trip faithfully — a `->` branch DAG — rather than silently rewrite it.
+#[test]
+fn fmt_refuses_unfaithful_branch_program() {
+    let prog = "U:\n open u.csv\n -> A: |? age >= 20 ;\n -> B: |? age < 20 ;\n;";
+    let out = Command::new(BIN)
+        .args(["fmt", "-c", prog])
+        .output()
+        .expect("spawn rivus");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "should not emit a rewritten program");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot yet faithfully round-trip"));
+}
+
 /// Passing both `-c` and a path is a usage error (exit code 2).
 #[test]
 fn inline_and_path_conflict_errors() {

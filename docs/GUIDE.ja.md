@@ -33,7 +33,9 @@ Scope:                 # 実行グラフ上の名前付きノード
 - `|?` `|>` `|#` `|!` はパイプ演算子。`->` `+` `&` で DAG（分岐 / マージ / 結合）を
   組みます。スコープは名前で相互参照できます。
 - 空白・改行は意味を持ちません（1 行でも複数行でも可）。`#` は行コメント
-  （ただし `|#` はグループ演算子）。
+  （ただし `|#` はグループ演算子）、`#{ … }#` はブロックコメント。コメントは
+  **inert trivia**（実行上の意味なし）ですが **IR に保持**されるので、`rivus fmt`
+  で往復します（整形でメモが消えません）。
 
 ---
 
@@ -43,6 +45,7 @@ Scope:                 # 実行グラフ上の名前付きノード
 rivus run     <program>     # 実行 + 可視化（グラフ・エラー・出力プレビュー）
 rivus explain <program>     # DAG IR・オプティマイザレポート・再生成ソースを表示
 rivus check   <program>     # 構文チェックのみ（構文エラーを報告）
+rivus fmt     <program>     # 正準ソースへ整形（コメントを保持）
 ```
 
 `<program>` は次の **いずれか**：
@@ -764,6 +767,7 @@ Ids:
 rivus run     <program> [--chunk-size N] [--no-opt] [--json]  フローを実行
 rivus explain <program> [--no-opt]                    DAG IR + オプティマイザレポート
 rivus check   <program>                               構文チェックのみ
+rivus fmt     <program> [--write|-w]                  正準ソースへ整形
 rivus gen     <shape>   [--rows N --seed S --ratio R] シード付きデータを stdout へ
 
 PROGRAM:
@@ -782,6 +786,15 @@ GEN SHAPES（決定的・シード付き — ベンチ/デモ用、awk 不要）
 # 自己完結ベンチ：生成してフィルタ — 外部ツール不要
 rivus gen clean --rows 1000000 | rivus '|? age >= 50 |> name age'
 ```
+
+**`rivus fmt`** はプログラムをパースして **IR から**正準形に再出力します
+（`explain` と同じレンダラ）。空白やフィールド表記が正規化され、結果は**冪等**。
+コメント（`#…` と `#{ … }#`）は inert trivia として IR に乗り **保持**されます。
+`--write`/`-w` はファイルをその場で書き換え（`-c`/stdin 不可・パス必須）、
+無指定なら正準ソースを stdout へ。fmt は **round-trip に正直**で、まだ無損失に
+描けない構文（現状 `->` の分岐 / fan-out DAG）を含む場合は、別物に書き換えず
+非ゼロ終了でソースを変更せず拒否します（線形フローと merge/join スコープは完全に
+整形。分岐の忠実描画は次段）。
 
 ---
 

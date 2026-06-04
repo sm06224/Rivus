@@ -798,6 +798,11 @@ pub struct Node {
     pub label: Option<String>,
     pub op: Op,
     pub hooks: Vec<Hook>,
+    /// Comment trivia that appeared immediately before this node's statement in
+    /// the source (already canonicalized to `# …` / `#{ … }#`). Inert — it has
+    /// no execution meaning — but preserved through the IR so `to_source` /
+    /// `rivus fmt` round-trip the author's notes (§25.7). Empty for most nodes.
+    pub leading_comments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -820,6 +825,7 @@ impl PlanGraph {
             label: None,
             op,
             hooks: Vec::new(),
+            leading_comments: Vec::new(),
         });
         id
     }
@@ -929,6 +935,12 @@ impl PlanGraph {
             let chain = self.linear_chain_to(node.id);
             let _ = writeln!(out, "{label}:");
             for &nid in &chain {
+                // Inert comment trivia preceding this step (§25.7), re-emitted
+                // in source order at the step's indentation so `rivus fmt`
+                // round-trips it.
+                for c in &self.nodes[nid].leading_comments {
+                    let _ = writeln!(out, "    {c}");
+                }
                 let _ = writeln!(out, "    {}", self.nodes[nid].op.to_src_line());
                 for h in &self.nodes[nid].hooks {
                     self.write_hook(&mut out, h);
