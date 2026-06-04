@@ -213,6 +213,12 @@ pub enum Expr {
         access: Access,
     },
     Literal(Value),
+    /// A `$x` **value hole** (§25.3): a named placeholder for a value, filled by
+    /// a binding (`| clean min=0`) or a scope parameter. It is bound at the
+    /// IR/value level — never by text interpolation — so an external binding can
+    /// only ever supply a *value*, never inject flow structure (injection-safe,
+    /// prepared-statement style). An unbound hole reaching evaluation is an error.
+    Hole(String),
     Compare {
         left: Box<Expr>,
         op: CmpOp,
@@ -256,6 +262,82 @@ impl Expr {
         }
     }
 
+    /// Return a copy with every `$x` hole bound from `bindings` replaced by its
+    /// value literal (§25.3 prepared binding). Holes absent from `bindings` are
+    /// left as holes. Binding happens structurally on the IR — the value is
+    /// placed as a `Literal`, never spliced as source text — so a binding can
+    /// never inject flow structure (injection-safe).
+    pub fn bind_holes(&self, bindings: &std::collections::HashMap<String, Value>) -> Expr {
+        match self {
+            Expr::Hole(name) => match bindings.get(name) {
+                Some(v) => Expr::Literal(v.clone()),
+                None => Expr::Hole(name.clone()),
+            },
+            Expr::Field { .. } | Expr::Literal(_) => self.clone(),
+            Expr::Compare { left, op, right } => Expr::Compare {
+                left: Box::new(left.bind_holes(bindings)),
+                op: *op,
+                right: Box::new(right.bind_holes(bindings)),
+            },
+            Expr::And(a, b) => Expr::And(
+                Box::new(a.bind_holes(bindings)),
+                Box::new(b.bind_holes(bindings)),
+            ),
+            Expr::Or(a, b) => Expr::Or(
+                Box::new(a.bind_holes(bindings)),
+                Box::new(b.bind_holes(bindings)),
+            ),
+            Expr::Arith { left, op, right } => Expr::Arith {
+                left: Box::new(left.bind_holes(bindings)),
+                op: *op,
+                right: Box::new(right.bind_holes(bindings)),
+            },
+            Expr::Cast { expr, ty } => Expr::Cast {
+                expr: Box::new(expr.bind_holes(bindings)),
+                ty: *ty,
+            },
+            Expr::Func { func, args } => Expr::Func {
+                func: *func,
+                args: args.iter().map(|a| a.bind_holes(bindings)).collect(),
+            },
+            Expr::Case { branches, default } => Expr::Case {
+                branches: branches
+                    .iter()
+                    .map(|(c, v)| (c.bind_holes(bindings), v.bind_holes(bindings)))
+                    .collect(),
+                default: default.as_ref().map(|d| Box::new(d.bind_holes(bindings))),
+            },
+        }
+    }
+
+    /// Collect the names of every `$x` hole in this expression (de-duplicated by
+    /// the caller if needed), in left-to-right order.
+    pub fn collect_holes(&self, out: &mut Vec<String>) {
+        match self {
+            Expr::Hole(name) => out.push(name.clone()),
+            Expr::Field { .. } | Expr::Literal(_) => {}
+            Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
+                left.collect_holes(out);
+                right.collect_holes(out);
+            }
+            Expr::And(a, b) | Expr::Or(a, b) => {
+                a.collect_holes(out);
+                b.collect_holes(out);
+            }
+            Expr::Cast { expr, .. } => expr.collect_holes(out),
+            Expr::Func { args, .. } => args.iter().for_each(|a| a.collect_holes(out)),
+            Expr::Case { branches, default } => {
+                for (c, v) in branches {
+                    c.collect_holes(out);
+                    v.collect_holes(out);
+                }
+                if let Some(d) = default {
+                    d.collect_holes(out);
+                }
+            }
+        }
+    }
+
     /// Source representation of the field accessor, for reversibility.
     fn field_src(name: &str, access: Access) -> String {
         match access {
@@ -272,6 +354,7 @@ impl fmt::Display for Expr {
             Expr::Field { name, access } => write!(f, "{}", Expr::field_src(name, *access)),
             Expr::Literal(Value::Str(s)) => write!(f, "\"{s}\""),
             Expr::Literal(v) => write!(f, "{v}"),
+            Expr::Hole(name) => write!(f, "${name}"),
             Expr::Compare { left, op, right } => {
                 write!(f, "{left} {} {right}", op.as_str())
             }

@@ -300,6 +300,26 @@ report:
   skip にはしない）。名前解決は列名ベースでスキーマ版に非依存。
 - **round-trip**します：`rivus fmt` は展開後の手順ではなく `| name` を再出力します。
 
+**値ホール（`$x`）と束縛。** レシピは**値**を `$x` ホールで開けておき、呼び出し側で
+埋められます（プリペアド方式）：
+
+```
+adults:
+    open raw.csv
+    |? age >= $min, age <= $max      # $min / $max は値ホール
+;
+report:
+    open today.csv
+    | adults min=20 max=65           # 呼び出し時にホールを埋める
+;
+```
+
+`| name k=v …` は各 `$k` ホールを**値** `v`（整数・`1.5`・`"str"`・`true`/`false`）に
+束縛します。束縛は構造的＝値を IR にリテラルとして置き、ソーステキストとして差し込み
+ません。だから呼び出し側は**値しか**渡せず、フロー構造を注入できません（**injection-safe**）。
+束縛済みホールはリテラルをインラインに書いたのと byte-identical に脱糖し、
+`| name k=v` は `rivus fmt` で round-trip します。
+
 ### 組み合わせる
 
 変換は任意の順で連結できます：
@@ -372,6 +392,7 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 | 現在行のフィールド | `age`（裸）, `$_.age`（明示） |
 | 深い / 動的フィールド | `$_..age`（再帰）, `item("age")`（動的） |
 | 親スコープのフィールド | `$_:1.country`（`$_:0` = 現在、`$_:1` = 親 …） |
+| 値ホール | `$min` — 束縛（`\| flow min=20`）で埋める値の穴、§4 |
 
 **関数**
 
@@ -840,7 +861,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
-           | '|' IDENT                                        (apply a named flow's transforms)
+           | '|' IDENT (IDENT '=' VALUE)*                      (apply a named flow; bind value holes)
            | '|!' expr (',' expr)* ('warn'|'reject'|'halt')   (validate / contract)
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)

@@ -305,6 +305,27 @@ report:
   schema-version-independent.
 - It **round-trips**: `rivus fmt` re-emits `| name` (not the expanded steps).
 
+**Value holes (`$x`) and bindings.** A recipe can leave **values** open with a
+`$x` hole and have each call fill them — `prepared-statement` style:
+
+```
+adults:
+    open raw.csv
+    |? age >= $min, age <= $max      # $min / $max are value holes
+;
+report:
+    open today.csv
+    | adults min=20 max=65           # fill the holes at the call site
+;
+```
+
+`| name k=v …` binds each `$k` hole to the **value** `v` (int, `1.5`, `"str"`,
+`true`/`false`). The binding is structural — the value is placed into the IR as a
+literal, never spliced as source text — so a call can only ever supply a *value*,
+never inject flow structure (**injection-safe**). A bound hole desugars
+byte-identically to writing the literal inline, and `| name k=v` round-trips
+through `rivus fmt`.
+
 ### Composing them
 
 Transforms chain in any order:
@@ -382,6 +403,7 @@ Used in `|?` predicates and `(…)` computed columns.
 | field of the current row | `age` (bare), `$_.age` (explicit) |
 | deep / dynamic field | `$_..age` (recursive), `item("age")` (dynamic) |
 | parent scope field | `$_:1.country` (`$_:0` = current, `$_:1` = parent …) |
+| value hole | `$min` — a placeholder filled by a binding (`\| flow min=20`), §4 |
 
 **Functions**
 
@@ -875,7 +897,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
-           | '|' IDENT                                        (apply a named flow's transforms)
+           | '|' IDENT (IDENT '=' VALUE)*                      (apply a named flow; bind value holes)
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
            | ('take'|'limit'|'head') INT
@@ -893,9 +915,9 @@ proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;
 expr       = or ; or = and ('or' and)* ; and = cmp ('and' cmp)* ;
 cmp        = add (CMP add)? ; add = mul (('+'|'-') mul)* ; mul = primary (('*'|'/'|'%') primary)* ;
 primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
-           | IDENT | '$_' field-tail | '$_:'N field-tail | 'item' '(' STRING ')'
+           | IDENT | '$_' field-tail | '$_:'N field-tail | '$' IDENT | 'item' '(' STRING ')'
            | FUNC '(' expr (',' expr)* ')'
-           | 'case' ('when' expr 'then' expr)+ ('else' expr)? 'end' ;
+           | 'case' ('when' expr 'then' expr)+ ('else' expr)? 'end' ;   ('$' IDENT = value hole)
 FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
 TYPE       = 'int'|'i64' | 'float'|'f64' | 'str'|'string'|'text' | 'bool' | 'decimal' '(' INT ')' ;
 AGG        = 'sum' | 'avg' | 'min' | 'max' | 'std'

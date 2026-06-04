@@ -7,11 +7,16 @@
 //! back into readable Rivus source (Master principle #5: IR reversibility).
 
 use crate::expr::{Access, CmpOp, Expr};
-use rivus_core::{DataType, Mode, Severity};
+use rivus_core::{DataType, Mode, Severity, Value};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
 pub type NodeId = usize;
+
+/// Provenance of a node spliced by `| name k=v …` (§25.3/§25.4): the apply
+/// `(site_id, flow_name, value-hole bindings)`. Nodes from the same apply share
+/// the `site_id` so `to_source` collapses them back to one `| name k=v …`.
+pub type ApplySite = (u32, String, Vec<(String, Value)>);
 
 /// Byte order for binary records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -474,6 +479,33 @@ fn escape_delim(b: u8) -> String {
 }
 
 impl Op {
+    /// Return a copy of this op with every `$x` value hole in its expressions
+    /// bound from `bindings` (§25.3). Only ops that carry expressions are
+    /// affected; the binding is structural (hole → value literal in the IR),
+    /// never textual, so it cannot inject flow structure.
+    pub fn bind_holes(&self, bindings: &HashMap<String, Value>) -> Op {
+        match self {
+            Op::Filter { pred } => Op::Filter {
+                pred: pred.bind_holes(bindings),
+            },
+            Op::Validate { pred, disposition } => Op::Validate {
+                pred: pred.bind_holes(bindings),
+                disposition: *disposition,
+            },
+            Op::ProjectExpr { items } => Op::ProjectExpr {
+                items: items
+                    .iter()
+                    .map(|(e, a)| (e.bind_holes(bindings), a.clone()))
+                    .collect(),
+            },
+            Op::FilterProject { preds, fields } => Op::FilterProject {
+                preds: preds.iter().map(|p| p.bind_holes(bindings)).collect(),
+                fields: fields.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// Is this a sink (leaf writer)? Used so `| name` reuse splices only a
     /// flow's *transforms* and never drags its sink along (§25.4).
     pub fn is_sink(&self) -> bool {
@@ -814,11 +846,13 @@ pub struct Node {
     pub leading_comments: Vec<String>,
     /// Provenance for the named-flow reuse form `| name` (§25.4): when this node
     /// was spliced in by *applying* a named flow's transforms, it carries that
-    /// apply site `(site_id, flow_name)`. Nodes spliced by the same `| name`
-    /// share a `site_id`, so `to_source` collapses the contiguous run back to
-    /// `| name` (round-trip), while execution sees the plain desugared ops
-    /// (byte-identical to writing them inline). `None` for hand-written nodes.
-    pub applied_from: Option<(u32, String)>,
+    /// apply site `(site_id, flow_name, bindings)`. Nodes spliced by the same
+    /// `| name` share a `site_id`, so `to_source` collapses the contiguous run
+    /// back to `| name k=v …` (round-trip), while execution sees the plain
+    /// desugared ops with the `$x` holes already bound to values (byte-identical
+    /// to writing them inline). `bindings` are the `$x` value holes filled at
+    /// this apply (§25.3), in source order. `None` for hand-written nodes.
+    pub applied_from: Option<ApplySite>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -980,11 +1014,18 @@ impl PlanGraph {
             }
             // A contiguous run spliced from one `| name` apply collapses back to
             // that single form (§25.4 round-trip), instead of the desugared ops.
-            if let Some((site, name)) = &self.nodes[nid].applied_from {
-                let _ = writeln!(out, "{pad}| {name}");
+            if let Some((site, name, bindings)) = &self.nodes[nid].applied_from {
+                let mut line = format!("| {name}");
+                for (k, v) in bindings {
+                    match v {
+                        Value::Str(s) => line.push_str(&format!(" {k}=\"{s}\"")),
+                        other => line.push_str(&format!(" {k}={other}")),
+                    }
+                }
+                let _ = writeln!(out, "{pad}{line}");
                 i += 1;
                 while i < chain.len()
-                    && self.nodes[chain[i]].applied_from.as_ref().map(|(s, _)| *s) == Some(*site)
+                    && self.nodes[chain[i]].applied_from.as_ref().map(|(s, ..)| *s) == Some(*site)
                 {
                     i += 1;
                 }
