@@ -296,8 +296,10 @@ report:
 ```
 
 - `| name` splices in `name`'s **transforms only** (everything after its
-  source), in order, so it behaves **byte-identically** to writing those steps
-  inline — same data, same error stream. Reuse is mechanical, not magic.
+  source, and stopping before any sink), in order, so it behaves
+  **byte-identically** to writing those steps inline — same data, same error
+  stream. A reuse recipe never drags its own `save …` along. Reuse is
+  mechanical, not magic.
 - The flow must be **defined earlier** in the program; an undefined `| name` is
   an error (never a silent skip). Name resolution is by column name, so it is
   schema-version-independent.
