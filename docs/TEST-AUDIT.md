@@ -85,3 +85,28 @@ at a sub-second `unit`; today datetime is `Sec` MVP — pair with the unit work.
 The GUIDE's `dropna` section must note it currently sees blanks only in **text**
 columns (declare `:str`) until the null model lands — otherwise it reads as a bug.
 Tracked here; applied alongside the BUG-A fix design.
+
+## 5. Relationship to existing issues (for reviewer confirmation)
+- **BUG-A** = **#81** (null-column model) almost verbatim — same `dropna`×cast
+  repro, same root (parse-failure/blank → 0, not null). The fix is #81's null
+  bitmap; `dropna`/`Required` ride it (and the `required` validator of #83/#82).
+  #81 already lists interim mitigations (`--on-parse-error` strict, a
+  dropna×cast **lint** in `explain`/`check`). → BUG-A needs **no new issue**;
+  this audit just adds the executable acceptance test for it.
+- **BUG-B** (datetime/date/time **not auto-inferred**) — **no existing issue**.
+  #58 added the subtypes and #56 is the time-series epic, but neither covers
+  *schema inference* of temporal columns from CSV. Candidate: a new #56
+  sub-issue, or a #58 follow-up.
+- **BUG-C** (AUTO_FORMATS lacks fractional-second / `Z` / `±offset`) — **no
+  existing issue**. Closest is #54 (DateTime lane) / #58. Candidate: a small new
+  issue (or #58/#54 follow-up). Note sub-second needs a sub-second datetime
+  `unit` (today `Sec` MVP), so it couples to the unit work flagged in #58's
+  Column::Time note.
+
+**Questions for the reviewer** (this PR is docs+tests only — fix is plan-only):
+1. Confirm BUG-A is owned by #81 (so this audit's spec attaches there, no new issue)?
+2. BUG-B and BUG-C have no tracking issue — file them as new #56 sub-issues, or
+   fold into #58/#54? Which, and what priority vs the #56 windowing roadmap?
+3. Is the per-feature coverage matrix (§2) missing anything you'd want pinned
+   before the #56/#82/#86 epics build on top?
+
