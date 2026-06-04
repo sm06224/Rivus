@@ -2596,6 +2596,41 @@ fn parallel_group_final_mode_matches_serial() {
 
 /// Collect a column's per-row `Value::to_string()` across all chunks of the
 /// output labeled `label` (used to inspect the datetime lane's ISO rendering).
+#[test]
+fn named_flow_apply_is_observationally_identical_to_inline() {
+    // End-to-end (§25.4): `R: open f | clean` produces the *same* output as
+    // writing `clean`'s transforms inline in R — the desugar is byte-identical.
+    let text = "name,age\nalice,30\nbob,15\ncarol,42\ndan,19\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "named_flow_apply",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let applied = run_src(
+        &format!("clean:\n open {p}\n |? age >= 20\n |> name age\n;\nR:\n open {p}\n | clean\n;"),
+        4096,
+    );
+    let inline = run_src(
+        &format!("R:\n open {p}\n |? age >= 20\n |> name age\n;"),
+        4096,
+    );
+    assert_eq!(
+        collect_strings(&applied, "R", "name"),
+        collect_strings(&inline, "R", "name"),
+        "`| clean` names differ from inline"
+    );
+    assert_eq!(
+        collect_i64(&applied, "R", "age"),
+        collect_i64(&inline, "R", "age"),
+        "`| clean` ages differ from inline"
+    );
+    // The kept set is the adults (filter applied through `| clean`).
+    assert_eq!(
+        collect_strings(&applied, "R", "name"),
+        vec!["alice", "carol"]
+    );
+}
+
 fn collect_strings(res: &rivus_runtime::RunResult, label: &str, col: &str) -> Vec<String> {
     let mut out = Vec::new();
     let o = res

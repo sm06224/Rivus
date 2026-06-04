@@ -803,6 +803,13 @@ pub struct Node {
     /// no execution meaning — but preserved through the IR so `to_source` /
     /// `rivus fmt` round-trip the author's notes (§25.7). Empty for most nodes.
     pub leading_comments: Vec<String>,
+    /// Provenance for the named-flow reuse form `| name` (§25.4): when this node
+    /// was spliced in by *applying* a named flow's transforms, it carries that
+    /// apply site `(site_id, flow_name)`. Nodes spliced by the same `| name`
+    /// share a `site_id`, so `to_source` collapses the contiguous run back to
+    /// `| name` (round-trip), while execution sees the plain desugared ops
+    /// (byte-identical to writing them inline). `None` for hand-written nodes.
+    pub applied_from: Option<(u32, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -826,6 +833,7 @@ impl PlanGraph {
             op,
             hooks: Vec::new(),
             leading_comments: Vec::new(),
+            applied_from: None,
         });
         id
     }
@@ -953,11 +961,25 @@ impl PlanGraph {
     fn write_chain(&self, out: &mut String, tail: NodeId, depth: usize) {
         let pad = "    ".repeat(depth);
         let chain = self.linear_chain_to(tail);
-        for &nid in &chain {
+        let mut i = 0;
+        while i < chain.len() {
+            let nid = chain[i];
             // Inert comment trivia preceding this step (§25.7), re-emitted in
             // source order at the step's indentation so `rivus fmt` round-trips.
             for c in &self.nodes[nid].leading_comments {
                 let _ = writeln!(out, "{pad}{c}");
+            }
+            // A contiguous run spliced from one `| name` apply collapses back to
+            // that single form (§25.4 round-trip), instead of the desugared ops.
+            if let Some((site, name)) = &self.nodes[nid].applied_from {
+                let _ = writeln!(out, "{pad}| {name}");
+                i += 1;
+                while i < chain.len()
+                    && self.nodes[chain[i]].applied_from.as_ref().map(|(s, _)| *s) == Some(*site)
+                {
+                    i += 1;
+                }
+                continue;
             }
             let _ = writeln!(out, "{pad}{}", self.nodes[nid].op.to_src_line());
             for h in &self.nodes[nid].hooks {
@@ -971,6 +993,7 @@ impl PlanGraph {
                 self.write_chain(out, child, depth + 1);
                 let _ = writeln!(out, "{pad};");
             }
+            i += 1;
         }
     }
 
@@ -1010,6 +1033,21 @@ impl PlanGraph {
                     .clone()
                     .unwrap_or_else(|| format!("<{}>", self.nodes[i].op.kind_str()))
             })
+            .collect()
+    }
+
+    /// The transform ops of the flow whose output node is `tail`, in source
+    /// order, **excluding the source head** — i.e. exactly what the named-flow
+    /// reuse form `| name` (§25.4) splices into another flow. Cloned, so the
+    /// caller can desugar `| name` into copies that execute byte-identically to
+    /// writing those transforms inline. (Only the linear chain is taken; a
+    /// referenced flow's own branches/merges are not spliced.)
+    pub fn flow_transform_ops(&self, tail: NodeId) -> Vec<Op> {
+        let chain = self.linear_chain_to(tail);
+        chain
+            .iter()
+            .skip(1) // drop the source head
+            .map(|&n| self.nodes[n].op.clone())
             .collect()
     }
 
