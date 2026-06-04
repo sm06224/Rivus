@@ -443,6 +443,15 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   Two-digit years pivot `00–68 → 20xx`, `69–99 → 19xx` (deterministic). A bare
   `:datetime` (no format) auto-infers `yyyy-MM-ddTHH:mm:ss`, `yyyy-MM-dd HH:mm:ss`,
   `yyyy-MM-dd`, `yyyyMMddHHmmss`, `yyMMddHHmmss`, `yyyyMMdd` in that order.
+- **ISO timezone & fractional seconds** are accepted on the auto path: a trailing
+  `Z` or `±HH:mm` offset is **normalised to UTC** (`…14:30:00+09:00` → `05:30:00`),
+  and a fractional second is **truncated** to the column's resolution
+  (`…14:30:00.5` → `…14:30:00`; the MVP lane is seconds).
+- **Auto-inference**: an *undeclared* column is read on the datetime lane when
+  every non-empty cell is a recognised datetime (and likewise `date` for
+  `yyyy-MM-dd`-only columns, `time` for `HH:mm:ss`). A purely numeric column
+  stays `i64`/`f64` — a number is never mis-read as a date. Declare the type to
+  override.
 - **Comparisons** parse the text literal into the same lane and compare
   instants (`ts >= "260601000000"`), so the literal's shape need not match the
   column's. A cell or literal that matches no format becomes epoch `0` / a

@@ -269,6 +269,44 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Split a trailing ISO-8601 timezone (`Z`/`z` or `±HH:mm`) off a datetime
+/// string, returning the remainder and the offset in seconds (UTC = local −
+/// offset). No timezone → offset `0`. #93.
+fn strip_iso_zone(s: &str) -> (&str, i64) {
+    let b = s.as_bytes();
+    let n = b.len();
+    if n > 0 && (b[n - 1] == b'Z' || b[n - 1] == b'z') {
+        return (&s[..n - 1], 0);
+    }
+    // `±HH:mm` at the very end: sign at n-6, `:` at n-3, the four HHmm digits.
+    if n >= 6 {
+        let c = b[n - 6];
+        if (c == b'+' || c == b'-')
+            && b[n - 3] == b':'
+            && b[n - 5].is_ascii_digit()
+            && b[n - 4].is_ascii_digit()
+            && b[n - 2].is_ascii_digit()
+            && b[n - 1].is_ascii_digit()
+        {
+            let hh = (b[n - 5] - b'0') as i64 * 10 + (b[n - 4] - b'0') as i64;
+            let mm = (b[n - 2] - b'0') as i64 * 10 + (b[n - 1] - b'0') as i64;
+            let mag = hh * 3600 + mm * 60;
+            return (&s[..n - 6], if c == b'-' { -mag } else { mag });
+        }
+    }
+    (s, 0)
+}
+
+/// Drop a fractional-seconds suffix (`.digits`) — the MVP truncates to the
+/// second (after the timezone is already stripped, a `.` is unambiguously the
+/// fraction since the date/time formats use `-`/`:`, never `.`). #93.
+fn strip_fraction(s: &str) -> &str {
+    match s.rfind('.') {
+        Some(i) if i + 1 < s.len() && s[i + 1..].bytes().all(|c| c.is_ascii_digit()) => &s[..i],
+        _ => s,
+    }
+}
+
 /// A timestamp on the **datetime lane** (design 23): integer `ticks` since the
 /// Unix epoch in `unit` resolution (UTC; no timezone yet). The integer form is
 /// exact and associative — like the decimal lane — so `min`/`max`/`count`/`first`/
@@ -318,9 +356,24 @@ impl DateTime {
     /// [`AUTO_FORMATS`]: DateTime::AUTO_FORMATS
     pub fn parse_auto(s: &str, unit: TimeUnit) -> Option<DateTime> {
         let s = s.trim();
+        // #93: accept ISO variants the base formats don't encode — a trailing
+        // timezone (`Z` or `±HH:mm`, normalised to UTC) and fractional seconds
+        // (truncated to the column's unit; the MVP `Sec` lane drops them; full
+        // sub-second preservation pairs with the datetime-unit work in #58).
+        let (base, offset_secs) = Self::normalize_iso(s);
         Self::AUTO_FORMATS
             .iter()
-            .find_map(|f| Self::parse_with_format(s, f, unit))
+            .find_map(|f| Self::parse_with_format(base, f, unit))
+            .map(|dt| DateTime::new(dt.ticks - offset_secs * unit.per_sec(), unit))
+    }
+
+    /// Strip a trailing ISO-8601 timezone (`Z` / `±HH:mm`) and fractional-second
+    /// suffix from a datetime string, returning the bare `…HH:mm:ss` text and the
+    /// UTC offset in seconds (UTC = local − offset). Shared by `parse_auto` and
+    /// the reader's `DtSpec` so both accept the same ISO variants. #93.
+    pub fn normalize_iso(s: &str) -> (&str, i64) {
+        let (base, off) = strip_iso_zone(s.trim());
+        (strip_fraction(base), off)
     }
 
     /// `(year, month, day, hour, minute, second)` in UTC (whole-second part).
@@ -1375,6 +1428,22 @@ mod decimal_tests {
         // Two-digit year token + compact format.
         let c = DateTime::parse_with_format("210304050607", "yyMMddHHmmss", TimeUnit::Sec).unwrap();
         assert_eq!(c.format("yyyy-MM-dd HH:mm:ss"), "2021-03-04 05:06:07");
+    }
+
+    #[test]
+    fn datetime_iso_zone_and_fraction_normalize() {
+        // #93: a trailing timezone normalises to UTC and a fractional second is
+        // truncated (MVP Sec lane). Oracle: exact rendered UTC instant.
+        let at = |s: &str| DateTime::parse_auto(s, TimeUnit::Sec).unwrap().to_string();
+        assert_eq!(at("2024-06-03T14:30:00Z"), "2024-06-03T14:30:00"); // Z = UTC
+        assert_eq!(at("2024-06-03T14:30:00.5"), "2024-06-03T14:30:00"); // frac truncated
+        assert_eq!(at("2024-06-03T14:30:00.123456"), "2024-06-03T14:30:00");
+        assert_eq!(at("2024-06-03T14:30:00+09:00"), "2024-06-03T05:30:00"); // −9h → UTC
+        assert_eq!(at("2024-06-03T14:30:00-05:00"), "2024-06-03T19:30:00"); // +5h → UTC
+        assert_eq!(at("2024-06-03T14:30:00.5Z"), "2024-06-03T14:30:00"); // frac + Z
+                                                                         // The plain and date-only forms are untouched by the normalisation.
+        assert_eq!(at("2024-06-03T14:30:00"), "2024-06-03T14:30:00");
+        assert_eq!(at("2024-06-03"), "2024-06-03T00:00:00");
     }
 
     #[test]
