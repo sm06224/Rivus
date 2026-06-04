@@ -474,6 +474,15 @@ fn escape_delim(b: u8) -> String {
 }
 
 impl Op {
+    /// Is this a sink (leaf writer)? Used so `| name` reuse splices only a
+    /// flow's *transforms* and never drags its sink along (§25.4).
+    pub fn is_sink(&self) -> bool {
+        matches!(
+            self,
+            Op::SinkPrint | Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. }
+        )
+    }
+
     pub fn kind_str(&self) -> &'static str {
         match self {
             Op::OpenCsv { .. } => "open",
@@ -1037,17 +1046,21 @@ impl PlanGraph {
     }
 
     /// The transform ops of the flow whose output node is `tail`, in source
-    /// order, **excluding the source head** — i.e. exactly what the named-flow
-    /// reuse form `| name` (§25.4) splices into another flow. Cloned, so the
-    /// caller can desugar `| name` into copies that execute byte-identically to
-    /// writing those transforms inline. (Only the linear chain is taken; a
-    /// referenced flow's own branches/merges are not spliced.)
+    /// order, **excluding the source head and any sink** — i.e. exactly what the
+    /// named-flow reuse form `| name` (§25.4) splices into another flow. A reuse
+    /// recipe contributes only its transforms; it never drags the original
+    /// flow's sink along (stops at the first sink). Cloned, so the caller can
+    /// desugar `| name` into copies that execute byte-identically to writing
+    /// those transforms inline. (Only the linear chain is taken; a referenced
+    /// flow's own branches/merges are not spliced.)
     pub fn flow_transform_ops(&self, tail: NodeId) -> Vec<Op> {
         let chain = self.linear_chain_to(tail);
         chain
             .iter()
             .skip(1) // drop the source head
-            .map(|&n| self.nodes[n].op.clone())
+            .map(|&n| &self.nodes[n].op)
+            .take_while(|op| !op.is_sink()) // stop before any sink
+            .cloned()
             .collect()
     }
 

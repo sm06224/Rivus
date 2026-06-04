@@ -289,30 +289,38 @@ impl Parser {
                 }
                 Tok::Pipe => {
                     self.bump(); // `|`
-                                 // `| name` — named-flow reuse (§25.4): apply a previously
-                                 // defined flow's transforms to the current stream. Desugared
-                                 // by splicing copies of those ops (byte-identical to writing
-                                 // them inline); each spliced node is stamped with this apply
-                                 // site so `to_source` collapses the run back to `| name`.
-                    let apply = matches!(self.tok(), Tok::Word(n) if self.g.labels.contains_key(n));
-                    if apply {
-                        let name = self.word()?;
-                        let tail = self.g.labels[&name];
-                        let ops = self.g.flow_transform_ops(tail);
-                        let site = self.apply_site;
-                        self.apply_site += 1;
-                        for op in ops {
-                            let nid = self.g.add_node(op);
-                            self.g.nodes[nid].applied_from = Some((site, name.clone()));
-                            self.g.add_edge(current, nid, EdgeKind::Stream);
-                            current = nid;
-                        }
-                    } else {
-                        // `| map { ... }` / `| { ... }` — MVP: skip the block (no-op).
-                        if self.peek_is_word("map") {
+                    match self.tok().clone() {
+                        // `| name` — named-flow reuse (§25.4): apply a previously
+                        // defined flow's transforms to the current stream.
+                        // Desugared by splicing copies of those ops (byte-identical
+                        // to writing them inline); each spliced node is stamped with
+                        // this apply site so `to_source` collapses the run back to
+                        // `| name`.
+                        Tok::Word(name) if self.g.labels.contains_key(&name) => {
                             self.bump();
+                            let tail = self.g.labels[&name];
+                            let ops = self.g.flow_transform_ops(tail);
+                            let site = self.apply_site;
+                            self.apply_site += 1;
+                            for op in ops {
+                                let nid = self.g.add_node(op);
+                                self.g.nodes[nid].applied_from = Some((site, name.clone()));
+                                self.g.add_edge(current, nid, EdgeKind::Stream);
+                                current = nid;
+                            }
                         }
-                        self.skip_block()?;
+                        // `| map { ... }` — MVP: skip the block (no-op).
+                        Tok::Word(w) if w == "map" => {
+                            self.bump();
+                            self.skip_block()?;
+                        }
+                        // A bare word that names no defined flow is a clear error
+                        // (not a silent skip), matching the merge/join diagnostic.
+                        Tok::Word(n) => {
+                            return Err(self.err(format!("`| {n}`: unknown flow '{n}'")));
+                        }
+                        // `| { ... }` — MVP: skip the block (no-op).
+                        _ => self.skip_block()?,
                     }
                 }
                 Tok::Arrow => {
@@ -1975,7 +1983,48 @@ Users:
     #[test]
     fn unknown_named_flow_apply_is_an_error() {
         // `| nope` with no such flow defined is a parse error (not a silent skip).
-        assert!(parse("R:\n open d.csv\n | nope\n;").is_err());
+        let err = parse("R:\n open d.csv\n | nope\n;").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("unknown flow 'nope'"),
+            "expected an `unknown flow` diagnostic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn adjacent_same_name_applies_round_trip_separately() {
+        // `| clean | clean` must NOT collapse into a single `| clean` — distinct
+        // apply sites keep distinct site_ids, so to_source re-emits both, and the
+        // doubled transforms re-parse to the same op chain.
+        let src = "clean:\n open c.csv\n |? age >= 20\n;\nR:\n open d.csv\n | clean\n | clean\n;";
+        let g1 = parse(src).unwrap();
+        let rendered = g1.to_source();
+        assert_eq!(
+            rendered.matches("| clean").count(),
+            2,
+            "two applies must render as two `| clean`:\n{rendered}"
+        );
+        let g2 = parse(&rendered).unwrap();
+        assert_eq!(
+            chain_ops(&g1, g1.labels["R"]),
+            chain_ops(&g2, g2.labels["R"]),
+            "doubled apply changed across round-trip:\n{rendered}"
+        );
+        assert_eq!(rendered, g2.to_source(), "not idempotent:\n{rendered}");
+    }
+
+    #[test]
+    fn named_flow_apply_drops_the_recipe_sink() {
+        // A reuse recipe that ends in a sink must contribute only its transforms;
+        // `| clean` never drags clean's `save …` along (footgun fix).
+        let g = parse(
+            "clean:\n open c.csv\n |? age >= 20\n save out.csv\n;\nR:\n open d.csv\n | clean\n;",
+        )
+        .unwrap();
+        let r_ops = chain_ops(&g, g.labels["R"]);
+        assert!(
+            !r_ops.iter().any(|o| o.contains("Sink")),
+            "the recipe's sink leaked into `| clean`: {r_ops:?}"
+        );
     }
 
     #[test]
