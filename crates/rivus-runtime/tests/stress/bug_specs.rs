@@ -6,9 +6,9 @@
 use super::*;
 
 #[test]
-#[ignore = "BUG-A: dropna blind to blank in inferred-numeric column (null model); docs/TEST-AUDIT.md"]
 fn dropna_drops_blank_numeric_rows_bug_a() {
-    // age inferred i64; rows 2 and 4 have a blank age and SHOULD be dropped.
+    // BUG-A (now fixed by the null model, design 26 STEP 2-②): age infers i64;
+    // a blank numeric cell is `null` (not 0), so `dropna age` drops rows 2 and 4.
     let text = "id,age\n1,25\n2,\n3,40\n4,\n";
     let f = TempCsv(gendata::write_temp_bytes("bug_dropna", text.as_bytes()));
     let p = f.0.display();

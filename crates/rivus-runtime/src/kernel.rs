@@ -172,6 +172,21 @@ pub fn run(preds: &[NumCmp], chunk: &Chunk) -> Vec<usize> {
     for p in &preds[1..] {
         and_mask(p, chunk, &mut mask);
     }
+    // Null model (design 26 §26.2a): a comparison with a `null` operand is
+    // false, so a row that is null in **any** compared column does not survive
+    // (the mask reads the type-default backing byte, which we must not trust for
+    // a null). Gated by `has_nulls()` → zero cost for all-valid columns, and
+    // matches the interpreter's `compare_fast` (kept byte-identical).
+    for p in preds {
+        let col = &chunk.columns[p.col];
+        if col.has_nulls() {
+            for (r, m) in mask.iter_mut().enumerate() {
+                if col.is_null(r) {
+                    *m = 0;
+                }
+            }
+        }
+    }
     // Single pass: surviving mask → the selection vector of row indices.
     compact_mask(&mask)
 }

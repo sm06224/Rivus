@@ -576,36 +576,44 @@ pub(crate) fn pow10_i128(n: u8) -> Option<i128> {
 /// Cast a whole column to a target lane (columnar path for computed columns).
 pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
     let n = col.len();
-    match ty {
-        DataType::I64 => Column::i64((0..n).map(|i| to_i64(col.value_at(i))).collect()),
-        DataType::F64 => Column::f64((0..n).map(|i| to_f64(col.value_at(i))).collect()),
+    // Null in → null out (design 26 §26.2c): a null row stays null after a cast
+    // (its backing is the lane default; validity, carried from the input, keeps
+    // it null). All-valid input stays all-valid (zero cost).
+    let validity = col.validity().clone();
+    let data = match ty {
+        DataType::I64 => ColumnData::I64((0..n).map(|i| to_i64(col.value_at(i))).collect()),
+        DataType::F64 => ColumnData::F64((0..n).map(|i| to_f64(col.value_at(i))).collect()),
         DataType::Decimal { scale } => {
             // Build the unscaled i128 lane per cell (design doc 21).
             let unscaled = (0..n)
                 .map(|i| f64_to_decimal(to_f64(col.value_at(i)), scale).unscaled)
                 .collect();
-            Column::dec(rivus_core::DecColumn { unscaled, scale })
+            ColumnData::Dec(rivus_core::DecColumn { unscaled, scale })
         }
         DataType::DateTime { unit } => {
             let ticks = (0..n).map(|i| to_i64(col.value_at(i))).collect();
-            Column::datetime(rivus_core::DtColumn { ticks, unit })
+            ColumnData::DateTime(rivus_core::DtColumn { ticks, unit })
         }
         DataType::Duration { unit } => {
             let ticks = (0..n).map(|i| to_i64(col.value_at(i))).collect();
-            Column::duration(rivus_core::DurColumn { ticks, unit })
+            ColumnData::Duration(rivus_core::DurColumn { ticks, unit })
         }
-        DataType::Date => Column::date((0..n).map(|i| to_i64(col.value_at(i)) as i32).collect()),
-        DataType::Time => Column::time((0..n).map(|i| to_i64(col.value_at(i))).collect()),
-        DataType::Bool => Column::bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
+        DataType::Date => {
+            ColumnData::Date((0..n).map(|i| to_i64(col.value_at(i)) as i32).collect())
+        }
+        DataType::Time => ColumnData::Time((0..n).map(|i| to_i64(col.value_at(i))).collect()),
+        DataType::Bool => ColumnData::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
         DataType::Str => {
             let mut s = StrColumn::with_capacity(n, n * 8);
             for i in 0..n {
+                // A null renders empty here, but `validity` below keeps it null.
                 s.push(&col.value_at(i).to_string());
             }
-            Column::str(s)
+            ColumnData::Str(s)
         }
-        DataType::Null => col,
-    }
+        DataType::Null => return col,
+    };
+    Column::new(data, validity)
 }
 
 /// Evaluate an expression over a whole chunk, producing a column of `chunk.len`
@@ -1120,7 +1128,21 @@ fn eval_field(name: &str, _access: Access, chunk: &Chunk, row: usize) -> Value {
 }
 
 /// Compare two sub-expressions for a row, taking borrowed fast paths first.
+/// Is `e` a column field that is **null** at `row`? Cheap (only inspects a
+/// `Field`; an all-valid column answers `false` without touching memory).
+fn field_is_null(e: &Expr, chunk: &Chunk, row: usize) -> bool {
+    matches!(e, Expr::Field { name, .. } if chunk.column(name).is_some_and(|c| c.is_null(row)))
+}
+
 fn compare_fast(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk, row: usize) -> bool {
+    // Null model (design 26 §26.2a): a comparison with a `null` operand is
+    // **false** (a null is neither equal to nor ordered against anything). This
+    // is checked *before* the fast paths below, which read the type-default
+    // backing byte and would otherwise compare a null as `0`/`""`. It also keeps
+    // the interpreter byte-identical with the kernel's null masking.
+    if field_is_null(left, chunk, row) || field_is_null(right, chunk, row) {
+        return false;
+    }
     // Exact decimal lane: a decimal column vs a numeric literal compares as i128
     // (matching the kernel), not via the lossy f64 view.
     if let Some(b) = dec_field_vs_literal(left, op, right, chunk, row) {
@@ -1285,6 +1307,13 @@ fn dt_cmp(l: &Value, op: CmpOp, r: &Value) -> Option<bool> {
 }
 
 fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
+    // Null model (design 26 §26.2a): any comparison with a `null` operand is
+    // false — including `null == null` and `null != x` in predicate context
+    // (distinct from the group-by key equality of §26.2b, which is built on a
+    // separate path). Covers operands that *evaluate* to null (arith/func/cast).
+    if l.is_null() || r.is_null() {
+        return false;
+    }
     if let Some(b) = dt_cmp(l, op, r) {
         return b;
     }

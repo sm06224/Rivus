@@ -20,13 +20,11 @@ This is the #bugreport ①⑤ / §24 nullable-column gap.
 `Column` (design 26): the reader marks an empty numeric cell *missing* instead of
 `0`; `null`/`empty`/`0` become distinct (`Value::Null`). Large, cross-cutting
 (core `Column`, reader, operators, aggregates, sinks, byte-identity), staged.
-**Status:** STEP 2-① **landed** (#105) — `Column { data, validity }`, the reader
-reads a blank/unparseable numeric cell as `null`, arithmetic propagates and
-aggregations skip it. The **`dropna` fix is STEP 2-②**: make `dropna`/`fill` and
-filter predicates validity-aware across every lane and **un-ignore this test**
-(`dropna_drops_blank_numeric_rows_bug_a`) to green. Until 2-② lands, `dropna`
-still only catches blanks in **text** columns, so this test stays `#[ignore]`
-(see §3) and the GUIDE notes the transition.
+**Status: RESOLVED.** STEP 2-① (#105) landed `Column { data, validity }` and the
+reader reads a blank/unparseable numeric cell as `null`. STEP 2-② made `dropna`
+validity-aware (drops null rows on every lane), so this test is **un-ignored and
+green** — `dropna age` now drops the blank-numeric rows. (filter predicates,
+`fill`, group-by/distinct keys and sort are null-aware too.)
 
 ### BUG-B (RESOLVED #92) · datetime / date / time are never auto-inferred
 **Repro.** `open f.csv` over an ISO-8601 `ts` column → the column stays `Str`
@@ -66,7 +64,7 @@ at a sub-second `unit`; today datetime is `Sec` MVP — pair with the unit work.
 | decimal lane | stress, value | ✅ |
 | datetime lane (read/fn/trunc/format/groupby/parallel) | stress | ✅ declared; ✅ auto-infer (#92), ✅ frac/TZ (#93) |
 | **date / time lanes** (#58) | stress, parser, core | ✅ (auto-infer #92) |
-| **dropna** | stress (str only) | ⚠️ **numeric blind (BUG-A)** — only `:str` tested |
+| **dropna** | stress, stress/null | ✅ **BUG-A fixed** (null model 2-②): drops null on every lane incl. inferred-numeric; `dropna_drops_blank_numeric_rows_bug_a` un-ignored & green |
 | fill (value/ffill/bfill/mean/median) | stress | ✅ |
 | sinks (csv/tsv/json/jsonl, stdout) | stress, cli | ✅ |
 | sources (csv/tsv/jsonl/binary/stdin, declared/noheader) | stress, cli | ✅ |
