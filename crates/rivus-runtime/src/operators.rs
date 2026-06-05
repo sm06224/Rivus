@@ -10,8 +10,8 @@ use crate::eval;
 use crate::jsonl;
 use crate::kernel;
 use rivus_core::{
-    Chunk, Column, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field, Schema, Severity,
-    StrColumn, TimeUnit, Value,
+    Chunk, Column, ColumnData, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field, Schema,
+    Severity, StrColumn, TimeUnit, Value,
 };
 use rivus_ir::{
     AggFunc, BinType, CmpOp, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
@@ -618,7 +618,7 @@ impl Operator for SourceCsv {
                                     Severity::Recoverable,
                                     ErrorScope::Item,
                                     format!(
-                                        "{n} value(s) in column {col} could not be parsed; kept as default 0"
+                                        "{n} value(s) in column {col} could not be parsed; set to null"
                                     ),
                                 )
                                 .at_node(ctx.label.clone()),
@@ -806,11 +806,11 @@ fn decode_bin_batch(
             let sz = t.size();
             let cell = |r: usize| -> &[u8] { &buf[r * rec_size + foff..r * rec_size + foff + sz] };
             match t.lane() {
-                DataType::Bool => Column::Bool((0..n).map(|r| cell(r)[0] != 0).collect()),
+                DataType::Bool => Column::bool((0..n).map(|r| cell(r)[0] != 0).collect()),
                 DataType::F64 => {
-                    Column::F64((0..n).map(|r| decode_f64(cell(r), *t, endian)).collect())
+                    Column::f64((0..n).map(|r| decode_f64(cell(r), *t, endian)).collect())
                 }
-                _ => Column::I64((0..n).map(|r| decode_int(cell(r), *t, endian)).collect()),
+                _ => Column::i64((0..n).map(|r| decode_int(cell(r), *t, endian)).collect()),
             }
         })
         .collect()
@@ -1336,23 +1336,23 @@ impl Sort {
 /// Compare two rows of one column for ordering (NaN treated as equal).
 fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    match col {
-        Column::Bool(v) => v[a].cmp(&v[b]),
-        Column::I64(v) => v[a].cmp(&v[b]),
-        Column::F64(v) => v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal),
+    match col.data() {
+        ColumnData::Bool(v) => v[a].cmp(&v[b]),
+        ColumnData::I64(v) => v[a].cmp(&v[b]),
+        ColumnData::F64(v) => v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal),
         // One column shares a scale, so the unscaled i128 order is the exact
         // value order — no precision loss in the sort key (design doc 21).
-        Column::Dec(d) => d.unscaled[a].cmp(&d.unscaled[b]),
+        ColumnData::Dec(d) => d.unscaled[a].cmp(&d.unscaled[b]),
         // One column shares a unit, so the integer tick order is the exact
         // chronological order.
-        Column::DateTime(d) => d.ticks[a].cmp(&d.ticks[b]),
+        ColumnData::DateTime(d) => d.ticks[a].cmp(&d.ticks[b]),
         // Duration shares a unit too → exact i64 magnitude order (#57).
-        Column::Duration(d) => d.ticks[a].cmp(&d.ticks[b]),
+        ColumnData::Duration(d) => d.ticks[a].cmp(&d.ticks[b]),
         // Date: epoch-day order is exact chronological order (#58).
-        Column::Date(v) => v[a].cmp(&v[b]),
+        ColumnData::Date(v) => v[a].cmp(&v[b]),
         // Time-of-day: tick order is exact chronological order (#58).
-        Column::Time(v) => v[a].cmp(&v[b]),
-        Column::Str(v) => v.get(a).cmp(v.get(b)),
+        ColumnData::Time(v) => v[a].cmp(&v[b]),
+        ColumnData::Str(v) => v.get(a).cmp(v.get(b)),
     }
 }
 
@@ -1521,9 +1521,9 @@ impl Operator for Describe {
         }
         self.count += chunk.len as u64;
         for (ci, col) in chunk.columns.iter().enumerate() {
-            let vals: &mut dyn Iterator<Item = f64> = match col {
-                Column::I64(v) => &mut v.iter().map(|&x| x as f64),
-                Column::F64(v) => &mut v.iter().copied(),
+            let vals: &mut dyn Iterator<Item = f64> = match col.data() {
+                ColumnData::I64(v) => &mut v.iter().map(|&x| x as f64),
+                ColumnData::F64(v) => &mut v.iter().copied(),
                 _ => continue, // non-numeric: only type + count are reported
             };
             for x in vals {
@@ -1578,12 +1578,12 @@ impl Operator for Describe {
             Field::new("mean", DataType::Str),
         ]));
         let columns = vec![
-            Column::Str(column),
-            Column::Str(typ),
-            Column::I64(count),
-            Column::Str(min),
-            Column::Str(max),
-            Column::Str(mean),
+            Column::str(column),
+            Column::str(typ),
+            Column::i64(count),
+            Column::str(min),
+            Column::str(max),
+            Column::str(mean),
         ];
         vec![Chunk::new(ctx.fresh_id(), schema, columns)]
     }
@@ -1648,7 +1648,7 @@ impl Operator for Fill {
             );
             return vec![chunk];
         };
-        let Column::Str(s) = &chunk.columns[ci] else {
+        let ColumnData::Str(s) = chunk.columns[ci].data() else {
             return vec![chunk]; // numeric column: no empty cells to fill
         };
         let mut filled = StrColumn::with_capacity(chunk.len, 0);
@@ -1657,7 +1657,7 @@ impl Operator for Fill {
             filled.push(if v.is_empty() { &self.value } else { v });
         }
         let mut columns = chunk.columns.clone();
-        columns[ci] = Column::Str(filled);
+        columns[ci] = Column::str(filled);
         let mut out = Chunk::new(chunk.meta.id, chunk.schema.clone(), columns);
         out.meta = chunk.meta.clone();
         vec![out]
@@ -1722,7 +1722,7 @@ impl FillDirectional {
             }
             return None;
         };
-        matches!(chunk.columns[ci], Column::Str(_)).then_some(ci)
+        matches!(chunk.columns[ci].data(), ColumnData::Str(_)).then_some(ci)
     }
 }
 
@@ -1736,7 +1736,7 @@ impl Operator for FillDirectional {
         let Some(ci) = self.target(&chunk, ctx) else {
             return vec![chunk];
         };
-        let Column::Str(s) = &chunk.columns[ci] else {
+        let ColumnData::Str(s) = chunk.columns[ci].data() else {
             return vec![chunk];
         };
         let mut filled = StrColumn::with_capacity(chunk.len, 0);
@@ -1753,7 +1753,7 @@ impl Operator for FillDirectional {
             }
         }
         let mut columns = chunk.columns.clone();
-        columns[ci] = Column::Str(filled);
+        columns[ci] = Column::str(filled);
         let mut out = Chunk::new(chunk.meta.id, chunk.schema.clone(), columns);
         out.meta = chunk.meta.clone();
         vec![out]
@@ -1773,7 +1773,7 @@ impl Operator for FillDirectional {
         let mut next: Option<String> = None;
         let mut out = chunks;
         for chunk in out.iter_mut().rev() {
-            let Column::Str(s) = &chunk.columns[ci] else {
+            let ColumnData::Str(s) = chunk.columns[ci].data() else {
                 continue;
             };
             let mut vals: Vec<String> = (0..chunk.len).map(|r| s.get(r).to_string()).collect();
@@ -1790,7 +1790,7 @@ impl Operator for FillDirectional {
             for v in &vals {
                 filled.push(v);
             }
-            chunk.columns[ci] = Column::Str(filled);
+            chunk.columns[ci] = Column::str(filled);
         }
         out
     }
@@ -1874,7 +1874,7 @@ impl Operator for FillStat {
             return chunks;
         };
         // Numeric column → no blanks to fill (parsed to 0 already); pass through.
-        if !matches!(chunks[0].columns[ci], Column::Str(_)) {
+        if !matches!(chunks[0].columns[ci].data(), ColumnData::Str(_)) {
             return chunks;
         }
 
@@ -1883,7 +1883,7 @@ impl Operator for FillStat {
         let mut count = 0f64;
         let mut sum = 0f64;
         for c in &chunks {
-            if let Column::Str(s) = &c.columns[ci] {
+            if let ColumnData::Str(s) = c.columns[ci].data() {
                 for r in 0..c.len {
                     let cell = s.get(r).trim();
                     if cell.is_empty() {
@@ -1924,7 +1924,7 @@ impl Operator for FillStat {
 
         // Pass 2: rewrite blank cells with the formatted statistic.
         for c in chunks.iter_mut() {
-            let Column::Str(s) = &c.columns[ci] else {
+            let ColumnData::Str(s) = c.columns[ci].data() else {
                 continue;
             };
             let mut filled = StrColumn::with_capacity(c.len, 0);
@@ -1932,7 +1932,7 @@ impl Operator for FillStat {
                 let v = s.get(r);
                 filled.push(if v.trim().is_empty() { &fill } else { v });
             }
-            c.columns[ci] = Column::Str(filled);
+            c.columns[ci] = Column::str(filled);
         }
         chunks
     }
@@ -2837,17 +2837,17 @@ impl Operator for GroupBy {
                 .values()
                 .map(|s| s.key_parts[ki].as_str())
                 .collect();
-            columns.push(Column::Str(col));
+            columns.push(Column::str(col));
         }
         let counts: Vec<i64> = self.groups.values().map(|s| s.count).collect();
-        columns.push(Column::I64(counts));
+        columns.push(Column::i64(counts));
 
         for (j, (func, col)) in self.aggs.iter().enumerate() {
             let name = format!("{}_{}", func.label(), col);
             let (dtype, column) = match func {
                 AggFunc::CountDistinct => (
                     DataType::I64,
-                    Column::I64(
+                    Column::i64(
                         self.groups
                             .values()
                             .map(|s| s.accs[j].distinct_count())
@@ -2864,7 +2864,7 @@ impl Operator for GroupBy {
                         };
                         sc.push(cell);
                     }
-                    (DataType::Str, Column::Str(sc))
+                    (DataType::Str, Column::str(sc))
                 }
                 // sum/avg/min/max/std/pct. On a decimal column these stay exact
                 // (i128) when every group produced an exact result; if any group
@@ -2886,7 +2886,7 @@ impl Operator for GroupBy {
                             .map(|s| s.accs[j].date_value().unwrap().epoch_day)
                             .collect();
                         fields.push(Field::new(name, DataType::Date));
-                        columns.push(Column::Date(epoch_days));
+                        columns.push(Column::date(epoch_days));
                         continue;
                     }
                     // Exact time-of-day min/max → keep the Time lane (i64 ticks),
@@ -2904,7 +2904,7 @@ impl Operator for GroupBy {
                             .map(|s| s.accs[j].time_value().unwrap().ticks)
                             .collect();
                         fields.push(Field::new(name, DataType::Time));
-                        columns.push(Column::Time(ticks));
+                        columns.push(Column::time(ticks));
                         continue;
                     }
                     // Exact datetime min/max → keep the DateTime lane (i64 ticks,
@@ -2921,7 +2921,7 @@ impl Operator for GroupBy {
                         let unit = dts[0].unit;
                         let ticks = dts.iter().map(|d| d.ticks).collect();
                         fields.push(Field::new(name, DataType::DateTime { unit }));
-                        columns.push(Column::DateTime(DtColumn { ticks, unit }));
+                        columns.push(Column::datetime(DtColumn { ticks, unit }));
                         continue;
                     }
                     // Exact duration sum/avg/min/max → keep the Duration lane
@@ -2943,7 +2943,7 @@ impl Operator for GroupBy {
                         let unit = durs[0].unit;
                         let ticks = durs.iter().map(|d| d.ticks).collect();
                         fields.push(Field::new(name, DataType::Duration { unit }));
-                        columns.push(Column::Duration(rivus_core::DurColumn { ticks, unit }));
+                        columns.push(Column::duration(rivus_core::DurColumn { ticks, unit }));
                         continue;
                     }
                     let dec_ok = matches!(
@@ -2966,12 +2966,12 @@ impl Operator for GroupBy {
                         let unscaled = decs.iter().map(|d| d.unscaled).collect();
                         (
                             DataType::Decimal { scale },
-                            Column::Dec(rivus_core::DecColumn { unscaled, scale }),
+                            Column::dec(rivus_core::DecColumn { unscaled, scale }),
                         )
                     } else {
                         (
                             DataType::F64,
-                            Column::F64(
+                            Column::f64(
                                 self.groups
                                     .values()
                                     .map(|s| s.accs[j].num_value())
@@ -3386,38 +3386,44 @@ pub fn write_csv_file(path: &str, chunks: &[Chunk], delim: u8) -> std::io::Resul
 /// with `"` doubled.
 fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
     use std::fmt::Write as _;
-    match col {
-        Column::I64(v) => {
+    // Null → an unquoted empty field (design 26 §26.5). A real empty string is a
+    // valid `Str` cell and falls through to the lane below, so the two stay
+    // distinguishable on round-trip.
+    if col.is_null(row) {
+        return;
+    }
+    match col.data() {
+        ColumnData::I64(v) => {
             let _ = write!(line, "{}", v[row]);
         }
-        Column::F64(v) => {
+        ColumnData::F64(v) => {
             let _ = write!(line, "{}", v[row]);
         }
-        Column::Bool(v) => line.push_str(if v[row] { "true" } else { "false" }),
-        Column::Dec(d) => {
+        ColumnData::Bool(v) => line.push_str(if v[row] { "true" } else { "false" }),
+        ColumnData::Dec(d) => {
             let _ = write!(
                 line,
                 "{}",
                 rivus_core::Decimal::new(d.unscaled[row], d.scale)
             );
         }
-        Column::DateTime(d) => {
+        ColumnData::DateTime(d) => {
             let _ = write!(line, "{}", rivus_core::DateTime::new(d.ticks[row], d.unit));
         }
-        Column::Duration(d) => {
+        ColumnData::Duration(d) => {
             let _ = write!(line, "{}", rivus_core::Duration::new(d.ticks[row], d.unit));
         }
-        Column::Date(v) => {
+        ColumnData::Date(v) => {
             let _ = write!(line, "{}", rivus_core::Date::new(v[row]));
         }
-        Column::Time(v) => {
+        ColumnData::Time(v) => {
             let _ = write!(
                 line,
                 "{}",
                 rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec)
             );
         }
-        Column::Str(s) => {
+        ColumnData::Str(s) => {
             let cell = s.get(row);
             if cell.bytes().any(|b| b == delim) || cell.contains('"') || cell.contains('\n') {
                 line.push('"');
@@ -3658,20 +3664,26 @@ pub fn write_json_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
 /// `to_string` allocation, but identical output to the per-`Value` formatter.
 fn write_json_cell(out: &mut String, col: &Column, row: usize) {
     use std::fmt::Write as _;
-    match col {
-        Column::I64(v) => {
+    // Null → a bare JSON `null` (design 26 §26.5); a real empty string is a
+    // quoted `""` and falls through to the `Str` lane below.
+    if col.is_null(row) {
+        out.push_str("null");
+        return;
+    }
+    match col.data() {
+        ColumnData::I64(v) => {
             let _ = write!(out, "{}", v[row]);
         }
         // JSON has no NaN/Infinity → emit null (continue-first), matching json_value.
-        Column::F64(v) => {
+        ColumnData::F64(v) => {
             if v[row].is_finite() {
                 let _ = write!(out, "{}", v[row]);
             } else {
                 out.push_str("null");
             }
         }
-        Column::Bool(v) => out.push_str(if v[row] { "true" } else { "false" }),
-        Column::Dec(d) => {
+        ColumnData::Bool(v) => out.push_str(if v[row] { "true" } else { "false" }),
+        ColumnData::Dec(d) => {
             let _ = write!(
                 out,
                 "{}",
@@ -3679,23 +3691,23 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
             );
         }
         // Datetime has no JSON literal form → emit a quoted ISO-8601 string.
-        Column::DateTime(d) => json_string(
+        ColumnData::DateTime(d) => json_string(
             out,
             &rivus_core::DateTime::new(d.ticks[row], d.unit).to_string(),
         ),
         // Duration likewise → quoted human-readable string (#57).
-        Column::Duration(d) => json_string(
+        ColumnData::Duration(d) => json_string(
             out,
             &rivus_core::Duration::new(d.ticks[row], d.unit).to_string(),
         ),
         // Date → quoted ISO yyyy-MM-dd string (#58).
-        Column::Date(v) => json_string(out, &rivus_core::Date::new(v[row]).to_string()),
+        ColumnData::Date(v) => json_string(out, &rivus_core::Date::new(v[row]).to_string()),
         // Time → quoted HH:mm:ss string (#58).
-        Column::Time(v) => json_string(
+        ColumnData::Time(v) => json_string(
             out,
             &rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec).to_string(),
         ),
-        Column::Str(s) => json_string(out, s.get(row)),
+        ColumnData::Str(s) => json_string(out, s.get(row)),
     }
 }
 

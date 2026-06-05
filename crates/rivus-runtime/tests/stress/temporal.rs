@@ -25,8 +25,8 @@ fn datetime_column_parses_and_is_chunk_size_independent() {
     let want_ts = vec![
         "2026-06-01T14:30:00".to_string(), // yy=26 → 2026
         "1999-12-31T23:59:59".to_string(), // yy=99 → 1999 (pivot >68 → 19xx)
-        "1970-01-01T00:00:00".to_string(), // "bad" → epoch 0 (continue-first)
-        "1970-01-01T00:00:00".to_string(), // yy=70 → 1970
+        "".to_string(),                    // "bad" → null (parse-fail; design 26)
+        "1970-01-01T00:00:00".to_string(), // yy=70 → 1970 (a real epoch instant)
     ];
     for cz in [1usize, 2, 3, 4096] {
         let res = run_src(&flow, cz);
@@ -77,8 +77,8 @@ fn date_column_parses_chunk_size_independent_and_surfaces_bad() {
     let flow = format!("D:\n open {p} (id:int d:date)\n |> id d\n;");
     let want_d = vec![
         "2024-06-03".to_string(),
-        "1970-01-01".to_string(), // invalid → epoch 0 (continue-first)
-        "1970-01-01".to_string(), // empty → epoch 0 (missing, not a failure)
+        "".to_string(), // invalid → null (parse-fail; design 26)
+        "".to_string(), // empty → null (missing; design 26)
         "2023-12-25".to_string(),
     ];
     for cz in [1usize, 2, 3, 4096] {
@@ -104,7 +104,7 @@ fn date_column_parses_chunk_size_independent_and_surfaces_bad() {
             .iter()
             .filter(|e| {
                 e.message
-                    .contains("in column 'd' (as date) could not be parsed; kept as default 0")
+                    .contains("in column 'd' (as date) could not be parsed; set to null")
             })
             .count();
         assert_eq!(
@@ -132,7 +132,7 @@ fn date_column_parses_chunk_size_independent_and_surfaces_bad() {
 #[test]
 fn time_column_reads_minmax_and_surfaces_bad() {
     // :time reads HH:mm:ss into the exact i64 tick lane; a bad cell is
-    // continue-first (00:00:00) AND surfaced; an empty cell is not counted;
+    // continue-first (null) AND surfaced; an empty cell is null (not counted);
     // min/max keep the Time lane (render HH:mm:ss) and are chunk-size
     // independent + parallel byte-identical (#58).
     let text = "k,t\n\
@@ -164,7 +164,7 @@ fn time_column_reads_minmax_and_surfaces_bad() {
             .iter()
             .filter(|e| {
                 e.message
-                    .contains("in column 't' (as time) could not be parsed; kept as default 0")
+                    .contains("in column 't' (as time) could not be parsed; set to null")
             })
             .count();
         assert_eq!(
@@ -197,14 +197,14 @@ fn time_column_reads_minmax_and_surfaces_bad() {
             "time min/max byte-identical serial vs parallel @cz={cz}"
         );
     }
-    // Oracle: key b spans 00:00:01..12:30:00; key a's bad/empty default to
-    // 00:00:00 so its min is midnight, max 23:59:59.
+    // Oracle: key b spans 00:00:01..12:30:00; key a's bad/empty are now null
+    // and skipped (design 26), so a's min/max is over its two real times.
     assert_eq!(
         snapshot(rivus_runtime::MemoryPref::Low, 4096),
         vec![
             (
                 "a".to_string(),
-                "00:00:00".to_string(),
+                "09:05:00".to_string(),
                 "23:59:59".to_string()
             ),
             (
@@ -269,7 +269,7 @@ fn date_extractors_chunk_size_independent() {
 #[test]
 fn datetime_auto_infer_common_formats() {
     // A bare `:datetime` (no explicit format) auto-infers common shapes per cell:
-    // ISO-with-T, ISO-with-space, and bare date all resolve; junk → epoch 0.
+    // ISO-with-T, ISO-with-space, and bare date all resolve; junk → null.
     let text = "ts\n\
                 2026-06-01T14:30:00\n\
                 2026-06-01 14:30:00\n\
@@ -285,7 +285,7 @@ fn datetime_auto_infer_common_formats() {
             "2026-06-01T14:30:00".to_string(),
             "2026-06-01T14:30:00".to_string(),
             "2026-06-01T00:00:00".to_string(),
-            "1970-01-01T00:00:00".to_string(),
+            "".to_string(), // "nope" → null (parse-fail; design 26)
         ],
     );
 }

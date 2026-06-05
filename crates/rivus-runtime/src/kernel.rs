@@ -30,7 +30,7 @@
 //! mispredictions (measured 7.3× over the branchy `filter().collect()` at 50 %,
 //! constant regardless of selectivity). See `docs/BENCHMARKS.md`.
 
-use rivus_core::{Chunk, Column, Decimal, Value};
+use rivus_core::{Chunk, ColumnData, Decimal, Value};
 use rivus_ir::{Access, CmpOp, Expr};
 use std::cmp::Ordering;
 
@@ -102,18 +102,22 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
             access: Access::Fast,
         } => {
             let idx = chunk.schema.index_of(name)?;
-            match chunk.columns[idx] {
-                Column::I64(_) | Column::F64(_) | Column::Bool(_) | Column::Dec(_) => Some(idx),
+            match chunk.columns[idx].data() {
+                ColumnData::I64(_)
+                | ColumnData::F64(_)
+                | ColumnData::Bool(_)
+                | ColumnData::Dec(_) => Some(idx),
                 // Datetime stays off the f64 kernel (ns ticks > 2^53 lose
                 // precision as f64); it routes to the interpreter's exact i64
                 // `dt_cmp` instead, so kernel and interpreter agree. Design 23 / #53.
                 // Datetime/duration stay off the f64 kernel (ns ticks > 2^53 lose
                 // precision as f64); they route to the interpreter's exact i64
                 // path instead, so kernel and interpreter agree. Design 23 / #53/#57.
-                Column::DateTime(_) | Column::Duration(_) | Column::Date(_) | Column::Time(_) => {
-                    None
-                }
-                Column::Str(_) => None,
+                ColumnData::DateTime(_)
+                | ColumnData::Duration(_)
+                | ColumnData::Date(_)
+                | ColumnData::Time(_) => None,
+                ColumnData::Str(_) => None,
             }
         }
         _ => None,
@@ -201,10 +205,10 @@ fn compact_mask(mask: &[u8]) -> Vec<usize> {
 
 /// Write `mask[i] = (col[i] <op> rhs)` for every row (seeding the conjunction).
 fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
-    match &chunk.columns[p.col] {
-        Column::I64(v) => cmp_i64_into(v, p.op, p.rhs, mask),
-        Column::F64(v) => cmp_f64_into(v, p.op, p.rhs, mask),
-        Column::Bool(v) => {
+    match chunk.columns[p.col].data() {
+        ColumnData::I64(v) => cmp_i64_into(v, p.op, p.rhs, mask),
+        ColumnData::F64(v) => cmp_f64_into(v, p.op, p.rhs, mask),
+        ColumnData::Bool(v) => {
             for (m, &b) in mask.iter_mut().zip(v.iter()) {
                 *m = cmp_scalar(if b { 1.0 } else { 0.0 }, p.op, p.rhs) as u8;
             }
@@ -212,15 +216,15 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         // Decimal: compare against the *exact* decimal literal at the larger of
         // the two scales — never rounding the literal (accounting contract;
         // shared with the interpreter so the two stay byte-identical). #44 / doc 21.
-        Column::Dec(d) => dec_write(d, p, mask),
+        ColumnData::Dec(d) => dec_write(d, p, mask),
         // Datetime/duration are never compiled into the kernel (`num_col` returns
         // `None`) — they route to the interpreter's exact i64 path. Unreachable;
         // here only for match exhaustiveness. #53/#57.
-        Column::DateTime(_)
-        | Column::Duration(_)
-        | Column::Date(_)
-        | Column::Time(_)
-        | Column::Str(_) => mask.fill(0),
+        ColumnData::DateTime(_)
+        | ColumnData::Duration(_)
+        | ColumnData::Date(_)
+        | ColumnData::Time(_)
+        | ColumnData::Str(_) => mask.fill(0),
     }
 }
 
@@ -298,29 +302,29 @@ fn dec_write(d: &rivus_core::DecColumn, p: &NumCmp, mask: &mut [u8]) {
 
 /// AND `(col[i] <op> rhs)` into an existing mask (narrowing the conjunction).
 fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
-    match &chunk.columns[p.col] {
-        Column::I64(v) => {
+    match chunk.columns[p.col].data() {
+        ColumnData::I64(v) => {
             for (m, &x) in mask.iter_mut().zip(v.iter()) {
                 *m &= cmp_scalar(x as f64, p.op, p.rhs) as u8;
             }
         }
-        Column::F64(v) => {
+        ColumnData::F64(v) => {
             for (m, &x) in mask.iter_mut().zip(v.iter()) {
                 *m &= cmp_scalar(x, p.op, p.rhs) as u8;
             }
         }
-        Column::Bool(v) => {
+        ColumnData::Bool(v) => {
             for (m, &b) in mask.iter_mut().zip(v.iter()) {
                 *m &= cmp_scalar(if b { 1.0 } else { 0.0 }, p.op, p.rhs) as u8;
             }
         }
-        Column::Dec(d) => dec_mask(d, p, mask, false),
+        ColumnData::Dec(d) => dec_mask(d, p, mask, false),
         // Unreachable: `num_col` excludes datetime/duration (exact i64 path). #53/#57.
-        Column::DateTime(_)
-        | Column::Duration(_)
-        | Column::Date(_)
-        | Column::Time(_)
-        | Column::Str(_) => mask.fill(0),
+        ColumnData::DateTime(_)
+        | ColumnData::Duration(_)
+        | ColumnData::Date(_)
+        | ColumnData::Time(_)
+        | ColumnData::Str(_) => mask.fill(0),
     }
 }
 
@@ -388,7 +392,7 @@ mod tests {
 
     fn f64_chunk(v: Vec<f64>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::F64)]));
-        Chunk::new(1, schema, vec![Column::F64(v)])
+        Chunk::new(1, schema, vec![Column::f64(v)])
     }
 
     /// `compact_mask` must produce exactly the branchy `filter(..).collect()`
@@ -520,9 +524,9 @@ mod tests {
             1,
             schema,
             vec![
-                Column::I64(ages.clone()),
-                Column::F64(scores.clone()),
-                Column::Bool(actives.clone()),
+                Column::i64(ages.clone()),
+                Column::f64(scores.clone()),
+                Column::bool(actives.clone()),
             ],
         );
         // age >= 30 AND score < 50.0 AND active == 1

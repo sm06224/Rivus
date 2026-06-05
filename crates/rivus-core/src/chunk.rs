@@ -179,9 +179,107 @@ pub struct DurColumn {
     pub unit: crate::value::TimeUnit,
 }
 
-/// A columnar buffer. One variant per execution lane (MVP subset).
+/// Per-column **validity bitmap** (the null model; design doc 26 §26.1).
+///
+/// One bit per row: bit = 1 means *valid* (a real value), bit = 0 means *null*
+/// (missing). `None` means "this column has no nulls" — **zero overhead**, so
+/// the dense fast path (SWAR/SIMD scans, the exact integer/decimal/datetime
+/// lanes) is untouched for the common all-valid case. Only a column that
+/// actually carries a null pays 1 bit/row. This is the Arrow-compatible shape,
+/// so a future backend maps onto it directly (design 01, "Operator boundary is
+/// thin").
+///
+/// `null` is structurally distinct from empty-string `""` (a real `Str` value)
+/// and from `0`/epoch-0 (a real integer value): those keep validity = 1 with
+/// their real backing byte; only a genuinely missing cell gets validity = 0.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Validity(Option<Box<[u64]>>);
+
+impl Validity {
+    /// The all-valid column (no nulls) — the zero-cost default.
+    pub const fn all_valid() -> Self {
+        Validity(None)
+    }
+
+    /// Does this column carry at least one null? `false` keeps the fast path.
+    pub fn has_nulls(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Is `row` null? All-valid columns answer `false` without touching memory.
+    #[inline]
+    pub fn is_null(&self, row: usize) -> bool {
+        match &self.0 {
+            None => false,
+            Some(words) => (words[row >> 6] >> (row & 63)) & 1 == 0,
+        }
+    }
+
+    /// Build from per-row validity bits (`true` = valid). Collapses to the
+    /// zero-cost all-valid form when every bit is set (the common case), so a
+    /// column only allocates a bitmap once it truly has a null.
+    pub fn from_bits(bits: &[bool]) -> Self {
+        if bits.iter().all(|&b| b) {
+            return Validity(None);
+        }
+        let words = bits.len().div_ceil(64);
+        let mut w = vec![0u64; words].into_boxed_slice();
+        for (i, &b) in bits.iter().enumerate() {
+            if b {
+                w[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        Validity(Some(w))
+    }
+
+    /// Materialize to a per-row `true = valid` vector of length `len`.
+    fn to_bits(&self, len: usize) -> Vec<bool> {
+        (0..len).map(|i| !self.is_null(i)).collect()
+    }
+
+    /// Gather validity for selected rows (parallels `Column::gather`). Stays
+    /// all-valid (zero-cost) when the source has no nulls.
+    pub fn gather(&self, indices: &[usize]) -> Self {
+        if self.0.is_none() {
+            return Validity(None);
+        }
+        let bits: Vec<bool> = indices.iter().map(|&i| !self.is_null(i)).collect();
+        Validity::from_bits(&bits)
+    }
+
+    /// Gather with optional indices: `None` (an unmatched outer-join side)
+    /// contributes a **null** (validity = 0), matching `Column::gather_opt`.
+    pub fn gather_opt(&self, indices: &[Option<usize>]) -> Self {
+        let bits: Vec<bool> = indices
+            .iter()
+            .map(|o| match o {
+                Some(i) => !self.is_null(*i),
+                None => false,
+            })
+            .collect();
+        Validity::from_bits(&bits)
+    }
+
+    /// Append `other` (of length `other_len`) after `self` (of length
+    /// `self_len`). Stays all-valid (zero-cost) when both sides are all-valid,
+    /// so concatenating dense chunks never allocates a bitmap.
+    pub fn append(&mut self, self_len: usize, other: &Validity, other_len: usize) {
+        if self.0.is_none() && other.0.is_none() {
+            return;
+        }
+        let mut bits = self.to_bits(self_len);
+        bits.extend(other.to_bits(other_len));
+        *self = Validity::from_bits(&bits);
+    }
+}
+
+/// The backing buffer of a column — one variant per execution lane (MVP
+/// subset). This is the dense, **validity-free** value lane; null-ness rides
+/// alongside in [`Column::validity`]. A null row keeps a type-default backing
+/// value (`0`/`0.0`/`""`) so SWAR/SIMD scans and the exact integer lanes stay
+/// branch-free; the validity bit, not the backing byte, decides null.
 #[derive(Debug, Clone)]
-pub enum Column {
+pub enum ColumnData {
     Bool(Vec<bool>),
     I64(Vec<i64>),
     F64(Vec<f64>),
@@ -199,18 +297,18 @@ pub enum Column {
     Str(StrColumn),
 }
 
-impl Column {
+impl ColumnData {
     pub fn len(&self) -> usize {
         match self {
-            Column::Bool(v) => v.len(),
-            Column::I64(v) => v.len(),
-            Column::F64(v) => v.len(),
-            Column::Dec(v) => v.unscaled.len(),
-            Column::DateTime(v) => v.ticks.len(),
-            Column::Duration(v) => v.ticks.len(),
-            Column::Date(v) => v.len(),
-            Column::Time(v) => v.len(),
-            Column::Str(v) => v.len(),
+            ColumnData::Bool(v) => v.len(),
+            ColumnData::I64(v) => v.len(),
+            ColumnData::F64(v) => v.len(),
+            ColumnData::Dec(v) => v.unscaled.len(),
+            ColumnData::DateTime(v) => v.ticks.len(),
+            ColumnData::Duration(v) => v.ticks.len(),
+            ColumnData::Date(v) => v.len(),
+            ColumnData::Time(v) => v.len(),
+            ColumnData::Str(v) => v.len(),
         }
     }
 
@@ -220,53 +318,57 @@ impl Column {
 
     pub fn dtype(&self) -> DataType {
         match self {
-            Column::Bool(_) => DataType::Bool,
-            Column::I64(_) => DataType::I64,
-            Column::F64(_) => DataType::F64,
-            Column::Dec(v) => DataType::Decimal { scale: v.scale },
-            Column::DateTime(v) => DataType::DateTime { unit: v.unit },
-            Column::Duration(v) => DataType::Duration { unit: v.unit },
-            Column::Date(_) => DataType::Date,
-            Column::Time(_) => DataType::Time,
-            Column::Str(_) => DataType::Str,
+            ColumnData::Bool(_) => DataType::Bool,
+            ColumnData::I64(_) => DataType::I64,
+            ColumnData::F64(_) => DataType::F64,
+            ColumnData::Dec(v) => DataType::Decimal { scale: v.scale },
+            ColumnData::DateTime(v) => DataType::DateTime { unit: v.unit },
+            ColumnData::Duration(v) => DataType::Duration { unit: v.unit },
+            ColumnData::Date(_) => DataType::Date,
+            ColumnData::Time(_) => DataType::Time,
+            ColumnData::Str(_) => DataType::Str,
         }
     }
 
     pub fn value_at(&self, row: usize) -> Value {
         match self {
-            Column::Bool(v) => Value::Bool(v[row]),
-            Column::I64(v) => Value::I64(v[row]),
-            Column::F64(v) => Value::F64(v[row]),
-            Column::Dec(v) => Value::Dec(crate::value::Decimal::new(v.unscaled[row], v.scale)),
-            Column::DateTime(v) => {
+            ColumnData::Bool(v) => Value::Bool(v[row]),
+            ColumnData::I64(v) => Value::I64(v[row]),
+            ColumnData::F64(v) => Value::F64(v[row]),
+            ColumnData::Dec(v) => Value::Dec(crate::value::Decimal::new(v.unscaled[row], v.scale)),
+            ColumnData::DateTime(v) => {
                 Value::DateTime(crate::value::DateTime::new(v.ticks[row], v.unit))
             }
-            Column::Duration(v) => {
+            ColumnData::Duration(v) => {
                 Value::Duration(crate::value::Duration::new(v.ticks[row], v.unit))
             }
-            Column::Date(v) => Value::Date(crate::value::Date::new(v[row])),
-            Column::Time(v) => Value::Time(crate::value::TimeOfDay::new(
+            ColumnData::Date(v) => Value::Date(crate::value::Date::new(v[row])),
+            ColumnData::Time(v) => Value::Time(crate::value::TimeOfDay::new(
                 v[row],
                 crate::value::TimeUnit::Sec,
             )),
-            Column::Str(v) => Value::Str(v.get(row).to_string()),
+            ColumnData::Str(v) => Value::Str(v.get(row).to_string()),
         }
     }
 
     /// Append another column of the same variant (used to concatenate buffered
     /// chunks before a blocking sort). Mismatched variants are ignored — within
     /// one stream every chunk shares the schema, so this never happens there.
-    pub fn append(&mut self, other: &Column) {
+    pub fn append(&mut self, other: &ColumnData) {
         match (self, other) {
-            (Column::Bool(a), Column::Bool(b)) => a.extend_from_slice(b),
-            (Column::I64(a), Column::I64(b)) => a.extend_from_slice(b),
-            (Column::F64(a), Column::F64(b)) => a.extend_from_slice(b),
-            (Column::Dec(a), Column::Dec(b)) => a.unscaled.extend_from_slice(&b.unscaled),
-            (Column::DateTime(a), Column::DateTime(b)) => a.ticks.extend_from_slice(&b.ticks),
-            (Column::Duration(a), Column::Duration(b)) => a.ticks.extend_from_slice(&b.ticks),
-            (Column::Date(a), Column::Date(b)) => a.extend_from_slice(b),
-            (Column::Time(a), Column::Time(b)) => a.extend_from_slice(b),
-            (Column::Str(a), Column::Str(b)) => a.append(b),
+            (ColumnData::Bool(a), ColumnData::Bool(b)) => a.extend_from_slice(b),
+            (ColumnData::I64(a), ColumnData::I64(b)) => a.extend_from_slice(b),
+            (ColumnData::F64(a), ColumnData::F64(b)) => a.extend_from_slice(b),
+            (ColumnData::Dec(a), ColumnData::Dec(b)) => a.unscaled.extend_from_slice(&b.unscaled),
+            (ColumnData::DateTime(a), ColumnData::DateTime(b)) => {
+                a.ticks.extend_from_slice(&b.ticks)
+            }
+            (ColumnData::Duration(a), ColumnData::Duration(b)) => {
+                a.ticks.extend_from_slice(&b.ticks)
+            }
+            (ColumnData::Date(a), ColumnData::Date(b)) => a.extend_from_slice(b),
+            (ColumnData::Time(a), ColumnData::Time(b)) => a.extend_from_slice(b),
+            (ColumnData::Str(a), ColumnData::Str(b)) => a.append(b),
             _ => {}
         }
     }
@@ -274,74 +376,224 @@ impl Column {
     /// Gather a new column from optional row indices: `Some(i)` takes row `i`,
     /// `None` writes the type's default (`false` / `0` / `0.0` / `""`). Used by
     /// outer joins, where an unmatched side contributes a null-like default.
-    pub fn gather_opt(&self, indices: &[Option<usize>]) -> Column {
+    pub fn gather_opt(&self, indices: &[Option<usize>]) -> ColumnData {
         match self {
-            Column::Bool(v) => {
-                Column::Bool(indices.iter().map(|o| o.is_some_and(|i| v[i])).collect())
+            ColumnData::Bool(v) => {
+                ColumnData::Bool(indices.iter().map(|o| o.is_some_and(|i| v[i])).collect())
             }
-            Column::I64(v) => Column::I64(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect()),
-            Column::F64(v) => {
-                Column::F64(indices.iter().map(|o| o.map_or(0.0, |i| v[i])).collect())
+            ColumnData::I64(v) => {
+                ColumnData::I64(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect())
             }
-            Column::Dec(v) => Column::Dec(DecColumn {
+            ColumnData::F64(v) => {
+                ColumnData::F64(indices.iter().map(|o| o.map_or(0.0, |i| v[i])).collect())
+            }
+            ColumnData::Dec(v) => ColumnData::Dec(DecColumn {
                 unscaled: indices
                     .iter()
                     .map(|o| o.map_or(0, |i| v.unscaled[i]))
                     .collect(),
                 scale: v.scale,
             }),
-            Column::DateTime(v) => Column::DateTime(DtColumn {
+            ColumnData::DateTime(v) => ColumnData::DateTime(DtColumn {
                 ticks: indices
                     .iter()
                     .map(|o| o.map_or(0, |i| v.ticks[i]))
                     .collect(),
                 unit: v.unit,
             }),
-            Column::Duration(v) => Column::Duration(DurColumn {
+            ColumnData::Duration(v) => ColumnData::Duration(DurColumn {
                 ticks: indices
                     .iter()
                     .map(|o| o.map_or(0, |i| v.ticks[i]))
                     .collect(),
                 unit: v.unit,
             }),
-            Column::Date(v) => {
-                Column::Date(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect())
+            ColumnData::Date(v) => {
+                ColumnData::Date(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect())
             }
-            Column::Time(v) => {
-                Column::Time(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect())
+            ColumnData::Time(v) => {
+                ColumnData::Time(indices.iter().map(|o| o.map_or(0, |i| v[i])).collect())
             }
-            Column::Str(v) => {
+            ColumnData::Str(v) => {
                 let mut out = StrColumn::with_capacity(indices.len(), 0);
                 for o in indices {
                     out.push(o.map_or("", |i| v.get(i)));
                 }
-                Column::Str(out)
+                ColumnData::Str(out)
             }
         }
     }
 
     /// Gather a new column from selected row indices (used by filter/join).
-    pub fn gather(&self, indices: &[usize]) -> Column {
+    pub fn gather(&self, indices: &[usize]) -> ColumnData {
         match self {
-            Column::Bool(v) => Column::Bool(indices.iter().map(|&i| v[i]).collect()),
-            Column::I64(v) => Column::I64(indices.iter().map(|&i| v[i]).collect()),
-            Column::F64(v) => Column::F64(indices.iter().map(|&i| v[i]).collect()),
-            Column::Dec(v) => Column::Dec(DecColumn {
+            ColumnData::Bool(v) => ColumnData::Bool(indices.iter().map(|&i| v[i]).collect()),
+            ColumnData::I64(v) => ColumnData::I64(indices.iter().map(|&i| v[i]).collect()),
+            ColumnData::F64(v) => ColumnData::F64(indices.iter().map(|&i| v[i]).collect()),
+            ColumnData::Dec(v) => ColumnData::Dec(DecColumn {
                 unscaled: indices.iter().map(|&i| v.unscaled[i]).collect(),
                 scale: v.scale,
             }),
-            Column::DateTime(v) => Column::DateTime(DtColumn {
+            ColumnData::DateTime(v) => ColumnData::DateTime(DtColumn {
                 ticks: indices.iter().map(|&i| v.ticks[i]).collect(),
                 unit: v.unit,
             }),
-            Column::Duration(v) => Column::Duration(DurColumn {
+            ColumnData::Duration(v) => ColumnData::Duration(DurColumn {
                 ticks: indices.iter().map(|&i| v.ticks[i]).collect(),
                 unit: v.unit,
             }),
-            Column::Date(v) => Column::Date(indices.iter().map(|&i| v[i]).collect()),
-            Column::Time(v) => Column::Time(indices.iter().map(|&i| v[i]).collect()),
-            Column::Str(v) => Column::Str(v.gather(indices)),
+            ColumnData::Date(v) => ColumnData::Date(indices.iter().map(|&i| v[i]).collect()),
+            ColumnData::Time(v) => ColumnData::Time(indices.iter().map(|&i| v[i]).collect()),
+            ColumnData::Str(v) => ColumnData::Str(v.gather(indices)),
         }
+    }
+}
+
+/// A columnar buffer **with a null model**: a dense value lane ([`ColumnData`])
+/// plus a per-row [`Validity`] bitmap (design doc 26 §26.1). `validity` is
+/// `None` (all-valid) by default, so an all-valid column is byte-for-byte the
+/// old representation with zero overhead. Null-ness rides here, never in the
+/// backing bytes, so `null` / empty-`""` / `0` stay three distinct things.
+#[derive(Debug, Clone)]
+pub struct Column {
+    data: ColumnData,
+    validity: Validity,
+}
+
+impl std::ops::Deref for Column {
+    type Target = ColumnData;
+    /// Read-only access to the dense value lane (so `col.len()`, a `match
+    /// &*col`, etc. reach `ColumnData` without naming the field).
+    fn deref(&self) -> &ColumnData {
+        &self.data
+    }
+}
+
+impl From<ColumnData> for Column {
+    /// Wrap a dense lane as an **all-valid** column (no nulls; zero-cost).
+    fn from(data: ColumnData) -> Self {
+        Column {
+            data,
+            validity: Validity::all_valid(),
+        }
+    }
+}
+
+impl Column {
+    /// Build a column from a dense lane and an explicit validity bitmap.
+    pub fn new(data: ColumnData, validity: Validity) -> Self {
+        Column { data, validity }
+    }
+
+    /// Borrow the dense value lane (the `match` target for lane-typed code).
+    pub fn data(&self) -> &ColumnData {
+        &self.data
+    }
+
+    /// Consume the column, yielding its dense value lane (drops validity).
+    pub fn into_data(self) -> ColumnData {
+        self.data
+    }
+
+    /// Mutably borrow the dense value lane (for in-place lane edits that do not
+    /// change null-ness, e.g. concatenating same-typed reader slices).
+    pub fn data_mut(&mut self) -> &mut ColumnData {
+        &mut self.data
+    }
+
+    /// Borrow the validity bitmap.
+    pub fn validity(&self) -> &Validity {
+        &self.validity
+    }
+
+    /// Is `row` null (missing)? All-valid columns answer `false` for free.
+    #[inline]
+    pub fn is_null(&self, row: usize) -> bool {
+        self.validity.is_null(row)
+    }
+
+    /// Does this column carry at least one null?
+    pub fn has_nulls(&self) -> bool {
+        self.validity.has_nulls()
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn dtype(&self) -> DataType {
+        self.data.dtype()
+    }
+
+    /// The value at `row` — **null-aware**: a null row yields [`Value::Null`]
+    /// regardless of the (type-default) backing byte. Never panics on null.
+    pub fn value_at(&self, row: usize) -> Value {
+        if self.validity.is_null(row) {
+            Value::Null
+        } else {
+            self.data.value_at(row)
+        }
+    }
+
+    /// All-valid lane constructors. These keep the old `Column::I64(v)` call
+    /// sites readable (now `Column::i64(v)`) while making "all-valid" explicit.
+    pub fn bool(v: Vec<bool>) -> Self {
+        ColumnData::Bool(v).into()
+    }
+    pub fn i64(v: Vec<i64>) -> Self {
+        ColumnData::I64(v).into()
+    }
+    pub fn f64(v: Vec<f64>) -> Self {
+        ColumnData::F64(v).into()
+    }
+    pub fn dec(v: DecColumn) -> Self {
+        ColumnData::Dec(v).into()
+    }
+    pub fn datetime(v: DtColumn) -> Self {
+        ColumnData::DateTime(v).into()
+    }
+    pub fn duration(v: DurColumn) -> Self {
+        ColumnData::Duration(v).into()
+    }
+    pub fn date(v: Vec<i32>) -> Self {
+        ColumnData::Date(v).into()
+    }
+    pub fn time(v: Vec<i64>) -> Self {
+        ColumnData::Time(v).into()
+    }
+    pub fn str(v: StrColumn) -> Self {
+        ColumnData::Str(v).into()
+    }
+
+    /// Gather selected rows, **carrying validity** so null positions survive
+    /// filter/join/sort (design 26 §26.1).
+    pub fn gather(&self, indices: &[usize]) -> Column {
+        Column {
+            data: self.data.gather(indices),
+            validity: self.validity.gather(indices),
+        }
+    }
+
+    /// Gather with optional indices: a `None` (unmatched outer-join row) is a
+    /// **null** in both the value lane (type default) and the validity bitmap.
+    pub fn gather_opt(&self, indices: &[Option<usize>]) -> Column {
+        Column {
+            data: self.data.gather_opt(indices),
+            validity: self.validity.gather_opt(indices),
+        }
+    }
+
+    /// Append another column of the same variant, concatenating both the value
+    /// lane and the validity bitmap (used before a blocking sort / in merges).
+    pub fn append(&mut self, other: &Column) {
+        let self_len = self.data.len();
+        let other_len = other.data.len();
+        self.data.append(&other.data);
+        self.validity.append(self_len, &other.validity, other_len);
     }
 }
 
@@ -414,7 +666,8 @@ impl Chunk {
 
 #[cfg(test)]
 mod tests {
-    use super::StrColumn;
+    use super::{Column, ColumnData, StrColumn, Validity};
+    use crate::value::Value;
 
     #[test]
     fn default_strcolumn_is_a_valid_empty_column() {
@@ -427,5 +680,96 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c.get(0), "first");
         assert_eq!(c.get(1), "second");
+    }
+
+    #[test]
+    fn validity_all_valid_is_zero_cost_and_reports_no_nulls() {
+        // The default (`None`) form is the zero-overhead all-valid case: it must
+        // not allocate a bitmap and must answer `is_null == false` for any row.
+        let v = Validity::all_valid();
+        assert!(!v.has_nulls());
+        assert!(!v.is_null(0));
+        assert!(!v.is_null(63));
+        assert!(!v.is_null(1_000_000));
+        // Building from an all-true bit vector collapses back to all-valid.
+        let from = Validity::from_bits(&[true, true, true]);
+        assert!(!from.has_nulls(), "all-true must stay zero-cost (None)");
+    }
+
+    #[test]
+    fn validity_from_bits_marks_nulls_across_word_boundary() {
+        // A null past row 63 exercises the second bitmap word (1 bit/row, packed
+        // into u64s) — guards the word-index/shift arithmetic.
+        let mut bits = vec![true; 130];
+        bits[0] = false;
+        bits[64] = false;
+        bits[129] = false;
+        let v = Validity::from_bits(&bits);
+        assert!(v.has_nulls());
+        for (i, &b) in bits.iter().enumerate() {
+            assert_eq!(v.is_null(i), !b, "row {i}");
+        }
+    }
+
+    /// An `I64` column whose middle row is null: backing byte is the type
+    /// default (0) but `value_at` must answer `Value::Null`, proving null is
+    /// distinct from a real `0` (the BUG-A confusion the null model removes).
+    fn i64_with_null() -> Column {
+        Column::new(
+            ColumnData::I64(vec![10, 0, 30]),
+            Validity::from_bits(&[true, false, true]),
+        )
+    }
+
+    #[test]
+    fn null_is_distinct_from_zero_in_value_at() {
+        let c = i64_with_null();
+        assert_eq!(c.value_at(0), Value::I64(10));
+        assert_eq!(c.value_at(1), Value::Null, "null row, not the backing 0");
+        assert_eq!(c.value_at(2), Value::I64(30));
+        assert!(c.is_null(1) && !c.is_null(0));
+    }
+
+    #[test]
+    fn gather_carries_validity() {
+        // Selecting rows [2, 1] must carry their null-ness with them.
+        let g = i64_with_null().gather(&[2, 1]);
+        assert_eq!(g.value_at(0), Value::I64(30));
+        assert_eq!(g.value_at(1), Value::Null);
+    }
+
+    #[test]
+    fn append_concatenates_validity() {
+        // All-valid + has-null, and the reverse, both preserve null positions.
+        let mut a = Column::i64(vec![1, 2]); // all-valid
+        a.append(&i64_with_null()); // [1,2, 10,null,30]
+        assert_eq!(a.len(), 5);
+        assert_eq!(a.value_at(1), Value::I64(2));
+        assert_eq!(a.value_at(3), Value::Null);
+        assert_eq!(a.value_at(4), Value::I64(30));
+
+        // has-null first, all-valid second.
+        let mut b = i64_with_null();
+        b.append(&Column::i64(vec![99]));
+        assert_eq!(b.value_at(1), Value::Null);
+        assert_eq!(b.value_at(3), Value::I64(99));
+    }
+
+    #[test]
+    fn append_two_all_valid_stays_zero_cost() {
+        // Concatenating dense chunks must not materialize a bitmap.
+        let mut a = Column::i64(vec![1, 2]);
+        a.append(&Column::i64(vec![3, 4]));
+        assert!(!a.has_nulls(), "all-valid append must stay None");
+        assert_eq!(a.value_at(2), Value::I64(3));
+    }
+
+    #[test]
+    fn gather_opt_none_index_is_null() {
+        // The outer-join fill path: a `None` index is a null on both lanes.
+        let g = Column::i64(vec![7, 8]).gather_opt(&[Some(1), None, Some(0)]);
+        assert_eq!(g.value_at(0), Value::I64(8));
+        assert_eq!(g.value_at(1), Value::Null);
+        assert_eq!(g.value_at(2), Value::I64(7));
     }
 }

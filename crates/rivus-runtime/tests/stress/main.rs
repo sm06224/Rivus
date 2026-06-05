@@ -91,6 +91,7 @@ mod decimal;
 mod groupby;
 mod io_formats;
 mod joins;
+mod null;
 mod syntax;
 mod temporal;
 mod transforms;

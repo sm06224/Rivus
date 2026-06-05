@@ -13,7 +13,7 @@
 //! runtime stays std-only). Nested objects and arrays as first-class columns
 //! are future work (design doc 03 nested columns / doc 18).
 
-use rivus_core::{Column, DataType, Field, Schema, StrColumn};
+use rivus_core::{Column, ColumnData, DataType, Field, Schema, StrColumn, Validity};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
@@ -180,42 +180,91 @@ fn infer(vals: &[JVal]) -> DataType {
     }
 }
 
+/// Build one typed column, tracking **validity** (design 26 §26.3): a JSON
+/// `null` — and a **missing key** (assembled as `JVal::Null` upstream) — becomes
+/// a `null` (validity = 0), never a silent `0`/`""`. A JSON empty string `""`
+/// stays a real empty string (validity = 1).
 fn build_column(dtype: DataType, vals: &[JVal]) -> Column {
-    match dtype {
-        DataType::I64 => Column::I64(
+    let mut valid = Vec::with_capacity(vals.len());
+    let data = match dtype {
+        DataType::I64 => ColumnData::I64(
             vals.iter()
                 .map(|v| match v {
-                    JVal::Int(i) => *i,
-                    _ => 0,
+                    JVal::Int(i) => {
+                        valid.push(true);
+                        *i
+                    }
+                    _ => {
+                        valid.push(false);
+                        0
+                    }
                 })
                 .collect(),
         ),
-        DataType::F64 => Column::F64(
+        DataType::F64 => ColumnData::F64(
             vals.iter()
                 .map(|v| match v {
-                    JVal::Int(i) => *i as f64,
-                    JVal::Float(f) => *f,
-                    _ => 0.0,
+                    JVal::Int(i) => {
+                        valid.push(true);
+                        *i as f64
+                    }
+                    JVal::Float(f) => {
+                        valid.push(true);
+                        *f
+                    }
+                    _ => {
+                        valid.push(false);
+                        0.0
+                    }
                 })
                 .collect(),
         ),
-        DataType::Bool => {
-            Column::Bool(vals.iter().map(|v| matches!(v, JVal::Bool(true))).collect())
-        }
+        DataType::Bool => ColumnData::Bool(
+            vals.iter()
+                .map(|v| match v {
+                    JVal::Bool(b) => {
+                        valid.push(true);
+                        *b
+                    }
+                    _ => {
+                        valid.push(false);
+                        false
+                    }
+                })
+                .collect(),
+        ),
         _ => {
             let mut s = StrColumn::with_capacity(vals.len(), vals.len() * 8);
             for v in vals {
                 match v {
-                    JVal::Null => s.push(""),
-                    JVal::Bool(b) => s.push(if *b { "true" } else { "false" }),
-                    JVal::Int(i) => s.push(&i.to_string()),
-                    JVal::Float(f) => s.push(&f.to_string()),
-                    JVal::Str(x) | JVal::Raw(x) => s.push(x),
+                    // JSON `null` / missing key → null (validity = 0). A real
+                    // empty string arrives as `JVal::Str("")` and stays valid.
+                    JVal::Null => {
+                        s.push("");
+                        valid.push(false);
+                    }
+                    JVal::Bool(b) => {
+                        s.push(if *b { "true" } else { "false" });
+                        valid.push(true);
+                    }
+                    JVal::Int(i) => {
+                        s.push(&i.to_string());
+                        valid.push(true);
+                    }
+                    JVal::Float(f) => {
+                        s.push(&f.to_string());
+                        valid.push(true);
+                    }
+                    JVal::Str(x) | JVal::Raw(x) => {
+                        s.push(x);
+                        valid.push(true);
+                    }
                 }
             }
-            Column::Str(s)
+            ColumnData::Str(s)
         }
-    }
+    };
+    Column::new(data, Validity::from_bits(&valid))
 }
 
 // ------------------------------------------------------------- streaming reader
@@ -726,8 +775,8 @@ mod tests {
         assert_eq!(d.schema.fields[1].dtype, DataType::I64);
         assert_eq!(d.schema.fields[2].dtype, DataType::F64);
         assert_eq!(d.schema.fields[3].dtype, DataType::Bool);
-        match &d.columns[0] {
-            Column::Str(s) => assert_eq!(s.get(0), "aki"),
+        match d.columns[0].data() {
+            ColumnData::Str(s) => assert_eq!(s.get(0), "aki"),
             _ => panic!("expected str"),
         }
     }
@@ -737,8 +786,8 @@ mod tests {
         let text = "{\"a\":1}\nnot json\n{\"a\":2}\n";
         let d = parse(text).unwrap();
         assert_eq!(d.bad_rows, 1);
-        match &d.columns[0] {
-            Column::I64(v) => assert_eq!(v, &[1, 2]),
+        match d.columns[0].data() {
+            ColumnData::I64(v) => assert_eq!(v, &[1, 2]),
             _ => panic!("expected i64"),
         }
     }
@@ -751,8 +800,8 @@ mod tests {
         let d = parse(text).unwrap();
         assert_eq!(d.schema.field_names(), vec!["name", "age"]);
         assert_eq!(d.bad_rows, 1); // the bare `42` element
-        match &d.columns[1] {
-            Column::I64(v) => assert_eq!(v, &[30, 15, 40]),
+        match d.columns[1].data() {
+            ColumnData::I64(v) => assert_eq!(v, &[30, 15, 40]),
             _ => panic!("expected i64 age"),
         }
     }
@@ -762,8 +811,8 @@ mod tests {
         let text = "{\"id\":1,\"meta\":{\"x\":2}}\n";
         let d = parse(text).unwrap();
         let idx = d.schema.index_of("meta").unwrap();
-        match &d.columns[idx] {
-            Column::Str(s) => assert!(s.get(0).contains("\"x\"")),
+        match d.columns[idx].data() {
+            ColumnData::Str(s) => assert!(s.get(0).contains("\"x\"")),
             _ => panic!("expected raw string column"),
         }
     }
