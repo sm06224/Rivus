@@ -567,3 +567,151 @@ fn groupby_count_col_serial_parallel_byte_identical() {
         "null-aware count:v group-by must be serial==parallel"
     );
 }
+
+// --- STEP 2-④ sink null round-trip (design 26 §26.5): null / "" / 0 survive
+// read → write → read, symmetrically on CSV and JSON. ---
+
+/// Run `src` to completion (a `save` sink writes the output file).
+fn run_to(src: &str) {
+    let g = rivus_parser::parse(src).expect("parse");
+    run(
+        &g,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("run");
+}
+
+#[test]
+fn csv_null_empty_zero_round_trip() {
+    // Three distinct cells: null (unquoted blank), "" (quoted empty), real 0.
+    // After read → write → read they must stay distinct (§26.5).
+    let text = "id,s,n\n1,a,5\n2,,\n3,\"\",0\n";
+    let inf = TempCsv(gendata::write_temp_bytes("rt_csv_in", text.as_bytes()));
+    let ip = inf.0.display();
+    let outf = TempCsv(gendata::write_temp_bytes("rt_csv_out", b""));
+    let op = outf.0.display();
+
+    run_to(&format!(
+        "W:\n open {ip} (id:int s:str n:int)\n |> id s n\n save {op}\n;"
+    ));
+
+    // The written CSV must distinguish null (bare empty) from "" (quoted).
+    let raw = std::fs::read_to_string(&outf.0).expect("read out");
+    assert!(
+        raw.contains("2,,\n"),
+        "null s and null n → bare empty fields: {raw:?}"
+    );
+    assert!(
+        raw.contains("3,\"\",0\n"),
+        "real empty string → quoted \"\": {raw:?}"
+    );
+
+    // Read the written file back; coalesce proves null vs "" survived.
+    let res = run_src(
+        &format!("R:\n open {op} (id:int s:str n:int)\n |> id (coalesce(s, \"NULL\")) as s (coalesce(n, 999)) as n\n;"),
+        4096,
+    );
+    assert_eq!(
+        collect_strings(&res, "R", "s"),
+        vec!["a", "NULL", ""],
+        "row2 s round-tripped null (→NULL); row3 s round-tripped empty string",
+    );
+    assert_eq!(
+        collect_strings(&res, "R", "n"),
+        vec!["5", "999", "0"],
+        "row2 n round-tripped null (→999); row3 n round-tripped real 0",
+    );
+}
+
+#[test]
+fn json_null_empty_round_trip() {
+    // JSON: an explicit null and an empty string "" stay distinct across
+    // read → write (JSONL) → read (§26.5).
+    let text = "{\"id\":1,\"s\":\"a\"}\n{\"id\":2,\"s\":null}\n{\"id\":3,\"s\":\"\"}\n";
+    let raw_in = gendata::write_temp("rt_json_in", text);
+    let mut ip = raw_in.clone();
+    ip.set_extension("jsonl");
+    std::fs::rename(&raw_in, &ip).unwrap();
+    let _in = TempCsv(ip.clone());
+    let raw_out = gendata::write_temp("rt_json_out", "");
+    let mut op = raw_out.clone();
+    op.set_extension("jsonl");
+    std::fs::rename(&raw_out, &op).unwrap();
+    let _out = TempCsv(op.clone());
+
+    run_to(&format!(
+        "W:\n open {}\n |> id s\n save {}\n;",
+        ip.display(),
+        op.display()
+    ));
+
+    // The written JSONL must emit a bare `null` and a quoted `""` — distinct.
+    let raw = std::fs::read_to_string(&op).expect("read json out");
+    assert!(
+        raw.contains("\"s\":null"),
+        "explicit null → bare JSON null: {raw:?}"
+    );
+    assert!(
+        raw.contains("\"s\":\"\""),
+        "empty string → quoted \"\": {raw:?}"
+    );
+
+    let res = run_src(
+        &format!(
+            "R:\n open {}\n |> id (coalesce(s, \"NULL\")) as s\n;",
+            op.display()
+        ),
+        4096,
+    );
+    assert_eq!(
+        collect_strings(&res, "R", "s"),
+        vec!["a", "NULL", ""],
+        "JSON null vs empty string survived the round-trip",
+    );
+}
+
+#[test]
+fn csv_round_trip_is_idempotent_chunk_size_independent() {
+    // read → write → read → write must reach a fixed point (byte-identical
+    // second write), independent of chunk size — null/empty rendering is stable.
+    let text = "id,s,n\n1,a,5\n2,,\n3,\"\",0\n4,z,\n";
+    let inf = TempCsv(gendata::write_temp_bytes("rt_idem_in", text.as_bytes()));
+    let ip = inf.0.display();
+    for cz in [1usize, 2, 4096] {
+        let o1 = TempCsv(gendata::write_temp_bytes("rt_idem_o1", b""));
+        let o2 = TempCsv(gendata::write_temp_bytes("rt_idem_o2", b""));
+        let g1 = rivus_parser::parse(&format!(
+            "W:\n open {ip} (id:int s:str n:int)\n |> id s n\n save {}\n;",
+            o1.0.display()
+        ))
+        .expect("parse");
+        run(
+            &g1,
+            RunOptions {
+                chunk_size: cz,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let g2 = rivus_parser::parse(&format!(
+            "W:\n open {} (id:int s:str n:int)\n |> id s n\n save {}\n;",
+            o1.0.display(),
+            o2.0.display()
+        ))
+        .expect("parse");
+        run(
+            &g2,
+            RunOptions {
+                chunk_size: cz,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let a = std::fs::read_to_string(&o1.0).unwrap();
+        let b = std::fs::read_to_string(&o2.0).unwrap();
+        assert_eq!(a, b, "round-trip must be a fixed point @cz={cz}");
+    }
+}
