@@ -1183,9 +1183,15 @@ enum Lane {
 /// `null` / empty-`""` / `0` stay distinct.
 struct ColBuilder {
     lane: Lane,
-    /// `valid[row]` is `true` for a real value, `false` for null. Collapsed to a
-    /// zero-cost all-valid `Validity` in [`finish`] when no null occurred.
+    /// Per-row validity, tracked **lazily**: it stays empty (no allocation, no
+    /// per-cell push) while every cell so far is valid — the common case — and
+    /// is only materialized once the first null appears (back-filling the rows
+    /// before it as valid). So an all-valid column pays *nothing* here, keeping
+    /// the reader's hot path at its pre-null-model cost (the zero-cost promise of
+    /// design 26 §26.1 extends to construction, not just representation).
     valid: Vec<bool>,
+    /// Rows pushed so far (drives the lazy back-fill above).
+    len: usize,
 }
 
 impl ColBuilder {
@@ -1213,8 +1219,24 @@ impl ColBuilder {
         };
         ColBuilder {
             lane,
-            valid: Vec::with_capacity(cap),
+            // No pre-allocation: an all-valid column never touches `valid`.
+            valid: Vec::new(),
+            len: 0,
         }
+    }
+
+    /// Record one row's validity, materializing the bitmap lazily (see
+    /// [`ColBuilder::valid`]): while all cells are valid this is a single
+    /// counter bump; the first null back-fills the prior rows as valid.
+    #[inline]
+    fn record(&mut self, valid: bool) {
+        if !self.valid.is_empty() {
+            self.valid.push(valid);
+        } else if !valid {
+            self.valid = vec![true; self.len];
+            self.valid.push(false);
+        }
+        self.len += 1;
     }
 
     /// Parse one cell into the lane and record its validity (design 26 §26.3),
@@ -1327,7 +1349,7 @@ impl ColBuilder {
                 (!cell.is_empty() || quoted, false)
             }
         };
-        self.valid.push(valid);
+        self.record(valid);
         fail
     }
 
@@ -1352,8 +1374,14 @@ impl ColBuilder {
             Lane::Time(v) => ColumnData::Time(std::mem::take(v)),
             Lane::Str(v) => ColumnData::Str(std::mem::take(v)),
         };
-        let validity = Validity::from_bits(&self.valid);
-        self.valid.clear();
+        // Empty `valid` ⇒ no null ever occurred ⇒ the zero-cost all-valid form.
+        let validity = if self.valid.is_empty() {
+            Validity::all_valid()
+        } else {
+            Validity::from_bits(&self.valid)
+        };
+        self.valid = Vec::new();
+        self.len = 0;
         Column::new(data, validity)
     }
 }
