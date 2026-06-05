@@ -11,7 +11,7 @@ use crate::jsonl;
 use crate::kernel;
 use rivus_core::{
     Chunk, Column, ColumnData, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field, Schema,
-    Severity, StrColumn, TimeUnit, Value,
+    Severity, StrColumn, TimeUnit, Validity, Value,
 };
 use rivus_ir::{
     AggFunc, BinType, CmpOp, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
@@ -2286,6 +2286,9 @@ struct AggAcc {
     min: f64,
     max: f64,
     n: i64,
+    /// Number of **non-null** values observed — `COUNT(col)` for `AggFunc::Count`
+    /// (design 26 §26.2d). Counts every lane (unlike `n`, which is numeric-only).
+    non_null: i64,
     first: Option<String>,
     last: Option<String>,
     distinct: std::collections::HashSet<String>,
@@ -2363,6 +2366,7 @@ impl AggAcc {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             n: 0,
+            non_null: 0,
             first: None,
             last: None,
             distinct: std::collections::HashSet::new(),
@@ -2457,24 +2461,29 @@ impl AggAcc {
                     }
                 }
             }
-            AggFunc::CountDistinct => {
-                let s = v.to_string();
-                if !s.is_empty() {
-                    self.distinct.insert(s);
+            // COUNT(col): the number of non-null values (design 26 §26.2d).
+            AggFunc::Count => {
+                if !v.is_null() {
+                    self.non_null += 1;
                 }
             }
+            // Distinct **non-null** values: a null is not a distinct value, but a
+            // real empty string is (rectified from "non-empty" to "non-null").
+            AggFunc::CountDistinct => {
+                if !v.is_null() {
+                    self.distinct.insert(v.to_string());
+                }
+            }
+            // First/last **non-null** value (rectified from "non-empty": a real
+            // empty string is now a value, a null is skipped). §26.2d.
             AggFunc::First => {
-                if self.first.is_none() {
-                    let s = v.to_string();
-                    if !s.is_empty() {
-                        self.first = Some(s);
-                    }
+                if self.first.is_none() && !v.is_null() {
+                    self.first = Some(v.to_string());
                 }
             }
             AggFunc::Last => {
-                let s = v.to_string();
-                if !s.is_empty() {
-                    self.last = Some(s);
+                if !v.is_null() {
+                    self.last = Some(v.to_string());
                 }
             }
             AggFunc::Pct(_) => {
@@ -2497,6 +2506,7 @@ impl AggAcc {
         self.sum += other.sum;
         self.sum_sq += other.sum_sq;
         self.n += other.n;
+        self.non_null += other.non_null;
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
         // Exact decimal lane (associative i128); a column shares one scale.
@@ -2717,9 +2727,23 @@ impl AggAcc {
     fn distinct_count(&self) -> i64 {
         self.distinct.len() as i64
     }
+    /// `COUNT(col)` — the number of non-null values observed (§26.2d).
+    fn count_value(&self) -> i64 {
+        self.non_null
+    }
+    /// First/last non-null cell, or `None` for an all-null group (§26.2d) — the
+    /// caller renders that as a null in the output column.
+    fn first_opt(&self) -> Option<&str> {
+        self.first.as_deref()
+    }
+    fn last_opt(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+    #[cfg(test)]
     fn first_str(&self) -> &str {
         self.first.as_deref().unwrap_or("")
     }
+    #[cfg(test)]
     fn last_str(&self) -> &str {
         self.last.as_deref().unwrap_or("")
     }
@@ -2785,7 +2809,9 @@ pub(crate) fn group_parallel_safe(
     col_type: impl Fn(&str) -> Option<DataType>,
 ) -> bool {
     aggs.iter().all(|(f, col)| match f {
-        AggFunc::Min
+        // COUNT(col) is a non-null tally → associative (counts sum) → safe.
+        AggFunc::Count
+        | AggFunc::Min
         | AggFunc::Max
         | AggFunc::CountDistinct
         | AggFunc::First
@@ -2910,6 +2936,16 @@ impl Operator for GroupBy {
         for (j, (func, col)) in self.aggs.iter().enumerate() {
             let name = format!("{}_{}", func.label(), col);
             let (dtype, column) = match func {
+                // COUNT(col): the per-group non-null tally (§26.2d).
+                AggFunc::Count => (
+                    DataType::I64,
+                    Column::i64(
+                        self.groups
+                            .values()
+                            .map(|s| s.accs[j].count_value())
+                            .collect(),
+                    ),
+                ),
                 AggFunc::CountDistinct => (
                     DataType::I64,
                     Column::i64(
@@ -2920,16 +2956,23 @@ impl Operator for GroupBy {
                     ),
                 ),
                 AggFunc::First | AggFunc::Last => {
+                    // An all-null group has no first/last non-null value → the
+                    // output cell is null (§26.2d), carried by the validity bitmap.
                     let mut sc = StrColumn::default();
+                    let mut valid = Vec::with_capacity(self.groups.len());
                     for s in self.groups.values() {
                         let cell = if matches!(func, AggFunc::First) {
-                            s.accs[j].first_str()
+                            s.accs[j].first_opt()
                         } else {
-                            s.accs[j].last_str()
+                            s.accs[j].last_opt()
                         };
-                        sc.push(cell);
+                        sc.push(cell.unwrap_or(""));
+                        valid.push(cell.is_some());
                     }
-                    (DataType::Str, Column::str(sc))
+                    (
+                        DataType::Str,
+                        Column::new(ColumnData::Str(sc), Validity::from_bits(&valid)),
+                    )
                 }
                 // sum/avg/min/max/std/pct. On a decimal column these stay exact
                 // (i128) when every group produced an exact result; if any group

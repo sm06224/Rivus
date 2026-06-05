@@ -112,11 +112,15 @@ pub enum AggFunc {
     Max,
     /// Sample standard deviation (ddof=1; `0` for fewer than two values).
     Std,
-    /// Number of distinct non-empty values (`nunique` is an accepted alias).
+    /// `count:col` — the number of **non-null** values of a column (SQL
+    /// `COUNT(col)`), as opposed to the always-emitted implicit `count` which is
+    /// `COUNT(*)` = the group's row count (design 26 §26.2d).
+    Count,
+    /// Number of distinct **non-null** values (`nunique` is an accepted alias).
     CountDistinct,
-    /// First non-empty value seen in the group (source order).
+    /// First **non-null** value seen in the group (source order).
     First,
-    /// Last non-empty value seen in the group (source order).
+    /// Last **non-null** value seen in the group (source order).
     Last,
     /// Percentile of the numeric values in the group (linear interpolation,
     /// like numpy/pandas default). The `u8` is the percentile in 0..=100;
@@ -133,6 +137,7 @@ impl AggFunc {
             "min" => AggFunc::Min,
             "max" => AggFunc::Max,
             "std" => AggFunc::Std,
+            "count" => AggFunc::Count,
             "count_distinct" | "nunique" => AggFunc::CountDistinct,
             "first" => AggFunc::First,
             "last" => AggFunc::Last,
@@ -168,6 +173,7 @@ impl AggFunc {
             AggFunc::Min => "min",
             AggFunc::Max => "max",
             AggFunc::Std => "std",
+            AggFunc::Count => "count",
             AggFunc::CountDistinct => "count_distinct",
             AggFunc::First => "first",
             AggFunc::Last => "last",
