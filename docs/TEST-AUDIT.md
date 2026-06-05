@@ -16,13 +16,17 @@ open dn.csv (age:str)     dropna age      # → correctly drops rows 2,4
 representation), so by the time `dropna` runs the "missing" is indistinguishable
 from a real `0`. `dropna` only works on `:str` columns, where blank stays `""`.
 This is the #bugreport ①⑤ / §24 nullable-column gap.
-**Fix plan (null model).** Introduce per-column missingness (a null bitmap on
-`Column`, or a sentinel tracked at parse): the reader marks an empty numeric cell
-*missing* instead of `0`; `dropna`/`Required` validators test missingness;
-`null`/`empty`/`0` become distinct (`Value::Null`). Large, cross-cutting (core
-`Column`, reader, operators, aggregates, sinks, byte-identity). Belongs to the
-validation-layer epic (§24); design doc + sign-off before code. Until then the
-GUIDE must state `dropna` only sees blanks in **text** columns (see §3).
+**Fix plan (null model #81).** Per-column missingness via a null bitmap on
+`Column` (design 26): the reader marks an empty numeric cell *missing* instead of
+`0`; `null`/`empty`/`0` become distinct (`Value::Null`). Large, cross-cutting
+(core `Column`, reader, operators, aggregates, sinks, byte-identity), staged.
+**Status:** STEP 2-① **landed** (#105) — `Column { data, validity }`, the reader
+reads a blank/unparseable numeric cell as `null`, arithmetic propagates and
+aggregations skip it. The **`dropna` fix is STEP 2-②**: make `dropna`/`fill` and
+filter predicates validity-aware across every lane and **un-ignore this test**
+(`dropna_drops_blank_numeric_rows_bug_a`) to green. Until 2-② lands, `dropna`
+still only catches blanks in **text** columns, so this test stays `#[ignore]`
+(see §3) and the GUIDE notes the transition.
 
 ### BUG-B (RESOLVED #92) · datetime / date / time are never auto-inferred
 **Repro.** `open f.csv` over an ISO-8601 `ts` column → the column stays `Str`
