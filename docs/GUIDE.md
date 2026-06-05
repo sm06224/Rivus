@@ -238,8 +238,16 @@ fill score mean        # fill blanks with the column mean (numeric cells)
 fill score median      # fill blanks with the column median
 ```
 
-A "missing" cell is an empty string. Numeric columns can't hold a blank (it
-parses to 0), so declare a column `:str` if you need to detect/clean its blanks.
+A "missing" cell is **`null`** — a first-class missing value, distinct from a
+real `0` and from an empty string `""` (the null model, design 26). **Before:**
+a blank numeric cell collapsed to `0`, so a blank was indistinguishable from a
+real zero. **After:** a blank (or unparseable) numeric/date/time cell reads as
+`null`, so missing-ness is detectable on every lane — you no longer have to
+declare a column `:str` to spot its blanks. A `null` renders as an empty CSV
+field (and a bare `null` in JSON); a real `""` round-trips as a quoted `""`.
+`null` is skipped by aggregations (`sum`/`avg`/`min`/`max` ignore it) and
+propagates through arithmetic (`null + x → null`).
+
 `ffill`/`bfill` carry the nearest neighbour across chunk boundaries (a leading
 blank has nothing to forward-fill from, a trailing blank nothing to back-fill);
 `bfill` buffers the stream to finish (a pipeline-breaker like `sort`), `ffill`
@@ -368,8 +376,8 @@ Merged:
   `A & B on country region` matches rows agreeing on both. Each key may be
   `lk:rk` for differing names (`on a x:y`). Works for every join kind below.
 - `A &left B on key` — **left outer join**: every left row is kept; when no
-  right row matches, the right columns are padded with type defaults (`0` /
-  `0.0` / `false` / empty string).
+  right row matches, the right columns are padded with **`null`** (the
+  unmatched side is genuinely missing, not a zero/empty string).
 - `A &right B on key` — **right outer join**: every right row is kept (the left
   columns padded with defaults). The join-key column keeps the right key, so an
   orphan right row never loses its key.
@@ -418,8 +426,9 @@ Used in `|?` predicates and `(…)` computed columns.
   regex`) `regexp(s, re)`.
 - *numeric* — `abs(x)`, `round(x)` (ties away from zero), `floor(x)`, `ceil(x)`;
   each returns an integer when the result is whole, else a float.
-- *null-coalesce* — `coalesce(a, b, …)`: the first argument whose text is
-  non-empty (the SQL/pandas null-coalesce).
+- *null-coalesce* — `coalesce(a, b, …)`: the first **non-null** argument
+  (the SQL/pandas null-coalesce). A real empty string `""` is non-null, so it
+  is kept; only `null` is skipped (design 26 §26.2).
 
 ```
 |? contains(email, "@gmail")
@@ -556,10 +565,10 @@ open events.csv (id:int day:date)   # parse "2024-06-03" into the date lane
 - **ISO `yyyy-MM-dd` only**, and it renders back as `yyyy-MM-dd` (round-trips
   through `save`, JSON emits a quoted `"2024-06-03"`).
 - **Never-silent on a bad date**: an impossible date like `2024-02-30` (or any
-  malformed cell) is kept as the default `1970-01-01` (continue-first) **and**
+  malformed cell) reads as **`null`** (continue-first, renders empty) **and**
   the loss is reported on the error stream — `N value(s) in column 'day' (as
-  date) could not be parsed; kept as default 0`. An **empty** cell is "missing",
-  not a failure (never counted), so clean data stays quiet.
+  date) could not be parsed; set to null`. An **empty** cell is also `null`, but
+  is "missing" not a failure (never counted), so clean data stays quiet.
 - **Exact, never f64**: comparison ordering and `min`/`max`/`count` run on the
   integer epoch-day.
 
@@ -574,9 +583,9 @@ open log.csv (start:time end:time)   # parse "09:05:00" into the time lane
 ```
 
 - **`HH:mm:ss` only** (hour `0..23`, minute/second `0..59`); a bad time like
-  `25:00:00` is kept as `00:00:00` (continue-first) **and** surfaced on the error
-  stream (`N value(s) in column '…' (as time) could not be parsed`); an empty
-  cell is "missing", not counted. Non-zero-padded input (`9:5:0`) parses and
+  `25:00:00` reads as **`null`** (continue-first, renders empty) **and** surfaced
+  on the error stream (`N value(s) in column '…' (as time) could not be parsed;
+  set to null`); an empty cell is also `null`, but "missing" not counted. Non-zero-padded input (`9:5:0`) parses and
   canonicalizes to `HH:mm:ss`. Sub-second input is truncated to second
   resolution (`12:30:00.5` → `12:30:00`; `:time` is a second-resolution type).
 
