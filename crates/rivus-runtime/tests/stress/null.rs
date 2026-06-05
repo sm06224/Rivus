@@ -205,3 +205,214 @@ fn null_bearing_data_is_serial_parallel_chunk_size_byte_identical() {
         );
     }
 }
+
+// --- STEP 2-② operators: null-aware filter / group-by / distinct / fill /
+// cast / sort (design 26 §26.2). ---
+
+#[test]
+fn filter_treats_null_as_predicate_false() {
+    // §26.2(a): a comparison with a null operand is false, so a null row is
+    // never kept — `age == 0` excludes the blank (only the real 0 survives),
+    // and `age >= 0` excludes it too.
+    let text = "id,age\n1,25\n2,\n3,0\n4,40\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_filter",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        assert_eq!(
+            collect_i64(
+                &run_src(
+                    &format!("N:\n open {p} (id:int age:int)\n |? age == 0\n |> id\n;"),
+                    cz
+                ),
+                "N",
+                "id"
+            ),
+            vec![3],
+            "age == 0 must match the real 0 only, not the null @cz={cz}",
+        );
+        assert_eq!(
+            collect_i64(
+                &run_src(
+                    &format!("N:\n open {p} (id:int age:int)\n |? age >= 0\n |> id\n;"),
+                    cz
+                ),
+                "N",
+                "id"
+            ),
+            vec![1, 3, 4],
+            "age >= 0 must exclude the null @cz={cz}",
+        );
+    }
+}
+
+#[test]
+fn filter_null_kernel_and_interpreter_agree() {
+    // The kernel (compilable `field op literal`) and the interpreter (forced by
+    // an OR) must treat null identically — byte-identical row sets.
+    let text = "id,age\n1,25\n2,\n3,0\n4,40\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_filt_parity",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    // Kernel path: a pure numeric conjunction.
+    let kernel = collect_i64(
+        &run_src(
+            &format!("N:\n open {p} (id:int age:int)\n |? age >= 0\n |> id\n;"),
+            4096,
+        ),
+        "N",
+        "id",
+    );
+    // Interpreter path: the OR makes `kernel::compile` bail; same logical result.
+    let interp = collect_i64(
+        &run_src(
+            &format!("N:\n open {p} (id:int age:int)\n |? age >= 0 or age >= 999999\n |> id\n;"),
+            4096,
+        ),
+        "N",
+        "id",
+    );
+    assert_eq!(
+        kernel, interp,
+        "kernel and interpreter must agree on null=false"
+    );
+    assert_eq!(kernel, vec![1, 3, 4]);
+}
+
+#[test]
+fn groupby_folds_null_key_into_one_group() {
+    // §26.2(b): null group-by keys fold into a single "null group" (kept, not
+    // dropped, not split). g = a, null, null, b → groups {a:1, null:2, b:1}.
+    let text = "g,v\na,1\n,2\n,3\nb,4\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_group",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        let mut counts = collect_i64(
+            &run_src(&format!("N:\n open {p} (g:str v:int)\n |# g sum:v\n;"), cz),
+            "N",
+            "count",
+        );
+        counts.sort_unstable();
+        assert_eq!(
+            counts,
+            vec![1, 1, 2],
+            "the two null keys must fold into one group of 2 @cz={cz}",
+        );
+    }
+}
+
+#[test]
+fn distinct_folds_duplicate_nulls() {
+    // §26.2(b): distinct folds duplicate nulls to one row (first occurrence).
+    // x = a, null, null, b → 3 distinct rows.
+    let text = "id,x\n1,a\n2,\n3,\n4,b\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_distinct",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        let xs = col_strings(
+            &format!("N:\n open {p} (id:int x:str)\n distinct x\n |> x\n;"),
+            cz,
+            "N",
+            "x",
+        );
+        assert_eq!(
+            xs,
+            vec!["a", "", "b"],
+            "duplicate nulls fold to one @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn fill_replaces_null_on_numeric_lane() {
+    // `fill age 0` replaces the null (former blank) with a real 0; existing
+    // values are untouched. (Before the null model this was a no-op on numeric.)
+    let text = "id,age\n1,25\n2,\n3,40\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_fill",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        assert_eq!(
+            col_strings(
+                &format!("N:\n open {p} (id:int age:int)\n fill age 0\n |> age\n;"),
+                cz,
+                "N",
+                "age"
+            ),
+            vec!["25", "0", "40"],
+            "fill replaces the null with a real 0 @cz={cz}",
+        );
+    }
+}
+
+#[test]
+fn cast_propagates_null() {
+    // §26.2(c): casting a null yields null (not a coerced 0). age:int (with a
+    // null) cast to f64 keeps the null hole.
+    let text = "id,age\n1,25\n2,\n3,40\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_cast",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        assert_eq!(
+            col_strings(
+                &format!("N:\n open {p} (id:int age:int)\n |> (age:f64) as af\n;"),
+                cz,
+                "N",
+                "af"
+            ),
+            vec!["25", "", "40"],
+            "cast int→f64 must keep the null @cz={cz}",
+        );
+    }
+}
+
+#[test]
+fn sort_orders_nulls_last_ascending_first_descending() {
+    // §26.2(b): nulls sort as the largest value — last on ascending, first on
+    // descending. age = 25, null, 5, 40.
+    let text = "id,age\n1,25\n2,\n3,5\n4,40\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_sort",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    assert_eq!(
+        collect_i64(
+            &run_src(
+                &format!("N:\n open {p} (id:int age:int)\n sort age\n |> id\n;"),
+                4096
+            ),
+            "N",
+            "id"
+        ),
+        vec![3, 1, 4, 2],
+        "ascending: 5,25,40 then null",
+    );
+    assert_eq!(
+        collect_i64(
+            &run_src(
+                &format!("N:\n open {p} (id:int age:int)\n sort age desc\n |> id\n;"),
+                4096
+            ),
+            "N",
+            "id"
+        ),
+        vec![2, 4, 1, 3],
+        "descending: null then 40,25,5",
+    );
+}

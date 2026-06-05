@@ -1336,6 +1336,18 @@ impl Sort {
 /// Compare two rows of one column for ordering (NaN treated as equal).
 fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+    // Null model §26.2b: a null sorts as the largest value → **nulls last** on an
+    // ascending sort (and first on descending, since the caller reverses). null
+    // == null is Equal (the stable sort then keeps source order). Gated by
+    // has_nulls → zero cost for all-valid columns.
+    if col.has_nulls() {
+        match (col.is_null(a), col.is_null(b)) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Greater,
+            (false, true) => return Ordering::Less,
+            (false, false) => {}
+        }
+    }
     match col.data() {
         ColumnData::Bool(v) => v[a].cmp(&v[b]),
         ColumnData::I64(v) => v[a].cmp(&v[b]),
@@ -1421,6 +1433,20 @@ impl Operator for Sort {
 
 // ------------------------------------------------------------------ distinct
 
+/// Append `row`'s value in column `ci` to a **grouping/dedup key**, tagging null
+/// distinctly (null model §26.2b): every `null` folds to the same key (so a
+/// `null` group-by key keeps its rows in one "null group", and `distinct` folds
+/// duplicate nulls), yet a `null` never collides with a real value — not even a
+/// real empty string. Present cells are written `\x01<text>`, a null as `\x00`.
+fn push_group_key_field(key: &mut String, chunk: &Chunk, ci: usize, row: usize) {
+    if chunk.columns[ci].is_null(row) {
+        key.push('\u{0}');
+    } else {
+        key.push('\u{1}');
+        key.push_str(&chunk.value(row, ci).to_string());
+    }
+}
+
 /// `distinct [keys...]` — keep the first occurrence of each distinct key,
 /// dropping later duplicates. Streaming (emits surviving rows per chunk) but
 /// stateful: a global seen-set spans chunks, so it runs serially. Output order
@@ -1459,7 +1485,7 @@ impl Operator for Distinct {
                 if j > 0 {
                     key.push('\u{1f}'); // unit separator: unlikely in data
                 }
-                key.push_str(&chunk.value(row, ci).to_string());
+                push_group_key_field(&mut key, &chunk, ci, row);
             }
             if self.seen.insert(key.clone()) {
                 keep.push(row);
@@ -1591,11 +1617,11 @@ impl Operator for Describe {
 
 // ------------------------------------------------------------ dropna / fill
 
-/// `dropna [cols]` — drop rows whose value in any target column is missing
-/// (renders empty: an empty string cell or null). With no columns, any column.
-/// Streaming and stateless. (Numeric columns can't carry an "empty" cell — a
-/// blank parses to 0 — so dropna is meaningful on text columns; declare a
-/// column `:str` first if you need to detect its blanks.)
+/// `dropna [cols]` — drop rows that are **null** (missing) in any target column;
+/// with no columns, in any column. Streaming and stateless. Null-aware (design
+/// 26 §26.9): it drops a `null`, **not** a real empty string `""` or a real `0`
+/// — those are present values. (Before the null model a blank numeric parsed to
+/// `0` and dropna was blind to it; that is BUG-A, now fixed.)
 struct DropNa {
     cols: Vec<String>,
 }
@@ -1611,11 +1637,7 @@ impl Operator for DropNa {
                 .collect()
         };
         let keep: Vec<usize> = (0..chunk.len)
-            .filter(|&r| {
-                !idxs
-                    .iter()
-                    .any(|&ci| chunk.value(r, ci).to_string().is_empty())
-            })
+            .filter(|&r| !idxs.iter().any(|&ci| chunk.columns[ci].is_null(r)))
             .collect();
         if keep.is_empty() {
             return Vec::new();
@@ -1627,12 +1649,39 @@ impl Operator for DropNa {
     }
 }
 
-/// `fill col VALUE` — replace missing (empty) cells of a text column with
-/// `VALUE`. Streaming, stateless. A non-text column is passed through unchanged
-/// (its blanks already became 0 at parse time).
+/// `fill col VALUE` — replace **null** (missing) cells of a column with `VALUE`,
+/// on **any** lane (null model §26; numeric blanks are now null, no longer `0`,
+/// so `fill price 0` works). Streaming, stateless. `VALUE` is coerced to the
+/// column's lane; a real `0`/`""` is a present value and is left untouched. A
+/// column with no nulls passes through unchanged (zero cost).
 struct Fill {
     col: String,
     value: String,
+}
+
+/// Coerce the `fill` literal text into the column's lane (`Value::Null` if it
+/// can't be represented there, leaving such rows null).
+fn parse_fill(value: &str, dtype: DataType) -> Value {
+    let t = value.trim();
+    match dtype {
+        DataType::Str => Value::Str(value.to_string()),
+        DataType::I64 => t.parse::<i64>().map(Value::I64).unwrap_or(Value::Null),
+        DataType::F64 => t.parse::<f64>().map(Value::F64).unwrap_or(Value::Null),
+        DataType::Bool => match t {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::Null,
+        },
+        DataType::Decimal { scale } => {
+            rivus_core::Decimal::parse_scaled(t, scale).map_or(Value::Null, Value::Dec)
+        }
+        DataType::Date => rivus_core::Date::parse(t).map_or(Value::Null, Value::Date),
+        DataType::Time => rivus_core::TimeOfDay::parse_at(t, rivus_core::TimeUnit::Sec)
+            .map_or(Value::Null, Value::Time),
+        // Datetime/duration need a format/unit to parse a literal; not supported
+        // as a `fill` constant yet (those rows stay null). Tracked for a follow-up.
+        DataType::DateTime { .. } | DataType::Duration { .. } | DataType::Null => Value::Null,
+    }
 }
 
 impl Operator for Fill {
@@ -1648,16 +1697,23 @@ impl Operator for Fill {
             );
             return vec![chunk];
         };
-        let ColumnData::Str(s) = chunk.columns[ci].data() else {
-            return vec![chunk]; // numeric column: no empty cells to fill
-        };
-        let mut filled = StrColumn::with_capacity(chunk.len, 0);
-        for r in 0..chunk.len {
-            let v = s.get(r);
-            filled.push(if v.is_empty() { &self.value } else { v });
+        // No nulls → nothing to fill (zero-cost passthrough for all-valid data).
+        if !chunk.columns[ci].has_nulls() {
+            return vec![chunk];
         }
+        let fill_val = parse_fill(&self.value, chunk.columns[ci].dtype());
+        let col = &chunk.columns[ci];
+        let vals: Vec<Value> = (0..chunk.len)
+            .map(|r| {
+                if col.is_null(r) {
+                    fill_val.clone()
+                } else {
+                    col.value_at(r)
+                }
+            })
+            .collect();
         let mut columns = chunk.columns.clone();
-        columns[ci] = Column::str(filled);
+        columns[ci] = eval::column_from_values(vals);
         let mut out = Chunk::new(chunk.meta.id, chunk.schema.clone(), columns);
         out.meta = chunk.meta.clone();
         vec![out]
@@ -2798,7 +2854,16 @@ impl Operator for GroupBy {
                 .iter()
                 .map(|&i| chunk.value(row, i).to_string())
                 .collect();
-            let composite = parts.join("\u{1f}");
+            // Dedup composite tags null distinctly so a `null` key folds into one
+            // group and never collides with a real value (§26.2b); `parts` keeps
+            // the rendered text for the output key column.
+            let mut composite = String::new();
+            for (j, &i) in key_idx.iter().enumerate() {
+                if j > 0 {
+                    composite.push('\u{1f}');
+                }
+                push_group_key_field(&mut composite, &chunk, i, row);
+            }
             let state = self.groups.entry(composite).or_insert_with(|| GroupState {
                 key_parts: parts,
                 count: 0,
