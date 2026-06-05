@@ -827,7 +827,14 @@ fn const_column(v: &Value, n: usize) -> Column {
             }
             Column::str(c)
         }
-        Value::Null => Column::f64(vec![f64::NAN; n]),
+        // A constant `null` → an all-null column (validity = 0), not an
+        // all-valid NaN column (design 26). Not reachable today — there is no
+        // `null` literal in the syntax (§26.6) — but kept correct so a future
+        // literal / constant-fold can't silently ship NaN-as-null.
+        Value::Null => Column::new(
+            ColumnData::F64(vec![0.0; n]),
+            rivus_core::Validity::all_null(n),
+        ),
     }
 }
 

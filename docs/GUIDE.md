@@ -248,6 +248,15 @@ field (and a bare `null` in JSON); a real `""` round-trips as a quoted `""`.
 `null` is skipped by aggregations (`sum`/`avg`/`min`/`max` ignore it) and
 propagates through arithmetic (`null + x → null`).
 
+> **Transitional (v1.3.0-dev, by design).** The null model is rolling out in
+> stages. **Aggregations already skip `null`** (`sum`/`avg`/`min`/`max`), but
+> **filters/comparisons (`|?`) and `dropna`/`fill` still treat a numeric `null`
+> as its backing `0`** — so `|? age == 0` currently *also* matches a blank, and
+> `|? age > 5` excludes it. Predicate null-awareness (`null` → *not kept*, the
+> SQL semantics) and null-aware `dropna`/`fill` land in the next step (design
+> 26 STEP 2-②); whole-`null` skip in aggregation is intentionally already here.
+> Until then, to filter on missing-ness use a `:str` column and test `== ""`.
+
 `ffill`/`bfill` carry the nearest neighbour across chunk boundaries (a leading
 blank has nothing to forward-fill from, a trailing blank nothing to back-fill);
 `bfill` buffers the stream to finish (a pipeline-breaker like `sort`), `ffill`

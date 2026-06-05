@@ -201,6 +201,16 @@ impl Validity {
         Validity(None)
     }
 
+    /// An **all-null** column of `len` rows (every bit 0). Used where a value is
+    /// known missing for the whole column (e.g. a `null` constant). `len == 0`
+    /// stays the zero-cost all-valid form (no rows to be null).
+    pub fn all_null(len: usize) -> Self {
+        if len == 0 {
+            return Validity(None);
+        }
+        Validity(Some(vec![0u64; len.div_ceil(64)].into_boxed_slice()))
+    }
+
     /// Does this column carry at least one null? `false` keeps the fast path.
     pub fn has_nulls(&self) -> bool {
         self.0.is_some()
@@ -762,6 +772,18 @@ mod tests {
         a.append(&Column::i64(vec![3, 4]));
         assert!(!a.has_nulls(), "all-valid append must stay None");
         assert_eq!(a.value_at(2), Value::I64(3));
+    }
+
+    #[test]
+    fn all_null_marks_every_row_missing() {
+        // A whole-column null constant: every row is null, none is a real 0/NaN.
+        let v = Validity::all_null(70); // spans two bitmap words
+        assert!(v.has_nulls());
+        for i in 0..70 {
+            assert!(v.is_null(i), "row {i} must be null");
+        }
+        // Degenerate: zero rows can't be null, so stay zero-cost all-valid.
+        assert!(!Validity::all_null(0).has_nulls());
     }
 
     #[test]
