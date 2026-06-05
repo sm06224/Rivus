@@ -248,14 +248,15 @@ field (and a bare `null` in JSON); a real `""` round-trips as a quoted `""`.
 `null` is skipped by aggregations (`sum`/`avg`/`min`/`max` ignore it) and
 propagates through arithmetic (`null + x → null`).
 
-> **Transitional (v1.3.0-dev, by design).** The null model is rolling out in
-> stages. **Aggregations already skip `null`** (`sum`/`avg`/`min`/`max`), but
-> **filters/comparisons (`|?`) and `dropna`/`fill` still treat a numeric `null`
-> as its backing `0`** — so `|? age == 0` currently *also* matches a blank, and
-> `|? age > 5` excludes it. Predicate null-awareness (`null` → *not kept*, the
-> SQL semantics) and null-aware `dropna`/`fill` land in the next step (design
-> 26 STEP 2-②); whole-`null` skip in aggregation is intentionally already here.
-> Until then, to filter on missing-ness use a `:str` column and test `== ""`.
+> **Null semantics (design 26).** A comparison with a `null` operand is
+> **false**, so a filter never keeps a null row: `|? age == 0` matches only a
+> real `0` (not a blank), and `|? age >= 0` excludes the blank. `dropna` drops
+> rows that are `null` in a target column (not a real `""`/`0`); `fill col V`
+> replaces `null` cells on any lane (`fill age 0` works on a numeric column).
+> Aggregations skip `null`; group-by / `distinct` fold all nulls into one key
+> (distinct from a real `""`); `sort` orders nulls last (ascending) / first
+> (descending). An explicit `is null` / `is not null` predicate to *select*
+> missing rows is planned (§25 syntax v2).
 
 `ffill`/`bfill` carry the nearest neighbour across chunk boundaries (a leading
 blank has nothing to forward-fill from, a trailing blank nothing to back-fill);
