@@ -177,7 +177,14 @@ fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
         }
         ColumnData::Str(s) => {
             let cell = s.get(row);
-            if cell.bytes().any(|b| b == delim) || cell.contains('"') || cell.contains('\n') {
+            // A real empty string is written **quoted** (`""`) so it round-trips
+            // back to an empty string — an *unquoted* empty field is reserved for
+            // `null` (handled above). Design 26 §26.5.
+            if cell.is_empty()
+                || cell.bytes().any(|b| b == delim)
+                || cell.contains('"')
+                || cell.contains('\n')
+            {
                 line.push('"');
                 for ch in cell.chars() {
                     if ch == '"' {

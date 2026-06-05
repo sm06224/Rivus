@@ -250,7 +250,9 @@ a blank numeric cell collapsed to `0`, so a blank was indistinguishable from a
 real zero. **After:** a blank (or unparseable) numeric/date/time cell reads as
 `null`, so missing-ness is detectable on every lane — you no longer have to
 declare a column `:str` to spot its blanks. A `null` renders as an empty CSV
-field (and a bare `null` in JSON); a real `""` round-trips as a quoted `""`.
+field (and a bare `null` in JSON); a real `""` is written as a quoted `""`. So
+`null`, `""` and `0` survive **read → write → read** as three distinct cells
+(§26.5 symmetry; the round-trip is idempotent).
 `null` is skipped by aggregations (`sum`/`avg`/`min`/`max` ignore it) and
 propagates through arithmetic (`null + x → null`).
 
