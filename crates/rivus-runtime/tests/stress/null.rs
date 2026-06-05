@@ -416,3 +416,154 @@ fn sort_orders_nulls_last_ascending_first_descending() {
         "descending: null then 40,25,5",
     );
 }
+
+// --- STEP 2-③ aggregation rectification: COUNT(*) vs COUNT(col), first/last
+// and count_distinct over non-null (design 26 §26.2d). ---
+
+#[test]
+fn count_star_vs_count_col_distinguishes_null() {
+    // The implicit `count` is COUNT(*) = the group's row count (null included);
+    // `count:v` is COUNT(v) = the non-null tally. g=a has a null v, so a's
+    // count=2 but count_v=1.
+    let text = "g,v\na,1\na,\nb,3\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_count",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(
+            &format!("N:\n open {p} (g:str v:int)\n |# g count:v\n;"),
+            cz,
+        );
+        // Rows come out keyed by g; collect (count, count_v) by sorting on g via
+        // the count column order is group-insertion → sort both for stability.
+        let mut star = collect_i64(&res, "N", "count");
+        let mut col = collect_i64(&res, "N", "count_v");
+        star.sort_unstable();
+        col.sort_unstable();
+        assert_eq!(
+            star,
+            vec![1, 2],
+            "COUNT(*) counts all rows incl. null @cz={cz}"
+        );
+        assert_eq!(col, vec![1, 1], "COUNT(v) skips the null @cz={cz}");
+    }
+}
+
+#[test]
+fn first_last_are_first_last_non_null() {
+    // first/last skip leading/trailing nulls (§26.2d): v = null, x, y → first=x,
+    // last=y. (Rectified from "non-empty": a real "" would now count, a null
+    // never does.)
+    let text = "g,v\na,\na,x\na,y\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_firstlast",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        assert_eq!(
+            col_strings(
+                &format!("N:\n open {p} (g:str v:str)\n |# g first:v last:v\n;"),
+                cz,
+                "N",
+                "first_v"
+            ),
+            vec!["x"],
+            "first non-null is x @cz={cz}",
+        );
+        assert_eq!(
+            col_strings(
+                &format!("N:\n open {p} (g:str v:str)\n |# g first:v last:v\n;"),
+                cz,
+                "N",
+                "last_v"
+            ),
+            vec!["y"],
+            "last non-null is y @cz={cz}",
+        );
+    }
+}
+
+#[test]
+fn count_distinct_skips_null() {
+    // count_distinct counts distinct non-null values (§26.2d): v = x, null, x →
+    // 1 distinct (the null is not a value).
+    let text = "g,v\na,x\na,\na,x\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_null_cd", text.as_bytes()));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        assert_eq!(
+            collect_i64(
+                &run_src(
+                    &format!("N:\n open {p} (g:str v:str)\n |# g count_distinct:v\n;"),
+                    cz
+                ),
+                "N",
+                "count_distinct_v"
+            ),
+            vec![1],
+            "one distinct non-null value @cz={cz}",
+        );
+    }
+}
+
+#[test]
+fn groupby_count_col_serial_parallel_byte_identical() {
+    // §26.4 with the null-aware aggregates: a null-bearing group-by with
+    // count:v (and the implicit COUNT(*)) is byte-identical serial vs the
+    // parallel byte-range reader. >1 MiB file forces the Fast parallel path.
+    let rows = 300_000usize;
+    let mut text = String::from("g,v\n");
+    for i in 0..rows {
+        let g = format!("grp{:04}", i % 50);
+        let v = if i % 7 == 0 {
+            String::new() // ~1/7 null
+        } else {
+            (i % 1000).to_string()
+        };
+        text.push_str(&format!("{g},{v}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_pcount",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("G:\n open {p} (g:str v:int)\n |# g count:v min:v max:v\n;");
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join(","));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+    let (serial, _) = collect(rivus_runtime::MemoryPref::Low);
+    let (parallel, engaged) = collect(rivus_runtime::MemoryPref::Fast);
+    assert!(engaged, "parallel group-by did not engage");
+    assert_eq!(
+        parallel, serial,
+        "null-aware count:v group-by must be serial==parallel"
+    );
+}

@@ -177,15 +177,20 @@ where age >= 20, country == "JP"      # カンマ = AND（`and` と同じ）
 1 つ以上のキー列で分割し集約します。`count` 列は常に出力され、各 `func:col` が
 集約列を 1 つ追加します。関数：
 
-- 数値: `sum avg min max std`（std は標本、ddof=1）
+- 数値: `sum avg min max std`（std は標本、ddof=1）— すべて **`null` を skip**
 - パーセンタイル: `median` と `pNN`（`p50 p90 p99 …`、線形補間）
-- 異なり数: `count_distinct`（別名 `nunique`）
-- 位置: `first last`（ソース順で最初/最後の非空値）
+- **カウントの区別（COUNT(\*) vs COUNT(col)、design 26 §26.2d）**：暗黙の `count`
+  は **COUNT(\*)** ＝グループの行数（null 含む）、`count:col` は **COUNT(col)** ＝
+  その列の **非 null** 値数
+- 異なり数: `count_distinct`（別名 `nunique`）— **非 null** の異なり値（実在の
+  `""` は値、`null` は数えない）
+- 位置: `first last`（ソース順で最初/最後の **非 null** 値。全 null グループは `null`）
 
 ```
-|# country                          # → country, count
+|# country                          # → country, count   （COUNT(*)）
 |# country region sum:score         # 複数キー → country, region, count, sum_score
 |# country sum:score avg:age        # → country, count, sum_score, avg_age
+|# country count:email              # → country, count, count_email  （非 null の COUNT(email)）
 |# country median:score p90:score   # → country, count, median_score, p90_score
 |# country count_distinct:city      # → country, count, count_distinct_city
 ```
@@ -906,7 +911,7 @@ TYPE       = 'int'|'i64' | 'float'|'f64' | 'str'|'string'|'text' | 'bool'
            | 'decimal' '(' INT ')' | 'datetime' ('(' STRING ')')? | 'duration'
            | 'date' | 'time' ;
 AGG        = 'sum' | 'avg' | 'min' | 'max' | 'std'
-           | 'count_distinct' | 'nunique' | 'first' | 'last'
+           | 'count' | 'count_distinct' | 'nunique' | 'first' | 'last'
            | 'median' | 'p' DIGITS ;   (percentile, 0..=100)
 CMP        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
 ```

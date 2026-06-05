@@ -177,15 +177,21 @@ Select columns, rename them, or compute new ones. Each item is one of:
 Partition by one or more key columns and aggregate. A `count` column is always
 emitted; each `func:col` adds one aggregate. Functions:
 
-- numeric: `sum avg min max std` (std is sample, ddof=1)
+- numeric: `sum avg min max std` (std is sample, ddof=1) — all **skip `null`**
 - percentiles: `median` and `pNN` (`p50 p90 p99 …`, linear interpolation)
-- distinct count: `count_distinct` (alias `nunique`)
-- positional: `first last` (first/last non-empty value in source order)
+- **counts (the COUNT(\*) vs COUNT(col) distinction, design 26 §26.2d):** the
+  implicit `count` is **COUNT(\*)** = the group's row count (nulls included);
+  `count:col` is **COUNT(col)** = the number of **non-null** values of a column
+- distinct count: `count_distinct` (alias `nunique`) — distinct **non-null**
+  values (a real `""` is a value, a `null` is not)
+- positional: `first last` — the first/last **non-null** value in source order
+  (an all-null group yields `null`)
 
 ```
-|# country                          # → country, count
+|# country                          # → country, count   (COUNT(*))
 |# country region sum:score         # multi-key: → country, region, count, sum_score
 |# country sum:score avg:age        # → country, count, sum_score, avg_age
+|# country count:email              # → country, count, count_email   (non-null COUNT(email))
 |# country median:score p90:score   # → country, count, median_score, p90_score
 |# country count_distinct:city      # → country, count, count_distinct_city
 ```
@@ -942,7 +948,7 @@ primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
 FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
 TYPE       = 'int'|'i64' | 'float'|'f64' | 'str'|'string'|'text' | 'bool' | 'decimal' '(' INT ')' ;
 AGG        = 'sum' | 'avg' | 'min' | 'max' | 'std'
-           | 'count_distinct' | 'nunique' | 'first' | 'last'
+           | 'count' | 'count_distinct' | 'nunique' | 'first' | 'last'
            | 'median' | 'p' DIGITS ;   (percentile, 0..=100)
 CMP        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
 ```
