@@ -68,7 +68,7 @@ hidden serialization / opaque optimizer / runtime magic without observability。
 | 23 | [datetime-and-reshape](23-datetime-and-reshape.md) | 一部 | 日時/日付/時刻レーン（実装済）・list/set/join 集計・pivot/unpivot（計画） |
 | 24 | [validation](24-validation.md) | 一部 | バリデーション層（`\|!` warn/reject/halt 実装済・宣言ルール/quarantine 計画）。`#80`/`#81` を収斂 |
 | 25 | [syntax-v2](25-syntax-v2.md) | 一部 | 構文 v2（fmt・コメント trivia・分岐 round-trip・`\| name` 再利用・`$x` 値ホール 実装済／signature・以降 計画）。Epic `#86`/`#87` |
-| 26 | [null-model](26-null-model.md) | 設計中 | null モデル（列ごと validity bitmap・null/empty/0 区別・述語/順序/伝播/集約セマンティクス・null 込み byte-identity・sink round-trip）。`#81`（BUG-A の本丸） |
+| 26 | [null-model](26-null-model.md) | 一部 | null モデル（列ごと validity bitmap・null/empty/0 区別・述語/順序/伝播/集約セマンティクス・null 込み byte-identity・sink round-trip）。`#81`（BUG-A の本丸）。**STEP 2-① 実装済**：core validity・reader null 化・算術伝播・集約 null skip・null 込み byte-identity。operators/dropna（2-②）・集約整流（2-③）・sink round-trip 完全版（2-④）は計画 |
 
 ## 段階設計（MVP → 最適化 → JIT/分散）
 

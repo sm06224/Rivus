@@ -12,7 +12,7 @@
 //! doesn't fit the fast paths falls back to the owned-`Value` interpreter, so
 //! results are identical.
 
-use rivus_core::{Chunk, Column, DataType, StrColumn, Value};
+use rivus_core::{Chunk, Column, ColumnData, DataType, StrColumn, Validity, Value};
 use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func};
 use std::cmp::Ordering;
 
@@ -109,15 +109,17 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
         Func::Floor => num_value(arg(0), f64::floor),
         Func::Ceil => num_value(arg(0), f64::ceil),
         Func::Coalesce => {
-            // First argument whose text form is non-empty, kept as-is (preserves
-            // its lane). Empty string if every argument is empty/null.
+            // First **non-null** argument, kept as-is (preserves its lane). A
+            // real empty string `""` is non-null, so it is now returned (design
+            // 26 §26.2(c) / §26.7: rectified from "non-empty" to "non-null").
+            // Every argument null → null.
             for i in 0..args.len() {
                 let v = arg(i);
-                if !v.to_string().is_empty() {
+                if !v.is_null() {
                     return v;
                 }
             }
-            Value::Str(String::new())
+            Value::Null
         }
         // Datetime field extractors (design 23). The argument is coerced to a
         // `DateTime` (a datetime cell as-is, or a text/epoch value parsed into
@@ -312,19 +314,19 @@ fn regexp_column(args: &[Expr], chunk: &Chunk) -> Column {
     let pat = regex_literal(args).unwrap_or("");
     let col = eval_column(&args[0], chunk);
     with_regex(pat, |re| match re {
-        Some(re) => Column::Bool(
+        Some(re) => Column::bool(
             (0..chunk.len)
                 .map(|r| re.is_match(&col.value_at(r).to_string()))
                 .collect(),
         ),
         // Invalid pattern → all-false (continue-first: the run doesn't panic).
-        None => Column::Bool(vec![false; chunk.len]),
+        None => Column::bool(vec![false; chunk.len]),
     })
 }
 
 #[cfg(not(feature = "regex"))]
 fn regexp_column(_args: &[Expr], chunk: &Chunk) -> Column {
-    Column::Bool(vec![false; chunk.len])
+    Column::bool(vec![false; chunk.len])
 }
 
 /// `substr(s, start, len)` with a **1-based** start (SQL / DuckDB convention):
@@ -575,32 +577,32 @@ pub(crate) fn pow10_i128(n: u8) -> Option<i128> {
 pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
     let n = col.len();
     match ty {
-        DataType::I64 => Column::I64((0..n).map(|i| to_i64(col.value_at(i))).collect()),
-        DataType::F64 => Column::F64((0..n).map(|i| to_f64(col.value_at(i))).collect()),
+        DataType::I64 => Column::i64((0..n).map(|i| to_i64(col.value_at(i))).collect()),
+        DataType::F64 => Column::f64((0..n).map(|i| to_f64(col.value_at(i))).collect()),
         DataType::Decimal { scale } => {
             // Build the unscaled i128 lane per cell (design doc 21).
             let unscaled = (0..n)
                 .map(|i| f64_to_decimal(to_f64(col.value_at(i)), scale).unscaled)
                 .collect();
-            Column::Dec(rivus_core::DecColumn { unscaled, scale })
+            Column::dec(rivus_core::DecColumn { unscaled, scale })
         }
         DataType::DateTime { unit } => {
             let ticks = (0..n).map(|i| to_i64(col.value_at(i))).collect();
-            Column::DateTime(rivus_core::DtColumn { ticks, unit })
+            Column::datetime(rivus_core::DtColumn { ticks, unit })
         }
         DataType::Duration { unit } => {
             let ticks = (0..n).map(|i| to_i64(col.value_at(i))).collect();
-            Column::Duration(rivus_core::DurColumn { ticks, unit })
+            Column::duration(rivus_core::DurColumn { ticks, unit })
         }
-        DataType::Date => Column::Date((0..n).map(|i| to_i64(col.value_at(i)) as i32).collect()),
-        DataType::Time => Column::Time((0..n).map(|i| to_i64(col.value_at(i))).collect()),
-        DataType::Bool => Column::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
+        DataType::Date => Column::date((0..n).map(|i| to_i64(col.value_at(i)) as i32).collect()),
+        DataType::Time => Column::time((0..n).map(|i| to_i64(col.value_at(i))).collect()),
+        DataType::Bool => Column::bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
         DataType::Str => {
             let mut s = StrColumn::with_capacity(n, n * 8);
             for i in 0..n {
                 s.push(&col.value_at(i).to_string());
             }
-            Column::Str(s)
+            Column::str(s)
         }
         DataType::Null => col,
     }
@@ -615,7 +617,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
         Expr::Field { name, .. } => match chunk.column(name) {
             Some(c) => c.clone(),
             // Missing field → a NaN numeric lane (continue-first).
-            None => Column::F64(vec![f64::NAN; chunk.len]),
+            None => Column::f64(vec![f64::NAN; chunk.len]),
         },
         Expr::Literal(v) => const_column(v, chunk.len),
         Expr::Cast { expr, ty } => cast_column(eval_column(expr, chunk), *ty),
@@ -632,7 +634,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 | Func::Hour
                 | Func::Minute
                 | Func::Second
-                | Func::Weekday => Column::I64(
+                | Func::Weekday => Column::i64(
                     (0..n)
                         .map(|r| to_i64(call_func(*func, args, chunk, r)))
                         .collect(),
@@ -652,7 +654,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                 | Func::Like
                 | Func::Glob
                 | Func::Regexp
-                | Func::IsWeekend => Column::Bool(
+                | Func::IsWeekend => Column::bool(
                     (0..n)
                         .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
                         .collect(),
@@ -677,7 +679,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
                     for r in 0..n {
                         s.push(&call_func(*func, args, chunk, r).to_string());
                     }
-                    Column::Str(s)
+                    Column::str(s)
                 }
             }
         }
@@ -693,7 +695,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
             let v: Vec<bool> = (0..chunk.len)
                 .map(|row| eval_predicate(expr, chunk, row))
                 .collect();
-            Column::Bool(v)
+            Column::bool(v)
         }
     }
 }
@@ -702,19 +704,24 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
 /// (all-int → I64, all-numeric → F64, all-bool → Bool, else Str). Used by
 /// row-wise expressions like `case` that don't have a native columnar form.
 pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
-    let all_int = vals
-        .iter()
-        .all(|v| matches!(v, Value::I64(_) | Value::Bool(_)));
-    let all_num = vals
-        .iter()
-        .all(|v| matches!(v, Value::I64(_) | Value::F64(_) | Value::Bool(_)));
-    let all_bool = !vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Bool(_)));
+    // Null-aware (design 26): a `Value::Null` is *missing* — it does not force
+    // the column to the string lane, and it carries validity = 0 (the backing
+    // byte stays the lane default). Lane choice looks only at the non-null
+    // values, so `int op int` with a null stays the I64 lane with a null hole.
+    let bits: Vec<bool> = vals.iter().map(|v| !v.is_null()).collect();
+    let validity = Validity::from_bits(&bits);
+    let with = |data: ColumnData| Column::new(data, validity.clone());
+    let first_present = vals.iter().find(|v| !v.is_null());
+    let all = |pred: fn(&Value) -> bool| {
+        first_present.is_some() && vals.iter().filter(|v| !v.is_null()).all(pred)
+    };
+
     // All-datetime → keep the datetime lane (e.g. `trunc(ts, "day")`), carrying
-    // the first cell's unit (every cell shares it). Design 23.
-    if let Some(Value::DateTime(first)) = vals.first() {
-        if vals.iter().all(|v| matches!(v, Value::DateTime(_))) {
+    // the first non-null cell's unit (every cell shares it). Design 23.
+    if let Some(Value::DateTime(first)) = first_present {
+        if all(|v| matches!(v, Value::DateTime(_))) {
             let unit = first.unit;
-            return Column::DateTime(rivus_core::DtColumn {
+            return with(ColumnData::DateTime(rivus_core::DtColumn {
                 ticks: vals
                     .iter()
                     .map(|v| match v {
@@ -723,14 +730,14 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
                     })
                     .collect(),
                 unit,
-            });
+            }));
         }
     }
     // All-duration → keep the duration lane (e.g. `ts2 - ts1`). Design 23 / #57.
-    if let Some(Value::Duration(first)) = vals.first() {
-        if vals.iter().all(|v| matches!(v, Value::Duration(_))) {
+    if let Some(Value::Duration(first)) = first_present {
+        if all(|v| matches!(v, Value::Duration(_))) {
             let unit = first.unit;
-            return Column::Duration(rivus_core::DurColumn {
+            return with(ColumnData::Duration(rivus_core::DurColumn {
                 ticks: vals
                     .iter()
                     .map(|v| match v {
@@ -739,85 +746,95 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
                     })
                     .collect(),
                 unit,
-            });
+            }));
         }
     }
     // All-date → keep the date lane (e.g. `date(ts)`). Integer epoch-day, #58.
-    if vals.first().is_some_and(|v| matches!(v, Value::Date(_)))
-        && vals.iter().all(|v| matches!(v, Value::Date(_)))
-    {
-        return Column::Date(
+    if matches!(first_present, Some(Value::Date(_))) && all(|v| matches!(v, Value::Date(_))) {
+        return with(ColumnData::Date(
             vals.iter()
                 .map(|v| match v {
                     Value::Date(d) => d.epoch_day,
                     _ => 0,
                 })
                 .collect(),
-        );
+        ));
     }
     // All-time → keep the time-of-day lane (e.g. `time(ts)`). Integer ticks, #58.
-    if vals.first().is_some_and(|v| matches!(v, Value::Time(_)))
-        && vals.iter().all(|v| matches!(v, Value::Time(_)))
-    {
-        return Column::Time(
+    if matches!(first_present, Some(Value::Time(_))) && all(|v| matches!(v, Value::Time(_))) {
+        return with(ColumnData::Time(
             vals.iter()
                 .map(|v| match v {
                     Value::Time(t) => t.ticks,
                     _ => 0,
                 })
                 .collect(),
-        );
+        ));
     }
+    let all_bool = all(|v| matches!(v, Value::Bool(_)));
+    let all_int = all(|v| matches!(v, Value::I64(_) | Value::Bool(_)));
+    let all_num = all(|v| matches!(v, Value::I64(_) | Value::F64(_) | Value::Bool(_)));
     if all_bool {
-        Column::Bool(
+        with(ColumnData::Bool(
             vals.iter()
                 .map(|v| matches!(v, Value::Bool(true)))
                 .collect(),
-        )
+        ))
     } else if all_int {
-        Column::I64(
+        with(ColumnData::I64(
             vals.iter()
                 .map(|v| v.as_f64().unwrap_or(0.0) as i64)
                 .collect(),
-        )
+        ))
     } else if all_num {
-        Column::F64(vals.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect())
+        with(ColumnData::F64(
+            vals.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect(),
+        ))
     } else {
+        // Mixed / all-null → string lane. A null still renders empty (validity
+        // carries the null-ness), a real value keeps its text form.
         let mut s = StrColumn::with_capacity(vals.len(), vals.len() * 8);
         for v in &vals {
             s.push(&v.to_string());
         }
-        Column::Str(s)
+        with(ColumnData::Str(s))
     }
 }
 
 fn const_column(v: &Value, n: usize) -> Column {
     match v {
-        Value::I64(x) => Column::I64(vec![*x; n]),
-        Value::F64(x) => Column::F64(vec![*x; n]),
-        Value::Dec(d) => Column::Dec(rivus_core::DecColumn {
+        Value::I64(x) => Column::i64(vec![*x; n]),
+        Value::F64(x) => Column::f64(vec![*x; n]),
+        Value::Dec(d) => Column::dec(rivus_core::DecColumn {
             unscaled: vec![d.unscaled; n],
             scale: d.scale,
         }),
-        Value::DateTime(t) => Column::DateTime(rivus_core::DtColumn {
+        Value::DateTime(t) => Column::datetime(rivus_core::DtColumn {
             ticks: vec![t.ticks; n],
             unit: t.unit,
         }),
-        Value::Duration(d) => Column::Duration(rivus_core::DurColumn {
+        Value::Duration(d) => Column::duration(rivus_core::DurColumn {
             ticks: vec![d.ticks; n],
             unit: d.unit,
         }),
-        Value::Date(d) => Column::Date(vec![d.epoch_day; n]),
-        Value::Time(t) => Column::Time(vec![t.ticks; n]),
-        Value::Bool(x) => Column::Bool(vec![*x; n]),
+        Value::Date(d) => Column::date(vec![d.epoch_day; n]),
+        Value::Time(t) => Column::time(vec![t.ticks; n]),
+        Value::Bool(x) => Column::bool(vec![*x; n]),
         Value::Str(s) => {
             let mut c = StrColumn::with_capacity(n, s.len() * n);
             for _ in 0..n {
                 c.push(s);
             }
-            Column::Str(c)
+            Column::str(c)
         }
-        Value::Null => Column::F64(vec![f64::NAN; n]),
+        // A constant `null` → an all-null column (validity = 0), not an
+        // all-valid NaN column (design 26). Not reachable today — there is no
+        // `null` literal in the syntax (§26.6) — but kept correct so a future
+        // literal / constant-fold can't silently ship NaN-as-null.
+        Value::Null => Column::new(
+            ColumnData::F64(vec![0.0; n]),
+            rivus_core::Validity::all_null(n),
+        ),
     }
 }
 
@@ -827,25 +844,25 @@ fn const_column(v: &Value, n: usize) -> Column {
 /// arithmetic path inspects the column's lane for typed temporal ops (#57)
 /// before falling back here.
 fn col_num_lane(col: Column) -> (Vec<f64>, bool) {
-    match col {
-        Column::I64(v) => (v.iter().map(|&x| x as f64).collect(), true),
-        Column::Bool(v) => (v.iter().map(|&x| if x { 1.0 } else { 0.0 }).collect(), true),
-        Column::F64(v) => (v, false),
-        Column::Dec(d) => {
+    match col.into_data() {
+        ColumnData::I64(v) => (v.iter().map(|&x| x as f64).collect(), true),
+        ColumnData::Bool(v) => (v.iter().map(|&x| if x { 1.0 } else { 0.0 }).collect(), true),
+        ColumnData::F64(v) => (v, false),
+        ColumnData::Dec(d) => {
             let pow = 10f64.powi(d.scale as i32);
             (d.unscaled.iter().map(|&u| u as f64 / pow).collect(), false)
         }
         // DateTime arithmetic operates on the raw integer tick lane (epoch ticks
         // at the column's unit); diffs/offsets stay integer.
-        Column::DateTime(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
+        ColumnData::DateTime(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
         // Duration likewise rides the integer tick lane (#57).
-        Column::Duration(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
+        ColumnData::Duration(d) => (d.ticks.iter().map(|&t| t as f64).collect(), true),
         // Date arithmetic operates on the integer epoch-day lane (#58); diffs /
         // day-offsets stay integer.
-        Column::Date(v) => (v.iter().map(|&x| x as f64).collect(), true),
+        ColumnData::Date(v) => (v.iter().map(|&x| x as f64).collect(), true),
         // Time-of-day rides the integer tick lane too (#58).
-        Column::Time(v) => (v.iter().map(|&x| x as f64).collect(), true),
-        Column::Str(s) => {
+        ColumnData::Time(v) => (v.iter().map(|&x| x as f64).collect(), true),
+        ColumnData::Str(s) => {
             let lane = (0..s.len())
                 .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
                 .collect();
@@ -943,19 +960,30 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk) -> Column {
     // Typed temporal arithmetic (exact i64; #57) when either side is a datetime
     // or duration lane. Peek row 0: if the combination isn't a temporal op (e.g.
     // datetime+datetime), fall through to the numeric path unchanged.
-    let temporal = matches!(lc, Column::DateTime(_) | Column::Duration(_))
-        || matches!(rc, Column::DateTime(_) | Column::Duration(_));
+    let temporal = matches!(lc.data(), ColumnData::DateTime(_) | ColumnData::Duration(_))
+        || matches!(rc.data(), ColumnData::DateTime(_) | ColumnData::Duration(_));
     if temporal && (n == 0 || temporal_op(&lc.value_at(0), op, &rc.value_at(0)).is_some()) {
         let vals: Vec<Value> = (0..n)
             .map(|i| temporal_op(&lc.value_at(i), op, &rc.value_at(i)).unwrap_or(Value::Null))
             .collect();
         return column_from_values(vals);
     }
+    // Null propagation (design 26 §26.2(c)): a result row is null iff either
+    // operand is null there. All-valid operands keep the zero-cost path.
+    let out_validity = if lc.has_nulls() || rc.has_nulls() {
+        Validity::from_bits(
+            &(0..n)
+                .map(|i| !lc.is_null(i) && !rc.is_null(i))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        Validity::all_valid()
+    };
     let (lf, li) = col_num_lane(lc);
     let (rf, ri) = col_num_lane(rc);
     // Integer lane only when both sides are integers and the op preserves it
     // (division always yields a float, matching pandas/SQL `/` semantics).
-    if li && ri && op != ArithOp::Div {
+    let data = if li && ri && op != ArithOp::Div {
         let out: Vec<i64> = (0..n)
             .map(|i| {
                 let a = lf[i] as i64;
@@ -975,7 +1003,7 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk) -> Column {
                 }
             })
             .collect();
-        Column::I64(out)
+        ColumnData::I64(out)
     } else {
         let out: Vec<f64> = (0..n)
             .map(|i| {
@@ -990,8 +1018,9 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk) -> Column {
                 }
             })
             .collect();
-        Column::F64(out)
-    }
+        ColumnData::F64(out)
+    };
+    Column::new(data, out_validity)
 }
 
 /// Evaluate a predicate expression for a single row.
@@ -1123,7 +1152,7 @@ fn dec_field_vs_literal(
 ) -> Option<bool> {
     let dec_cell = |e: &Expr| -> Option<(i128, u8)> {
         if let Expr::Field { name, .. } = e {
-            if let Some(Column::Dec(d)) = chunk.column(name) {
+            if let Some(ColumnData::Dec(d)) = chunk.column(name).map(|c| c.data()) {
                 return Some((d.unscaled[row], d.scale));
             }
         }
@@ -1161,8 +1190,8 @@ fn dec_field_vs_literal(
 fn as_str<'a>(e: &'a Expr, chunk: &'a Chunk, row: usize) -> Option<&'a str> {
     match e {
         Expr::Literal(Value::Str(s)) => Some(s),
-        Expr::Field { name, .. } => match chunk.column(name)? {
-            Column::Str(s) => Some(s.get(row)),
+        Expr::Field { name, .. } => match chunk.column(name)?.data() {
+            ColumnData::Str(s) => Some(s.get(row)),
             _ => None,
         },
         _ => None,
@@ -1174,23 +1203,23 @@ fn as_str<'a>(e: &'a Expr, chunk: &'a Chunk, row: usize) -> Option<&'a str> {
 fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
     match e {
         Expr::Literal(v) => v.as_f64(),
-        Expr::Field { name, .. } => match chunk.column(name)? {
-            Column::I64(v) => Some(v[row] as f64),
-            Column::F64(v) => Some(v[row]),
-            Column::Dec(d) => Some(d.unscaled[row] as f64 / 10f64.powi(d.scale as i32)),
+        Expr::Field { name, .. } => match chunk.column(name)?.data() {
+            ColumnData::I64(v) => Some(v[row] as f64),
+            ColumnData::F64(v) => Some(v[row]),
+            ColumnData::Dec(d) => Some(d.unscaled[row] as f64 / 10f64.powi(d.scale as i32)),
             // Datetime is *not* read through this f64 lane: ns ticks exceed 2^53
             // and `tick as f64` would silently lose precision. A datetime field
             // routes to the owned-`Value` path → `dt_cmp` (exact i64). Design 23 / #53.
-            Column::DateTime(_) => None,
+            ColumnData::DateTime(_) => None,
             // Duration likewise stays off the f64 lane (exact i64; #57).
-            Column::Duration(_) => None,
+            ColumnData::Duration(_) => None,
             // Date routes to the exact Value path too (epoch-day compared as a
             // date, not a coerced float); #58.
-            Column::Date(_) => None,
+            ColumnData::Date(_) => None,
             // Time-of-day routes to the exact Value path too (#58).
-            Column::Time(_) => None,
-            Column::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
-            Column::Str(_) => None,
+            ColumnData::Time(_) => None,
+            ColumnData::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
+            ColumnData::Str(_) => None,
         },
         _ => None,
     }

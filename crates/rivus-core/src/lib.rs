@@ -15,7 +15,9 @@ pub mod numparse;
 pub mod schema;
 pub mod value;
 
-pub use chunk::{Chunk, ChunkMeta, Column, DecColumn, DtColumn, DurColumn, Mode, StrColumn};
+pub use chunk::{
+    Chunk, ChunkMeta, Column, ColumnData, DecColumn, DtColumn, DurColumn, Mode, StrColumn, Validity,
+};
 pub use error::{ErrorEvent, ErrorScope, Result, RivusError, Severity};
 pub use schema::{Field, Schema};
 pub use value::{DataType, Date, DateTime, Decimal, Duration, TimeOfDay, TimeUnit, Value};
@@ -31,8 +33,8 @@ mod tests {
             Field::new("age", DataType::I64),
         ]));
         let columns = vec![
-            Column::Str(["aki", "ben", "cho"].into_iter().collect()),
-            Column::I64(vec![30, 15, 40]),
+            Column::str(["aki", "ben", "cho"].into_iter().collect()),
+            Column::i64(vec![30, 15, 40]),
         ];
         Chunk::new(0, schema, columns)
     }

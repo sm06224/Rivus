@@ -23,7 +23,8 @@
 //! back to an owned, escape-aware split.
 
 use rivus_core::{
-    Column, DataType, DateTime, DecColumn, Decimal, DtColumn, Field, Schema, StrColumn, TimeUnit,
+    Column, ColumnData, DataType, DateTime, DecColumn, Decimal, DtColumn, Field, Schema, StrColumn,
+    TimeUnit, Validity,
 };
 use rivus_ir::CmpOp;
 use std::borrow::Cow;
@@ -454,19 +455,19 @@ impl CsvChunker {
                 }
                 for (k, &ci) in self.keep.iter().enumerate() {
                     let (s, e) = offsets[ci];
-                    if builders[k].push(&l[s..e]) {
+                    if builders[k].push(&l[s..e], false) {
                         self.parse_failures[k] += 1;
                     }
                 }
             } else {
                 // Quoted records take the owned slow path and skip the prefilter
                 // (rare; FilterProject still filters them downstream).
-                let fields = split_record(l, self.delim);
+                let fields = split_record_q(l, self.delim);
                 if fields.len() != self.ncols {
                     continue;
                 }
                 for (k, &ci) in self.keep.iter().enumerate() {
-                    if builders[k].push(&fields[ci]) {
+                    if builders[k].push(&fields[ci].0, fields[ci].1) {
                         self.parse_failures[k] += 1;
                     }
                 }
@@ -878,7 +879,7 @@ fn parse_parallel(
 /// Infer column types (for kept columns) and count valid / bad rows in a slice.
 fn infer_slice(slice: &str, ncols: usize, keep: &[usize], delim: u8) -> Inferred {
     let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
-    let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
+    let mut scratch: Vec<(Cow<str>, bool)> = Vec::with_capacity(ncols);
     let mut nrows = 0usize;
     let mut bad = 0usize;
     for line in slice.lines() {
@@ -892,7 +893,7 @@ fn infer_slice(slice: &str, ncols: usize, keep: &[usize], delim: u8) -> Inferred
             continue;
         }
         for (k, &ci) in keep.iter().enumerate() {
-            flags[k].observe(scratch[ci].as_ref());
+            flags[k].observe(scratch[ci].0.as_ref());
         }
         nrows += 1;
     }
@@ -912,7 +913,7 @@ fn build_slice(
         .iter()
         .map(|d| ColBuilder::with_capacity(*d, cap))
         .collect();
-    let mut scratch: Vec<Cow<str>> = Vec::with_capacity(ncols);
+    let mut scratch: Vec<(Cow<str>, bool)> = Vec::with_capacity(ncols);
     for line in slice.lines() {
         if line.trim().is_empty() {
             continue;
@@ -923,7 +924,7 @@ fn build_slice(
             continue; // identical skip rule as inference
         }
         for (k, &ci) in keep.iter().enumerate() {
-            builders[k].push(scratch[ci].as_ref());
+            builders[k].push(scratch[ci].0.as_ref(), scratch[ci].1);
         }
     }
     builders.iter_mut().map(ColBuilder::finish).collect()
@@ -962,13 +963,10 @@ fn split_lines(body: &str, n: usize) -> Vec<&str> {
 
 /// Append column `b` onto `a` (same dtype guaranteed by global inference).
 fn append_column(a: &mut Column, b: Column) {
-    match (a, b) {
-        (Column::Bool(x), Column::Bool(y)) => x.extend(y),
-        (Column::I64(x), Column::I64(y)) => x.extend(y),
-        (Column::F64(x), Column::F64(y)) => x.extend(y),
-        (Column::Str(x), Column::Str(y)) => x.append(&y),
-        _ => unreachable!("column dtype mismatch across slices"),
-    }
+    // Concatenate both the value lane and the validity bitmap (design 26): a
+    // null in a later slice stays null after the merge. All-valid slices keep
+    // the zero-cost path (`Validity::append` no-ops when both sides are None).
+    a.append(&b);
 }
 
 /// Byte offset just past the first line terminator (handles `\n` and `\r\n`).
@@ -1158,8 +1156,8 @@ impl DtSpec {
     }
 }
 
-/// A typed, pre-sized column accumulator.
-enum ColBuilder {
+/// A typed, pre-sized column value lane (the dense backing buffer).
+enum Lane {
     Bool(Vec<bool>),
     I64(Vec<i64>),
     F64(Vec<f64>),
@@ -1179,6 +1177,23 @@ enum ColBuilder {
     Str(StrColumn),
 }
 
+/// A typed, pre-sized column accumulator that also tracks **per-row validity**
+/// (the null model; design 26 §26.3). A null row keeps a type-default backing
+/// value in the lane; `valid[row] = false` records that it is missing, so
+/// `null` / empty-`""` / `0` stay distinct.
+struct ColBuilder {
+    lane: Lane,
+    /// Per-row validity, tracked **lazily**: it stays empty (no allocation, no
+    /// per-cell push) while every cell so far is valid — the common case — and
+    /// is only materialized once the first null appears (back-filling the rows
+    /// before it as valid). So an all-valid column pays *nothing* here, keeping
+    /// the reader's hot path at its pre-null-model cost (the zero-cost promise of
+    /// design 26 §26.1 extends to construction, not just representation).
+    valid: Vec<bool>,
+    /// Rows pushed so far (drives the lazy back-fill above).
+    len: usize,
+}
+
 impl ColBuilder {
     fn with_capacity(dtype: DataType, cap: usize) -> Self {
         Self::with_capacity_dt(dtype, cap, None)
@@ -1187,151 +1202,187 @@ impl ColBuilder {
     /// Like [`with_capacity`], but a `:datetime` column may carry an explicit
     /// parse spec (from `:datetime("fmt")`); `None` falls back to the auto list.
     fn with_capacity_dt(dtype: DataType, cap: usize, dt_spec: Option<Arc<DtSpec>>) -> Self {
-        match dtype {
-            DataType::Bool => ColBuilder::Bool(Vec::with_capacity(cap)),
-            DataType::I64 => ColBuilder::I64(Vec::with_capacity(cap)),
-            DataType::F64 => ColBuilder::F64(Vec::with_capacity(cap)),
-            DataType::Decimal { scale } => ColBuilder::Dec(Vec::with_capacity(cap), scale),
-            DataType::DateTime { unit } => ColBuilder::DateTime(
+        let lane = match dtype {
+            DataType::Bool => Lane::Bool(Vec::with_capacity(cap)),
+            DataType::I64 => Lane::I64(Vec::with_capacity(cap)),
+            DataType::F64 => Lane::F64(Vec::with_capacity(cap)),
+            DataType::Decimal { scale } => Lane::Dec(Vec::with_capacity(cap), scale),
+            DataType::DateTime { unit } => Lane::DateTime(
                 Vec::with_capacity(cap),
                 dt_spec.unwrap_or_else(|| Arc::new(DtSpec::auto(unit))),
             ),
-            DataType::Duration { unit } => ColBuilder::Duration(Vec::with_capacity(cap), unit),
-            DataType::Date => ColBuilder::Date(Vec::with_capacity(cap)),
-            DataType::Time => ColBuilder::Time(Vec::with_capacity(cap)),
+            DataType::Duration { unit } => Lane::Duration(Vec::with_capacity(cap), unit),
+            DataType::Date => Lane::Date(Vec::with_capacity(cap)),
+            DataType::Time => Lane::Time(Vec::with_capacity(cap)),
             // Estimate ~8 bytes per string cell for the backing byte buffer.
-            _ => ColBuilder::Str(StrColumn::with_capacity(cap, cap * 8)),
+            _ => Lane::Str(StrColumn::with_capacity(cap, cap * 8)),
+        };
+        ColBuilder {
+            lane,
+            // No pre-allocation: an all-valid column never touches `valid`.
+            valid: Vec::new(),
+            len: 0,
         }
     }
 
-    /// Parse one cell into the lane, returning `true` if a **non-empty** cell
-    /// could not be parsed and was defaulted (a malformed value or, for the
-    /// decimal lane, an `i128` overflow — #bugreport ②④). An empty cell is
-    /// "missing", not a parse failure, so it never counts (the null/empty/0
-    /// distinction is the separate null-model work). Bool/Str are lenient and
-    /// never report a failure.
+    /// Record one row's validity, materializing the bitmap lazily (see
+    /// [`ColBuilder::valid`]): while all cells are valid this is a single
+    /// counter bump; the first null back-fills the prior rows as valid.
     #[inline]
-    fn push(&mut self, cell: &str) -> bool {
+    fn record(&mut self, valid: bool) {
+        if !self.valid.is_empty() {
+            self.valid.push(valid);
+        } else if !valid {
+            self.valid = vec![true; self.len];
+            self.valid.push(false);
+        }
+        self.len += 1;
+    }
+
+    /// Parse one cell into the lane and record its validity (design 26 §26.3),
+    /// returning `true` only if a **non-empty** cell could not be parsed.
+    ///
+    /// Null-ification rules:
+    /// - An **empty** cell is *missing* → `null` (validity = 0), on every lane
+    ///   (numeric too: `0` is no longer conflated with blank — this is what
+    ///   unblocks BUG-A). It is **not** a parse failure, so it never reports.
+    /// - A **non-empty** cell that fails to parse in a typed lane → `null`
+    ///   (validity = 0) **and** reports `true` (surfaced as "… set to null",
+    ///   #80 reworded). The backing byte stays the type default.
+    /// - `Str` keeps an empty cell as a real `""` **only when it was quoted**
+    ///   (`a,"",b`); an unquoted empty (`a,,b`) is `null`, like every other lane.
+    #[inline]
+    fn push(&mut self, cell: &str, quoted: bool) -> bool {
         let t = cell.trim();
-        match self {
-            ColBuilder::Bool(v) => {
+        let (valid, fail) = match &mut self.lane {
+            Lane::Bool(v) => {
                 v.push(t == "true");
-                false
+                (!t.is_empty(), false)
             }
-            ColBuilder::I64(v) => match parse_i64_fast(t).or_else(|| t.parse::<i64>().ok()) {
+            Lane::I64(v) => match parse_i64_fast(t).or_else(|| t.parse::<i64>().ok()) {
                 Some(n) => {
                     v.push(n);
-                    false
+                    (true, false)
                 }
                 None => {
                     v.push(0);
-                    !t.is_empty()
+                    (false, !t.is_empty())
                 }
             },
-            ColBuilder::F64(v) => match t.parse::<f64>() {
+            Lane::F64(v) => match t.parse::<f64>() {
                 Ok(n) => {
                     v.push(n);
-                    false
+                    (true, false)
                 }
                 Err(_) => {
                     v.push(0.0);
-                    !t.is_empty()
+                    (false, !t.is_empty())
                 }
             },
             // Exact decimal text → unscaled i128 (no f64). A malformed cell or
-            // i128 overflow yields 0 (continue-first; §21.7) and is reported on
-            // the error stream (#bugreport ②④).
-            ColBuilder::Dec(v, scale) => match Decimal::parse_scaled(t, *scale) {
+            // i128 overflow → null (continue-first; §21.7), reported on the
+            // error stream (#bugreport ②④).
+            Lane::Dec(v, scale) => match Decimal::parse_scaled(t, *scale) {
                 Some(d) => {
                     v.push(d.unscaled);
-                    false
+                    (true, false)
                 }
                 None => {
                     v.push(0);
-                    !t.is_empty()
+                    (false, !t.is_empty())
                 }
             },
-            // Datetime text → epoch ticks; a malformed non-empty cell yields 0
-            // and is reported on the error stream, matching the other lanes (#80).
-            ColBuilder::DateTime(v, spec) => match spec.parse_opt(cell) {
+            // Datetime text → epoch ticks; a malformed non-empty cell → null,
+            // reported on the error stream, matching the other lanes (#80).
+            Lane::DateTime(v, spec) => match spec.parse_opt(cell) {
                 Some(ticks) => {
                     v.push(ticks);
-                    false
+                    (true, false)
                 }
                 None => {
                     v.push(0);
-                    !t.is_empty()
+                    (false, !t.is_empty())
                 }
             },
-            // Duration text → exact i64 ticks; a malformed non-empty cell yields 0
-            // and is reported on the error stream, matching the other lanes
+            // Duration text → exact i64 ticks; a malformed non-empty cell → null
             // (continue-first; #57, surfaced in #80).
-            ColBuilder::Duration(v, unit) => match rivus_core::Duration::parse_at(cell, *unit) {
+            Lane::Duration(v, unit) => match rivus_core::Duration::parse_at(cell, *unit) {
                 Some(d) => {
                     v.push(d.ticks);
-                    false
+                    (true, false)
                 }
                 None => {
                     v.push(0);
-                    !t.is_empty()
+                    (false, !t.is_empty())
                 }
             },
-            // Date text → i32 epoch-day; a malformed non-empty cell yields 0
-            // (1970-01-01) and is reported on the error stream, matching the
-            // other lanes (continue-first + never-silent; #58).
-            ColBuilder::Date(v) => match rivus_core::Date::parse(cell) {
+            // Date text → i32 epoch-day; a malformed non-empty cell → null
+            // (continue-first + never-silent; #58).
+            Lane::Date(v) => match rivus_core::Date::parse(cell) {
                 Some(d) => {
                     v.push(d.epoch_day);
-                    false
+                    (true, false)
                 }
                 None => {
                     v.push(0);
-                    !t.is_empty()
+                    (false, !t.is_empty())
                 }
             },
-            // Time-of-day text → i64 ticks; a malformed non-empty cell yields 0
-            // (midnight) and is reported on the error stream, like the other
-            // lanes (continue-first + never-silent; #58).
-            ColBuilder::Time(v) => {
+            // Time-of-day text → i64 ticks; a malformed non-empty cell → null
+            // (continue-first + never-silent; #58).
+            Lane::Time(v) => {
                 match rivus_core::TimeOfDay::parse_at(cell, rivus_core::TimeUnit::Sec) {
                     Some(tod) => {
                         v.push(tod.ticks);
-                        false
+                        (true, false)
                     }
                     None => {
                         v.push(0);
-                        !t.is_empty()
+                        (false, !t.is_empty())
                     }
                 }
             }
-            ColBuilder::Str(v) => {
+            // Empty unquoted `Str` is `null`; quoted `""` is a real empty string;
+            // anything non-empty is a real value (design 26 §26.3).
+            Lane::Str(v) => {
                 v.push(cell);
-                false
+                (!cell.is_empty() || quoted, false)
             }
-        }
+        };
+        self.record(valid);
+        fail
     }
 
     fn finish(&mut self) -> Column {
-        match self {
-            ColBuilder::Bool(v) => Column::Bool(std::mem::take(v)),
-            ColBuilder::I64(v) => Column::I64(std::mem::take(v)),
-            ColBuilder::F64(v) => Column::F64(std::mem::take(v)),
-            ColBuilder::Dec(v, scale) => Column::Dec(DecColumn {
+        let data = match &mut self.lane {
+            Lane::Bool(v) => ColumnData::Bool(std::mem::take(v)),
+            Lane::I64(v) => ColumnData::I64(std::mem::take(v)),
+            Lane::F64(v) => ColumnData::F64(std::mem::take(v)),
+            Lane::Dec(v, scale) => ColumnData::Dec(DecColumn {
                 unscaled: std::mem::take(v),
                 scale: *scale,
             }),
-            ColBuilder::DateTime(v, spec) => Column::DateTime(DtColumn {
+            Lane::DateTime(v, spec) => ColumnData::DateTime(DtColumn {
                 ticks: std::mem::take(v),
                 unit: spec.unit,
             }),
-            ColBuilder::Duration(v, unit) => Column::Duration(rivus_core::DurColumn {
+            Lane::Duration(v, unit) => ColumnData::Duration(rivus_core::DurColumn {
                 ticks: std::mem::take(v),
                 unit: *unit,
             }),
-            ColBuilder::Date(v) => Column::Date(std::mem::take(v)),
-            ColBuilder::Time(v) => Column::Time(std::mem::take(v)),
-            ColBuilder::Str(v) => Column::Str(std::mem::take(v)),
-        }
+            Lane::Date(v) => ColumnData::Date(std::mem::take(v)),
+            Lane::Time(v) => ColumnData::Time(std::mem::take(v)),
+            Lane::Str(v) => ColumnData::Str(std::mem::take(v)),
+        };
+        // Empty `valid` ⇒ no null ever occurred ⇒ the zero-cost all-valid form.
+        let validity = if self.valid.is_empty() {
+            Validity::all_valid()
+        } else {
+            Validity::from_bits(&self.valid)
+        };
+        self.valid = Vec::new();
+        self.len = 0;
+        Column::new(data, validity)
     }
 }
 
@@ -1583,14 +1634,17 @@ fn observe_line(
 /// Split a record into fields. Fast path: records without `"` split into
 /// borrowed slices with zero allocation. Slow path: quote/escape-aware owned
 /// split. Results are appended to `out` (reused across rows).
-fn split_into<'a>(line: &'a str, out: &mut Vec<Cow<'a, str>>, delim: u8) {
+/// Each field is paired with a `quoted` flag: `true` when its source token was
+/// quoted (so an empty `""` is a real empty string, not a `null`; design 26
+/// §26.3). The unquoted fast path is never quoted.
+fn split_into<'a>(line: &'a str, out: &mut Vec<(Cow<'a, str>, bool)>, delim: u8) {
     if !line.as_bytes().contains(&b'"') {
         for f in line.split(delim as char) {
-            out.push(Cow::Borrowed(f));
+            out.push((Cow::Borrowed(f), false));
         }
     } else {
-        for f in split_record(line, delim) {
-            out.push(Cow::Owned(f));
+        for (f, quoted) in split_record_q(line, delim) {
+            out.push((Cow::Owned(f), quoted));
         }
     }
 }
@@ -1606,10 +1660,22 @@ fn split_owned(line: &str, delim: u8) -> Vec<String> {
 
 /// Split a record on `delim`, honoring `"..."` quoting with `""` escapes.
 fn split_record(line: &str, delim: u8) -> Vec<String> {
+    split_record_q(line, delim)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect()
+}
+
+/// Like [`split_record`], but pairs each field with a `quoted` flag (`true` if
+/// the field's source token contained a quote). Lets the reader tell a quoted
+/// empty `""` (a real empty string) from an unquoted empty (`null`); design 26
+/// §26.3.
+fn split_record_q(line: &str, delim: u8) -> Vec<(String, bool)> {
     let sep = delim as char;
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
+    let mut field_quoted = false;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -1621,14 +1687,18 @@ fn split_record(line: &str, delim: u8) -> Vec<String> {
                     in_quotes = false;
                 }
             }
-            '"' => in_quotes = true,
+            '"' => {
+                in_quotes = true;
+                field_quoted = true;
+            }
             c if c == sep && !in_quotes => {
-                out.push(std::mem::take(&mut cur));
+                out.push((std::mem::take(&mut cur), field_quoted));
+                field_quoted = false;
             }
             _ => cur.push(c),
         }
     }
-    out.push(cur);
+    out.push((cur, field_quoted));
     out
 }
 
@@ -1803,15 +1873,15 @@ impl CompressedCsvReader {
             }
             for (k, &ci) in self.keep.iter().enumerate() {
                 let (s, e) = offsets[ci];
-                builders[k].push(&line[s..e]);
+                builders[k].push(&line[s..e], false);
             }
         } else {
-            let fields = split_record(line, self.delim);
+            let fields = split_record_q(line, self.delim);
             if fields.len() != self.ncols {
                 return false;
             }
             for (k, &ci) in self.keep.iter().enumerate() {
-                builders[k].push(&fields[ci]);
+                builders[k].push(&fields[ci].0, fields[ci].1);
             }
         }
         true
@@ -1885,8 +1955,8 @@ mod tests {
         assert_eq!(data.schema.fields[2].dtype, DataType::Bool);
         assert_eq!(data.schema.fields[3].dtype, DataType::Str);
         assert_eq!(data.bad_rows, 0);
-        match &data.columns[0] {
-            Column::I64(v) => assert_eq!(v, &[1, 2]),
+        match data.columns[0].data() {
+            ColumnData::I64(v) => assert_eq!(v, &[1, 2]),
             _ => panic!("expected i64"),
         }
     }
@@ -1898,8 +1968,8 @@ mod tests {
         let data = parse_projected("\u{feff}id,age\n1,30\n2,15\n", None, b',').unwrap();
         assert_eq!(data.schema.fields[0].name, "id", "BOM leaked into name");
         assert_eq!(data.schema.fields[1].name, "age");
-        match &data.columns[0] {
-            Column::I64(v) => assert_eq!(v, &[1, 2]),
+        match data.columns[0].data() {
+            ColumnData::I64(v) => assert_eq!(v, &[1, 2]),
             _ => panic!("first column should parse as i64 once the BOM is gone"),
         }
     }
@@ -1916,8 +1986,8 @@ mod tests {
     fn skips_malformed_rows() {
         let data = parse_projected("a,b\n1,2\nonly_one_field\n3,4\n", None, b',').unwrap();
         assert_eq!(data.bad_rows, 1);
-        match &data.columns[0] {
-            Column::I64(v) => assert_eq!(v, &[1, 3]),
+        match data.columns[0].data() {
+            ColumnData::I64(v) => assert_eq!(v, &[1, 3]),
             _ => panic!("expected i64"),
         }
     }
@@ -1926,12 +1996,12 @@ mod tests {
     fn handles_quoted_fields_with_commas() {
         let data =
             parse_projected("name,note\n\"a,b\",\"he said \"\"hi\"\"\"\n", None, b',').unwrap();
-        match &data.columns[0] {
-            Column::Str(v) => assert_eq!(v.get(0), "a,b"),
+        match data.columns[0].data() {
+            ColumnData::Str(v) => assert_eq!(v.get(0), "a,b"),
             _ => panic!("expected str"),
         }
-        match &data.columns[1] {
-            Column::Str(v) => assert_eq!(v.get(0), "he said \"hi\""),
+        match data.columns[1].data() {
+            ColumnData::Str(v) => assert_eq!(v.get(0), "he said \"hi\""),
             _ => panic!("expected str"),
         }
     }
