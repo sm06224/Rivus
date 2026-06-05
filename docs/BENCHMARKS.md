@@ -1123,3 +1123,40 @@ since parsing, not copying/dispatch, is the cost; measure before any further
 work. The real remaining lever stays the **selection-vector gather** on a
 genuinely gather-bound workload (multi-stage heavy predicates on cached input),
 not the parse-bound `open`.
+
+## #81 null model (STEP 2-①) — all-valid `open` regression check
+
+The null model wraps every `Column` as `{ data: ColumnData, validity: Validity }`
+with a per-column null bitmap. The promise (design 26 §26.1) is that an
+**all-valid** column — the common case — costs *nothing*: `validity = None`, the
+dense lane is the former representation byte-for-byte, and (after the lazy-
+tracking fix) the reader does no per-cell validity work until a null appears.
+This measures that promise on the parse-bound `open` path.
+
+- **Workload**: `gen clean --rows 5_000_000 --seed 7` (171 MB, 6 columns, **no
+  nulls**), declared schema `(id:int name:str age:int score:int country:bool…)`,
+  flow `open → |? age>=0 → |> id age score → save`. Serial reader
+  (`RIVUS_NO_PARALLEL=1`); `open` node `busy_ms` via `--json`. 8 runs each,
+  4 vCPU.
+- **Before** = `bd9143c` (the move-only test split; old `enum Column`, no null
+  model). **After** = the null model + lazy ColBuilder validity.
+
+| `open` busy_ms (5 M rows, all-valid) | min | median | max |
+|---|---:|---:|---:|
+| before (pre-null-model) | 1098 | 1114 | 1226 |
+| after (null model, all-valid path) | 1109 | 1140 | 1204 |
+
+**Result: no measurable regression.** The two ranges overlap heavily (the
+before *max* 1226 exceeds the after *max* 1204); on the least-noisy **min** the
+delta is **+11 ms (+1.0 %)** — within run-to-run jitter (the bands are ~110 ms
+wide). The dense parse loop is unchanged machine code (`match col.data() { … }`
+reads the same `&[T]`), and lazy validity tracking means an all-valid column
+never allocates or fills a bitmap. Throughput ≈ **155 MB/s** serial, unchanged.
+
+Null-bearing data pays only where it must: a column that actually carries a null
+allocates a 1 bit/row bitmap (and the reader back-fills once, at the first null).
+That cost is gated behind `has_nulls()` and never touches all-valid columns. The
+`Validity::gather`/`append` helpers currently materialize through a `Vec<bool>`
+(correctness-first); they are gated by `has_nulls()`, so all-valid data skips
+them entirely, and they are a candidate for bit-twiddling once a null-heavy
+workload proves the win.
