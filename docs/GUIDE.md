@@ -254,7 +254,9 @@ field (and a bare `null` in JSON); a real `""` is written as a quoted `""`. So
 `null`, `""` and `0` survive **read → write → read** as three distinct cells
 (§26.5 symmetry; the round-trip is idempotent).
 `null` is skipped by aggregations (`sum`/`avg`/`min`/`max` ignore it) and
-propagates through arithmetic (`null + x → null`).
+propagates through arithmetic (`null + x → null`). Null-bearing data stays
+**byte-identical across serial, parallel and any chunk size** — null positions
+are positional and ride the merge path unchanged (§26.4).
 
 > **Null semantics (design 26).** A comparison with a `null` operand is
 > **false**, so a filter never keeps a null row: `|? age == 0` matches only a

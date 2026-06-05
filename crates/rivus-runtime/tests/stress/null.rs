@@ -715,3 +715,138 @@ fn csv_round_trip_is_idempotent_chunk_size_independent() {
         assert_eq!(a, b, "round-trip must be a fixed point @cz={cz}");
     }
 }
+
+// --- STEP 2-⑤ parallel-merge null byte-identity (design 26 §26.4): the merge
+// path (byte-range reader concat + parallel group-by fold) is serial ==
+// parallel == chunk-size on null-bearing data. ---
+
+/// Run `flow` serial (MemoryPref::Low) and parallel (Fast), returning the
+/// sorted output lines of label `L` and whether parallel workers engaged.
+fn serial_vs_parallel(flow: &str, label: &str) -> (Vec<String>, Vec<String>, bool) {
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some(label))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join("\u{1f}"));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+    let (serial, _) = collect(rivus_runtime::MemoryPref::Low);
+    let (parallel, engaged) = collect(rivus_runtime::MemoryPref::Fast);
+    (serial, parallel, engaged)
+}
+
+#[test]
+fn parallel_group_null_keys_fold_byte_identical() {
+    // A null group KEY must fold into one group identically on the serial and
+    // parallel paths (the null-tagged composite key is worker-independent). ~1/9
+    // of the key column is null. >1 MiB file forces the parallel path.
+    let rows = 300_000usize;
+    let mut text = String::from("g,v\n");
+    for i in 0..rows {
+        let g = if i % 9 == 0 {
+            String::new() // null key
+        } else {
+            format!("grp{:04}", i % 40)
+        };
+        text.push_str(&format!("{g},{}\n", i % 1000));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_pkey",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("G:\n open {p} (g:str v:int)\n |# g count:v min:v max:v\n;");
+    let (serial, parallel, engaged) = serial_vs_parallel(&flow, "G");
+    assert!(engaged, "parallel group-by did not engage");
+    assert_eq!(
+        parallel, serial,
+        "null-key group-by must be serial == parallel"
+    );
+    // The null group is present (its key renders empty) — sanity that we tested it.
+    assert!(
+        serial.iter().any(|l| l.starts_with('\u{1f}')),
+        "expected a null-key group"
+    );
+}
+
+#[test]
+fn parallel_group_null_aggs_byte_identical() {
+    // Every parallel-safe, null-aware aggregate over a null-bearing column must
+    // merge byte-identically: count:v (non-null tally), min/max (skip null),
+    // count_distinct (non-null distinct), first/last (non-null, source order).
+    let rows = 300_000usize;
+    let mut text = String::from("g,v\n");
+    for i in 0..rows {
+        let g = format!("grp{:03}", i % 40);
+        let v = if i % 7 == 0 {
+            String::new() // ~1/7 null
+        } else {
+            format!("val{:03}", i % 200)
+        };
+        text.push_str(&format!("{g},{v}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_paggs",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow =
+        format!("G:\n open {p} (g:str v:str)\n |# g count:v count_distinct:v first:v last:v\n;");
+    let (serial, parallel, engaged) = serial_vs_parallel(&flow, "G");
+    assert!(engaged, "parallel group-by did not engage");
+    assert_eq!(
+        parallel, serial,
+        "null-aware aggregates must be serial == parallel"
+    );
+}
+
+#[test]
+fn parallel_group_all_null_column_byte_identical() {
+    // A column that is entirely null in some groups: count:v = 0, first/last =
+    // null, min/max = null. Serial and parallel must agree (all-null merge).
+    let rows = 200_000usize;
+    let mut text = String::from("g,v\n");
+    for i in 0..rows {
+        let g = format!("grp{:03}", i % 30);
+        // group 0 is entirely null; others have values.
+        let v = if i % 30 == 0 {
+            String::new()
+        } else {
+            (i % 500).to_string()
+        };
+        text.push_str(&format!("{g},{v}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_null_pallnull",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("G:\n open {p} (g:str v:int)\n |# g count count:v min:v max:v\n;");
+    let (serial, parallel, engaged) = serial_vs_parallel(&flow, "G");
+    assert!(engaged, "parallel group-by did not engage");
+    assert_eq!(
+        parallel, serial,
+        "all-null-group aggregates must be serial == parallel"
+    );
+}
