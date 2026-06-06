@@ -1,5 +1,14 @@
 # 27. Filesystem integration — 実 ETL 移行のためのファイル入出力拡張
 
+> **再編注記（2026-06-06, §00 North Star 据え置きに伴う）**: 本書は **§00 North Star の
+> ピラー1「I/O サブストレート」の一部に再編**される。North Star では I/O を
+> **Discovery→Transport→Codec→Provenance の直交基盤**・**handle 第一級値型 `Resource`**・
+> **discovery-as-flow** として形式非依存に一般化する（§00 0.6）。本書の 6 項目はその具体
+> ユースケースで、`filename` 列（slice 1, #114 系）は `with source` の特殊形として残る。
+> **slice 2 以降（再帰入力・動的/分割出力・長パス・Unicode）は Phase 1（I/O サブストレート）
+> の design doc を批准してから**、その枠組みの中で進める（CSV 寄りスライス積み上げは一旦
+> 停止）。本書はユースケース集として維持。
+
 > 統括方針（2026-06-06, 申し送り経由）: **DuckDB ベースの実 ETL を Rivus に移行**できる
 > ようにする「移行トラック」テーマ2。テーマ1（DuckDB 件数パリティ＝null 扱いで件数を
 > ズラさない）は landed（join null キー非マッチ＋パリティ・オラクル）。本書はテーマ2の

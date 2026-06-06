@@ -1,5 +1,13 @@
 # Rivus Revision Plan (改修計画)
 
+> **North Star (canon):** the long-term vision and root architecture live in
+> [`docs/design/00-north-star.md`](design/00-north-star.md) — Rivus is a
+> dataflow-specialized language **and** a unified execution / visualization /
+> control substrate (IR as the only currency; interpret == compile == distribute
+> by byte-identity; orthogonal edge I/O). This backlog is the near-term path
+> *under* that North Star; the I/O substrate (Pillar 1) supersedes the
+> CSV-centric slices once its design doc is ratified.
+
 A living, prioritized backlog. Each item has a **status** — ✅ done · 🚧 in
 progress · 📋 planned — and a short design note so work can be picked up
 incrementally. Driven by the project philosophy: *Stream correctness >
