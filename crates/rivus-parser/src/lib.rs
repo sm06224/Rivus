@@ -755,6 +755,16 @@ impl Parser {
                 } else {
                     (None, Vec::new())
                 };
+                // Optional `with filename`: append a `filename` provenance column
+                // (design 27 §27.1; CSV only for now).
+                let want_filename = self.peek_is_word("with");
+                if want_filename {
+                    self.bump(); // `with`
+                    if !self.peek_is_word("filename") {
+                        return Err(self.err("expected `filename` after `with`"));
+                    }
+                    self.bump(); // `filename`
+                }
                 let delim = resolve_delim(&path, explicit.as_deref());
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
@@ -764,6 +774,7 @@ impl Parser {
                     header,
                     declared,
                     dt_formats,
+                    with_filename,
                     ..
                 } = &mut op
                 {
@@ -772,6 +783,9 @@ impl Parser {
                     }
                     *declared = decl;
                     *dt_formats = dtf;
+                    *with_filename = want_filename;
+                } else if want_filename {
+                    return Err(self.err("`with filename` is supported on CSV/TSV sources only"));
                 }
                 Ok(self.g.add_node(op))
             }
@@ -787,6 +801,7 @@ impl Parser {
                     header: true,
                     declared: None,
                     dt_formats: Vec::new(),
+                    with_filename: false,
                 }))
             }
             Tok::Word(w) if w == "readjson" => {
@@ -1357,6 +1372,7 @@ impl Format {
                 declared: None,
                 dt_formats: Vec::new(),
                 delim,
+                with_filename: false,
             },
             // The JSON reader accepts both NDJSON and a top-level array, so both
             // surface forms open the same source.

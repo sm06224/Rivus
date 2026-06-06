@@ -30,6 +30,7 @@ mod tests {
             declared: None,
             dt_formats: Vec::new(),
             delim: b',',
+            with_filename: false,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {
@@ -56,6 +57,7 @@ mod tests {
             declared: None,
             dt_formats: Vec::new(),
             delim: b',',
+            with_filename: false,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {

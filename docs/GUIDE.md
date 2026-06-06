@@ -81,6 +81,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), `duration` (signed time spans), `date` (ISO `yyyy-MM-dd` calendar dates), or `time` (`HH:mm:ss` time-of-day; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
+| `open PATH with filename` | append a **`filename`** column carrying each row's source path (provenance; design 27). Off by default. CSV/TSV only for now; reads serially. e.g. `open data.csv with filename` or `open data.csv (id:int v:str) with filename` |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |

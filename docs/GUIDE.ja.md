@@ -84,6 +84,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH.gz` / `PATH.zst` | **圧縮** CSV/TSV — gzip（`.gz`、`--features gzip`）または zstd（`.zst`/`.zstd`、`--features zstd`）。直列・単一パス・有界メモリ。既定（依存ゼロ）ビルドは `rebuild with --features gzip`/`zstd` を促すエラー |
 | `open PATH noheader` | ヘッダ行なし CSV — 全行がデータ、列名は `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定 — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点）, `datetime[("fmt")]`（厳密な時刻）, `duration`（符号付き時間量）, `date`（ISO `yyyy-MM-dd` の暦日）, `time`（`HH:mm:ss` の時刻、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む。`open log.csv (ts:datetime("yyMMddHHmmss"))` は `ts` を時刻として読む |
+| `open PATH with filename` | 各行に由来パスを持つ **`filename`** 列を付与（provenance、design 27）。既定オフ。当面 CSV/TSV のみ・直列読み。例 `open data.csv with filename` / `open data.csv (id:int v:str) with filename` |
 | `readcsv PATH` | CSV を明示 |
 | `readjson PATH` | JSON / JSON Lines を明示 |
 | `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ） |

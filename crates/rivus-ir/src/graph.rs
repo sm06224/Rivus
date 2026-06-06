@@ -296,6 +296,10 @@ pub enum Op {
         /// `.tsv`/`.tab` file or `open f.x as tsv`. Std-only — the reader just
         /// splits on a different byte.
         delim: u8,
+        /// `open … with filename` — append a `filename` `Str` column carrying
+        /// each row's source path (provenance; design 27 §27.1). Off by default
+        /// (zero regression: no extra column unless asked).
+        with_filename: bool,
     },
     /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
     /// binary records (a C struct dump). `endian` selects byte order;
@@ -575,6 +579,7 @@ impl Op {
                 declared,
                 dt_formats,
                 delim,
+                with_filename,
             } => {
                 let mut s = format!("open {path}");
                 if !header {
@@ -602,6 +607,9 @@ impl Op {
                         })
                         .collect();
                     s.push_str(&format!(" ({})", parts.join(" ")));
+                }
+                if *with_filename {
+                    s.push_str(" with filename");
                 }
                 if let Some(cols) = projection {
                     s.push_str(&format!("  # read-only: {}", cols.join(",")));

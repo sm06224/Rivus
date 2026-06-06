@@ -130,7 +130,7 @@ partitioned output → long-path / Unicode.
 
 | | item | note |
 |---|---|---|
-| 📋 | **`filename` implicit column** | DuckDB-equivalent provenance: tag each row with its source path (opt-in, since it adds a column). The anchor for multi-file reads. |
+| ✅ | **`filename` implicit column** | **slice 1 landed** — `open … with filename` appends a `filename` `Str` column = each row's source path (opt-in; DuckDB-equivalent provenance; the anchor for multi-file reads). CSV/TSV; reversible (`to_source` re-emits `with filename`); reads serially for now (byte-range threading is a follow-up). |
 | 📋 | **Recursive glob + filter input** | PowerShell `gci -re`-equivalent: recursively enumerate a directory, filter by pattern, and read the matching **file set** as one input stream. |
 | 📋 | **Dynamic output filenames** | generate the output path from data / column values (a template), not a fixed name. |
 | 📋 | **Dynamic output routing / partitioned writes** | DuckDB `PARTITION BY`-equivalent: split the output across files by a key/filter. Pipeline-breaker bounded by partition cardinality. |

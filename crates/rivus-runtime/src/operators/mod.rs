@@ -241,6 +241,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             declared,
             dt_formats,
             delim,
+            with_filename,
         } => Box::new(SourceCsv::new(
             path.clone(),
             projection.clone(),
@@ -252,6 +253,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             declared.clone(),
             dt_formats.clone(),
             *delim,
+            *with_filename,
         )),
         Op::OpenBinary {
             path,

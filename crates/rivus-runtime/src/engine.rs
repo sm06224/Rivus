@@ -1598,8 +1598,15 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             declared,
             dt_formats,
             delim,
+            with_filename,
             ..
         } => {
+            // `with filename` reads serially for now — the provenance column is
+            // appended by the serial SourceCsv; threading it through the
+            // byte-range workers is a slice-1 follow-up (design 27 §27.1).
+            if *with_filename {
+                return None;
+            }
             let path = source_path(op).filter(|p| *p != "-" && !is_compressed_source(p))?;
             let plan = crate::csv::plan_parallel(
                 path,

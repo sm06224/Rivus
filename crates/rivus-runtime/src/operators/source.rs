@@ -29,6 +29,9 @@ pub(crate) struct SourceCsv {
     dt_formats: Vec<(String, String)>,
     /// Field delimiter byte (`b','` CSV, `b'\t'` TSV).
     delim: u8,
+    /// `open … with filename` — append a `filename` `Str` column carrying the
+    /// source path to every row (provenance; design 27 §27.1).
+    with_filename: bool,
     schema: Arc<Schema>,
     /// Streaming reader for a real file; `None` for stdin / after a load error.
     stream: Option<csv::CsvChunker>,
@@ -54,6 +57,7 @@ impl SourceCsv {
         declared: Option<Vec<(String, Option<DataType>)>>,
         dt_formats: Vec<(String, String)>,
         delim: u8,
+        with_filename: bool,
     ) -> Self {
         SourceCsv {
             path,
@@ -67,6 +71,7 @@ impl SourceCsv {
             declared,
             dt_formats,
             delim,
+            with_filename,
             schema: Schema::empty(),
             stream: None,
             #[cfg(any(feature = "gzip", feature = "zstd"))]
@@ -92,6 +97,8 @@ impl SourceCsv {
             declared: None,
             dt_formats: Vec::new(),
             delim: b',',
+            // Parallel workers never carry `with filename` (it forces serial).
+            with_filename: false,
             schema,
             stream: Some(chunker),
             #[cfg(any(feature = "gzip", feature = "zstd"))]
@@ -100,6 +107,32 @@ impl SourceCsv {
             cursor: 0,
             total: 0,
         }
+    }
+
+    /// Append the `filename` provenance field to a freshly-inferred schema when
+    /// `with filename` is set (design 27 §27.1).
+    fn finalize_schema(&self, base: Schema) -> Arc<Schema> {
+        if self.with_filename {
+            let mut fields = base.fields.clone();
+            fields.push(Field::new("filename", DataType::Str));
+            Arc::new(Schema::new(fields))
+        } else {
+            Arc::new(base)
+        }
+    }
+
+    /// Build the output chunk, appending the constant `filename` column (= the
+    /// source path) when `with filename` is set, to match `self.schema`.
+    fn make_chunk(&self, id: u64, mut cols: Vec<Column>) -> Chunk {
+        if self.with_filename {
+            let n = cols.first().map(|c| c.len()).unwrap_or(0);
+            let mut s = StrColumn::with_capacity(n, n.saturating_mul(self.path.len()));
+            for _ in 0..n {
+                s.push(&self.path);
+            }
+            cols.push(Column::str(s));
+        }
+        Chunk::new(id, self.schema.clone(), cols)
     }
 
     fn load(&mut self, ctx: &mut OpCtx) {
@@ -132,7 +165,7 @@ impl SourceCsv {
                             .at_node(ctx.label.clone()),
                         );
                     }
-                    self.schema = Arc::new(schema);
+                    self.schema = self.finalize_schema(schema);
                     self.stream = Some(chunker);
                 }
                 Err(e) => ctx.raise(
@@ -168,7 +201,7 @@ impl SourceCsv {
                         .at_node(ctx.label.clone()),
                     );
                 }
-                self.schema = Arc::new(schema);
+                self.schema = self.finalize_schema(schema);
                 self.cz_stream = Some(reader);
             }
             Err(e) => ctx.raise(
@@ -222,7 +255,7 @@ impl SourceCsv {
                     );
                 }
                 self.total = data.columns.first().map(|c| c.len()).unwrap_or(0);
-                self.schema = Arc::new(data.schema);
+                self.schema = self.finalize_schema(data.schema);
                 self.columns = data.columns;
             }
             Err(e) => ctx.raise(
@@ -252,7 +285,7 @@ impl Operator for SourceCsv {
             match chunker.next_columns() {
                 Some(cols) => {
                     let id = ctx.fresh_id();
-                    return Some(Chunk::new(id, self.schema.clone(), cols));
+                    return Some(self.make_chunk(id, cols));
                 }
                 None => {
                     // Source exhausted: report how many rows the pushed-down
@@ -300,7 +333,7 @@ impl Operator for SourceCsv {
         if let Some(cz) = self.cz_stream.as_mut() {
             let cols = cz.next_columns()?;
             let id = ctx.fresh_id();
-            return Some(Chunk::new(id, self.schema.clone(), cols));
+            return Some(self.make_chunk(id, cols));
         }
         // Buffered (stdin) path.
         if self.cursor >= self.total {
@@ -311,7 +344,7 @@ impl Operator for SourceCsv {
         let columns = self.columns.iter().map(|c| c.gather(&idx)).collect();
         let id = ctx.fresh_id();
         self.cursor = end;
-        Some(Chunk::new(id, self.schema.clone(), columns))
+        Some(self.make_chunk(id, columns))
     }
 
     fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
