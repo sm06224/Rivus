@@ -111,4 +111,35 @@ fn parity_null_filter_join_group_counts() {
         r, d,
         "group-by null-key parity (one null group): rivus={r} duckdb={d}"
     );
+
+    // --- Case 4: maintainer's real ETL (scaled) — extract rows whose 34-char id
+    // has "0059" at positions 22-25, from data carrying a blank / `***.**` /
+    // garbage `0-.-2` value and a broken (wrong-arity) row. The migration blocker
+    // is **count parity**: a value that won't parse must not drop the row. Rivus
+    // keeps such rows (val → null); DuckDB matches when `val` is read as text and
+    // the broken row is skipped (`ignore_errors`). Both → 5 extracted rows.
+    let id_tag = |tag: &str| format!("{}{}{}", "A".repeat(21), tag, "B".repeat(9));
+    let m = id_tag("0059");
+    let x = id_tag("1234");
+    let body = format!(
+        "ts,id,val\n\
+         260601120000,{m},123.4500\n260601120001,{m},\n260601120002,{m},***.**\n\
+         260601120003,{m},0-.-2\n260601120004,{x},500.0\n260601120005,{m},-999999.9999\n\
+         260601120006,brokenrow,with,too,many\n"
+    );
+    let ef = write_tmp("etl", &body);
+    let _g5 = Tmp(ef.clone());
+    let ep = ef.display();
+    let r = rivus_count(&format!(
+        "E: open {ep} (ts:datetime(\"yyMMddHHmmss\") id:str val:f64) |? substr(id, 22, 4) == \"0059\" |> id\n;"
+    ));
+    let d = duckdb_count(&format!(
+        "SELECT id FROM read_csv('{ep}', header=true, \
+         columns={{'ts':'VARCHAR','id':'VARCHAR','val':'VARCHAR'}}, ignore_errors=true) \
+         WHERE substr(id, 22, 4) = '0059'"
+    ));
+    assert_eq!(
+        r, d,
+        "real-ETL id-substring extract count parity: rivus={r} duckdb={d}"
+    );
 }
