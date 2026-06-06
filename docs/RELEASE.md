@@ -39,6 +39,15 @@ generation or newer.
 
 Other platforms: build from source (README → Installation).
 
+### Release contents (each archive)
+
+Every per-platform archive bundles, alongside the `rivus` binary: `README.md`,
+`LICENSE`, `NOTICE`, and the **usage guides `GUIDE.md` (EN) + `GUIDE.ja.md`
+(JA)** — so the docs ship with every release and there's no need to look up
+usage separately (maintainer request 2026-06-06). The per-step gate already
+requires the EN/JA guides updated together with each feature PR, so a release
+always carries an accurate guide.
+
 ### Standing rule — favor the maintainer's lineup
 
 When adding release artifacts, the maintainer's own machines are **first-class

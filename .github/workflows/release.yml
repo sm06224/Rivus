@@ -102,6 +102,9 @@ jobs:
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/rivus" "dist/${name}/"
           cp README.md LICENSE NOTICE "dist/${name}/"
+          # Bundle the usage guides (EN + JA) so the docs ship with every release
+          # — no need to look up usage separately (maintainer request 2026-06-06).
+          cp docs/GUIDE.md docs/GUIDE.ja.md "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           echo "ASSET=dist/${name}.tar.gz" >> "$GITHUB_ENV"
@@ -115,7 +118,9 @@ jobs:
           $name = "rivus-$tag-${{ matrix.label }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/rivus.exe" "dist/$name/"
-          Copy-Item README.md,LICENSE,NOTICE "dist/$name/"
+          # Bundle the usage guides (EN + JA) with every release (maintainer
+          # request 2026-06-06) alongside README/LICENSE/NOTICE.
+          Copy-Item README.md,LICENSE,NOTICE,docs/GUIDE.md,docs/GUIDE.ja.md "dist/$name/"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
