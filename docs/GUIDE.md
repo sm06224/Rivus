@@ -392,6 +392,10 @@ Merged:
 - `A & B on key` — **inner join** on a key (use `on lkey:rkey` when the two
   sides name the key differently). Output = left columns + right columns (minus
   the join key; a name clashing with a left column is suffixed `_r`).
+- **A `null` key matches nothing** (SQL `NULL`-join semantics, §26.2a): a row
+  whose join key is `null` never joins — it drops on an inner join, and is kept
+  with the other side padded `null` on an outer join. So a `null` key never
+  folds rows together (matching DuckDB's output count).
 - **Composite keys:** `on k1 k2 …` joins on the column *tuple* — e.g.
   `A & B on country region` matches rows agreeing on both. Each key may be
   `lk:rk` for differing names (`on a x:y`). Works for every join kind below.

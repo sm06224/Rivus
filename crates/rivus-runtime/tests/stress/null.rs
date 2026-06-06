@@ -850,3 +850,75 @@ fn parallel_group_all_null_column_byte_identical() {
         "all-null-group aggregates must be serial == parallel"
     );
 }
+
+// --- DuckDB parity (theme 1): join null-key semantics (§26.2a). A null join
+// key matches nothing — so output row counts agree with DuckDB (a null key must
+// not fold rows together). Expected values below are the DuckDB-correct result. ---
+
+#[test]
+fn inner_join_null_key_does_not_match() {
+    // L.k = a, null, b ; R.k = a, null, b. DuckDB inner join on k → only the
+    // non-null keys match (a, b) = 2 rows; the two null keys do NOT join.
+    let src = "\
+L: open LP (id:int k:str) ;
+R: open RP (k:str v:int) ;
+J: L & R on k |> id v\n;";
+    let lf = TempCsv(gendata::write_temp_bytes(
+        "join_null_l",
+        b"id,k\n1,a\n2,\n3,b\n",
+    ));
+    let rf = TempCsv(gendata::write_temp_bytes(
+        "join_null_r",
+        b"k,v\na,10\n,99\nb,20\n",
+    ));
+    let src = src
+        .replace("LP", &lf.0.display().to_string())
+        .replace("RP", &rf.0.display().to_string());
+    let res = run_src(&src, 4096);
+    let ids = collect_i64(&res, "J", "id");
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "null keys must not match (DuckDB parity): {ids:?}"
+    );
+    let vs = collect_i64(&res, "J", "v");
+    assert_eq!(
+        vs,
+        vec![10, 20],
+        "matched values only (99 from null-key R row excluded)"
+    );
+}
+
+#[test]
+fn left_join_null_key_row_is_kept_and_padded() {
+    // DuckDB left join keeps every left row; the null-key left row (id 2) has no
+    // match → its right columns are null. Output = 3 rows (count parity).
+    let src = "\
+L: open LP (id:int k:str) ;
+R: open RP (k:str v:int) ;
+J: L &left R on k |> id (coalesce(v, -1)) as v\n;";
+    let lf = TempCsv(gendata::write_temp_bytes(
+        "join_lnull_l",
+        b"id,k\n1,a\n2,\n3,b\n",
+    ));
+    let rf = TempCsv(gendata::write_temp_bytes(
+        "join_lnull_r",
+        b"k,v\na,10\n,99\nb,20\n",
+    ));
+    let src = src
+        .replace("LP", &lf.0.display().to_string())
+        .replace("RP", &rf.0.display().to_string())
+        .replace("-1", "999");
+    let res = run_src(&src, 4096);
+    assert_eq!(
+        collect_i64(&res, "J", "id"),
+        vec![1, 2, 3],
+        "every left row kept"
+    );
+    // id 2 (null key) is unmatched → v is null → coalesced to 999.
+    assert_eq!(
+        collect_i64(&res, "J", "v"),
+        vec![10, 999, 20],
+        "null-key left row padded with null (→999), DuckDB-parity",
+    );
+}
