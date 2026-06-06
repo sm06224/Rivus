@@ -43,15 +43,23 @@ impl Join {
 /// A row's composite join key: the values at `idxs` joined by the ASCII unit
 /// separator (`0x1F`, which can't appear in a parsed CSV field), so distinct key
 /// tuples never collide.
-fn join_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> String {
+/// Build the composite hash key for `row`, or `None` if **any** key part is
+/// null. A null join key matches nothing (design 26 §26.2a / SQL `NULL`-join
+/// semantics): the row is unmatched — dropped on an inner join, null-padded on
+/// an outer join — so a null key never folds rows together (which would inflate
+/// the output count vs DuckDB).
+fn join_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> Option<String> {
     let mut s = String::new();
     for (n, &ci) in idxs.iter().enumerate() {
+        if chunk.columns[ci].is_null(row) {
+            return None;
+        }
         if n > 0 {
             s.push('\u{1f}');
         }
         s.push_str(&chunk.value(row, ci).to_string());
     }
-    s
+    Some(s)
 }
 
 /// Concatenate buffered chunks (sharing a schema) into one.
@@ -153,16 +161,19 @@ impl Operator for Join {
         // take the right key so the key is never lost.
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for ri in 0..right.len {
-            table
-                .entry(join_key_at(&right, &rk, ri))
-                .or_default()
-                .push(ri);
+            // A null-key right row is never inserted, so it matches nothing; it
+            // still surfaces as an unmatched row for right/full joins below.
+            if let Some(k) = join_key_at(&right, &rk, ri) {
+                table.entry(k).or_default().push(ri);
+            }
         }
         let mut right_matched = vec![false; right.len];
         let mut lidx: Vec<Option<usize>> = Vec::new();
         let mut ridx: Vec<Option<usize>> = Vec::new();
         for li in 0..left.len {
-            match table.get(&join_key_at(&left, &lk, li)) {
+            // A null-key left row matches nothing (no table lookup at all).
+            let matched = join_key_at(&left, &lk, li).and_then(|k| table.get(&k));
+            match matched {
                 Some(rs) => {
                     for &ri in rs {
                         right_matched[ri] = true;

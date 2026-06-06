@@ -69,7 +69,8 @@ it in small, gated steps.
 |---|---|---|
 | ✅ | filter · project · group(sum/avg/min/max/count, **multi-key**) · **multi-key sort** · distinct · take | `\|# country region sum:score`; `sort team score desc` (per-key direction) |
 | ✅ | **Joins (hash join)** | `A & B on k` **inner**, `A &left B`, `A &right B`, `A &full B`, plus **composite keys** `on k1 k2 …` (join on the column tuple) all done (outer joins pad the missing side with type defaults and preserve the join keys; build side buffered, a pipeline-breaker like sort). |
-| 📋 | **Join null-key semantics (§26.2a)** | a `null` join key must **not match** anything (SQL `NULL`-join semantics): an unmatched-by-null row drops on inner join, pads with null on left/right/full. Today the hash key uses the rendered cell, so null keys coalesce and **match** — the inverse of §26.2a (known gap, out of the STEP 2-② operator scope). Fix: make `join_key_at` yield 'no match' for any null key part (skip the build-side insert, never probe-match). Tracked from null model #81. |
+| ✅ | **Join null-key semantics (§26.2a)** | a `null` join key now **matches nothing** (SQL `NULL`-join semantics): unmatched-by-null rows drop on inner join, pad with null on left/right/full — so a null key no longer folds rows and inflates the count vs DuckDB. `join_key_at` returns `None` for any null key part (skipped on the build side, never probe-matched). |
+| 🚧 | **DuckDB parity oracle** (migration track, theme 1) | an external test oracle: run the same null-semantics queries (filter / join / group / distinct / aggregate) in Rivus and DuckDB and assert the **output row counts (and results) agree** — the real migration blocker is that null handling must not change counts. The `duckdb` CLI is shelled out **only when present** (skipped otherwise), so the **zero-dependency default is preserved** (`tests/duckdb_parity.rs`). Done = a real ETL case matches DuckDB's count. Next: widen the case set, wire `duckdb` into CI for an always-on diff. |
 | ✅ | **Missing-value imputation** (欠測補完) | `dropna [cols]` ✅, `fill col VALUE` ✅, `fill col ffill\|bfill` ✅ (directional carry across chunks), **`fill col mean\|median`** ✅ (whole-column statistic over the non-empty numeric cells). All chunk-size independent; bfill/mean/median are pipeline-breakers. **Null model (#81): STEP 2 complete (2-①〜⑤).** The reader reads a blank/unparseable cell — **numeric lanes included** — as a first-class `null` (no longer `0`); arithmetic propagates null; aggregations skip it (incl. COUNT(\*) vs `count:col`, non-null first/last/distinct); filter/`dropna`/`fill`/`cast`/`sort` are null-aware (BUG-A fixed — `dropna_drops_blank_numeric_rows_bug_a` green); group-by/distinct fold null keys; sinks round-trip `null`/`""`/`0` distinctly (§26.5); and serial == parallel == chunk-size holds on null-bearing data through the merge path (§26.4). Remaining as separate items: join null-key non-match (§26.2a, tracked below) and the `is null`/`is not null` predicate (§25 syntax v2). |
 | ✅ | More aggregates | `std` (sample), `count_distinct`/`nunique`, `first`, `last`, `median`/`pNN` percentiles (linear interp) all done |
 | ✅ | `rename`, `drop`, `reorder` columns | `rename OLD NEW …`, `drop COL …`, and `reorder COL …` (move named columns to the front, rest follow in order) all done — stateless, parallel-safe, reversible |
@@ -118,6 +119,30 @@ read-throughput, in priority order:
 | 📋 | `\| view` interactive grid (Out-GridView), live analytics GUI | design doc 19; streaming, never full-materialize |
 | 📋 | Shell completion from IR/schema; nushell value interop | design doc 19 |
 
+## H. Filesystem integration (DuckDB-ETL migration track, theme 2)
+
+Real-ETL pain points where reaching for PowerShell / DuckDB is currently
+unavoidable. **Design-first**: capture the whole set in `docs/design/27-filesystem-io.md`
+and **ratify before implementing** (like §24/§25/§26); then land slice by slice
+(each a self-contained capability PR, EN/JA guides, reversible `to_source`).
+Suggested slice order: `filename` column → recursive-filter input → dynamic /
+partitioned output → long-path / Unicode.
+
+| | item | note |
+|---|---|---|
+| 📋 | **`filename` implicit column** | DuckDB-equivalent provenance: tag each row with its source path (opt-in, since it adds a column). The anchor for multi-file reads. |
+| 📋 | **Recursive glob + filter input** | PowerShell `gci -re`-equivalent: recursively enumerate a directory, filter by pattern, and read the matching **file set** as one input stream. |
+| 📋 | **Dynamic output filenames** | generate the output path from data / column values (a template), not a fixed name. |
+| 📋 | **Dynamic output routing / partitioned writes** | DuckDB `PARTITION BY`-equivalent: split the output across files by a key/filter. Pipeline-breaker bounded by partition cardinality. |
+| 📋 | **Long-path support** | Windows extended-length paths (`\\?\…`) and equivalents. |
+| 📋 | **Unicode / Japanese paths & column names** | natural handling of non-ASCII paths, headers and column names end-to-end (ties to the BOM/encoding item in §A). |
+
+## I. Dynamic / interactive IO (migration track, theme 3 — design later)
+
+| | item | note |
+|---|---|---|
+| 📋 | **Progressive / interactive input** | "ask for input as we go" — exploratory, so **design-doc first** (after themes 1–2 settle). Placeholder so it isn't lost; not yet scheduled. |
+
 ---
 
 ## Near-term order (how we eat the elephant)
@@ -131,7 +156,15 @@ read-throughput, in priority order:
    VALUE|ffill|bfill` done (D).
 7. ~~Compressed inputs `.gz` / `.zst`~~ ✅ done — features `gzip` (`flate2`) and
    `zstd` (pure-Rust `ruzstd`), serial single-pass; default build stays dep-free.
-8. **SIMD CSV scan** (E) — the next big speed lever vs DuckDB.
+8. ~~Null model (#81 STEP 2)~~ ✅ done — first-class `null` across read → ops →
+   aggregation → sink → parallel merge.
+9. **DuckDB-ETL migration track** (themes 1–3) — **prioritized over the SIMD CSV
+   scan speed lever** (統括 2026-06-06): the real blocker is *being able to
+   migrate*, not raw speed. Theme 1 (DuckDB **count parity**: join null-key ✅ +
+   parity oracle) → theme 2 (**filesystem integration**, §H, design doc 27
+   first) → theme 3 (interactive IO, design later, §I).
+10. **SIMD CSV scan** (E) — the next big speed lever vs DuckDB, after the
+    migration track unblocks real ETL.
 
 Each lands as a small commit on the single PR, gated locally (fmt · clippy ·
 test · gitleaks · cargo-deny) and, for optimizations, with a before/after number
