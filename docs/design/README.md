@@ -70,7 +70,7 @@ hidden serialization / opaque optimizer / runtime magic without observability。
 | 24 | [validation](24-validation.md) | 一部 | バリデーション層（`\|!` warn/reject/halt 実装済・宣言ルール/quarantine 計画）。`#80`/`#81` を収斂 |
 | 25 | [syntax-v2](25-syntax-v2.md) | 一部 | 構文 v2（fmt・コメント trivia・分岐 round-trip・`\| name` 再利用・`$x` 値ホール 実装済／signature・以降 計画）。Epic `#86`/`#87` |
 | 26 | [null-model](26-null-model.md) | 実装済 | null モデル（列ごと validity bitmap・null/empty/0 区別・述語/順序/伝播/集約セマンティクス・null 込み byte-identity・sink round-trip）。`#81`（BUG-A の本丸）。**#81 STEP 2 完了（2-①〜⑤）**：core validity・reader null 化・算術伝播・null 込み byte-identity（2-①）／filter null=false・dropna(BUG-A 解消)・fill・cast・sort nulls-last・group-by/distinct キー null 等価（2-②）／COUNT(*) vs COUNT(col)・first/last/distinct 非 null 整流＋operators.rs モジュール分割（2-③）。sink null round-trip（2-④）・並列マージ null byte-identity（2-⑤）。**join null キー非マッチ（§26.2a）も landed**（DuckDB 件数パリティ、移行トラック）。残るは `is null` 述語（§25.11）。 |
-| 27 | [filesystem-io](27-filesystem-io.md) | 一部（§00 ピラー1へ再編） | ファイルシステム統合：`filename` 暗黙カラム（slice 1 landed・`with source` の特殊形）・再帰グロブ+フィルタ入力・動的/分割出力・長パス・Unicode。**§00 North Star でピラー1（I/O サブストレート：形式非依存 codec・handle 値型・discovery-as-flow）に一般化・再編**。slice 2 以降は Phase 1 design doc 批准後 |
+| 27 | [filesystem-io](27-filesystem-io.md) | 一部（§00 ピラー1へ再編） | ファイルシステム統合：`filename` 暗黙カラム（slice 1=PR #114 は park／Phase 1 substrate で `with source` 再実装）・再帰グロブ+フィルタ入力・動的/分割出力・長パス・Unicode。**§00 North Star でピラー1（I/O サブストレート：形式非依存 codec・handle 値型・discovery-as-flow）に一般化・再編**。slice 2 以降は Phase 1 design doc 批准後 |
 
 ## 段階設計（MVP → 最適化 → JIT/分散）
 

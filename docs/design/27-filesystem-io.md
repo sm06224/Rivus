@@ -4,7 +4,7 @@
 > ピラー1「I/O サブストレート」の一部に再編**される。North Star では I/O を
 > **Discovery→Transport→Codec→Provenance の直交基盤**・**handle 第一級値型 `Resource`**・
 > **discovery-as-flow** として形式非依存に一般化する（§00 0.6）。本書の 6 項目はその具体
-> ユースケースで、`filename` 列（slice 1, #114 系）は `with source` の特殊形として残る。
+> ユースケースで、`filename` 列（slice 1, PR #114）は **park**（形式中心結合は壊す対象）。reader の由来付与機構を Phase 1 substrate へ cherry-pick し `with source`（全形式・handle ベース）として実装する。
 > **slice 2 以降（再帰入力・動的/分割出力・長パス・Unicode）は Phase 1（I/O サブストレート）
 > の design doc を批准してから**、その枠組みの中で進める（CSV 寄りスライス積み上げは一旦
 > 停止）。本書はユースケース集として維持。
