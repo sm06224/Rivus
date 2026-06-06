@@ -74,8 +74,8 @@ continue-first/zero-dep を維持。
 
 ## 0.9 派生ピラー（各 design-doc-first・批准制）
 
-1. **I/O サブストレート**（0.6）— §27 を吸収・一般化（形式非依存・handle 値型・
-   discovery-as-flow）
+1. **I/O サブストレート**（0.6・**設計＝§28**）— §27 を吸収・一般化（形式非依存・handle
+   値型・discovery-as-flow）
 2. **IR 通貨＋コンパイル backend**（Cranelift→LLVM）— 解釈==コンパイル byte-identity をゲート
 3. **分散**：フロー間リンク=ネットワーク transport（順序/背圧/byte-identity を跨いで保つ）
 4. **制御プレーン**：テレメトリ⇄制御フロー・p2p・無停止更新/スケール
@@ -100,8 +100,9 @@ continue-first/zero-dep を維持。
 ## 0.11 段階戦略（big-bang を避ける）
 
 - **Phase 0**: 本 North Star 批准。
-- **Phase 1**: I/O サブストレート再建（ピラー1）。既存の正しさを保持して I/O だけ載せ替え。
-  §27 はこの一部に再編。形式非依存・handle 値型・discovery-as-flow。
+- **Phase 1**: I/O サブストレート再建（ピラー1・**設計＝§28 io-substrate**）。既存の正しさを
+  保持して I/O だけ載せ替え。§27 はこの一部に吸収（§28.11）。形式非依存・handle 値型・
+  discovery-as-flow。
 - **Phase 2**: コンパイル backend（ピラー2）＋「解釈==コンパイル」byte-identity ゲート。
 - **Phase 3**: 分散リンク（ピラー3）。
 - **Phase 4**: 制御プレーン（ピラー4）。
