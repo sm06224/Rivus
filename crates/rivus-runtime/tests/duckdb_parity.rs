@@ -67,22 +67,33 @@ fn write_tmp(tag: &str, body: &str) -> std::path::PathBuf {
 
 #[test]
 fn parity_null_filter_join_group_counts() {
-    if !duckdb_available() {
-        eprintln!("duckdb not on PATH — skipping live parity oracle (zero-dep gate unaffected)");
-        return;
+    // The Rivus side runs **always** and is asserted against a known-correct
+    // (DuckDB-equivalent) expected count, so a broken Rivus flow is caught even
+    // without DuckDB. The DuckDB side runs **only when the CLI is present** and
+    // must hit the same expected count — the live parity diff.
+    let live = duckdb_available();
+    if !live {
+        eprintln!("duckdb not on PATH — Rivus golden checks run; live diff skipped");
     }
+    let check = |flow: &str, sql: &str, expected: u64, label: &str| {
+        let r = rivus_count(flow);
+        assert_eq!(r, expected, "{label}: rivus={r} expected={expected}");
+        if live {
+            let d = duckdb_count(sql);
+            assert_eq!(d, expected, "{label}: duckdb={d} expected={expected}");
+        }
+    };
 
     // --- Case 1: filter — `age >= 0` must exclude null ages (not treat them 0).
     let people = write_tmp("people", "id,age\n1,25\n2,\n3,0\n4,40\n");
     let _g1 = Tmp(people.clone());
     let pp = people.display();
-    let r = rivus_count(&format!(
-        "F: open {pp} (id:int age:int) |? age >= 0 |> id\n;"
-    ));
-    let d = duckdb_count(&format!(
-        "SELECT id FROM read_csv('{pp}', header=true, columns={{'id':'INT','age':'INT'}}) WHERE age >= 0"
-    ));
-    assert_eq!(r, d, "filter null parity: rivus={r} duckdb={d}");
+    check(
+        &format!("F: open {pp} (id:int age:int) |? age >= 0 |> id\n;"),
+        &format!("SELECT id FROM read_csv('{pp}', header=true, columns={{'id':'INT','age':'INT'}}) WHERE age >= 0"),
+        3, // ids 1,3,4 (null age excluded)
+        "filter null",
+    );
 
     // --- Case 2: inner join — a null join key must not match (no count inflation).
     let lf = write_tmp("ljoin", "id,k\n1,a\n2,\n3,b\n");
@@ -90,26 +101,27 @@ fn parity_null_filter_join_group_counts() {
     let _g2 = Tmp(lf.clone());
     let _g3 = Tmp(rf.clone());
     let (lp, rp) = (lf.display(), rf.display());
-    let r = rivus_count(&format!(
-        "L: open {lp} (id:int k:str) ;\nR: open {rp} (k:str v:int) ;\nJ: L & R on k |> id v\n;"
-    ));
-    let d = duckdb_count(&format!(
-        "SELECT l.id FROM read_csv('{lp}', header=true, columns={{'id':'INT','k':'VARCHAR'}}) l \
-         JOIN read_csv('{rp}', header=true, columns={{'k':'VARCHAR','v':'INT'}}) r ON l.k = r.k"
-    ));
-    assert_eq!(r, d, "inner-join null-key parity: rivus={r} duckdb={d}");
+    check(
+        &format!("L: open {lp} (id:int k:str) ;\nR: open {rp} (k:str v:int) ;\nJ: L & R on k |> id v\n;"),
+        &format!(
+            "SELECT l.id FROM read_csv('{lp}', header=true, columns={{'id':'INT','k':'VARCHAR'}}) l \
+             JOIN read_csv('{rp}', header=true, columns={{'k':'VARCHAR','v':'INT'}}) r ON l.k = r.k"
+        ),
+        2, // a,b match; the two null keys do not
+        "inner-join null-key",
+    );
 
-    // --- Case 3: group-by — null keys fold into one group, kept (COUNT(*) rows).
+    // --- Case 3: group-by — null keys fold into one group, kept (the implicit
+    // `count` is COUNT(*); the output has one row per group). `|# g` (not
+    // `|# g count`, which would read `count` as a second key).
     let gf = write_tmp("group", "g,v\na,1\n,2\n,3\nb,4\n");
     let _g4 = Tmp(gf.clone());
     let gp = gf.display();
-    let r = rivus_count(&format!("G: open {gp} (g:str v:int) |# g count\n;"));
-    let d = duckdb_count(&format!(
-        "SELECT g FROM read_csv('{gp}', header=true, columns={{'g':'VARCHAR','v':'INT'}}) GROUP BY g"
-    ));
-    assert_eq!(
-        r, d,
-        "group-by null-key parity (one null group): rivus={r} duckdb={d}"
+    check(
+        &format!("G: open {gp} (g:str v:int) |# g\n;"),
+        &format!("SELECT g FROM read_csv('{gp}', header=true, columns={{'g':'VARCHAR','v':'INT'}}) GROUP BY g"),
+        3, // groups a, null, b
+        "group-by null-key",
     );
 
     // --- Case 4: maintainer's real ETL (scaled) — extract rows whose 34-char id
@@ -130,16 +142,16 @@ fn parity_null_filter_join_group_counts() {
     let ef = write_tmp("etl", &body);
     let _g5 = Tmp(ef.clone());
     let ep = ef.display();
-    let r = rivus_count(&format!(
-        "E: open {ep} (ts:datetime(\"yyMMddHHmmss\") id:str val:f64) |? substr(id, 22, 4) == \"0059\" |> id\n;"
-    ));
-    let d = duckdb_count(&format!(
-        "SELECT id FROM read_csv('{ep}', header=true, \
-         columns={{'ts':'VARCHAR','id':'VARCHAR','val':'VARCHAR'}}, ignore_errors=true) \
-         WHERE substr(id, 22, 4) = '0059'"
-    ));
-    assert_eq!(
-        r, d,
-        "real-ETL id-substring extract count parity: rivus={r} duckdb={d}"
+    check(
+        &format!(
+            "E: open {ep} (ts:datetime(\"yyMMddHHmmss\") id:str val:f64) |? substr(id, 22, 4) == \"0059\" |> id\n;"
+        ),
+        &format!(
+            "SELECT id FROM read_csv('{ep}', header=true, \
+             columns={{'ts':'VARCHAR','id':'VARCHAR','val':'VARCHAR'}}, ignore_errors=true) \
+             WHERE substr(id, 22, 4) = '0059'"
+        ),
+        5, // the five 0059 rows; the 1234 row and the broken row excluded
+        "real-ETL id-substring extract",
     );
 }
