@@ -132,6 +132,41 @@ open data.csv with filename       # …and materialize a `filename` column
 open sales.csv with source |> id amount (source.uri) as src
 ```
 
+### `ls` — discovery (list files as a stream)
+
+`ls "glob"` turns a directory walk into a **flow**: it emits one row per matching
+file, which you filter / project / feed onward like any other stream. Aliases:
+`gci`, `dir`.
+
+```
+ls "logs/**/*.csv"            # recursive glob → a row per match
+  |? size > 1000              # filter on the file's columns
+  |> path name
+```
+
+- **Glob**: `*` / `?` / `[…]` match within a path segment, `**` recurses across
+  segments. std-only (zero-dep); symlinks are not followed. Matches come in
+  **deterministic** order (uri ascending); 0 matches → a warning + empty stream.
+- **Columns** (ordinary, so normal predicates/projection work):
+
+  | col | type | |
+  |---|---|---|
+  | `path` | resource | the file handle (renders as its path/uri; what `read` will consume) |
+  | `name` | str | the file name (basename) |
+  | `size` | int | size in bytes |
+  | `mtime` | datetime | last-modified time |
+
+- `size` / `mtime` are **outside the determinism contract** (§0.14): handy to
+  filter/display, but a result that depends on them isn't byte-identity /
+  parallel guaranteed (a file's size/mtime can change between runs). `path` and
+  `name` are deterministic.
+
+> **Handle fields go in a computed column.** A handle accessor like `source.uri`
+> (§6) must appear inside `|> (…)`, e.g. `|> (source.uri) as p`. Writing a dotted
+> field bare in a predicate (`|? source.uri == …`) is a deliberate error — it
+> would be ambiguous and wouldn't round-trip. For `ls`, just use the bare columns
+> (`name` / `size` / `path`).
+
 ---
 
 ## 4. Transforms
