@@ -92,6 +92,7 @@ mod groupby;
 mod io_formats;
 mod joins;
 mod null;
+mod provenance;
 mod real_etl;
 mod syntax;
 mod temporal;

@@ -12,7 +12,7 @@
 //! doesn't fit the fast paths falls back to the owned-`Value` interpreter, so
 //! results are identical.
 
-use rivus_core::{Chunk, Column, ColumnData, DataType, StrColumn, Validity, Value};
+use rivus_core::{Chunk, Column, ColumnData, DataType, Resource, StrColumn, Validity, Value};
 use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func};
 use std::cmp::Ordering;
 
@@ -638,6 +638,11 @@ pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
 /// numeric lanes; boolean-valued expressions become a `Bool` column.
 pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
     match expr {
+        // `source.<field>` (Access::Source) → provenance, not a data column.
+        Expr::Field {
+            name,
+            access: Access::Source,
+        } => source_column(name, chunk),
         Expr::Field { name, .. } => match chunk.column(name) {
             Some(c) => c.clone(),
             // Missing field → a NaN numeric lane (continue-first).
@@ -1147,7 +1152,17 @@ fn arith_value(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, row: usize
     }
 }
 
-fn eval_field(name: &str, _access: Access, chunk: &Chunk, row: usize) -> Value {
+fn eval_field(name: &str, access: Access, chunk: &Chunk, row: usize) -> Value {
+    // `source.<field>` (Access::Source) resolves against the chunk's provenance
+    // Resource (design §28.6), not a data column — the whole chunk shares one
+    // origin handle, so `row` is irrelevant. No provenance on this chunk → null
+    // (continue-first), exactly as a missing column would.
+    if !access.is_column() {
+        return match &chunk.meta.source {
+            Some(r) => resource_field(r, name),
+            None => Value::Null,
+        };
+    }
     // MVP: Fast / Deep / Dynamic all resolve via the flat schema. The slow-path
     // access strategies (recursive `$_..`, dynamic `item(..)`) are recorded in
     // the IR so the optimizer can specialize them once nested chunks land.
@@ -1157,11 +1172,58 @@ fn eval_field(name: &str, _access: Access, chunk: &Chunk, row: usize) -> Value {
     }
 }
 
+/// Generic field accessor on a [`Resource`] (design §28.6 / §00 0.14), shared by
+/// the `source.<field>` accessor and (slice 3) a discovery `Resource` *column*.
+/// `uri` and `scheme` are the in-contract, **deterministic** fields (a pure
+/// function of the handle). `size`/`mtime` are *out* of the determinism contract
+/// (§00 0.14), so they are deliberately not exposed on this byte-identity-checked
+/// path; an unknown field is a continue-first null too.
+fn resource_field(r: &Resource, field: &str) -> Value {
+    match field {
+        "uri" => Value::Str(r.uri().to_string()),
+        "scheme" => Value::Str(uri_scheme(r.uri()).to_string()),
+        // size/mtime are out of the determinism contract; unknown → null.
+        _ => Value::Null,
+    }
+}
+
+/// The transport scheme implied by a uri (design §28.1) — a pure function of the
+/// uri, so it is in-contract / deterministic. `-` is stdin; a `scheme://…` prefix
+/// is that scheme; a bare path is a local file.
+fn uri_scheme(uri: &str) -> &str {
+    if uri == "-" {
+        "stdin"
+    } else if let Some((scheme, _)) = uri.split_once("://") {
+        scheme
+    } else {
+        "file"
+    }
+}
+
+/// Columnar form of the `source.<field>` accessor: the chunk's provenance
+/// Resource is shared by every row, so the result is a **constant** column. A
+/// chunk without provenance yields an all-null column (continue-first); since a
+/// uri is text, the null lane is `Str` so the output type is stable.
+fn source_column(field: &str, chunk: &Chunk) -> Column {
+    match &chunk.meta.source {
+        Some(r) => const_column(&resource_field(r, field), chunk.len),
+        None => {
+            let mut s = StrColumn::with_capacity(chunk.len, 0);
+            for _ in 0..chunk.len {
+                s.push("");
+            }
+            Column::new(ColumnData::Str(s), Validity::all_null(chunk.len))
+        }
+    }
+}
+
 /// Compare two sub-expressions for a row, taking borrowed fast paths first.
 /// Is `e` a column field that is **null** at `row`? Cheap (only inspects a
 /// `Field`; an all-valid column answers `false` without touching memory).
 fn field_is_null(e: &Expr, chunk: &Chunk, row: usize) -> bool {
-    matches!(e, Expr::Field { name, .. } if chunk.column(name).is_some_and(|c| c.is_null(row)))
+    // Only a *column* field can be null this cheaply; a `source.<field>` accessor
+    // (Access::Source) is handled by the general eval path, never here.
+    matches!(e, Expr::Field { name, access } if access.is_column() && chunk.column(name).is_some_and(|c| c.is_null(row)))
 }
 
 fn compare_fast(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk, row: usize) -> bool {
@@ -1203,9 +1265,11 @@ fn dec_field_vs_literal(
     row: usize,
 ) -> Option<bool> {
     let dec_cell = |e: &Expr| -> Option<(i128, u8)> {
-        if let Expr::Field { name, .. } = e {
-            if let Some(ColumnData::Dec(d)) = chunk.column(name).map(|c| c.data()) {
-                return Some((d.unscaled[row], d.scale));
+        if let Expr::Field { name, access } = e {
+            if access.is_column() {
+                if let Some(ColumnData::Dec(d)) = chunk.column(name).map(|c| c.data()) {
+                    return Some((d.unscaled[row], d.scale));
+                }
             }
         }
         None
@@ -1242,7 +1306,8 @@ fn dec_field_vs_literal(
 fn as_str<'a>(e: &'a Expr, chunk: &'a Chunk, row: usize) -> Option<&'a str> {
     match e {
         Expr::Literal(Value::Str(s)) => Some(s),
-        Expr::Field { name, .. } => match chunk.column(name)?.data() {
+        // A `source.<field>` accessor is not a column borrow → general path.
+        Expr::Field { name, access } if access.is_column() => match chunk.column(name)?.data() {
             ColumnData::Str(s) => Some(s.get(row)),
             _ => None,
         },
@@ -1255,7 +1320,8 @@ fn as_str<'a>(e: &'a Expr, chunk: &'a Chunk, row: usize) -> Option<&'a str> {
 fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
     match e {
         Expr::Literal(v) => v.as_f64(),
-        Expr::Field { name, .. } => match chunk.column(name)?.data() {
+        // A `source.<field>` accessor is not a numeric column → general path.
+        Expr::Field { name, access } if access.is_column() => match chunk.column(name)?.data() {
             ColumnData::I64(v) => Some(v[row] as f64),
             ColumnData::F64(v) => Some(v[row]),
             ColumnData::Dec(d) => Some(d.unscaled[row] as f64 / 10f64.powi(d.scale as i32)),

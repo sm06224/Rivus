@@ -203,6 +203,22 @@ pub enum Access {
     Deep,
     /// `item("field")` — dynamic resolution.
     Dynamic,
+    /// `source.field` — a field of the chunk's origin [`rivus_core::Resource`]
+    /// (design §28.6 provenance), resolved against chunk metadata rather than a
+    /// data column. The `field` (`uri`/`scheme`) is *not* baked into the variant,
+    /// so one generic accessor covers every Resource field and is reused by the
+    /// discovery `Resource` column (slice 3).
+    Source,
+}
+
+impl Access {
+    /// Does this access resolve against a **data column** (the chunk's schema)?
+    /// `Source` resolves against chunk provenance metadata instead, so the
+    /// column-keyed fast paths must skip it (they would otherwise mistake the
+    /// Resource field name for a real column).
+    pub fn is_column(self) -> bool {
+        !matches!(self, Access::Source)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -363,6 +379,9 @@ impl Expr {
             Access::Fast => format!("$_.{name}"),
             Access::Deep => format!("$_..{name}"),
             Access::Dynamic => format!("item(\"{name}\")"),
+            // Provenance accessor (§28.6): `source.uri` / `source.scheme`. The
+            // field is generic, so this round-trips any Resource field name.
+            Access::Source => format!("source.{name}"),
         }
     }
 }

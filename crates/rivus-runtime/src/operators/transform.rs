@@ -1015,9 +1015,11 @@ impl Operator for ProjectExpr {
         let mut fields = Vec::with_capacity(self.items.len());
         let mut cols = Vec::with_capacity(self.items.len());
         for (expr, alias) in &self.items {
-            // Observe a bare reference to a missing column (continue-first).
-            if let Expr::Field { name, .. } = expr {
-                if chunk.column(name).is_none() {
+            // Observe a bare reference to a missing column (continue-first). A
+            // `source.<field>` accessor (Access::Source) reads provenance, not a
+            // column, so it is never "unknown" here.
+            if let Expr::Field { name, access } = expr {
+                if access.is_column() && chunk.column(name).is_none() {
                     ctx.raise(
                         ErrorEvent::new(
                             Severity::Warn,

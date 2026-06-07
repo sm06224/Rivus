@@ -6,6 +6,18 @@
 use super::*;
 use crate::transport::{read_whole, FileTransport, Scheme};
 
+/// Stamp a source's origin handle onto a freshly produced chunk's metadata
+/// (design §28.6 provenance). Zero-cost when provenance is off (`source` is
+/// `None`). Applied **identically** on the serial reader and on every byte-range
+/// parallel worker — each derives the same handle from the same path — so the
+/// origin is partition-independent and byte-identity holds (serial == parallel).
+fn stamp_source(mut chunk: Chunk, source: &Option<Resource>) -> Chunk {
+    if source.is_some() {
+        chunk.meta.source = source.clone();
+    }
+    chunk
+}
+
 // ---------------------------------------------------------------- source (csv)
 
 /// CSV source. A real file streams (bounded memory, [`csv::CsvChunker`]); the
@@ -39,6 +51,9 @@ pub(crate) struct SourceCsv {
     columns: Vec<Column>,
     cursor: usize,
     total: usize,
+    /// Origin handle stamped onto every produced chunk when `with source` /
+    /// `with filename` is set (design §28.6); `None` = provenance off.
+    source: Option<Resource>,
 }
 
 impl SourceCsv {
@@ -72,7 +87,15 @@ impl SourceCsv {
             columns: Vec::new(),
             cursor: 0,
             total: 0,
+            source: None,
         }
+    }
+
+    /// Set the provenance origin handle stamped onto every produced chunk
+    /// (design §28.6); `None` leaves provenance off (zero overhead).
+    pub(crate) fn with_source(mut self, source: Option<Resource>) -> Self {
+        self.source = source;
+        self
     }
 
     /// A source wrapping an already-built streaming reader (a parallel worker's
@@ -95,6 +118,7 @@ impl SourceCsv {
             columns: Vec::new(),
             cursor: 0,
             total: 0,
+            source: None,
         }
     }
 
@@ -248,7 +272,10 @@ impl Operator for SourceCsv {
             match dec.decode_chunk() {
                 Some(cols) => {
                     let id = ctx.fresh_id();
-                    return Some(Chunk::new(id, self.schema.clone(), cols));
+                    return Some(stamp_source(
+                        Chunk::new(id, self.schema.clone(), cols),
+                        &self.source,
+                    ));
                 }
                 None => {
                     // Source exhausted: report how many rows the pushed-down
@@ -303,7 +330,10 @@ impl Operator for SourceCsv {
         let columns = self.columns.iter().map(|c| c.gather(&idx)).collect();
         let id = ctx.fresh_id();
         self.cursor = end;
-        Some(Chunk::new(id, self.schema.clone(), columns))
+        Some(stamp_source(
+            Chunk::new(id, self.schema.clone(), columns),
+            &self.source,
+        ))
     }
 
     fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
@@ -325,6 +355,9 @@ pub(crate) struct SourceBinary {
     schema: Arc<Schema>,
     decoder: Option<Box<dyn crate::codec::Decoder>>,
     loaded: bool,
+    /// Origin handle stamped onto every produced chunk (design §28.6); `None` =
+    /// provenance off.
+    source: Option<Resource>,
 }
 
 impl SourceBinary {
@@ -344,7 +377,15 @@ impl SourceBinary {
             schema: Schema::empty(),
             decoder: None,
             loaded: false,
+            source: None,
         }
+    }
+
+    /// Set the provenance origin handle stamped onto every produced chunk
+    /// (design §28.6); `None` leaves provenance off (zero overhead).
+    pub(crate) fn with_source(mut self, source: Option<Resource>) -> Self {
+        self.source = source;
+        self
     }
 
     /// A source wrapping an already-built streaming binary reader (a parallel
@@ -359,6 +400,7 @@ impl SourceBinary {
             schema,
             decoder: Some(Box::new(chunker)),
             loaded: true,
+            source: None,
         }
     }
 
@@ -404,7 +446,10 @@ impl Operator for SourceBinary {
         let dec = self.decoder.as_mut()?;
         let columns = dec.decode_chunk()?;
         let id = ctx.fresh_id();
-        Some(Chunk::new(id, self.schema.clone(), columns))
+        Some(stamp_source(
+            Chunk::new(id, self.schema.clone(), columns),
+            &self.source,
+        ))
     }
 
     fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
@@ -592,11 +637,12 @@ pub fn bin_range_source(
     start_rec: usize,
     n_recs: usize,
     chunk_size: usize,
+    source: Option<Resource>,
 ) -> Box<dyn Operator> {
     match BinChunker::for_range(
         path, fields, offsets, rec_size, endian, start_rec, n_recs, chunk_size,
     ) {
-        Ok(ch) => Box::new(SourceBinary::from_chunker(schema, ch)),
+        Ok(ch) => Box::new(SourceBinary::from_chunker(schema, ch).with_source(source)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
         }),
@@ -658,6 +704,9 @@ pub(crate) struct SourceJsonl {
     cursor: usize,
     total: usize,
     loaded: bool,
+    /// Origin handle stamped onto every produced chunk (design §28.6); `None` =
+    /// provenance off.
+    source: Option<Resource>,
 }
 
 impl SourceJsonl {
@@ -671,7 +720,15 @@ impl SourceJsonl {
             cursor: 0,
             total: 0,
             loaded: false,
+            source: None,
         }
+    }
+
+    /// Set the provenance origin handle stamped onto every produced chunk
+    /// (design §28.6); `None` leaves provenance off (zero overhead).
+    pub(crate) fn with_source(mut self, source: Option<Resource>) -> Self {
+        self.source = source;
+        self
     }
 
     /// A source wrapping an already-built streaming JSONL reader (a parallel
@@ -686,6 +743,7 @@ impl SourceJsonl {
             cursor: 0,
             total: 0,
             loaded: true,
+            source: None,
         }
     }
 
@@ -765,7 +823,10 @@ impl Operator for SourceJsonl {
         if let Some(dec) = self.decoder.as_mut() {
             let columns = dec.decode_chunk()?;
             let id = ctx.fresh_id();
-            return Some(Chunk::new(id, self.schema.clone(), columns));
+            return Some(stamp_source(
+                Chunk::new(id, self.schema.clone(), columns),
+                &self.source,
+            ));
         }
         if self.cursor >= self.total {
             return None;
@@ -775,7 +836,10 @@ impl Operator for SourceJsonl {
         let columns = self.columns.iter().map(|c| c.gather(&idx)).collect();
         let id = ctx.fresh_id();
         self.cursor = end;
-        Some(Chunk::new(id, self.schema.clone(), columns))
+        Some(stamp_source(
+            Chunk::new(id, self.schema.clone(), columns),
+            &self.source,
+        ))
     }
 
     fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {

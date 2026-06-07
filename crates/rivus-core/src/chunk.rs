@@ -7,7 +7,7 @@
 //! that slots in behind this same API.
 
 use crate::schema::Schema;
-use crate::value::{DataType, Value};
+use crate::value::{DataType, Resource, Value};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -46,6 +46,13 @@ pub struct ChunkMeta {
     pub warnings: Vec<String>,
     pub corrupt: bool,
     pub mode: Mode,
+    /// Origin handle of this chunk (design §28.6 provenance): set by a source
+    /// operator when `with source` / `with filename` is requested, reachable
+    /// downstream via the `source.uri` accessor. `None` by default — zero
+    /// overhead when provenance is off. Only the uri is in-contract (§00 0.14),
+    /// and every reader (serial and each byte-range parallel worker) derives the
+    /// same handle from the same path, so it stays byte-identical.
+    pub source: Option<Resource>,
 }
 
 impl ChunkMeta {
@@ -56,6 +63,7 @@ impl ChunkMeta {
             warnings: Vec::new(),
             corrupt: false,
             mode: Mode::Normal,
+            source: None,
         }
     }
 }

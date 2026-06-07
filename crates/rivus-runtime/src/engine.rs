@@ -1500,6 +1500,10 @@ struct ParPlan {
     path: String,
     bad_rows: usize,
     src: ParSource,
+    /// Provenance mode of the source op (design §28.6): each byte-range worker
+    /// derives the same origin handle from `path`, so provenance is partition-
+    /// independent and byte-identical to the serial reader.
+    provenance: rivus_ir::Provenance,
 }
 
 enum ParSource {
@@ -1527,6 +1531,9 @@ enum ParSource {
 impl ParPlan {
     /// Open a streaming source for byte range `[a, b)`.
     fn make_source(&self, a: u64, b: u64, chunk_size: usize) -> Box<dyn Operator> {
+        // Every worker derives the same origin handle from the same path, so the
+        // provenance it stamps is partition-independent (byte-identical to serial).
+        let source = self.provenance.source(&self.path);
         match &self.src {
             ParSource::Csv {
                 dtypes,
@@ -1549,6 +1556,7 @@ impl ParPlan {
                 prefilter.clone(),
                 str_prefilter.clone(),
                 *delim,
+                source,
             ),
             ParSource::Jsonl { names, dtypes } => operators::jsonl_range_source(
                 &self.path,
@@ -1558,6 +1566,7 @@ impl ParPlan {
                 a,
                 b,
                 chunk_size,
+                source,
             ),
             ParSource::Binary {
                 fields,
@@ -1574,6 +1583,7 @@ impl ParPlan {
                 a as usize / rec_size,
                 (b - a) as usize / rec_size,
                 chunk_size,
+                source,
             ),
         }
     }
@@ -1592,6 +1602,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             declared,
             dt_formats,
             delim,
+            provenance,
             ..
         } => {
             let path = source_path(op).filter(|p| crate::transport::Scheme::of(p).is_seekable())?;
@@ -1624,9 +1635,10 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                     str_prefilter: plan.str_prefilter,
                     delim: *delim,
                 },
+                provenance: *provenance,
             })
         }
-        Op::OpenJsonl { path, .. } => {
+        Op::OpenJsonl { path, provenance } => {
             if path == "-" {
                 return None;
             }
@@ -1638,6 +1650,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 path: path.clone(),
                 bad_rows,
                 src: ParSource::Jsonl { names, dtypes },
+                provenance: *provenance,
             })
         }
         Op::OpenBinary {
@@ -1645,7 +1658,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             fields,
             endian,
             c_align,
-            ..
+            provenance,
         } => {
             if path == "-" {
                 return None;
@@ -1681,6 +1694,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                     rec_size,
                     endian: *endian,
                 },
+                provenance: *provenance,
             })
         }
         _ => None,
