@@ -6,6 +6,7 @@
 //! `docs/design/02-execution-model.md` and `05-scheduler.md`.
 
 mod analytics;
+mod codec;
 mod csv;
 mod engine;
 mod eval;

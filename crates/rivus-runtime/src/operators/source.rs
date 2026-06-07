@@ -31,11 +31,10 @@ pub(crate) struct SourceCsv {
     /// Field delimiter byte (`b','` CSV, `b'\t'` TSV).
     delim: u8,
     schema: Arc<Schema>,
-    /// Streaming reader for a real file; `None` for stdin / after a load error.
-    stream: Option<csv::CsvChunker>,
-    /// Streaming reader for a compressed file (`--features gzip`/`zstd`).
-    #[cfg(any(feature = "gzip", feature = "zstd"))]
-    cz_stream: Option<csv::CompressedCsvReader>,
+    /// Streaming codec decoder for a real file (plain or compressed); `None` for
+    /// stdin / after a load error. The seekable and compressed CSV readers both
+    /// present the same [`crate::codec::Decoder`] face (§28.5).
+    decoder: Option<Box<dyn crate::codec::Decoder>>,
     /// Buffered fallback (stdin): pre-parsed columns sliced by `pull`.
     columns: Vec<Column>,
     cursor: usize,
@@ -69,9 +68,7 @@ impl SourceCsv {
             dt_formats,
             delim,
             schema: Schema::empty(),
-            stream: None,
-            #[cfg(any(feature = "gzip", feature = "zstd"))]
-            cz_stream: None,
+            decoder: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -94,9 +91,7 @@ impl SourceCsv {
             dt_formats: Vec::new(),
             delim: b',',
             schema,
-            stream: Some(chunker),
-            #[cfg(any(feature = "gzip", feature = "zstd"))]
-            cz_stream: None,
+            decoder: Some(Box::new(chunker)),
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -134,7 +129,7 @@ impl SourceCsv {
                         );
                     }
                     self.schema = Arc::new(schema);
-                    self.stream = Some(chunker);
+                    self.decoder = Some(Box::new(chunker));
                 }
                 Err(e) => ctx.raise(
                     ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
@@ -170,7 +165,7 @@ impl SourceCsv {
                     );
                 }
                 self.schema = Arc::new(schema);
-                self.cz_stream = Some(reader);
+                self.decoder = Some(Box::new(reader));
             }
             Err(e) => ctx.raise(
                 ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
@@ -239,9 +234,9 @@ impl Operator for SourceCsv {
     }
 
     fn inference(&self) -> Vec<(String, DataType, bool)> {
-        self.stream
+        self.decoder
             .as_ref()
-            .map(|c| c.inference().to_vec())
+            .map(|d| d.inferred().to_vec())
             .unwrap_or_default()
     }
 
@@ -249,8 +244,8 @@ impl Operator for SourceCsv {
         if !self.loaded {
             self.load(ctx);
         }
-        if let Some(chunker) = self.stream.as_mut() {
-            match chunker.next_columns() {
+        if let Some(dec) = self.decoder.as_mut() {
+            match dec.decode_chunk() {
                 Some(cols) => {
                     let id = ctx.fresh_id();
                     return Some(Chunk::new(id, self.schema.clone(), cols));
@@ -259,7 +254,9 @@ impl Operator for SourceCsv {
                     // Source exhausted: report how many rows the pushed-down
                     // prefilter skipped building (pure accounting — the result is
                     // unchanged, the downstream FilterProject would drop them).
-                    let skipped = chunker.rows_prefiltered;
+                    // The compressed reader reports none (trait default), exactly
+                    // as before its dedicated branch.
+                    let skipped = dec.rows_prefiltered();
                     if skipped > 0 {
                         ctx.raise(
                             ErrorEvent::new(
@@ -275,7 +272,7 @@ impl Operator for SourceCsv {
                     // in the decimal lane) and were defaulted to 0 — surfaced once
                     // on exhaustion so the loss is visible (continue-first; #②④).
                     // `parse_failures` is aligned to the output schema's fields.
-                    for (k, &n) in chunker.parse_failures.iter().enumerate() {
+                    for (k, &n) in dec.parse_failures().iter().enumerate() {
                         if n > 0 {
                             let col = match self.schema.fields.get(k) {
                                 Some(f) => format!("'{}' (as {})", f.name, f.dtype),
@@ -296,12 +293,6 @@ impl Operator for SourceCsv {
                     return None;
                 }
             }
-        }
-        #[cfg(any(feature = "gzip", feature = "zstd"))]
-        if let Some(cz) = self.cz_stream.as_mut() {
-            let cols = cz.next_columns()?;
-            let id = ctx.fresh_id();
-            return Some(Chunk::new(id, self.schema.clone(), cols));
         }
         // Buffered (stdin) path.
         if self.cursor >= self.total {

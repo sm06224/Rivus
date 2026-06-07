@@ -137,11 +137,21 @@ pub struct CsvChunker {
     delim: u8,
 }
 
-impl CsvChunker {
-    /// The per-column inference outcome (A4 telemetry); empty for declared or
-    /// sample-inferred schemas.
-    pub fn inference(&self) -> &[(String, DataType, bool)] {
+/// Codec face (§28.5): the streaming CSV reader *is* the decoder — every method
+/// delegates to its inherent state, unchanged. `inferred` exposes the per-column
+/// inference outcome (A4 telemetry; empty for declared / sample-inferred schemas).
+impl crate::codec::Decoder for CsvChunker {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
+    }
+    fn inferred(&self) -> &[(String, DataType, bool)] {
         &self.inference
+    }
+    fn rows_prefiltered(&self) -> u64 {
+        self.rows_prefiltered
+    }
+    fn parse_failures(&self) -> &[u64] {
+        &self.parse_failures
     }
 }
 
@@ -1902,6 +1912,16 @@ impl CompressedCsvReader {
             return None;
         }
         Some(builders.iter_mut().map(ColBuilder::finish).collect())
+    }
+}
+
+/// Codec face (§28.5) for the single-pass compressed reader. It has no
+/// prefilter/parse-failure accounting (those are the seekable reader's), so it
+/// uses the trait defaults — matching the source's prior behavior for this path.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+impl crate::codec::Decoder for CompressedCsvReader {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
     }
 }
 
