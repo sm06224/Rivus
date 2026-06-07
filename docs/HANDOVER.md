@@ -19,7 +19,7 @@
 
 ---
 
-## 1. §28 で main にマージ済み（このセッション）
+## 1. §28 進捗（landed＝main マージ済み／本PR＝レビュー待ち）
 
 | slice | 内容 | 主な成果物 |
 |---|---|---|
@@ -28,47 +28,46 @@
 | **2-①** | provenance 配線（挙動ゼロ） | IR `Provenance{Off,Source,Filename}` を `Op::OpenCsv/OpenBinary/OpenJsonl` に追加。parser `with source`/`with filename`（全形式・`with`未知=Err）、to_source 可逆。**runtime は `..` で無視＝byte-identity 完全不変** |
 | **2-②a** | provenance 活性化（アクセサ＋付与） | core `ChunkMeta.source: Option<Resource>`（加算的）。ir `Access::Source`（field 名を焼き込まない汎用）・`Access::is_column()`・`Provenance::source(path)`・to_source `source.<field>`。parser `source.<field>`（`.field` が続く時だけ予約）。runtime eval `source.uri`/`source.scheme`＝`resource_field`（slice 3 の Resource 列と共有）・provenance 無し→null。source op が serial＋全並列ワーカで同一ハンドルを stamp＝**byte-identity（serial==parallel==chunk-size）**。optimizer の prefilter/projection pushdown は Access::Source を非列として除外 |
 | **2-②b** | `with filename` 材化 ＋ ガイド | `with filename`＝`(source.uri) as filename`：source op が行末に `filename` 列（=path・Str）を材化。衝突時 `filename_r`（join 規則）。`with source` は handle のみ（列ゼロ）。英日ガイド（§3 Sources＋§6 アクセサ）。stress: 材化・衝突・並列 byte-identity |
+| **[Op::Source]** | 形式別3変種統一（move-only・**本PR・レビュー待ち**） | `Op::Source{discovery:Discovery::Fixed, transport:Transport::Local, codec:Csv/Jsonl/Binary, provenance}`。`OpenCsv/OpenJsonl/OpenBinary` を撤去。parser は `open`/`readcsv`/`readjson`/`readbin` を desugar、`to_source` は同一文字列を復元。optimizer pushdown/`dedup_sources`・runtime `build`/`plan_parallel_source`・source ゲートは codec/discovery 分岐へ。**挙動ゼロ・byte-identity 不変**（注意1＝再石化回避） |
 
 ゲートは各 commit で全緑（fmt / clippy `--all-features -D warnings` 0 / 全テスト /
-stress serial==parallel==chunk-size / optimizer_equiv / 依存ゼロ）。2-② は CLI でも
-e2e 確認済（`with source`・`with filename`・`explain` の to_source 往復）。
+stress serial==parallel==chunk-size / optimizer_equiv / 依存ゼロ）。2-②・Op::Source とも
+CLI で e2e 確認済（`open`/`readcsv`/`with source`/`with filename`/`explain` 往復）。
 
-**リリース**：1a/1b/2-① マージ分の提案タグ **`v1.3.0-dev.6`** はカット待ち。2-②（②a/②b）
-マージ後は **`v1.3.0-dev.7`**（カットは統括判断：`git tag v1.3.0-dev.7 && git push origin v1.3.0-dev.7`）。
-
----
-
-## 2. 次タスク＝\[Op::Source 統一\]（move-only）→ slice 3（discovery-as-flow）
-
-slice 2（provenance）は **landed**（2-①/②a/②b）。§28.10 の順では次は slice 3
-（discovery-as-flow）だが、その**前に** §3 tracked の 🟠 **`Op::Source` 統一**（形式別
-`Op::OpenCsv/OpenJsonl/OpenBinary` → `Op::Source{discovery, transport, codec,
-provenance}`）を**専用 move-only スライス**として入れる（統括指示・下記 §3）。これを
-先にやらないと discovery（slice 3）/route（slice 4）を3形式別変種に足して**形式中心 I/O
-結合が再石化**する。
-
-実装メモ（2-② で増えた配線の踏襲先）:
-- `provenance` フィールドは現在 3 つの `Op::Open*` 変種それぞれにある。統一後は
-  `Op::Source` の 1 フィールドに集約。runtime 側は `operators/mod.rs build`・
-  `engine.rs plan_parallel_source`/`ParPlan.provenance`・range source の
-  `with_provenance(prov, path)` を新 `Op::Source` 形に合わせて配線し直すだけ（挙動不変）。
-- provenance アクセサ実装（`eval.rs` の `resource_field`/`uri_scheme`/`source_column`・
-  `Access::Source`）は slice 3 の **Resource 列 base** にそのまま一般化できる形にしてある
-  （base=meta.source → base=Resource 列）。
+**リリース**：1a/1b/2-① 分の提案タグ **`v1.3.0-dev.6`** はカット待ち。2-② マージ後は
+**`v1.3.0-dev.7`**、Op::Source マージ後は **`v1.3.0-dev.8`**（カットは統括判断：
+`git tag v1.3.0-dev.N && git push origin v1.3.0-dev.N`）。
 
 ---
 
-## 3. tracked（後続スライスの前に必ず）
-- 🟠 **slice 3 の前に `Op::Source` 統一**（§28.8）：`provenance` を3つの形式別変種に
-  足したが、discovery（slice 3）/route（slice 4）も同じ3変種に足すと**形式中心 I/O 結合
-  の再石化**。`Op::Source{discovery, transport, codec, provenance}` への統一を**専用
-  move-only スライス**として slice 3 の前に入れる（統括指示・注意1）。
-- 🟡 slice 3 で「**`ls` の Resource 列名が `source`**」の解決（実列優先 → provenance 別名）
-  を確定（注意2 の一般化）。
+## 2. 次タスク＝slice 3（discovery-as-flow・ローカル fs）
+
+slice 2（provenance）も \[Op::Source 統一\] も **done**（後者は本PR・レビュー待ち）。
+次は §28.10 **slice 3**：`ls`/`glob`/再帰（std-only）→ `Stream<Resource>`、述語
+プッシュダウン、`read … with source` で多ファイルを **union-by-name** 連結（§27.2 吸収）。
+決定的順序（uri バイト昇順）・continue-first・chunk-size 非依存。
+
+実装の足場（本セッションで整えた共有機構）:
+- 新 `Op::Source{discovery, transport, codec, provenance}` に discovery 段が乗る。
+  slice 3 は `Discovery` に `Glob`/`Ls`/再帰の変種を**足すだけ**（`Op` の再形成は不要）。
+- provenance アクセサ（`eval.rs` の `resource_field`/`uri_scheme`／`Access::Source`）は
+  **base=meta.source → base=Resource 列**へ一般化できる形にしてある（discovery の
+  Resource 列にそのまま効かせる）。
+- 🟡 slice 3 で「**`ls` の Resource 列名が `source`**」の解決（実列優先 → provenance
+  別名）を確定（注意2 の一般化）。
+
+---
+
+## 3. tracked
+- ✅ **`Op::Source` 統一（注意1）＝done**（本PR）。`Discovery`/`Transport`/`Codec` 直交
+  4層を IR に導入。`Transport::Local` は枠の予約（slice 5 で http/socket）、`Discovery`
+  は `Fixed` のみ（slice 3 で glob/ls）。
+- 🟡 `dedup_sources` は現状 **CSV のみ**（path キー）を踏襲（jsonl/binary は非対象）。
+  全 `Op::Source` への一般化は follow-up（挙動変更になるため別途）。
 
 ## 4. 以降のスライス順（§28.10）
-2（provenance・**landed**）→ \[Op::Source 統一・**次**\] → 3（discovery-as-flow・
-union-by-name）→ 4（route 出力）→ 5（非有界骨組み・feature-gate）。
+2（provenance・**done**）→ \[Op::Source 統一・**done**\] → 3（discovery-as-flow・
+**次**・union-by-name）→ 4（route 出力）→ 5（非有界骨組み・feature-gate）。
 
 ---
 

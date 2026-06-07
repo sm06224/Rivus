@@ -27,8 +27,9 @@ mod lexer;
 use lexer::{Comment, Lexer, Tok};
 use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
-    Access, AggFunc, ArithOp, BinType, CmpOp, Disposition, EdgeKind, Endian, Expr, FillMethod,
-    Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph, Provenance,
+    Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery, Disposition, EdgeKind, Endian,
+    Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
+    Provenance, Transport,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -787,23 +788,25 @@ impl Parser {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                 })?;
                 let mut op = fmt.into_op(path, delim);
-                match &mut op {
-                    Op::OpenCsv {
+                // Layer the parsed read config / provenance onto the fresh source.
+                if let Op::Source {
+                    codec, provenance, ..
+                } = &mut op
+                {
+                    *provenance = prov;
+                    if let Codec::Csv {
                         header,
                         declared,
                         dt_formats,
-                        provenance,
                         ..
-                    } => {
+                    } = codec
+                    {
                         if noheader {
                             *header = false;
                         }
                         *declared = decl;
                         *dt_formats = dtf;
-                        *provenance = prov;
                     }
-                    Op::OpenJsonl { provenance, .. } => *provenance = prov,
-                    _ => {}
                 }
                 Ok(self.g.add_node(op))
             }
@@ -811,15 +814,11 @@ impl Parser {
                 self.bump();
                 let path = norm_path(self.path_word()?);
                 let provenance = self.parse_provenance()?;
-                Ok(self.g.add_node(Op::OpenCsv {
-                    delim: rivus_ir::delim_for_path(&path),
-                    path,
-                    projection: None,
-                    prefilter: Vec::new(),
-                    str_prefilter: Vec::new(),
-                    header: true,
-                    declared: None,
-                    dt_formats: Vec::new(),
+                let delim = rivus_ir::delim_for_path(&path);
+                Ok(self.g.add_node(Op::Source {
+                    discovery: Discovery::Fixed(path),
+                    transport: Transport::Local,
+                    codec: Codec::csv(delim),
                     provenance,
                 }))
             }
@@ -827,7 +826,12 @@ impl Parser {
                 self.bump();
                 let path = norm_path(self.path_word()?);
                 let provenance = self.parse_provenance()?;
-                Ok(self.g.add_node(Op::OpenJsonl { path, provenance }))
+                Ok(self.g.add_node(Op::Source {
+                    discovery: Discovery::Fixed(path),
+                    transport: Transport::Local,
+                    codec: Codec::Jsonl,
+                    provenance,
+                }))
             }
             Tok::Word(w) if w == "stream" => {
                 self.bump();
@@ -876,11 +880,14 @@ impl Parser {
                     return Err(self.err("readbin requires at least one field"));
                 }
                 let provenance = self.parse_provenance()?;
-                Ok(self.g.add_node(Op::OpenBinary {
-                    path,
-                    fields,
-                    endian,
-                    c_align,
+                Ok(self.g.add_node(Op::Source {
+                    discovery: Discovery::Fixed(path),
+                    transport: Transport::Local,
+                    codec: Codec::Binary {
+                        fields,
+                        endian,
+                        c_align,
+                    },
                     provenance,
                 }))
             }
@@ -1417,25 +1424,13 @@ enum Format {
 
 impl Format {
     fn into_op(self, path: String, delim: u8) -> Op {
-        match self {
-            Format::Csv => Op::OpenCsv {
-                path,
-                projection: None,
-                prefilter: Vec::new(),
-                str_prefilter: Vec::new(),
-                header: true,
-                declared: None,
-                dt_formats: Vec::new(),
-                delim,
-                provenance: Provenance::Off,
-            },
+        let codec = match self {
+            Format::Csv => Codec::csv(delim),
             // The JSON reader accepts both NDJSON and a top-level array, so both
             // surface forms open the same source.
-            Format::Jsonl | Format::Json => Op::OpenJsonl {
-                path,
-                provenance: Provenance::Off,
-            },
-        }
+            Format::Jsonl | Format::Json => Codec::Jsonl,
+        };
+        Op::source(path, codec)
     }
 
     fn into_sink_op(self, path: String, delim: u8) -> Op {
@@ -1829,10 +1824,13 @@ mod tests {
             .nodes[0]
             .op
         {
-            Op::OpenCsv { dt_formats, .. } => {
+            Op::Source {
+                codec: Codec::Csv { dt_formats, .. },
+                ..
+            } => {
                 assert_eq!(dt_formats, &[("ts".to_string(), "yyyy-MM-dd".to_string())]);
             }
-            o => panic!("expected OpenCsv, got {o:?}"),
+            o => panic!("expected a CSV source, got {o:?}"),
         }
         // A non-string format argument is a clear error, not a silent default.
         assert!(parse("F:\n open s.csv (a:datetime(123))\n;").is_err());
@@ -1937,8 +1935,8 @@ mod tests {
         // `stdin`/`stdout` (and `-`) map to the "-" sentinel for source & sink.
         let g = parse("F:\n open stdin\n save stdout\n;").unwrap();
         match &g.nodes[0].op {
-            Op::OpenCsv { path, .. } => assert_eq!(path, "-"),
-            o => panic!("expected OpenCsv, got {o:?}"),
+            Op::Source { discovery, .. } => assert_eq!(discovery.path(), "-"),
+            o => panic!("expected a source, got {o:?}"),
         }
         let sink = g
             .nodes
@@ -1952,7 +1950,7 @@ mod tests {
         // stdin with an explicit format.
         assert!(matches!(
             &parse("F:\n open stdin as json\n;").unwrap().nodes[0].op,
-            Op::OpenJsonl { path, .. } if path == "-"
+            Op::Source { discovery, codec: Codec::Jsonl, .. } if discovery.path() == "-"
         ));
     }
 
@@ -1962,8 +1960,8 @@ mod tests {
         // (distinct from `->` branch and expression `-`), mapping to "-".
         let g = parse("F:\n open -\n |> name\n save -\n;").unwrap();
         match &g.nodes[0].op {
-            Op::OpenCsv { path, .. } => assert_eq!(path, "-"),
-            o => panic!("expected OpenCsv, got {o:?}"),
+            Op::Source { discovery, .. } => assert_eq!(discovery.path(), "-"),
+            o => panic!("expected a source, got {o:?}"),
         }
         let sink = g
             .nodes
@@ -2024,35 +2022,65 @@ mod tests {
 
     #[test]
     fn format_selection_extension_alias_and_override() {
-        // Default: extension picks the format.
-        assert!(matches!(first_op("F:\n open d.csv\n;"), Op::OpenCsv { .. }));
+        // Default: extension picks the format (codec).
+        assert!(matches!(
+            first_op("F:\n open d.csv\n;"),
+            Op::Source {
+                codec: Codec::Csv { .. },
+                ..
+            }
+        ));
         assert!(matches!(
             first_op("F:\n open d.jsonl\n;"),
-            Op::OpenJsonl { .. }
+            Op::Source {
+                codec: Codec::Jsonl,
+                ..
+            }
         ));
         assert!(matches!(
             first_op("F:\n open d.ndjson\n;"),
-            Op::OpenJsonl { .. }
+            Op::Source {
+                codec: Codec::Jsonl,
+                ..
+            }
         ));
         // Odd/absent extension defaults to CSV...
-        assert!(matches!(first_op("F:\n open d.dat\n;"), Op::OpenCsv { .. }));
+        assert!(matches!(
+            first_op("F:\n open d.dat\n;"),
+            Op::Source {
+                codec: Codec::Csv { .. },
+                ..
+            }
+        ));
         // ...but `as FMT` overrides the extension entirely.
         assert!(matches!(
             first_op("F:\n open d.dat as json\n;"),
-            Op::OpenJsonl { .. }
+            Op::Source {
+                codec: Codec::Jsonl,
+                ..
+            }
         ));
         assert!(matches!(
             first_op("F:\n open d.jsonl as csv\n;"),
-            Op::OpenCsv { .. }
+            Op::Source {
+                codec: Codec::Csv { .. },
+                ..
+            }
         ));
         // Explicit aliases ignore the extension.
         assert!(matches!(
             first_op("F:\n readjson d.weird\n;"),
-            Op::OpenJsonl { .. }
+            Op::Source {
+                codec: Codec::Jsonl,
+                ..
+            }
         ));
         assert!(matches!(
             first_op("F:\n readcsv d.weird\n;"),
-            Op::OpenCsv { .. }
+            Op::Source {
+                codec: Codec::Csv { .. },
+                ..
+            }
         ));
         // Unknown explicit format is an error.
         assert!(parse("F:\n open d.x as toml\n;").is_err());
@@ -2408,16 +2436,25 @@ Import:
         // `.tsv`/`.tab` open as tab-delimited without an explicit `as tsv`.
         assert!(matches!(
             first_op("F:\n open d.tsv\n;"),
-            Op::OpenCsv { delim: b'\t', .. }
+            Op::Source {
+                codec: Codec::Csv { delim: b'\t', .. },
+                ..
+            }
         ));
         assert!(matches!(
             first_op("F:\n open d.tab\n;"),
-            Op::OpenCsv { delim: b'\t', .. }
+            Op::Source {
+                codec: Codec::Csv { delim: b'\t', .. },
+                ..
+            }
         ));
         // A plain `.csv` stays comma.
         assert!(matches!(
             first_op("F:\n open d.csv\n;"),
-            Op::OpenCsv { delim: b',', .. }
+            Op::Source {
+                codec: Codec::Csv { delim: b',', .. },
+                ..
+            }
         ));
     }
 
@@ -2426,11 +2463,17 @@ Import:
         // `as tsv` forces a tab on any path; `as csv` forces a comma back.
         assert!(matches!(
             first_op("F:\n open d.txt as tsv\n;"),
-            Op::OpenCsv { delim: b'\t', .. }
+            Op::Source {
+                codec: Codec::Csv { delim: b'\t', .. },
+                ..
+            }
         ));
         assert!(matches!(
             first_op("F:\n open d.tsv as csv\n;"),
-            Op::OpenCsv { delim: b',', .. }
+            Op::Source {
+                codec: Codec::Csv { delim: b',', .. },
+                ..
+            }
         ));
     }
 
@@ -2759,7 +2802,7 @@ Import:
         // `open -` / `save -` map to the "-" sentinel, like `open stdin` /
         // `save stdout` (the bare dash lexes as Minus; path_word accepts it).
         let g = parse("F:\n open -\n |> name\n save -\n;").unwrap();
-        assert!(matches!(&g.nodes[0].op, Op::OpenCsv { path, .. } if path == "-"));
+        assert!(matches!(&g.nodes[0].op, Op::Source { discovery, .. } if discovery.path() == "-"));
         let sink = g
             .nodes
             .iter()

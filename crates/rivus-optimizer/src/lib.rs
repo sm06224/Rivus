@@ -12,7 +12,7 @@
 //! Rules are added incrementally (design doc 08). The first is `dedup_sources`.
 
 use rivus_core::Value;
-use rivus_ir::{CmpOp, Edge, EdgeKind, Expr, Func, Node, NodeId, Op, PlanGraph};
+use rivus_ir::{CmpOp, Codec, Edge, EdgeKind, Expr, Func, Node, NodeId, Op, PlanGraph};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -71,7 +71,7 @@ fn string_prefilter(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
     for sid in 0..graph.nodes.len() {
         if !matches!(
             &graph.nodes[sid].op,
-            Op::OpenCsv { str_prefilter, .. } if str_prefilter.is_empty()
+            Op::Source { codec: Codec::Csv { str_prefilter, .. }, .. } if str_prefilter.is_empty()
         ) {
             continue;
         }
@@ -95,7 +95,11 @@ fn string_prefilter(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
         if needles.is_empty() {
             continue;
         }
-        if let Op::OpenCsv { str_prefilter, .. } = &mut graph.nodes[sid].op {
+        if let Op::Source {
+            codec: Codec::Csv { str_prefilter, .. },
+            ..
+        } = &mut graph.nodes[sid].op
+        {
             *str_prefilter = needles;
             pushed += 1;
         }
@@ -182,7 +186,8 @@ fn prescan_safe(needle: &str) -> bool {
 fn filter_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
     let mut pushed = 0usize;
     for sid in 0..graph.nodes.len() {
-        if !matches!(&graph.nodes[sid].op, Op::OpenCsv { prefilter, .. } if prefilter.is_empty()) {
+        if !matches!(&graph.nodes[sid].op, Op::Source { codec: Codec::Csv { prefilter, .. }, .. } if prefilter.is_empty())
+        {
             continue;
         }
         let consumers = graph.outputs_of(sid);
@@ -206,7 +211,11 @@ fn filter_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
         if pf.is_empty() {
             continue;
         }
-        if let Op::OpenCsv { prefilter, .. } = &mut graph.nodes[sid].op {
+        if let Op::Source {
+            codec: Codec::Csv { prefilter, .. },
+            ..
+        } = &mut graph.nodes[sid].op
+        {
             *prefilter = pf;
             pushed += 1;
         }
@@ -277,8 +286,11 @@ fn project_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
     for sid in 0..graph.nodes.len() {
         if !matches!(
             graph.nodes[sid].op,
-            Op::OpenCsv {
-                projection: None,
+            Op::Source {
+                codec: Codec::Csv {
+                    projection: None,
+                    ..
+                },
                 ..
             }
         ) {
@@ -312,7 +324,11 @@ fn project_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
         if !safe || needed.is_empty() {
             continue;
         }
-        if let Op::OpenCsv { projection, .. } = &mut graph.nodes[sid].op {
+        if let Op::Source {
+            codec: Codec::Csv { projection, .. },
+            ..
+        } = &mut graph.nodes[sid].op
+        {
             *projection = Some(needed);
             pushed += 1;
         }
@@ -536,13 +552,21 @@ fn dedup_sources(graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
     let mut canon: HashMap<&str, NodeId> = HashMap::new();
     let mut redirect: HashMap<NodeId, NodeId> = HashMap::new();
     for n in &graph.nodes {
-        if let Op::OpenCsv { path, .. } = &n.op {
+        // CSV-only, by path — unchanged from the format-specific era (other codecs
+        // were never deduped; generalizing to all sources is a follow-up).
+        if let Op::Source {
+            codec: Codec::Csv { .. },
+            discovery,
+            ..
+        } = &n.op
+        {
             if n.label.is_some() {
                 continue;
             }
-            match canon.get(path.as_str()) {
+            let path = discovery.path();
+            match canon.get(path) {
                 None => {
-                    canon.insert(path.as_str(), n.id);
+                    canon.insert(path, n.id);
                 }
                 Some(&c) => {
                     redirect.insert(n.id, c);
@@ -621,7 +645,7 @@ mod tests {
     fn count_opens(g: &PlanGraph) -> usize {
         g.nodes
             .iter()
-            .filter(|n| matches!(n.op, Op::OpenCsv { .. }))
+            .filter(|n| matches!(n.op, Op::Source { .. }))
             .count()
     }
 
@@ -642,7 +666,7 @@ B:\n open data.csv\n |# country\n;";
         let src_id = opt
             .nodes
             .iter()
-            .find(|n| matches!(n.op, Op::OpenCsv { .. }))
+            .find(|n| matches!(n.op, Op::Source { .. }))
             .unwrap()
             .id;
         assert_eq!(opt.outputs_of(src_id).len(), 2);
@@ -678,16 +702,19 @@ B:\n open data.csv\n |# country\n;";
         let s = opt
             .nodes
             .iter()
-            .find(|n| matches!(n.op, Op::OpenCsv { .. }))
+            .find(|n| matches!(n.op, Op::Source { .. }))
             .unwrap();
         match &s.op {
-            Op::OpenCsv { prefilter, .. } => {
+            Op::Source {
+                codec: Codec::Csv { prefilter, .. },
+                ..
+            } => {
                 // Only the numeric atom is lifted; the string compare stays put.
                 assert_eq!(prefilter.len(), 1);
                 assert_eq!(prefilter[0].0, "age");
                 assert_eq!(prefilter[0].2, 20.0);
             }
-            other => panic!("expected OpenCsv, got {other:?}"),
+            other => panic!("expected a CSV source, got {other:?}"),
         }
         assert!(report.applied.iter().any(|l| l.contains("filter_pushdown")));
     }
@@ -739,11 +766,15 @@ B:\n open data.csv\n |# country\n;";
         let s = opt
             .nodes
             .iter()
-            .find(|n| matches!(n.op, Op::OpenCsv { .. }))
+            .find(|n| matches!(n.op, Op::Source { .. }))
             .unwrap();
         match &s.op {
-            Op::OpenCsv {
-                projection: Some(cols),
+            Op::Source {
+                codec:
+                    Codec::Csv {
+                        projection: Some(cols),
+                        ..
+                    },
                 ..
             } => {
                 // Predicate column `age` and projected `name`, `age`.
@@ -770,13 +801,16 @@ B:\n open d.csv\n |# country\n;";
         let s = opt
             .nodes
             .iter()
-            .find(|n| matches!(n.op, Op::OpenCsv { .. }))
+            .find(|n| matches!(n.op, Op::Source { .. }))
             .unwrap();
         assert!(
             matches!(
                 s.op,
-                Op::OpenCsv {
-                    projection: None,
+                Op::Source {
+                    codec: Codec::Csv {
+                        projection: None,
+                        ..
+                    },
                     ..
                 }
             ),

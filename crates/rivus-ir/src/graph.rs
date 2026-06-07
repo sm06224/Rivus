@@ -308,61 +308,107 @@ impl Provenance {
     }
 }
 
+/// **Discovery** (design §28.2): which resource(s) a source reads. The v1 form
+/// is a single fixed path (`open PATH` / `readbin PATH`); slice 3 adds `ls` /
+/// `glob` / recursive discovery as further variants. Keeping it a layer (not a
+/// bare `path: String` on the source) is what lets discovery become a flow
+/// without re-shaping `Op`.
+#[derive(Debug, Clone)]
+pub enum Discovery {
+    /// A single fixed resource path — the v1 `open` / `readbin` source.
+    Fixed(String),
+}
+
+impl Discovery {
+    /// The single resource path of the v1 `Fixed` form. (Slice 3's multi-resource
+    /// discovery variants will expose a stream of resources instead.)
+    pub fn path(&self) -> &str {
+        match self {
+            Discovery::Fixed(p) => p,
+        }
+    }
+}
+
+/// **Transport** (design §28.2): how a resource's bytes are obtained. Today this
+/// is always the local family, selected at read time from the path scheme (a
+/// plain file / stdin `-` / a compressed `.gz`/`.zst` stream), so the single
+/// `Local` variant reserves the orthogonal slot; slice 5 adds feature-gated
+/// `Http` / `Socket` without re-shaping `Op`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    #[default]
+    Local,
+}
+
+/// **Codec** (design §28.2): how bytes decode into chunks — the format, plus its
+/// format-specific configuration. The optimizer's reader pushdowns
+/// (`projection` / `prefilter` / `str_prefilter`) ride on the CSV codec because
+/// only the CSV reader implements them.
+#[derive(Debug, Clone)]
+pub enum Codec {
+    /// Delimited text (CSV/TSV). `delim` is the field byte (`b','` / `b'\t'`).
+    /// `header` / `declared` / `dt_formats` are read config; `projection` /
+    /// `prefilter` / `str_prefilter` are optimizer-set reader pushdowns (see the
+    /// `Op::Source` doc and the optimizer module).
+    Csv {
+        header: bool,
+        declared: Option<Vec<(String, Option<DataType>)>>,
+        dt_formats: Vec<(String, String)>,
+        delim: u8,
+        projection: Option<Vec<String>>,
+        prefilter: Vec<(String, CmpOp, f64)>,
+        str_prefilter: Vec<String>,
+    },
+    /// JSON Lines (one flat JSON object per line) or a top-level JSON array.
+    Jsonl,
+    /// Fixed-width binary records (a C-struct dump). `endian` selects byte order;
+    /// `c_align` true uses C `repr(C)` natural-alignment padding, false packs.
+    Binary {
+        fields: Vec<(String, BinType)>,
+        endian: Endian,
+        c_align: bool,
+    },
+}
+
+impl Codec {
+    /// A CSV/TSV codec with default read config and no optimizer pushdowns set
+    /// (the parser's fresh source; `delim` picks CSV `b','` vs TSV `b'\t'`).
+    pub fn csv(delim: u8) -> Codec {
+        Codec::Csv {
+            header: true,
+            declared: None,
+            dt_formats: Vec::new(),
+            delim,
+            projection: None,
+            prefilter: Vec::new(),
+            str_prefilter: Vec::new(),
+        }
+    }
+}
+
 /// A flow operator. One enum spanning sources, transforms, fan-out/in and
 /// sinks — because in Rivus they are all just nodes in the same graph.
 #[derive(Debug, Clone)]
 pub enum Op {
-    /// `open path.csv`. `projection`, when set by the optimizer
-    /// (`project_pushdown`), restricts which columns the reader builds — unused
-    /// columns are never parsed or allocated. `prefilter`, set by
-    /// `filter_pushdown`, lets the reader skip *building* rows whose numeric
-    /// `(column, op, rhs)` conjunction is definitely false — a conservative
-    /// pre-pass; the downstream `FilterProject` remains authoritative.
-    /// `str_prefilter` carries required literal substrings (from `contains` /
-    /// `starts_with` / `ends_with` / `==` / `like`-literal predicates): the
-    /// reader skips any *raw line* lacking the substring before splitting it
-    /// (a ripgrep-style superset filter, so the result is unchanged).
-    OpenCsv {
-        path: String,
-        projection: Option<Vec<String>>,
-        prefilter: Vec<(String, CmpOp, f64)>,
-        str_prefilter: Vec<String>,
-        /// Whether the first line is a header. `false` (`open f.csv noheader`)
-        /// treats every line as data and names columns `c0, c1, …`.
-        header: bool,
-        /// Declared column schema `(name[:type] ...)`, set by
-        /// `open f.csv (id:int name:str age:int)`. When present it names the
-        /// columns positionally (overriding the header / `c0…`) and, where a
-        /// type is given, fixes that column's lane instead of inferring it.
-        declared: Option<Vec<(String, Option<DataType>)>>,
-        /// Strptime-style parse formats for `:datetime("fmt")` columns, keyed by
-        /// column name (design 23). Only columns given an *explicit* format
-        /// appear here; a bare `:datetime` (auto-infer) has no entry. Carried
-        /// alongside `declared` because the format is a read-time parse hint, not
-        /// part of the (Copy) lane tag `DataType::DateTime`.
-        dt_formats: Vec<(String, String)>,
-        /// Field delimiter byte. `b','` for CSV (the default); `b'\t'` for a
-        /// `.tsv`/`.tab` file or `open f.x as tsv`. Std-only — the reader just
-        /// splits on a different byte.
-        delim: u8,
-        /// Source provenance (`with source` / `with filename`); design §28.6.
-        provenance: Provenance,
-    },
-    /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
-    /// binary records (a C struct dump). `endian` selects byte order;
-    /// `c_align` true uses C `repr(C)` natural-alignment padding, false packs.
-    OpenBinary {
-        path: String,
-        fields: Vec<(String, BinType)>,
-        endian: Endian,
-        c_align: bool,
-        /// Source provenance (`with source` / `with filename`); design §28.6.
-        provenance: Provenance,
-    },
-    /// `open path.jsonl` — JSON Lines (one flat JSON object per line).
-    OpenJsonl {
-        path: String,
-        /// Source provenance (`with source` / `with filename`); design §28.6.
+    /// A **source** (design §28.2/§28.8): read a resource (`discovery`) over a
+    /// `transport`, decode it with a `codec`, optionally attaching `provenance`.
+    /// One composable node replacing the former format-specific `OpenCsv` /
+    /// `OpenJsonl` / `OpenBinary`, so discovery (slice 3) and routing (slice 4)
+    /// attach here without re-stratifying I/O by format. The v1 surface forms —
+    /// `open PATH [as FMT] (schema) [with …]`, `readcsv`/`readjson`/`readbin` —
+    /// desugar to this (`Discovery::Fixed` + `Transport::Local` + the matching
+    /// `Codec`), and `to_source` restores the original surface form (reversible).
+    ///
+    /// Reader pushdowns set by the optimizer ride on `Codec::Csv`: `projection`
+    /// (`project_pushdown`) restricts which columns the reader builds; `prefilter`
+    /// (`filter_pushdown`) lets it skip *building* rows whose numeric conjunction
+    /// is definitely false; `str_prefilter` carries required literal substrings
+    /// (a ripgrep-style raw-line pre-scan). All are conservative supersets — the
+    /// downstream `FilterProject` stays authoritative — so results are unchanged.
+    Source {
+        discovery: Discovery,
+        transport: Transport,
+        codec: Codec,
         provenance: Provenance,
     },
     /// `stream X` — replay of a named flow (and, internally, a reference edge).
@@ -588,11 +634,26 @@ impl Op {
         )
     }
 
+    /// A v1 single-file source: `Discovery::Fixed(path)` + `Transport::Local` +
+    /// `codec`, provenance off. The parser layers provenance / read config /
+    /// optimizer pushdowns on afterward.
+    pub fn source(path: impl Into<String>, codec: Codec) -> Op {
+        Op::Source {
+            discovery: Discovery::Fixed(path.into()),
+            transport: Transport::Local,
+            codec,
+            provenance: Provenance::Off,
+        }
+    }
+
     pub fn kind_str(&self) -> &'static str {
         match self {
-            Op::OpenCsv { .. } => "open",
-            Op::OpenBinary { .. } => "readbin",
-            Op::OpenJsonl { .. } => "open",
+            // `readbin` for the binary codec, `open` for csv/jsonl (matching the
+            // surface verb each desugars from).
+            Op::Source { codec, .. } => match codec {
+                Codec::Binary { .. } => "readbin",
+                Codec::Csv { .. } | Codec::Jsonl => "open",
+            },
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Validate { .. } => "validate",
@@ -623,86 +684,94 @@ impl Op {
     /// Render this op as the pipeline fragment that produced it.
     fn to_src_line(&self) -> String {
         match self {
-            Op::OpenCsv {
-                path,
-                projection,
-                prefilter,
-                str_prefilter,
-                header,
-                declared,
-                dt_formats,
-                delim,
+            // A source renders by codec back to its v1 surface form (reversible),
+            // using the discovery path and the top-level provenance modifier. The
+            // `transport` layer has no surface syntax today (always Local).
+            Op::Source {
+                discovery,
+                codec,
                 provenance,
+                ..
             } => {
-                let mut s = format!("open {path}");
-                if !header {
-                    s.push_str(" noheader");
+                let path = discovery.path();
+                match codec {
+                    Codec::Csv {
+                        header,
+                        declared,
+                        dt_formats,
+                        delim,
+                        projection,
+                        prefilter,
+                        str_prefilter,
+                    } => {
+                        let mut s = format!("open {path}");
+                        if !header {
+                            s.push_str(" noheader");
+                        }
+                        if let Some(m) = delim_modifier_for(path, *delim) {
+                            s.push(' ');
+                            s.push_str(&m);
+                        }
+                        if let Some(cols) = declared {
+                            let parts: Vec<String> = cols
+                                .iter()
+                                .map(|(n, t)| match t {
+                                    // Datetime renders in its annotation form
+                                    // (`datetime` or `datetime("fmt")`), not the
+                                    // DataType Display, so an explicit parse format
+                                    // round-trips.
+                                    Some(DataType::DateTime { .. }) => {
+                                        match dt_formats.iter().find(|(c, _)| c == n) {
+                                            Some((_, fmt)) => format!("{n}:datetime({fmt:?})"),
+                                            None => format!("{n}:datetime"),
+                                        }
+                                    }
+                                    Some(t) => format!("{n}:{t}"),
+                                    None => n.clone(),
+                                })
+                                .collect();
+                            s.push_str(&format!(" ({})", parts.join(" ")));
+                        }
+                        s.push_str(provenance.modifier());
+                        if let Some(cols) = projection {
+                            s.push_str(&format!("  # read-only: {}", cols.join(",")));
+                        }
+                        if !prefilter.is_empty() {
+                            let preds: Vec<String> = prefilter
+                                .iter()
+                                .map(|(c, op, v)| format!("{c}{}{v}", op.as_str()))
+                                .collect();
+                            s.push_str(&format!("  # pre-filter: {}", preds.join(" and ")));
+                        }
+                        if !str_prefilter.is_empty() {
+                            s.push_str(&format!("  # str-prefilter: {:?}", str_prefilter));
+                        }
+                        s
+                    }
+                    Codec::Binary {
+                        fields,
+                        endian,
+                        c_align,
+                    } => {
+                        let cols: Vec<String> = fields
+                            .iter()
+                            .map(|(n, t)| format!("{n}:{}", t.as_str()))
+                            .collect();
+                        let mut mods = String::new();
+                        if *endian == Endian::Big {
+                            mods.push_str("be ");
+                        }
+                        if *c_align {
+                            mods.push_str("aligned ");
+                        }
+                        format!(
+                            "readbin {path} {mods}({}){}",
+                            cols.join(" "),
+                            provenance.modifier()
+                        )
+                    }
+                    Codec::Jsonl => format!("open {path}{}", provenance.modifier()),
                 }
-                if let Some(m) = delim_modifier_for(path, *delim) {
-                    s.push(' ');
-                    s.push_str(&m);
-                }
-                if let Some(cols) = declared {
-                    let parts: Vec<String> = cols
-                        .iter()
-                        .map(|(n, t)| match t {
-                            // Datetime renders in its annotation form
-                            // (`datetime` or `datetime("fmt")`), not the DataType
-                            // Display, so an explicit parse format round-trips.
-                            Some(DataType::DateTime { .. }) => {
-                                match dt_formats.iter().find(|(c, _)| c == n) {
-                                    Some((_, fmt)) => format!("{n}:datetime({fmt:?})"),
-                                    None => format!("{n}:datetime"),
-                                }
-                            }
-                            Some(t) => format!("{n}:{t}"),
-                            None => n.clone(),
-                        })
-                        .collect();
-                    s.push_str(&format!(" ({})", parts.join(" ")));
-                }
-                s.push_str(provenance.modifier());
-                if let Some(cols) = projection {
-                    s.push_str(&format!("  # read-only: {}", cols.join(",")));
-                }
-                if !prefilter.is_empty() {
-                    let preds: Vec<String> = prefilter
-                        .iter()
-                        .map(|(c, op, v)| format!("{c}{}{v}", op.as_str()))
-                        .collect();
-                    s.push_str(&format!("  # pre-filter: {}", preds.join(" and ")));
-                }
-                if !str_prefilter.is_empty() {
-                    s.push_str(&format!("  # str-prefilter: {:?}", str_prefilter));
-                }
-                s
-            }
-            Op::OpenBinary {
-                path,
-                fields,
-                endian,
-                c_align,
-                provenance,
-            } => {
-                let cols: Vec<String> = fields
-                    .iter()
-                    .map(|(n, t)| format!("{n}:{}", t.as_str()))
-                    .collect();
-                let mut mods = String::new();
-                if *endian == Endian::Big {
-                    mods.push_str("be ");
-                }
-                if *c_align {
-                    mods.push_str("aligned ");
-                }
-                format!(
-                    "readbin {path} {mods}({}){}",
-                    cols.join(" "),
-                    provenance.modifier()
-                )
-            }
-            Op::OpenJsonl { path, provenance } => {
-                format!("open {path}{}", provenance.modifier())
             }
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),

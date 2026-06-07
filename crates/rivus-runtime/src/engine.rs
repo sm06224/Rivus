@@ -14,7 +14,7 @@
 use crate::operators::{self, OpCtx, Operator};
 use crate::telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
 use rivus_core::{Chunk, DataType, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
-use rivus_ir::{HookAction, HookEvent, NodeId, Op, PlanGraph};
+use rivus_ir::{Codec, HookAction, HookEvent, NodeId, Op, PlanGraph};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -748,9 +748,7 @@ fn concat_parts(final_path: &str, parts: &[String], jsonl: bool) -> std::io::Res
 /// The file path of a single-file source op (for the parallel size gate).
 fn source_path(op: &Op) -> Option<&str> {
     match op {
-        Op::OpenCsv { path, .. } | Op::OpenJsonl { path, .. } | Op::OpenBinary { path, .. } => {
-            Some(path)
-        }
+        Op::Source { discovery, .. } => Some(discovery.path()),
         _ => None,
     }
 }
@@ -816,10 +814,7 @@ fn parallel_min_bytes_for(pref: crate::analytics::MemoryPref) -> u64 {
 fn single_file_source(graph: &PlanGraph) -> Option<NodeId> {
     let mut found: Option<NodeId> = None;
     for node in &graph.nodes {
-        if matches!(
-            node.op,
-            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. }
-        ) {
+        if matches!(node.op, Op::Source { .. }) {
             if found.is_some() {
                 return None; // multiple sources
             }
@@ -993,7 +988,7 @@ fn try_parallel(
     let mut source: Option<NodeId> = None;
     for node in &graph.nodes {
         match &node.op {
-            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. } => {
+            Op::Source { .. } => {
                 if source.is_some() {
                     return None; // multiple sources → serial
                 }
@@ -1163,10 +1158,7 @@ fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<Node
 /// Splittable sources the bounded byte-range path can stream (CSV / JSONL /
 /// fixed-width binary).
 fn is_splittable_source(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::OpenCsv { .. } | Op::OpenJsonl { .. } | Op::OpenBinary { .. }
-    )
+    matches!(op, Op::Source { .. })
 }
 
 /// Same shape as [`eligible_group_flow`] but accepting **any** single source
@@ -1184,7 +1176,7 @@ fn eligible_group_flow_inner(
     let mut group = None;
     for node in &graph.nodes {
         match &node.op {
-            Op::OpenCsv { .. } | Op::OpenBinary { .. } | Op::OpenJsonl { .. } => {
+            Op::Source { .. } => {
                 if source.is_some() {
                     return None;
                 }
@@ -1593,8 +1585,19 @@ impl ParPlan {
 /// CSV or a line-oriented JSONL file with ≥2 ranges). `None` for stdin,
 /// compressed, a JSON array, binary (no streaming reader yet), or too small.
 fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
-    match op {
-        Op::OpenCsv {
+    // Only a source op plans a parallel read; dispatch on its codec.
+    let Op::Source {
+        discovery,
+        codec,
+        provenance,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    let provenance = *provenance;
+    match codec {
+        Codec::Csv {
             projection,
             prefilter,
             str_prefilter,
@@ -1602,8 +1605,6 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             declared,
             dt_formats,
             delim,
-            provenance,
-            ..
         } => {
             let path = source_path(op).filter(|p| crate::transport::Scheme::of(p).is_seekable())?;
             let plan = crate::csv::plan_parallel(
@@ -1635,10 +1636,11 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                     str_prefilter: plan.str_prefilter,
                     delim: *delim,
                 },
-                provenance: *provenance,
+                provenance,
             })
         }
-        Op::OpenJsonl { path, provenance } => {
+        Codec::Jsonl => {
+            let path = discovery.path();
             if path == "-" {
                 return None;
             }
@@ -1647,19 +1649,18 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             Some(ParPlan {
                 schema: std::sync::Arc::new(schema),
                 ranges,
-                path: path.clone(),
+                path: path.to_string(),
                 bad_rows,
                 src: ParSource::Jsonl { names, dtypes },
-                provenance: *provenance,
+                provenance,
             })
         }
-        Op::OpenBinary {
-            path,
+        Codec::Binary {
             fields,
             endian,
             c_align,
-            provenance,
         } => {
+            let path = discovery.path();
             if path == "-" {
                 return None;
             }
@@ -1686,7 +1687,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             Some(ParPlan {
                 schema: std::sync::Arc::new(operators::bin_schema(fields)),
                 ranges,
-                path: path.clone(),
+                path: path.to_string(),
                 bad_rows: len % rec_size,
                 src: ParSource::Binary {
                     fields: fields.clone(),
@@ -1694,10 +1695,9 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                     rec_size,
                     endian: *endian,
                 },
-                provenance: *provenance,
+                provenance,
             })
         }
-        _ => None,
     }
 }
 
@@ -2238,7 +2238,7 @@ mod tests {
         let src_id = gp
             .nodes
             .iter()
-            .position(|nd| matches!(nd.op, Op::OpenCsv { .. }))
+            .position(|nd| matches!(nd.op, Op::Source { .. }))
             .unwrap();
         try_streaming_parallel(&gp, &opts, src_id, 4, None)
             .expect("streaming-parallel should engage");
