@@ -838,6 +838,26 @@ impl Parser {
                 let name = self.word()?;
                 Ok(self.g.add_node(Op::StreamRef { name }))
             }
+            // `ls "glob"` — discovery-as-flow (§28.3): enumerate files matching the
+            // glob into a stream of `Resource` handles (one `path` column). The
+            // pattern is a string literal (`**` recurses); no codec decode.
+            Tok::Word(w) if w == "ls" => {
+                self.bump();
+                let pattern = match self.bump() {
+                    Tok::Str(s) => s,
+                    other => {
+                        return Err(
+                            self.err(format!("ls expects a quoted glob pattern, found {other:?}"))
+                        )
+                    }
+                };
+                Ok(self.g.add_node(Op::Source {
+                    discovery: Discovery::Glob(pattern),
+                    transport: Transport::Local,
+                    codec: Codec::Discover,
+                    provenance: Provenance::Off,
+                }))
+            }
             // `readbin path [le|be] [packed|aligned] (name:type ...)`.
             Tok::Word(w) if w == "readbin" => {
                 self.bump();
@@ -1329,13 +1349,23 @@ impl Parser {
                     access: Access::Source,
                 })
             }
-            // Bare field of the current object: `age`.
+            // Bare field of the current object: `age`. A `word.field` tail (e.g.
+            // `path.uri`) is a field of a Resource-typed column (§28.3): the lexer
+            // tokenizes it as `Word Dot Word` in expression mode, so the `.field`
+            // is read here. (`source.field` is handled above as provenance; `$_.`
+            // is its own token.) A non-Resource base yields null at eval.
             Tok::Word(name) => {
                 self.bump();
-                Ok(Expr::Field {
-                    name,
-                    access: Access::Fast,
-                })
+                if self.at(&Tok::Dot) {
+                    self.bump();
+                    let field = self.word()?;
+                    Ok(Expr::ResourceField { base: name, field })
+                } else {
+                    Ok(Expr::Field {
+                        name,
+                        access: Access::Fast,
+                    })
+                }
             }
             other => Err(self.err(format!("unexpected token in expression: {other:?}"))),
         }
@@ -1762,6 +1792,44 @@ mod tests {
         assert!(matches!(
             &bproj[0].0,
             Expr::Field { name, access: Access::Fast } if name == "source"
+        ));
+    }
+
+    #[test]
+    fn ls_discovery_parses_and_round_trips() {
+        // `ls "glob"` (§28.3) → a discovery source (Glob + Codec::Discover); the
+        // `path.<field>` accessor on the Resource column is a ResourceField. Both
+        // survive source -> IR -> source.
+        let src = "L:\n ls \"logs/**/*.csv\"\n |? path.name == \"a.csv\"\n |> (path.uri) as u\n;";
+        let g = parse(src).unwrap();
+        assert!(matches!(
+            &g.nodes[0].op,
+            Op::Source {
+                discovery: Discovery::Glob(p),
+                codec: Codec::Discover,
+                ..
+            } if p == "logs/**/*.csv"
+        ));
+        let s = g.to_source();
+        assert!(s.contains("ls \"logs/**/*.csv\""), "ls lost in {s}");
+        assert!(s.contains("(path.uri) as u"), "resource field lost in {s}");
+        assert!(
+            s.contains("path.name"),
+            "predicate resource field lost in {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        // `path.uri` parses to a ResourceField (base `path`, field `uri`).
+        let proj = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::ProjectExpr { items } => Some(items),
+                _ => None,
+            })
+            .expect("computed projection");
+        assert!(matches!(
+            &proj[0].0,
+            Expr::ResourceField { base, field } if base == "path" && field == "uri"
         ));
     }
 

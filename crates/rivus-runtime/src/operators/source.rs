@@ -893,6 +893,82 @@ impl Operator for SourceJsonl {
     }
 }
 
+// ------------------------------------------------------------ source (discover)
+
+/// `ls "glob"` — discovery-as-flow (design §28.3 / `Codec::Discover`). Enumerates
+/// the glob into a deterministic (uri-ascending) list of resources and emits them
+/// as a single `Resource` column named `path`, in `chunk_size` batches (so the
+/// stream is chunk-size independent). No bytes are decoded; field access uses the
+/// `path.uri` / `.name` / `.scheme` accessor. 0 matches → a warning + empty
+/// stream (continue-first).
+pub(crate) struct SourceDiscover {
+    pattern: String,
+    chunk_size: usize,
+    loaded: bool,
+    uris: Vec<String>,
+    cursor: usize,
+    schema: Arc<Schema>,
+}
+
+impl SourceDiscover {
+    pub(crate) fn new(pattern: String, chunk_size: usize) -> Self {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "path".to_string(),
+            DataType::Resource,
+        )]));
+        SourceDiscover {
+            pattern,
+            chunk_size: chunk_size.max(1),
+            loaded: false,
+            uris: Vec::new(),
+            cursor: 0,
+            schema,
+        }
+    }
+}
+
+impl Operator for SourceDiscover {
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
+        if !self.loaded {
+            self.loaded = true;
+            self.uris = crate::discovery::glob_paths(&self.pattern);
+            if self.uris.is_empty() {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Graph,
+                        format!("ls: no files match '{}'", self.pattern),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+        }
+        if self.cursor >= self.uris.len() {
+            return None;
+        }
+        let end = (self.cursor + self.chunk_size).min(self.uris.len());
+        let mut col = StrColumn::with_capacity(end - self.cursor, 0);
+        for u in &self.uris[self.cursor..end] {
+            col.push(u);
+        }
+        self.cursor = end;
+        let id = ctx.fresh_id();
+        Some(Chunk::new(
+            id,
+            self.schema.clone(),
+            vec![Column::resource(col)],
+        ))
+    }
+
+    fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        Vec::new()
+    }
+}
+
 // ----------------------------------------------------------- stream ref (stub)
 
 /// `stream X` replay. The MVP has no checkpoint store yet, so a replay with no

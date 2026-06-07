@@ -228,6 +228,16 @@ pub enum Expr {
         name: String,
         access: Access,
     },
+    /// `base.field` — a field of a **`Resource`-typed column** (design §28.3): the
+    /// generic accessor over a discovery handle column (`path.uri` / `.name` /
+    /// `.scheme` / `.size` / `.mtime`), shared with the `source.<field>`
+    /// provenance accessor via the runtime's `resource_field`. `base` is the
+    /// column name; a non-Resource / missing base yields null (continue-first).
+    /// Kept distinct from `Field`+`Access` so `Access` stays `Copy` (no `String`).
+    ResourceField {
+        base: String,
+        field: String,
+    },
     Literal(Value),
     /// A `$x` **value hole** (§25.3): a named placeholder for a value, filled by
     /// a binding (`| clean min=0`) or a scope parameter. It is bound at the
@@ -291,7 +301,7 @@ impl Expr {
                 Some(v) => Expr::Literal(v.clone()),
                 None => Expr::Hole(name.clone()),
             },
-            Expr::Field { .. } | Expr::Literal(_) => self.clone(),
+            Expr::Field { .. } | Expr::ResourceField { .. } | Expr::Literal(_) => self.clone(),
             Expr::Compare { left, op, right } => Expr::Compare {
                 left: Box::new(left.bind_holes(bindings)),
                 op: *op,
@@ -333,7 +343,7 @@ impl Expr {
     pub fn collect_holes(&self, out: &mut Vec<String>) {
         match self {
             Expr::Hole(name) => out.push(name.clone()),
-            Expr::Field { .. } | Expr::Literal(_) => {}
+            Expr::Field { .. } | Expr::ResourceField { .. } | Expr::Literal(_) => {}
             Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
                 left.collect_holes(out);
                 right.collect_holes(out);
@@ -390,6 +400,8 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Field { name, access } => write!(f, "{}", Expr::field_src(name, *access)),
+            // `base.field` on a Resource column (§28.3) — round-trips as written.
+            Expr::ResourceField { base, field } => write!(f, "{base}.{field}"),
             Expr::Literal(Value::Str(s)) => write!(f, "\"{}\"", Expr::escape_string(s)),
             // A resource literal round-trips its uri **only** — `size`/`mtime` are
             // out of the determinism contract (§00 0.14), so they are never emitted.

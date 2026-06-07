@@ -351,6 +351,8 @@ fn collect_fields(e: &Expr, out: &mut Vec<String>) {
                 push_unique(out, name)
             }
         }
+        // `base.field` on a Resource column needs the `base` column to be live.
+        Expr::ResourceField { base, .. } => push_unique(out, base),
         // A value hole references no column.
         Expr::Literal(_) | Expr::Hole(_) => {}
         Expr::Compare { left, right, .. } => {

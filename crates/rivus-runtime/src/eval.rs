@@ -648,6 +648,11 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
             // Missing field → a NaN numeric lane (continue-first).
             None => Column::f64(vec![f64::NAN; chunk.len]),
         },
+        // `base.field` on a Resource column (§28.3): per-row accessor over the
+        // handle column (null where the base is missing / not a Resource).
+        Expr::ResourceField { .. } => {
+            column_from_values((0..chunk.len).map(|r| eval(expr, chunk, r)).collect())
+        }
         Expr::Literal(v) => const_column(v, chunk.len),
         Expr::Cast { expr, ty } => cast_column(eval_column(expr, chunk), *ty),
         Expr::Arith { left, op, right } => eval_arith(left, *op, right, chunk),
@@ -1083,6 +1088,15 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
         // reaches eval it yields Null (continue-first, never a panic).
         Expr::Hole(_) => Value::Null,
         Expr::Field { name, access } => eval_field(name, *access, chunk, row),
+        // `base.field` — a field of a Resource-typed column (§28.3). Null when the
+        // base column is missing or is not a Resource (continue-first).
+        Expr::ResourceField { base, field } => match chunk.column(base) {
+            Some(col) => match col.value_at(row) {
+                Value::Resource(r) => resource_field(&r, field),
+                _ => Value::Null,
+            },
+            None => Value::Null,
+        },
         Expr::Compare { left, op, right } => {
             Value::Bool(compare_fast(left, *op, right, chunk, row))
         }
@@ -1172,19 +1186,29 @@ fn eval_field(name: &str, access: Access, chunk: &Chunk, row: usize) -> Value {
     }
 }
 
-/// Generic field accessor on a [`Resource`] (design §28.6 / §00 0.14), shared by
-/// the `source.<field>` accessor and (slice 3) a discovery `Resource` *column*.
-/// `uri` and `scheme` are the in-contract, **deterministic** fields (a pure
-/// function of the handle). `size`/`mtime` are *out* of the determinism contract
-/// (§00 0.14), so they are deliberately not exposed on this byte-identity-checked
-/// path; an unknown field is a continue-first null too.
+/// Generic field accessor on a [`Resource`] (design §28.6/§28.3), shared by the
+/// `source.<field>` provenance accessor and the discovery `path.<field>` accessor.
+/// `uri` / `scheme` / `name` are in-contract, **deterministic** (pure functions
+/// of the uri). `size` / `mtime` are *out* of the determinism contract (§00
+/// 0.14): exposed only when the handle actually carries them — discovery fills
+/// them, while provenance leaves them `None` → null, so the byte-identity path
+/// stays deterministic. An unknown field is a continue-first null.
 fn resource_field(r: &Resource, field: &str) -> Value {
     match field {
         "uri" => Value::Str(r.uri().to_string()),
         "scheme" => Value::Str(uri_scheme(r.uri()).to_string()),
-        // size/mtime are out of the determinism contract; unknown → null.
+        "name" => Value::Str(uri_basename(r.uri()).to_string()),
+        "size" => r.size().map_or(Value::Null, |s| Value::I64(s as i64)),
+        "mtime" => r.mtime().map_or(Value::Null, |t| {
+            Value::DateTime(rivus_core::DateTime::new(t, rivus_core::TimeUnit::Sec))
+        }),
         _ => Value::Null,
     }
+}
+
+/// The final path segment of a uri (the `name` field): `logs/a.csv` → `a.csv`.
+fn uri_basename(uri: &str) -> &str {
+    uri.rsplit(['/', '\\']).next().unwrap_or(uri)
 }
 
 /// The transport scheme implied by a uri (design §28.1) — a pure function of the
