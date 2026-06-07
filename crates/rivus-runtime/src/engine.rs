@@ -1532,8 +1532,8 @@ impl ParPlan {
     /// Open a streaming source for byte range `[a, b)`.
     fn make_source(&self, a: u64, b: u64, chunk_size: usize) -> Box<dyn Operator> {
         // Every worker derives the same origin handle from the same path, so the
-        // provenance it stamps is partition-independent (byte-identical to serial).
-        let source = self.provenance.source(&self.path);
+        // provenance it stamps (and the materialized `filename` column) is
+        // partition-independent — byte-identical to the serial reader.
         match &self.src {
             ParSource::Csv {
                 dtypes,
@@ -1556,7 +1556,7 @@ impl ParPlan {
                 prefilter.clone(),
                 str_prefilter.clone(),
                 *delim,
-                source,
+                self.provenance,
             ),
             ParSource::Jsonl { names, dtypes } => operators::jsonl_range_source(
                 &self.path,
@@ -1566,7 +1566,7 @@ impl ParPlan {
                 a,
                 b,
                 chunk_size,
-                source,
+                self.provenance,
             ),
             ParSource::Binary {
                 fields,
@@ -1583,7 +1583,7 @@ impl ParPlan {
                 a as usize / rec_size,
                 (b - a) as usize / rec_size,
                 chunk_size,
-                source,
+                self.provenance,
             ),
         }
     }

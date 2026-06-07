@@ -10,8 +10,8 @@ use crate::eval;
 use crate::jsonl;
 use crate::kernel;
 use rivus_core::{
-    Chunk, Column, ColumnData, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field,
-    Resource, Schema, Severity, StrColumn, TimeUnit, Validity, Value,
+    Chunk, Column, ColumnData, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field, Schema,
+    Severity, StrColumn, TimeUnit, Validity, Value,
 };
 use rivus_ir::{
     AggFunc, BinType, CmpOp, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
@@ -143,10 +143,10 @@ pub fn jsonl_range_source(
     start: u64,
     end: u64,
     chunk_size: usize,
-    source: Option<Resource>,
+    provenance: rivus_ir::Provenance,
 ) -> Box<dyn Operator> {
     match jsonl::JsonlChunker::for_range(path, names, dtypes, start, end, chunk_size) {
-        Ok(ch) => Box::new(SourceJsonl::from_chunker(schema, ch).with_source(source)),
+        Ok(ch) => Box::new(SourceJsonl::from_chunker(schema, ch).with_provenance(provenance, path)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
         }),
@@ -171,7 +171,7 @@ pub fn csv_range_source(
     prefilter: Vec<(usize, CmpOp, f64)>,
     str_prefilter: Vec<String>,
     delim: u8,
-    source: Option<Resource>,
+    provenance: rivus_ir::Provenance,
 ) -> Box<dyn Operator> {
     match csv::CsvChunker::for_range(
         path,
@@ -186,7 +186,7 @@ pub fn csv_range_source(
         str_prefilter,
         delim,
     ) {
-        Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch).with_source(source)),
+        Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch).with_provenance(provenance, path)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
         }),
@@ -236,7 +236,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                 dt_formats.clone(),
                 *delim,
             )
-            .with_source(provenance.source(path)),
+            .with_provenance(*provenance, path),
         ),
         Op::OpenBinary {
             path,
@@ -246,11 +246,11 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             provenance,
         } => Box::new(
             SourceBinary::new(path.clone(), fields.clone(), *endian, *c_align, chunk_size)
-                .with_source(provenance.source(path)),
+                .with_provenance(*provenance, path),
         ),
-        Op::OpenJsonl { path, provenance } => Box::new(
-            SourceJsonl::new(path.clone(), chunk_size).with_source(provenance.source(path)),
-        ),
+        Op::OpenJsonl { path, provenance } => {
+            Box::new(SourceJsonl::new(path.clone(), chunk_size).with_provenance(*provenance, path))
+        }
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Validate { pred, disposition } => Box::new(Validate {

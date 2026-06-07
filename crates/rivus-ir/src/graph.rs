@@ -298,6 +298,14 @@ impl Provenance {
             Provenance::Source | Provenance::Filename => Some(rivus_core::Resource::new(path)),
         }
     }
+
+    /// Does this mode materialize a `filename` column (= `source.uri`) at the end
+    /// of each chunk? Only `with filename` does (slice 2-②b); `with source`
+    /// rides the handle on metadata only. The column is suffixed `filename_r` on
+    /// collision with an existing column (§27.1, the join rule).
+    pub fn materializes_filename(self) -> bool {
+        matches!(self, Provenance::Filename)
+    }
 }
 
 /// A flow operator. One enum spanning sources, transforms, fan-out/in and

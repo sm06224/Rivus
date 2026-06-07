@@ -5,15 +5,39 @@
 
 use super::*;
 use crate::transport::{read_whole, FileTransport, Scheme};
+use rivus_core::Resource;
 
-/// Stamp a source's origin handle onto a freshly produced chunk's metadata
-/// (design §28.6 provenance). Zero-cost when provenance is off (`source` is
-/// `None`). Applied **identically** on the serial reader and on every byte-range
-/// parallel worker — each derives the same handle from the same path — so the
-/// origin is partition-independent and byte-identity holds (serial == parallel).
-fn stamp_source(mut chunk: Chunk, source: &Option<Resource>) -> Chunk {
-    if source.is_some() {
-        chunk.meta.source = source.clone();
+/// Attach provenance to a freshly produced chunk (design §28.6). Stamps the
+/// origin handle on chunk metadata (reachable via the `source.uri` accessor);
+/// under `with filename` (`filename == true`) it additionally **materializes** a
+/// `filename` Str column at the end of the chunk — the `(source.uri) as filename`
+/// sugar (§27.1) — suffixed `filename_r` when the data already has a `filename`
+/// column (the join collision rule). Zero-cost when provenance is off (`source`
+/// is `None`). Applied **identically** on the serial reader and on every
+/// byte-range parallel worker — each derives the same handle from the same path
+/// — so the origin (and the materialized column) is partition-independent and
+/// byte-identity holds (serial == parallel == chunk-size).
+fn attach_provenance(mut chunk: Chunk, source: &Option<Resource>, filename: bool) -> Chunk {
+    let Some(handle) = source else {
+        return chunk;
+    };
+    chunk.meta.source = Some(handle.clone());
+    if filename {
+        // `filename` unless the data already has that column → `filename_r`.
+        let name = if chunk.schema.index_of("filename").is_some() {
+            "filename_r"
+        } else {
+            "filename"
+        };
+        let uri = handle.uri();
+        let mut col = StrColumn::with_capacity(chunk.len, uri.len() * chunk.len);
+        for _ in 0..chunk.len {
+            col.push(uri);
+        }
+        let mut fields = chunk.schema.fields.clone();
+        fields.push(Field::new(name.to_string(), DataType::Str));
+        chunk.schema = Arc::new(Schema::new(fields));
+        chunk.columns.push(Column::str(col));
     }
     chunk
 }
@@ -54,6 +78,9 @@ pub(crate) struct SourceCsv {
     /// Origin handle stamped onto every produced chunk when `with source` /
     /// `with filename` is set (design §28.6); `None` = provenance off.
     source: Option<Resource>,
+    /// `with filename`: also materialize a `filename` column (= source.uri) at
+    /// the end of each chunk (§27.1). False for `with source` / off.
+    filename: bool,
 }
 
 impl SourceCsv {
@@ -88,13 +115,16 @@ impl SourceCsv {
             cursor: 0,
             total: 0,
             source: None,
+            filename: false,
         }
     }
 
-    /// Set the provenance origin handle stamped onto every produced chunk
-    /// (design §28.6); `None` leaves provenance off (zero overhead).
-    pub(crate) fn with_source(mut self, source: Option<Resource>) -> Self {
-        self.source = source;
+    /// Configure provenance (design §28.6) from the IR mode and source path: the
+    /// stamped origin handle and whether to materialize the `filename` column.
+    /// `Off` leaves provenance off (zero overhead).
+    pub(crate) fn with_provenance(mut self, prov: rivus_ir::Provenance, path: &str) -> Self {
+        self.source = prov.source(path);
+        self.filename = prov.materializes_filename();
         self
     }
 
@@ -119,6 +149,7 @@ impl SourceCsv {
             cursor: 0,
             total: 0,
             source: None,
+            filename: false,
         }
     }
 
@@ -272,9 +303,10 @@ impl Operator for SourceCsv {
             match dec.decode_chunk() {
                 Some(cols) => {
                     let id = ctx.fresh_id();
-                    return Some(stamp_source(
+                    return Some(attach_provenance(
                         Chunk::new(id, self.schema.clone(), cols),
                         &self.source,
+                        self.filename,
                     ));
                 }
                 None => {
@@ -330,9 +362,10 @@ impl Operator for SourceCsv {
         let columns = self.columns.iter().map(|c| c.gather(&idx)).collect();
         let id = ctx.fresh_id();
         self.cursor = end;
-        Some(stamp_source(
+        Some(attach_provenance(
             Chunk::new(id, self.schema.clone(), columns),
             &self.source,
+            self.filename,
         ))
     }
 
@@ -358,6 +391,8 @@ pub(crate) struct SourceBinary {
     /// Origin handle stamped onto every produced chunk (design §28.6); `None` =
     /// provenance off.
     source: Option<Resource>,
+    /// `with filename`: also materialize a `filename` column (§27.1).
+    filename: bool,
 }
 
 impl SourceBinary {
@@ -378,13 +413,14 @@ impl SourceBinary {
             decoder: None,
             loaded: false,
             source: None,
+            filename: false,
         }
     }
 
-    /// Set the provenance origin handle stamped onto every produced chunk
-    /// (design §28.6); `None` leaves provenance off (zero overhead).
-    pub(crate) fn with_source(mut self, source: Option<Resource>) -> Self {
-        self.source = source;
+    /// Configure provenance (design §28.6) from the IR mode and source path.
+    pub(crate) fn with_provenance(mut self, prov: rivus_ir::Provenance, path: &str) -> Self {
+        self.source = prov.source(path);
+        self.filename = prov.materializes_filename();
         self
     }
 
@@ -401,6 +437,7 @@ impl SourceBinary {
             decoder: Some(Box::new(chunker)),
             loaded: true,
             source: None,
+            filename: false,
         }
     }
 
@@ -446,9 +483,10 @@ impl Operator for SourceBinary {
         let dec = self.decoder.as_mut()?;
         let columns = dec.decode_chunk()?;
         let id = ctx.fresh_id();
-        Some(stamp_source(
+        Some(attach_provenance(
             Chunk::new(id, self.schema.clone(), columns),
             &self.source,
+            self.filename,
         ))
     }
 
@@ -637,12 +675,14 @@ pub fn bin_range_source(
     start_rec: usize,
     n_recs: usize,
     chunk_size: usize,
-    source: Option<Resource>,
+    provenance: rivus_ir::Provenance,
 ) -> Box<dyn Operator> {
     match BinChunker::for_range(
         path, fields, offsets, rec_size, endian, start_rec, n_recs, chunk_size,
     ) {
-        Ok(ch) => Box::new(SourceBinary::from_chunker(schema, ch).with_source(source)),
+        Ok(ch) => {
+            Box::new(SourceBinary::from_chunker(schema, ch).with_provenance(provenance, path))
+        }
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
         }),
@@ -707,6 +747,8 @@ pub(crate) struct SourceJsonl {
     /// Origin handle stamped onto every produced chunk (design §28.6); `None` =
     /// provenance off.
     source: Option<Resource>,
+    /// `with filename`: also materialize a `filename` column (§27.1).
+    filename: bool,
 }
 
 impl SourceJsonl {
@@ -721,13 +763,14 @@ impl SourceJsonl {
             total: 0,
             loaded: false,
             source: None,
+            filename: false,
         }
     }
 
-    /// Set the provenance origin handle stamped onto every produced chunk
-    /// (design §28.6); `None` leaves provenance off (zero overhead).
-    pub(crate) fn with_source(mut self, source: Option<Resource>) -> Self {
-        self.source = source;
+    /// Configure provenance (design §28.6) from the IR mode and source path.
+    pub(crate) fn with_provenance(mut self, prov: rivus_ir::Provenance, path: &str) -> Self {
+        self.source = prov.source(path);
+        self.filename = prov.materializes_filename();
         self
     }
 
@@ -744,6 +787,7 @@ impl SourceJsonl {
             total: 0,
             loaded: true,
             source: None,
+            filename: false,
         }
     }
 
@@ -823,9 +867,10 @@ impl Operator for SourceJsonl {
         if let Some(dec) = self.decoder.as_mut() {
             let columns = dec.decode_chunk()?;
             let id = ctx.fresh_id();
-            return Some(stamp_source(
+            return Some(attach_provenance(
                 Chunk::new(id, self.schema.clone(), columns),
                 &self.source,
+                self.filename,
             ));
         }
         if self.cursor >= self.total {
@@ -836,9 +881,10 @@ impl Operator for SourceJsonl {
         let columns = self.columns.iter().map(|c| c.gather(&idx)).collect();
         let id = ctx.fresh_id();
         self.cursor = end;
-        Some(stamp_source(
+        Some(attach_provenance(
             Chunk::new(id, self.schema.clone(), columns),
             &self.source,
+            self.filename,
         ))
     }
 
