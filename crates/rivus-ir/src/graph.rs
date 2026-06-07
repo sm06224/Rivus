@@ -317,14 +317,20 @@ impl Provenance {
 pub enum Discovery {
     /// A single fixed resource path — the v1 `open` / `readbin` source.
     Fixed(String),
+    /// A glob pattern enumerated into a **stream of resources** (`ls "logs/**/*.csv"`,
+    /// design §28.3): `**` recurses, `*`/`?`/`[...]` match within a path segment.
+    /// std-only (no deps); resources are emitted in deterministic uri-ascending
+    /// order. Paired with `Codec::Discover` it lists files as a `Resource` table.
+    Glob(String),
 }
 
 impl Discovery {
-    /// The single resource path of the v1 `Fixed` form. (Slice 3's multi-resource
-    /// discovery variants will expose a stream of resources instead.)
+    /// The discovery's path/pattern string: the fixed path (`Fixed`) or the glob
+    /// pattern (`Glob`). Used for `to_source` and the parallel-read size gate
+    /// (`Glob` never plans a byte-range read — its codec is `Discover`).
     pub fn path(&self) -> &str {
         match self {
-            Discovery::Fixed(p) => p,
+            Discovery::Fixed(p) | Discovery::Glob(p) => p,
         }
     }
 }
@@ -368,6 +374,12 @@ pub enum Codec {
         endian: Endian,
         c_align: bool,
     },
+    /// **Discovery codec** (design §28.3): no bytes are decoded — the discovered
+    /// resources are emitted directly as a single `Resource` column named `path`.
+    /// This is the `ls` source (`Discovery::Glob` + `Codec::Discover`); fields of
+    /// each handle are read with the `path.uri` / `.name` / `.size` / `.mtime`
+    /// accessor. Slice 3c's `read` consumes such a resource stream to decode files.
+    Discover,
 }
 
 impl Codec {
@@ -652,6 +664,7 @@ impl Op {
             // surface verb each desugars from).
             Op::Source { codec, .. } => match codec {
                 Codec::Binary { .. } => "readbin",
+                Codec::Discover => "ls",
                 Codec::Csv { .. } | Codec::Jsonl => "open",
             },
             Op::StreamRef { .. } => "stream",
@@ -771,6 +784,10 @@ impl Op {
                         )
                     }
                     Codec::Jsonl => format!("open {path}{}", provenance.modifier()),
+                    // `ls "glob"` — the path is the glob pattern; quote it so it
+                    // re-lexes as one string token (reversible). Provenance is not
+                    // applicable to a discovery source (it emits handles already).
+                    Codec::Discover => format!("ls {path:?}"),
                 }
             }
             Op::StreamRef { name } => format!("stream {name}"),

@@ -8,6 +8,7 @@
 mod analytics;
 mod codec;
 mod csv;
+mod discovery;
 mod engine;
 mod eval;
 mod jsonl;

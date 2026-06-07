@@ -88,6 +88,7 @@ fn collect_strings(res: &rivus_runtime::RunResult, label: &str, col: &str) -> Ve
 mod bug_specs;
 mod byte_identity;
 mod decimal;
+mod discovery;
 mod groupby;
 mod io_formats;
 mod joins;

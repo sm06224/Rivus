@@ -838,6 +838,27 @@ impl Parser {
                 let name = self.word()?;
                 Ok(self.g.add_node(Op::StreamRef { name }))
             }
+            // `ls "glob"` — discovery-as-flow (§28.3): enumerate files matching the
+            // glob into a stream of file rows (`path`/`name`/`size`/`mtime`). The
+            // pattern is a string literal (`**` recurses); no codec decode.
+            // Aliases `gci` / `dir` (PowerShell), verb-only (no `Verb-Noun`).
+            Tok::Word(w) if w == "ls" || w == "gci" || w == "dir" => {
+                self.bump();
+                let pattern = match self.bump() {
+                    Tok::Str(s) => s,
+                    other => {
+                        return Err(
+                            self.err(format!("ls expects a quoted glob pattern, found {other:?}"))
+                        )
+                    }
+                };
+                Ok(self.g.add_node(Op::Source {
+                    discovery: Discovery::Glob(pattern),
+                    transport: Transport::Local,
+                    codec: Codec::Discover,
+                    provenance: Provenance::Off,
+                }))
+            }
             // `readbin path [le|be] [packed|aligned] (name:type ...)`.
             Tok::Word(w) if w == "readbin" => {
                 self.bump();
@@ -1329,9 +1350,21 @@ impl Parser {
                     access: Access::Source,
                 })
             }
-            // Bare field of the current object: `age`.
+            // Bare field of the current object: `age`. Outside parens (flow mode)
+            // the lexer folds `a.b` into a single identifier, so a dotted bare word
+            // here is almost always a mis-placed handle accessor (`source.uri`,
+            // §28.6) or a dotted column name. Rather than silently build a field
+            // literally named `a.b` (never-silent + it would not round-trip), it is
+            // an explicit error: handle fields go in a computed column `|> (…)`, and
+            // a genuinely dotted column name is reached with `item("a.b")`.
             Tok::Word(name) => {
                 self.bump();
+                if name.contains('.') {
+                    return Err(self.err(format!(
+                        "dotted field `{name}` is ambiguous here; use it in a computed column \
+                         `|> (…)` (e.g. `source.uri`), or `item(\"{name}\")` for a real column"
+                    )));
+                }
                 Ok(Expr::Field {
                     name,
                     access: Access::Fast,
@@ -1763,6 +1796,48 @@ mod tests {
             &bproj[0].0,
             Expr::Field { name, access: Access::Fast } if name == "source"
         ));
+    }
+
+    #[test]
+    fn ls_discovery_parses_and_round_trips() {
+        // `ls "glob"` (§28.3) → a discovery source (Glob + Codec::Discover) that
+        // emits ordinary file columns; `name`/`size` are *bare* fields (no handle
+        // accessor), so predicate + projection round-trip cleanly.
+        let src = "L:\n ls \"logs/**/*.csv\"\n |? size > 1000\n |> path name\n;";
+        let g = parse(src).unwrap();
+        assert!(matches!(
+            &g.nodes[0].op,
+            Op::Source {
+                discovery: Discovery::Glob(p),
+                codec: Codec::Discover,
+                ..
+            } if p == "logs/**/*.csv"
+        ));
+        let s = g.to_source();
+        assert!(s.contains("ls \"logs/**/*.csv\""), "ls lost in {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        // Aliases `gci` / `dir` parse to the same discovery codec (verb-only).
+        for alias in ["gci", "dir"] {
+            let a = parse(&format!("A:\n {alias} \"*.csv\"\n;")).unwrap();
+            assert!(matches!(
+                &a.nodes[0].op,
+                Op::Source {
+                    codec: Codec::Discover,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn dotted_bare_field_is_rejected_outside_a_computed_column() {
+        // A handle accessor (`source.uri`) belongs in a computed column; a bare
+        // dotted field in a predicate is an explicit error (never-silent +
+        // reversibility), not a silently-built field named "source.uri".
+        assert!(parse("F:\n open a.csv with source\n |? source.uri == \"x\"\n;").is_err());
+        assert!(parse("L:\n ls \"*.csv\"\n |? path.name == \"a\"\n;").is_err());
+        // In a computed column it is the provenance accessor (works, slice 2).
+        assert!(parse("F:\n open a.csv with source\n |> (source.uri) as u\n;").is_ok());
     }
 
     #[test]

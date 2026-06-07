@@ -1172,17 +1172,15 @@ fn eval_field(name: &str, access: Access, chunk: &Chunk, row: usize) -> Value {
     }
 }
 
-/// Generic field accessor on a [`Resource`] (design §28.6 / §00 0.14), shared by
-/// the `source.<field>` accessor and (slice 3) a discovery `Resource` *column*.
-/// `uri` and `scheme` are the in-contract, **deterministic** fields (a pure
-/// function of the handle). `size`/`mtime` are *out* of the determinism contract
-/// (§00 0.14), so they are deliberately not exposed on this byte-identity-checked
-/// path; an unknown field is a continue-first null too.
+/// Generic field accessor on a [`Resource`] (design §28.6 / §00 0.14), used by
+/// the `source.<field>` provenance accessor. `uri` and `scheme` are the
+/// in-contract, **deterministic** fields (a pure function of the uri). Other
+/// fields (`size`/`mtime` — out of the determinism contract) are not exposed on
+/// this provenance path; an unknown field is a continue-first null.
 fn resource_field(r: &Resource, field: &str) -> Value {
     match field {
         "uri" => Value::Str(r.uri().to_string()),
         "scheme" => Value::Str(uri_scheme(r.uri()).to_string()),
-        // size/mtime are out of the determinism contract; unknown → null.
         _ => Value::Null,
     }
 }

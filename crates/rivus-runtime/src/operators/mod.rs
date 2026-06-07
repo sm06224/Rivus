@@ -264,6 +264,9 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                     SourceJsonl::new(path.to_string(), chunk_size)
                         .with_provenance(*provenance, path),
                 ),
+                // `ls` discovery: enumerate the glob (`path` is the pattern) into a
+                // Resource stream; no codec decode, no provenance.
+                Codec::Discover => Box::new(SourceDiscover::new(path.to_string(), chunk_size)),
             }
         }
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),

@@ -893,6 +893,119 @@ impl Operator for SourceJsonl {
     }
 }
 
+// ------------------------------------------------------------ source (discover)
+
+/// `ls "glob"` — discovery-as-flow (design §28.3 / `Codec::Discover`). Enumerates
+/// the glob into a deterministic (uri-ascending) list of files and emits them as
+/// **ordinary columns** `{ path: Resource, name: str, size: int, mtime: datetime }`,
+/// in `chunk_size` batches (so the stream is chunk-size independent). `path` is the
+/// composable handle (consumed by `read`, slice 3c); `name`/`size`/`mtime` are
+/// derived filter columns. `size`/`mtime` are out of the determinism contract
+/// (§00 0.14) — results that depend on them aren't byte-identity/parallel
+/// guaranteed; `path`/`name` order is deterministic. 0 matches → warn + empty
+/// stream (continue-first).
+pub(crate) struct SourceDiscover {
+    pattern: String,
+    chunk_size: usize,
+    loaded: bool,
+    uris: Vec<String>,
+    cursor: usize,
+    schema: Arc<Schema>,
+}
+
+impl SourceDiscover {
+    pub(crate) fn new(pattern: String, chunk_size: usize) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("path".to_string(), DataType::Resource),
+            Field::new("name".to_string(), DataType::Str),
+            Field::new("size".to_string(), DataType::I64),
+            Field::new(
+                "mtime".to_string(),
+                DataType::DateTime {
+                    unit: TimeUnit::Sec,
+                },
+            ),
+        ]));
+        SourceDiscover {
+            pattern,
+            chunk_size: chunk_size.max(1),
+            loaded: false,
+            uris: Vec::new(),
+            cursor: 0,
+            schema,
+        }
+    }
+}
+
+/// The final path segment of a uri (the `name` column): `logs/a.csv` → `a.csv`.
+fn basename(uri: &str) -> &str {
+    uri.rsplit(['/', '\\']).next().unwrap_or(uri)
+}
+
+impl Operator for SourceDiscover {
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
+        if !self.loaded {
+            self.loaded = true;
+            self.uris = crate::discovery::glob_paths(&self.pattern);
+            if self.uris.is_empty() {
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Graph,
+                        format!("ls: no files match '{}'", self.pattern),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+        }
+        if self.cursor >= self.uris.len() {
+            return None;
+        }
+        let end = (self.cursor + self.chunk_size).min(self.uris.len());
+        let n = end - self.cursor;
+        let mut path = StrColumn::with_capacity(n, 0);
+        let mut name = StrColumn::with_capacity(n, 0);
+        let mut size = Vec::with_capacity(n);
+        let mut mtime = Vec::with_capacity(n);
+        for u in &self.uris[self.cursor..end] {
+            path.push(u);
+            name.push(basename(u));
+            // size / mtime are out-of-contract (§00 0.14); a failed stat → 0.
+            let meta = std::fs::metadata(u).ok();
+            size.push(meta.as_ref().map(|m| m.len() as i64).unwrap_or(0));
+            mtime.push(
+                meta.and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            );
+        }
+        self.cursor = end;
+        let id = ctx.fresh_id();
+        Some(Chunk::new(
+            id,
+            self.schema.clone(),
+            vec![
+                Column::resource(path),
+                Column::str(name),
+                Column::i64(size),
+                Column::datetime(DtColumn {
+                    ticks: mtime,
+                    unit: TimeUnit::Sec,
+                }),
+            ],
+        ))
+    }
+
+    fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        Vec::new()
+    }
+}
+
 // ----------------------------------------------------------- stream ref (stub)
 
 /// `stream X` replay. The MVP has no checkpoint store yet, so a replay with no
