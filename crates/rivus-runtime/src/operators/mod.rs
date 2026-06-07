@@ -134,6 +134,7 @@ pub fn collector() -> Box<dyn Operator> {
 /// A streaming JSONL source over one newline-aligned byte range `[start, end)`,
 /// used by the parallel executor (#49). The global schema/types are pre-inferred
 /// (see [`jsonl::plan_parallel`]); on open error it yields nothing (continue-first).
+#[allow(clippy::too_many_arguments)]
 pub fn jsonl_range_source(
     path: &str,
     names: Vec<String>,
@@ -142,9 +143,10 @@ pub fn jsonl_range_source(
     start: u64,
     end: u64,
     chunk_size: usize,
+    provenance: rivus_ir::Provenance,
 ) -> Box<dyn Operator> {
     match jsonl::JsonlChunker::for_range(path, names, dtypes, start, end, chunk_size) {
-        Ok(ch) => Box::new(SourceJsonl::from_chunker(schema, ch)),
+        Ok(ch) => Box::new(SourceJsonl::from_chunker(schema, ch).with_provenance(provenance, path)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
         }),
@@ -169,6 +171,7 @@ pub fn csv_range_source(
     prefilter: Vec<(usize, CmpOp, f64)>,
     str_prefilter: Vec<String>,
     delim: u8,
+    provenance: rivus_ir::Provenance,
 ) -> Box<dyn Operator> {
     match csv::CsvChunker::for_range(
         path,
@@ -183,7 +186,7 @@ pub fn csv_range_source(
         str_prefilter,
         delim,
     ) {
-        Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch)),
+        Ok(ch) => Box::new(SourceCsv::from_stream(schema, ch).with_provenance(provenance, path)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),
         }),
@@ -219,33 +222,35 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             declared,
             dt_formats,
             delim,
-            ..
-        } => Box::new(SourceCsv::new(
-            path.clone(),
-            projection.clone(),
-            chunk_size,
-            preview,
-            prefilter.clone(),
-            str_prefilter.clone(),
-            *header,
-            declared.clone(),
-            dt_formats.clone(),
-            *delim,
-        )),
+            provenance,
+        } => Box::new(
+            SourceCsv::new(
+                path.clone(),
+                projection.clone(),
+                chunk_size,
+                preview,
+                prefilter.clone(),
+                str_prefilter.clone(),
+                *header,
+                declared.clone(),
+                dt_formats.clone(),
+                *delim,
+            )
+            .with_provenance(*provenance, path),
+        ),
         Op::OpenBinary {
             path,
             fields,
             endian,
             c_align,
-            ..
-        } => Box::new(SourceBinary::new(
-            path.clone(),
-            fields.clone(),
-            *endian,
-            *c_align,
-            chunk_size,
-        )),
-        Op::OpenJsonl { path, .. } => Box::new(SourceJsonl::new(path.clone(), chunk_size)),
+            provenance,
+        } => Box::new(
+            SourceBinary::new(path.clone(), fields.clone(), *endian, *c_align, chunk_size)
+                .with_provenance(*provenance, path),
+        ),
+        Op::OpenJsonl { path, provenance } => {
+            Box::new(SourceJsonl::new(path.clone(), chunk_size).with_provenance(*provenance, path))
+        }
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Validate { pred, disposition } => Box::new(Validate {

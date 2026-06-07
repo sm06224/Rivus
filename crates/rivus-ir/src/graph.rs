@@ -284,6 +284,28 @@ impl Provenance {
             Provenance::Filename => " with filename",
         }
     }
+
+    /// The origin handle a source attaches to each chunk under this mode, or
+    /// `None` when provenance is off (`Off` → zero overhead). Both `source` and
+    /// `filename` ride the handle (`filename` additionally materializes a column,
+    /// slice 2-②b). Only the uri is in-contract (§00 0.14), and every reader —
+    /// the serial path and each byte-range parallel worker — derives the same
+    /// handle from the same path, so provenance is byte-identical (serial ==
+    /// parallel, partition-independent).
+    pub fn source(self, path: &str) -> Option<rivus_core::Resource> {
+        match self {
+            Provenance::Off => None,
+            Provenance::Source | Provenance::Filename => Some(rivus_core::Resource::new(path)),
+        }
+    }
+
+    /// Does this mode materialize a `filename` column (= `source.uri`) at the end
+    /// of each chunk? Only `with filename` does (slice 2-②b); `with source`
+    /// rides the handle on metadata only. The column is suffixed `filename_r` on
+    /// collision with an existing column (§27.1, the join rule).
+    pub fn materializes_filename(self) -> bool {
+        matches!(self, Provenance::Filename)
+    }
 }
 
 /// A flow operator. One enum spanning sources, transforms, fan-out/in and

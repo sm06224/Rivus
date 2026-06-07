@@ -1306,6 +1306,22 @@ impl Parser {
                 self.bump(); // case
                 self.parse_case()
             }
+            // `source.field` — provenance accessor (design §28.6): a field of the
+            // chunk's origin Resource (`source.uri` / `source.scheme`). `source`
+            // is reserved only when followed by `.field`; a bare `source` (no
+            // dot) stays an ordinary column reference, so an actual `source`
+            // column is still reachable. Inside parens the lexer tokenizes
+            // `source.uri` as `Word("source") Dot Word("uri")` (identifiers are
+            // dot-free in expression mode), so the `.field` tail is parsed here.
+            Tok::Word(ref w) if w == "source" && self.toks[self.pos + 1].0 == Tok::Dot => {
+                self.bump(); // source
+                self.expect(&Tok::Dot)?;
+                let name = self.word()?;
+                Ok(Expr::Field {
+                    name,
+                    access: Access::Source,
+                })
+            }
             // Bare field of the current object: `age`.
             Tok::Word(name) => {
                 self.bump();
@@ -1702,6 +1718,56 @@ mod tests {
         }
         // `with` followed by garbage is an error, not silently ignored.
         assert!(parse("F:\n open a.csv with wat\n |> id\n;").is_err());
+    }
+
+    #[test]
+    fn source_accessor_parses_and_round_trips() {
+        // `source.<field>` (§28.6) parses to a Field with Access::Source and the
+        // bare field name (the `.uri`/`.scheme` is generic, not baked in), and
+        // survives source -> IR -> source as `(source.uri) as …`.
+        let src =
+            "F:\n open a.csv with source\n |> id (source.uri) as path (source.scheme) as sch\n;";
+        let g = parse(src).unwrap();
+        // The two accessors resolve to generic Resource-field references.
+        let proj = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::ProjectExpr { items } => Some(items),
+                _ => None,
+            })
+            .expect("computed projection");
+        assert!(matches!(
+            &proj[1].0,
+            Expr::Field { name, access: Access::Source } if name == "uri"
+        ));
+        assert!(matches!(
+            &proj[2].0,
+            Expr::Field { name, access: Access::Source } if name == "scheme"
+        ));
+        let s = g.to_source();
+        assert!(
+            s.contains("(source.uri) as path") && s.contains("(source.scheme) as sch"),
+            "source accessor lost in {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+
+        // A bare `source` (no `.field`) stays an ordinary column reference, so an
+        // actual column named `source` is still reachable (the accessor reserves
+        // `source` only when a `.field` follows).
+        let bare = parse("F:\n open a.csv\n |> (source) as s\n;").unwrap();
+        let bproj = bare
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::ProjectExpr { items } => Some(items),
+                _ => None,
+            })
+            .expect("computed projection");
+        assert!(matches!(
+            &bproj[0].0,
+            Expr::Field { name, access: Access::Fast } if name == "source"
+        ));
     }
 
     #[test]

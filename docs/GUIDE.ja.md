@@ -107,6 +107,31 @@ B: readbin dump.bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
 で C `repr(C)` 自然アライメントのパディングを選択。フィールド型：
 `i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`。
 
+### 来歴（provenance）— `with source` / `with filename`
+
+各行が**どこから来たか**を付与します。任意のソースの後ろに `with source`
+（または `with filename`）を付けるだけ。全形式で動きます：
+
+```
+open data.csv with source        # 各チャンクに由来ハンドルを載せる
+open data.csv with filename       # …さらに `filename` 列を材化する
+```
+
+- `with source` は各チャンクに由来**ハンドル**を載せます（列は増えません。
+  `source.uri` / `source.scheme` アクセサで取り出す、§6）。既定オフなので、
+  素の `open` には一切オーバーヘッドがありません。
+- `with filename` は `(source.uri) as filename` のシュガーで、行末に `filename`
+  列（ソースパス＝`str`）を付与します。既に `filename` 列がある場合は
+  `filename_r`（join と同じ衝突規則）になります。
+- 来歴は直列読み・並列読みで**バイト一致**です。どの読み手も同じパスから同じ
+  ハンドルを導くため、並列実行は直列のバイト列を厳密に再現します。契約内なのは
+  uri のみ（将来の探索が付ける size/mtime は決定性契約の外）。
+
+```
+# 各行にファイルを付け、その列を残す
+open sales.csv with source |> id amount (source.uri) as src
+```
+
 ---
 
 ## 4. 変換
@@ -423,12 +448,19 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 | 親スコープのフィールド | `$_:1.country`（`$_:0` = 現在、`$_:1` = 親 …） |
 | 値ホール | `$min` — 束縛（`\| flow min=20`）で埋める値の穴、§4 |
 | リソースハンドル | `resource("file:///data/a.csv")` — 第一級の I/O ハンドル |
+| 来歴フィールド | `source.uri`, `source.scheme` — チャンクの由来のフィールド（`with source` が必要、§3） |
 
 > **リソースハンドル**（`resource("uri")`）は `uri`（`file://` / `s3://` / `http://` /
 > stdin の `-`）で同一視される第一級の値です。来歴（`with source`）や探索（`ls`/`glob`）が
 > 土台にするハンドル型で、値の同一性は **uri のみ**。探索が付ける size/mtime は等価比較・
 > 整列・`to_source` に**含めません**（結果が再現可能なまま）。`expr:resource` で任意の値を
 > ハンドルに変換できます（テキストが uri になります）。
+
+> **来歴アクセサ** `source.<field>` は、`with source`（§3）が付けたチャンクの由来
+> ハンドルのフィールドを読みます：`source.uri` は行を読んだパス/uri、`source.scheme`
+> はその転送方式（`file` / `stdin` / `s3` …）。`with source` 無しで開いたソースでは
+> `null`（continue-first）。裸の `source`（`.field` 無し）は通常の列参照のままなので、
+> `source` という名前の実列にも引き続きアクセスできます。
 
 **関数**
 

@@ -120,13 +120,22 @@ fn literal_substring_atom(e: &Expr) -> Option<String> {
         right,
     } = e
     {
-        if let (Expr::Field { .. }, Expr::Literal(Value::Str(s))) = (left.as_ref(), right.as_ref())
+        // Only a real **column** field can imply a raw-line substring: a
+        // `source.<field>` accessor (Access::Source) reads provenance, not the
+        // row bytes, so its literal must NOT be pushed to the byte pre-scan.
+        if let (Expr::Field { access, .. }, Expr::Literal(Value::Str(s))) =
+            (left.as_ref(), right.as_ref())
         {
-            return Some(s.clone());
+            if access.is_column() {
+                return Some(s.clone());
+            }
         }
-        if let (Expr::Literal(Value::Str(s)), Expr::Field { .. }) = (left.as_ref(), right.as_ref())
+        if let (Expr::Literal(Value::Str(s)), Expr::Field { access, .. }) =
+            (left.as_ref(), right.as_ref())
         {
-            return Some(s.clone());
+            if access.is_column() {
+                return Some(s.clone());
+            }
         }
     }
     // String functions whose match requires a literal substring to be present.
@@ -227,9 +236,13 @@ fn simple_numeric_atom(e: &Expr) -> Option<(String, CmpOp, f64)> {
     let Expr::Compare { left, op, right } = e else {
         return None;
     };
+    // A `source.<field>` accessor (Access::Source) is not a readable column, so
+    // it can't be lifted into the reader's numeric prefilter.
     match (left.as_ref(), right.as_ref()) {
-        (Expr::Field { name, .. }, Expr::Literal(v)) => v.as_f64().map(|r| (name.clone(), *op, r)),
-        (Expr::Literal(v), Expr::Field { name, .. }) => {
+        (Expr::Field { name, access }, Expr::Literal(v)) if access.is_column() => {
+            v.as_f64().map(|r| (name.clone(), *op, r))
+        }
+        (Expr::Literal(v), Expr::Field { name, access }) if access.is_column() => {
             v.as_f64().map(|r| (name.clone(), flip_cmp(*op), r))
         }
         _ => None,
@@ -315,7 +328,13 @@ fn project_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
 /// Collect referenced field names from a predicate expression.
 fn collect_fields(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr::Field { name, .. } => push_unique(out, name),
+        // A `source.<field>` accessor (Access::Source) reads provenance, not a
+        // column, so it is not a "live column" for projection pushdown.
+        Expr::Field { name, access } => {
+            if access.is_column() {
+                push_unique(out, name)
+            }
+        }
         // A value hole references no column.
         Expr::Literal(_) | Expr::Hole(_) => {}
         Expr::Compare { left, right, .. } => {

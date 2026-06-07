@@ -105,6 +105,33 @@ B: readbin dump.bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
 `aligned` choose C `repr(C)` natural-alignment padding. Field types:
 `i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`.
 
+### Provenance — `with source` / `with filename`
+
+Attach **where each row came from**. Add `with source` (or `with filename`)
+after any source — it works on every format:
+
+```
+open data.csv with source        # ride the origin handle on each chunk
+open data.csv with filename       # …and materialize a `filename` column
+```
+
+- `with source` rides the origin **handle** on each chunk (zero new columns —
+  reach it with the `source.uri` / `source.scheme` accessor, §6). Off by default,
+  so a plain `open` adds no overhead.
+- `with filename` is the sugar `(source.uri) as filename`: it appends a
+  `filename` column (the source path, a `str`) at the end of the row. If the data
+  already has a `filename` column, the new one is named `filename_r` (the join
+  collision rule).
+- Provenance is **byte-identical** across serial and parallel reads: every reader
+  derives the same handle from the same path, so a parallel run reproduces the
+  serial bytes exactly. Only the uri is in-contract; any size/mtime a future
+  discovery attaches stays out of the determinism contract.
+
+```
+# tag each row with its file, then keep that column
+open sales.csv with source |> id amount (source.uri) as src
+```
+
 ---
 
 ## 4. Transforms
@@ -439,6 +466,7 @@ Used in `|?` predicates and `(…)` computed columns.
 | parent scope field | `$_:1.country` (`$_:0` = current, `$_:1` = parent …) |
 | value hole | `$min` — a placeholder filled by a binding (`\| flow min=20`), §4 |
 | resource handle | `resource("file:///data/a.csv")` — a first-class I/O handle |
+| provenance field | `source.uri`, `source.scheme` — a field of the chunk's origin (needs `with source`, §3) |
 
 > **Resource handle** (`resource("uri")`) is a first-class value identified by its
 > `uri` (`file://`, `s3://`, `http://`, `-` for stdin). It is the handle type that
@@ -446,6 +474,13 @@ Used in `|?` predicates and `(…)` computed columns.
 > the value's identity — any size/mtime metadata a discovery attaches is *not* part
 > of equality, ordering, or `to_source` (so results stay reproducible). Cast any
 > value to it with `expr:resource` (its text becomes the uri).
+
+> **Provenance accessor** `source.<field>` reads a field of the chunk's origin
+> handle, set by `with source` (§3): `source.uri` is the path/uri the row was read
+> from, `source.scheme` its transport (`file`, `stdin`, `s3`, …). It is `null`
+> when the source was opened without `with source` (continue-first). A bare
+> `source` (no `.field`) is still an ordinary column reference, so a real column
+> named `source` stays reachable.
 
 **Functions**
 
