@@ -13,6 +13,7 @@ mod jsonl;
 mod kernel;
 mod operators;
 mod telemetry;
+mod transport;
 
 #[doc(hidden)]
 pub mod gendata;

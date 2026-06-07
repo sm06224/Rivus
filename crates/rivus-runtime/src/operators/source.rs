@@ -4,6 +4,7 @@
 //! mechanical move-only split; logic unchanged).
 
 use super::*;
+use crate::transport::{read_whole, FileTransport, Scheme};
 
 // ---------------------------------------------------------------- source (csv)
 
@@ -106,7 +107,7 @@ impl SourceCsv {
         self.loaded = true;
         if self.path == "-" {
             self.load_stdin(ctx);
-        } else if is_compressed_path(&self.path) {
+        } else if Scheme::of(&self.path).is_compressed() {
             self.load_compressed(ctx);
         } else {
             match csv::CsvChunker::open(
@@ -195,7 +196,7 @@ impl SourceCsv {
     }
 
     fn load_stdin(&mut self, ctx: &mut OpCtx) {
-        let text = match read_input(&self.path) {
+        let text = match read_whole(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -510,12 +511,12 @@ impl BinChunker {
         let len = std::fs::metadata(path)
             .map_err(|e| format!("cannot open '{path}': {e}"))?
             .len() as usize;
-        let f = std::fs::File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let schema = bin_schema(&fields);
         Ok((
             schema,
             BinChunker {
-                reader: std::io::BufReader::with_capacity(256 * 1024, f),
+                reader,
                 fields,
                 offsets,
                 rec_size,
@@ -538,14 +539,15 @@ impl BinChunker {
         n_recs: usize,
         chunk_size: usize,
     ) -> Result<BinChunker, String> {
-        let mut f = std::fs::File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut reader =
+            FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         std::io::Seek::seek(
-            &mut f,
+            &mut reader,
             std::io::SeekFrom::Start((start_rec * rec_size) as u64),
         )
         .map_err(|e| e.to_string())?;
         Ok(BinChunker {
-            reader: std::io::BufReader::with_capacity(256 * 1024, f),
+            reader,
             fields,
             offsets,
             rec_size,
@@ -714,7 +716,7 @@ impl SourceJsonl {
             }
             return;
         }
-        let text = match read_input(&self.path) {
+        let text = match read_whole(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
