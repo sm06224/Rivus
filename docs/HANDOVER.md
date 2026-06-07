@@ -30,24 +30,29 @@
 | **2-②b** | `with filename` 材化 ＋ ガイド | `with filename`＝`(source.uri) as filename`：source op が行末に `filename` 列（=path・Str）を材化。衝突時 `filename_r`（join 規則）。`with source` は handle のみ（列ゼロ）。英日ガイド（§3 Sources＋§6 アクセサ）。stress: 材化・衝突・並列 byte-identity |
 | **Op::Source 統一** | 形式別3変種統一（move-only・#122 マージ済） | `Op::Source{discovery:Discovery::Fixed, transport:Transport::Local, codec:Csv/Jsonl/Binary, provenance}`。`OpenCsv/OpenJsonl/OpenBinary` を撤去。parser は `open`/`readcsv`/`readjson`/`readbin` を desugar、`to_source` は同一文字列を復元。**挙動ゼロ・byte-identity 不変**（注意1＝再石化回避） |
 | **3a** | discovery-as-flow（`ls`・#123 マージ済） | `ls "glob"`(+alias `gci`/`dir`)＝`Op::Source{Discovery::Glob, Codec::Discover}`。std 自前 glob（`**`/`*`/`?`/`[…]`・symlink 非追従・uri 昇順・0件→warn）。**bare-columns** `{path:Resource, name:str, size:int, mtime:datetime}`（accessor 不採用＝可逆性確保）。述語の dotted `word.field`（`source.uri` 含む）は明示エラー（never-silent＋可逆性ガード）。size/mtime は §0.14 契約外 |
-| **3b** | discovery 述語プッシュダウン（**本PR**） | optimizer `discovery_prefilter`：`ls` の単一 FilterProject 消費者から `name` の必須サブ文字列（`==`/`contains`/`starts_with`/`ends_with`/`like` 先頭）を抽出し `Codec::Discover{name_prefilter}` へ。enumeration walk が **stat 前**に basename で枝刈り（大ディレクトリで syscall 節約）。superset prune＋filter 権威＝結果不変（optimizer_equiv 固定）。size/mtime は stat 必須で利得なしのため非対象。決定性文言を精緻化（同一 run 内 byte-identity 成立／契約外は interpret==compile・分散） |
+| **3b** | discovery 述語プッシュダウン（#124 マージ済） | optimizer `discovery_prefilter`：`ls` の単一 FilterProject 消費者から `name` の必須サブ文字列（`==`/`contains`/`starts_with`/`ends_with`/`like` 先頭）を抽出し `Codec::Discover{name_prefilter}` へ。enumeration walk が **stat 前**に basename で枝刈り（大ディレクトリで syscall 節約）。superset prune＋filter 権威＝結果不変（optimizer_equiv 固定）。size/mtime は stat 必須で利得なしのため非対象。決定性文言を精緻化 |
+| **3c-①** | `resource(式)`（**本PR**） | `resource(EXPR)`：文字列リテラルは Resource リテラル（1b 維持）、それ以外は **cast `EXPR:resource`** へ desugar（マニフェスト列 `(resource(filepath)) as path`・計算パス `resource(concat(...))`）。parser `decl_type` に `resource` を追加（1b の `:resource` cast の parser 欠落も同時に解消）。＋ canon メモ追記（§0.7 制御プレーンからの対象注入・§28.3 供給元非依存・ROADMAP 📋） |
 
 ゲートは各 commit で全緑（fmt / clippy `--all-features -D warnings` 0 / 全テスト /
 stress serial==parallel==chunk-size / optimizer_equiv / 依存ゼロ）。各 slice は CLI で
-e2e 確認済（`open`/`readcsv`/`with source`/`with filename`/`ls`/`gci`/`explain` 往復）。
+e2e 確認済（`open`/`readcsv`/`with source`/`with filename`/`ls`/`gci`/`resource(式)`/`explain` 往復）。
 
 **Verb 命名ポリシー（恒久・§25.2a）**：Verb のみ・`Verb-Noun` 不採用・PowerShell 動詞/別名
 語彙・短縮は alias（正名へ解決、to_source は正名）。
 
 **リリース**：提案タグは 2-② → **`v1.3.0-dev.7`**、Op::Source → **`v1.3.0-dev.8`**、
-3a → **`v1.3.0-dev.9`**、3b → **`v1.3.0-dev.10`**（カットは統括判断：`git tag v1.3.0-dev.N && git push origin v1.3.0-dev.N`）。
+3a → **`v1.3.0-dev.9`**、3b → **`v1.3.0-dev.10`**、3c-① → **`v1.3.0-dev.11`**（カットは統括判断）。
 
 ---
 
-## 2. 次タスク＝slice 3c（read … 多ファイル union-by-name）
+## 2. 次タスク＝slice 3c-②（read … 多ファイル union-by-name）
 
-slice 3a（`ls`）・3b（discovery 述語プッシュダウン）は **done**（3b は本PR）。次：
-- **3c：`read [as fmt] with source`** — `Stream<Resource>`（`ls` の `path` 列）→ 多ファイルを
+slice 3a（`ls`）・3b（pushdown）・3c-①（`resource(式)`）は **done**（3c-① は本PR）。次：
+- **3c-②：`read [as fmt] with source`** — Resource 列（既定 `path`、無ければ最初の Resource 型列、
+  無ければ明示エラー）→ 多ファイルを transport(scheme dispatch・今は file)+codec で開き
+  **union-by-name** 連結。型突合＝数値 widening（int⊆float⊆decimal⊆str）・非数値 first-seen＋cast
+  surface。🔴 スキーマ不一致は「warn して継続」不可＝不一致行/ファイルは **reject/quarantine を
+  error stream に surface**
   transport+codec で開き **union-by-name** 連結（§27.2 吸収）。🔴 スキーマ不一致は「warn して
   継続」不可＝名前整合＋不一致行/ファイルは **reject/quarantine を error stream に surface**
   （never-silent・§13/§24）。決定的順序（uri 昇順連結）。

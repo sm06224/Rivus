@@ -488,7 +488,10 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 > stdin の `-`）で同一視される第一級の値です。来歴（`with source`）や探索（`ls`/`glob`）が
 > 土台にするハンドル型で、値の同一性は **uri のみ**。探索が付ける size/mtime は等価比較・
 > 整列・`to_source` に**含めません**（結果が再現可能なまま）。`expr:resource` で任意の値を
-> ハンドルに変換できます（テキストが uri になります）。
+> ハンドルに変換できます（テキストが uri になります）。`resource(EXPR)` も同じで、
+> `resource("…")` はリテラル、`resource(col)` /
+> `resource(concat("data/", region, ".csv"))` はマニフェスト列や計算パスからハンドルを
+> 作ります（将来の `read` が開くハンドル列）。
 
 > **来歴アクセサ** `source.<field>` は、`with source`（§3）が付けたチャンクの由来
 > ハンドルのフィールドを読みます：`source.uri` は行を読んだパス/uri、`source.scheme`
