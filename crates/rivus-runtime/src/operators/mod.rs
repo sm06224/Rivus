@@ -106,28 +106,6 @@ pub trait Operator {
     }
 }
 
-/// Read a text source: the `-` sentinel reads stdin, otherwise a file.
-fn read_input(path: &str) -> std::io::Result<String> {
-    if path == "-" {
-        use std::io::Read;
-        let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s)?;
-        Ok(s)
-    } else {
-        std::fs::read_to_string(path)
-    }
-}
-
-/// A compressed source path (`.gz`/`.zst`/`.zstd`) needs the single-pass
-/// decompressing reader (features `gzip` / `zstd`).
-fn is_compressed_path(path: &str) -> bool {
-    if path == "-" {
-        return false;
-    }
-    let l = path.to_ascii_lowercase();
-    l.ends_with(".gz") || l.ends_with(".zst") || l.ends_with(".zstd")
-}
-
 /// Write a text sink: the `-` sentinel writes stdout, otherwise a file.
 fn write_output(path: &str, data: &str) -> std::io::Result<()> {
     if path == "-" {

@@ -13,6 +13,7 @@
 //! runtime stays std-only). Nested objects and arrays as first-class columns
 //! are future work (design doc 03 nested columns / doc 18).
 
+use crate::transport::FileTransport;
 use rivus_core::{Column, ColumnData, DataType, Field, Schema, StrColumn, Validity};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -269,8 +270,6 @@ fn build_column(dtype: DataType, vals: &[JVal]) -> Column {
 
 // ------------------------------------------------------------- streaming reader
 
-const JSONL_BUF: usize = 256 * 1024;
-
 /// Streaming per-key type flags — `infer` accumulated one value at a time so the
 /// reader needn't buffer a whole column. Resolves identically to [`infer`].
 #[derive(Clone)]
@@ -334,10 +333,9 @@ impl Flags {
 /// not line-oriented (an element can span lines), so it can't be streamed or
 /// byte-range split — the caller falls back to the whole-file [`parse`].
 pub fn is_json_array(path: &str) -> bool {
-    let Ok(f) = File::open(path) else {
+    let Ok(mut r) = FileTransport::open(path) else {
         return false;
     };
-    let mut r = BufReader::new(f);
     let mut byte = [0u8; 1];
     loop {
         match r.read(&mut byte) {
@@ -358,8 +356,7 @@ pub fn is_json_array(path: &str) -> bool {
 /// valid object and each key's lane inferred over every row, plus the malformed
 /// line count. Byte-identical to the schema [`parse`] derives.
 fn infer_global(path: &str) -> Result<(Vec<String>, Vec<DataType>, usize), String> {
-    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-    let mut r = BufReader::with_capacity(JSONL_BUF, f);
+    let mut r = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
     let mut names: Vec<String> = Vec::new();
     let mut flags: Vec<Flags> = Vec::new();
     let mut bad_rows = 0usize;
@@ -426,11 +423,11 @@ impl JsonlChunker {
                 .map(|(n, d)| Field::new(n.clone(), *d))
                 .collect(),
         );
-        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         Ok((
             schema,
             JsonlChunker {
-                reader: BufReader::with_capacity(JSONL_BUF, f),
+                reader,
                 names,
                 dtypes,
                 chunk_size: chunk_size.max(1),
@@ -453,10 +450,13 @@ impl JsonlChunker {
         end: u64,
         chunk_size: usize,
     ) -> Result<JsonlChunker, String> {
-        let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        let mut reader =
+            FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        reader
+            .seek(SeekFrom::Start(start))
+            .map_err(|e| e.to_string())?;
         Ok(JsonlChunker {
-            reader: BufReader::with_capacity(JSONL_BUF, f),
+            reader,
             names,
             dtypes,
             chunk_size: chunk_size.max(1),
@@ -524,6 +524,14 @@ impl JsonlChunker {
     }
 }
 
+/// Codec face (§28.5): the streaming JSONL reader *is* the decoder. It has no
+/// prefilter / parse-failure accounting, so it uses the trait defaults.
+impl crate::codec::Decoder for JsonlChunker {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
+    }
+}
+
 /// Plan a byte-range parallel read of a JSON-Lines file: the global schema and
 /// `nparts` newline-aligned ranges covering the file exactly once. Returns
 /// `None` for a top-level array (not splittable) — the caller stays serial.
@@ -557,7 +565,7 @@ fn snap_ranges(path: &str, nparts: usize) -> Option<Vec<(u64, u64)>> {
     if len == 0 {
         return None;
     }
-    let mut f = BufReader::with_capacity(JSONL_BUF, File::open(path).ok()?);
+    let mut f = FileTransport::open(path).ok()?;
     let mut bounds = vec![0u64];
     let mut scratch = String::new();
     for i in 1..nparts {

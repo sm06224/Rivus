@@ -4,6 +4,7 @@
 //! mechanical move-only split; logic unchanged).
 
 use super::*;
+use crate::transport::{read_whole, FileTransport, Scheme};
 
 // ---------------------------------------------------------------- source (csv)
 
@@ -30,11 +31,10 @@ pub(crate) struct SourceCsv {
     /// Field delimiter byte (`b','` CSV, `b'\t'` TSV).
     delim: u8,
     schema: Arc<Schema>,
-    /// Streaming reader for a real file; `None` for stdin / after a load error.
-    stream: Option<csv::CsvChunker>,
-    /// Streaming reader for a compressed file (`--features gzip`/`zstd`).
-    #[cfg(any(feature = "gzip", feature = "zstd"))]
-    cz_stream: Option<csv::CompressedCsvReader>,
+    /// Streaming codec decoder for a real file (plain or compressed); `None` for
+    /// stdin / after a load error. The seekable and compressed CSV readers both
+    /// present the same [`crate::codec::Decoder`] face (§28.5).
+    decoder: Option<Box<dyn crate::codec::Decoder>>,
     /// Buffered fallback (stdin): pre-parsed columns sliced by `pull`.
     columns: Vec<Column>,
     cursor: usize,
@@ -68,9 +68,7 @@ impl SourceCsv {
             dt_formats,
             delim,
             schema: Schema::empty(),
-            stream: None,
-            #[cfg(any(feature = "gzip", feature = "zstd"))]
-            cz_stream: None,
+            decoder: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -93,9 +91,7 @@ impl SourceCsv {
             dt_formats: Vec::new(),
             delim: b',',
             schema,
-            stream: Some(chunker),
-            #[cfg(any(feature = "gzip", feature = "zstd"))]
-            cz_stream: None,
+            decoder: Some(Box::new(chunker)),
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -106,7 +102,7 @@ impl SourceCsv {
         self.loaded = true;
         if self.path == "-" {
             self.load_stdin(ctx);
-        } else if is_compressed_path(&self.path) {
+        } else if Scheme::of(&self.path).is_compressed() {
             self.load_compressed(ctx);
         } else {
             match csv::CsvChunker::open(
@@ -133,7 +129,7 @@ impl SourceCsv {
                         );
                     }
                     self.schema = Arc::new(schema);
-                    self.stream = Some(chunker);
+                    self.decoder = Some(Box::new(chunker));
                 }
                 Err(e) => ctx.raise(
                     ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
@@ -169,7 +165,7 @@ impl SourceCsv {
                     );
                 }
                 self.schema = Arc::new(schema);
-                self.cz_stream = Some(reader);
+                self.decoder = Some(Box::new(reader));
             }
             Err(e) => ctx.raise(
                 ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
@@ -195,7 +191,7 @@ impl SourceCsv {
     }
 
     fn load_stdin(&mut self, ctx: &mut OpCtx) {
-        let text = match read_input(&self.path) {
+        let text = match read_whole(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -238,9 +234,9 @@ impl Operator for SourceCsv {
     }
 
     fn inference(&self) -> Vec<(String, DataType, bool)> {
-        self.stream
+        self.decoder
             .as_ref()
-            .map(|c| c.inference().to_vec())
+            .map(|d| d.inferred().to_vec())
             .unwrap_or_default()
     }
 
@@ -248,8 +244,8 @@ impl Operator for SourceCsv {
         if !self.loaded {
             self.load(ctx);
         }
-        if let Some(chunker) = self.stream.as_mut() {
-            match chunker.next_columns() {
+        if let Some(dec) = self.decoder.as_mut() {
+            match dec.decode_chunk() {
                 Some(cols) => {
                     let id = ctx.fresh_id();
                     return Some(Chunk::new(id, self.schema.clone(), cols));
@@ -258,7 +254,9 @@ impl Operator for SourceCsv {
                     // Source exhausted: report how many rows the pushed-down
                     // prefilter skipped building (pure accounting — the result is
                     // unchanged, the downstream FilterProject would drop them).
-                    let skipped = chunker.rows_prefiltered;
+                    // The compressed reader reports none (trait default), exactly
+                    // as before its dedicated branch.
+                    let skipped = dec.rows_prefiltered();
                     if skipped > 0 {
                         ctx.raise(
                             ErrorEvent::new(
@@ -274,7 +272,7 @@ impl Operator for SourceCsv {
                     // in the decimal lane) and were defaulted to 0 — surfaced once
                     // on exhaustion so the loss is visible (continue-first; #②④).
                     // `parse_failures` is aligned to the output schema's fields.
-                    for (k, &n) in chunker.parse_failures.iter().enumerate() {
+                    for (k, &n) in dec.parse_failures().iter().enumerate() {
                         if n > 0 {
                             let col = match self.schema.fields.get(k) {
                                 Some(f) => format!("'{}' (as {})", f.name, f.dtype),
@@ -295,12 +293,6 @@ impl Operator for SourceCsv {
                     return None;
                 }
             }
-        }
-        #[cfg(any(feature = "gzip", feature = "zstd"))]
-        if let Some(cz) = self.cz_stream.as_mut() {
-            let cols = cz.next_columns()?;
-            let id = ctx.fresh_id();
-            return Some(Chunk::new(id, self.schema.clone(), cols));
         }
         // Buffered (stdin) path.
         if self.cursor >= self.total {
@@ -331,7 +323,7 @@ pub(crate) struct SourceBinary {
     c_align: bool,
     chunk_size: usize,
     schema: Arc<Schema>,
-    chunker: Option<BinChunker>,
+    decoder: Option<Box<dyn crate::codec::Decoder>>,
     loaded: bool,
 }
 
@@ -350,7 +342,7 @@ impl SourceBinary {
             c_align,
             chunk_size: chunk_size.max(1),
             schema: Schema::empty(),
-            chunker: None,
+            decoder: None,
             loaded: false,
         }
     }
@@ -365,7 +357,7 @@ impl SourceBinary {
             c_align: false,
             chunk_size: 0,
             schema,
-            chunker: Some(chunker),
+            decoder: Some(Box::new(chunker)),
             loaded: true,
         }
     }
@@ -391,7 +383,7 @@ impl SourceBinary {
                     );
                 }
                 self.schema = Arc::new(schema);
-                self.chunker = Some(ch);
+                self.decoder = Some(Box::new(ch));
             }
             Err(e) => ctx.raise(
                 ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
@@ -409,8 +401,8 @@ impl Operator for SourceBinary {
         if !self.loaded {
             self.load(ctx);
         }
-        let ch = self.chunker.as_mut()?;
-        let columns = ch.next_columns()?;
+        let dec = self.decoder.as_mut()?;
+        let columns = dec.decode_chunk()?;
         let id = ctx.fresh_id();
         Some(Chunk::new(id, self.schema.clone(), columns))
     }
@@ -510,12 +502,12 @@ impl BinChunker {
         let len = std::fs::metadata(path)
             .map_err(|e| format!("cannot open '{path}': {e}"))?
             .len() as usize;
-        let f = std::fs::File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let schema = bin_schema(&fields);
         Ok((
             schema,
             BinChunker {
-                reader: std::io::BufReader::with_capacity(256 * 1024, f),
+                reader,
                 fields,
                 offsets,
                 rec_size,
@@ -538,14 +530,15 @@ impl BinChunker {
         n_recs: usize,
         chunk_size: usize,
     ) -> Result<BinChunker, String> {
-        let mut f = std::fs::File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        let mut reader =
+            FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         std::io::Seek::seek(
-            &mut f,
+            &mut reader,
             std::io::SeekFrom::Start((start_rec * rec_size) as u64),
         )
         .map_err(|e| e.to_string())?;
         Ok(BinChunker {
-            reader: std::io::BufReader::with_capacity(256 * 1024, f),
+            reader,
             fields,
             offsets,
             rec_size,
@@ -575,6 +568,14 @@ impl BinChunker {
             self.endian,
             take,
         ))
+    }
+}
+
+/// Codec face (§28.5): fixed-width binary needs no inference and has no
+/// prefilter / parse-failure accounting, so the decoder is just the chunk pull.
+impl crate::codec::Decoder for BinChunker {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
     }
 }
 
@@ -649,9 +650,10 @@ pub(crate) struct SourceJsonl {
     path: String,
     chunk_size: usize,
     schema: Arc<Schema>,
-    /// Line-oriented JSONL streams in bounded memory; a top-level array can't be
-    /// streamed (an element may span lines) so it materializes via `jsonl::parse`.
-    chunker: Option<jsonl::JsonlChunker>,
+    /// Line-oriented JSONL streams in bounded memory via the codec decoder; a
+    /// top-level array can't be streamed (an element may span lines) so it
+    /// materializes via `jsonl::parse` into `columns` instead.
+    decoder: Option<Box<dyn crate::codec::Decoder>>,
     columns: Vec<Column>,
     cursor: usize,
     total: usize,
@@ -664,7 +666,7 @@ impl SourceJsonl {
             path,
             chunk_size: chunk_size.max(1),
             schema: Schema::empty(),
-            chunker: None,
+            decoder: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -679,7 +681,7 @@ impl SourceJsonl {
             path: String::new(),
             chunk_size: 0,
             schema,
-            chunker: Some(chunker),
+            decoder: Some(Box::new(chunker)),
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -705,7 +707,7 @@ impl SourceJsonl {
                         );
                     }
                     self.schema = Arc::new(schema);
-                    self.chunker = Some(ch);
+                    self.decoder = Some(Box::new(ch));
                 }
                 Err(e) => ctx.raise(
                     ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
@@ -714,7 +716,7 @@ impl SourceJsonl {
             }
             return;
         }
-        let text = match read_input(&self.path) {
+        let text = match read_whole(&self.path) {
             Ok(t) => t,
             Err(e) => {
                 ctx.raise(
@@ -760,8 +762,8 @@ impl Operator for SourceJsonl {
         if !self.loaded {
             self.load(ctx);
         }
-        if let Some(ch) = &mut self.chunker {
-            let columns = ch.next_columns()?;
+        if let Some(dec) = self.decoder.as_mut() {
+            let columns = dec.decode_chunk()?;
             let id = ctx.fresh_id();
             return Some(Chunk::new(id, self.schema.clone(), columns));
         }

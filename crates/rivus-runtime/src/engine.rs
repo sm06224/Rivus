@@ -755,17 +755,6 @@ fn source_path(op: &Op) -> Option<&str> {
     }
 }
 
-/// Is this source path compressed (`.gz`/`.zst`/`.zstd`)? Such sources are read
-/// serially in a single pass (a compressed stream can't be seeked for
-/// byte-range parallelism).
-fn is_compressed_source(path: &str) -> bool {
-    if path == "-" {
-        return false;
-    }
-    let l = path.to_ascii_lowercase();
-    l.ends_with(".gz") || l.ends_with(".zst") || l.ends_with(".zstd")
-}
-
 /// Rank for escalating runtime modes when merging parallel partitions.
 fn mode_rank(m: Mode) -> u8 {
     match m {
@@ -1047,7 +1036,9 @@ fn try_parallel(
     // two-pass) and its on-disk size is the *compressed* size — force the
     // serial, single-pass streaming reader (bounded memory), which `run()`
     // falls through to.
-    if source_path(&graph.nodes[src_id].op).is_some_and(is_compressed_source) {
+    if source_path(&graph.nodes[src_id].op)
+        .is_some_and(|p| crate::transport::Scheme::of(p).is_compressed())
+    {
         return None;
     }
 
@@ -1057,7 +1048,10 @@ fn try_parallel(
     // threshold is the autotuner's (`min_bytes`), so the decision and the reader
     // agree exactly.
     if let Some(path) = source_path(&graph.nodes[src_id].op) {
-        if path != "-" {
+        // Byte-range streaming needs a *seekable* source. A compressed source was
+        // already routed serial above, so the only non-seekable case left here is
+        // stdin (`-`) — making this equivalent to the prior `path != "-"`.
+        if crate::transport::Scheme::of(path).is_seekable() {
             if let Ok(meta) = std::fs::metadata(path) {
                 if meta.len() >= min_bytes {
                     return try_streaming_parallel(graph, opts, src_id, threads, hook);
@@ -1600,7 +1594,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             delim,
             ..
         } => {
-            let path = source_path(op).filter(|p| *p != "-" && !is_compressed_source(p))?;
+            let path = source_path(op).filter(|p| crate::transport::Scheme::of(p).is_seekable())?;
             let plan = crate::csv::plan_parallel(
                 path,
                 projection.as_deref(),

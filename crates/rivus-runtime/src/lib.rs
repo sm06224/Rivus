@@ -6,6 +6,7 @@
 //! `docs/design/02-execution-model.md` and `05-scheduler.md`.
 
 mod analytics;
+mod codec;
 mod csv;
 mod engine;
 mod eval;
@@ -13,6 +14,7 @@ mod jsonl;
 mod kernel;
 mod operators;
 mod telemetry;
+mod transport;
 
 #[doc(hidden)]
 pub mod gendata;

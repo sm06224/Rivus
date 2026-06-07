@@ -22,6 +22,7 @@
 //! overwhelmingly common case — split into pure borrows; quoted records fall
 //! back to an owned, escape-aware split.
 
+use crate::transport::FileTransport;
 use rivus_core::{
     Column, ColumnData, DataType, DateTime, DecColumn, Decimal, DtColumn, Field, Schema, StrColumn,
     TimeUnit, Validity,
@@ -31,10 +32,6 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::sync::Arc;
-
-/// Read buffer for the streaming reader. Larger than the 8 KiB default to cut
-/// syscalls on big sequential scans (inference and build each stream the file).
-const READ_BUF: usize = 256 * 1024;
 
 /// A pushed-down numeric predicate compiled to a raw column index for the
 /// reader: `(raw_col, op, rhs)`. Used to skip *building* rows that are
@@ -140,11 +137,21 @@ pub struct CsvChunker {
     delim: u8,
 }
 
-impl CsvChunker {
-    /// The per-column inference outcome (A4 telemetry); empty for declared or
-    /// sample-inferred schemas.
-    pub fn inference(&self) -> &[(String, DataType, bool)] {
+/// Codec face (§28.5): the streaming CSV reader *is* the decoder — every method
+/// delegates to its inherent state, unchanged. `inferred` exposes the per-column
+/// inference outcome (A4 telemetry; empty for declared / sample-inferred schemas).
+impl crate::codec::Decoder for CsvChunker {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
+    }
+    fn inferred(&self) -> &[(String, DataType, bool)] {
         &self.inference
+    }
+    fn rows_prefiltered(&self) -> u64 {
+        self.rows_prefiltered
+    }
+    fn parse_failures(&self) -> &[u64] {
+        &self.parse_failures
     }
 }
 
@@ -184,8 +191,7 @@ impl CsvChunker {
             );
         }
         // ---- pass 1: infer a global schema by streaming the whole file ----
-        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut r = BufReader::with_capacity(READ_BUF, f);
+        let mut r = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         // `r` is left positioned at the first data row (after the header, or at
         // byte 0 for a header-less file).
         let (names, data_start) = read_header(&mut r, header, declared, delim)?;
@@ -236,8 +242,8 @@ impl CsvChunker {
         let pre = compile_prefilter(&names, &keep, &dtypes, prefilter);
 
         // ---- pass 2 setup: reopen and seek to the first data row ----
-        let f2 = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut reader = BufReader::with_capacity(READ_BUF, f2);
+        let mut reader =
+            FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         reader
             .seek(SeekFrom::Start(data_start))
             .map_err(|e| e.to_string())?;
@@ -280,8 +286,8 @@ impl CsvChunker {
         dt_formats: &[(String, String)],
         delim: u8,
     ) -> Result<(Schema, CsvChunker), String> {
-        let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let mut reader = BufReader::with_capacity(READ_BUF, f);
+        let mut reader =
+            FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         let (names, data_start) = read_header(&mut reader, header, declared, delim)?;
         let ncols = names.len();
         if ncols == 0 {
@@ -367,10 +373,13 @@ impl CsvChunker {
         str_prefilter: Vec<String>,
         delim: u8,
     ) -> Result<CsvChunker, String> {
-        let mut f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        let mut reader =
+            FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        reader
+            .seek(SeekFrom::Start(start))
+            .map_err(|e| e.to_string())?;
         Ok(CsvChunker {
-            reader: BufReader::with_capacity(READ_BUF, f),
+            reader,
             ncols,
             parse_failures: vec![0; dtypes.len()],
             keep,
@@ -521,8 +530,7 @@ pub fn plan_parallel(
         .len();
 
     // Header → column names, kept indices, and the first data byte offset.
-    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-    let mut r = BufReader::with_capacity(READ_BUF, f);
+    let mut r = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
     let (names, data_start) = read_header(&mut r, header, declared, delim)?;
     let ncols = names.len();
     if ncols == 0 {
@@ -619,11 +627,10 @@ fn infer_range(
 ) -> (Vec<Flags>, usize) {
     let mut flags: Vec<Flags> = keep.iter().map(|_| Flags::new()).collect();
     let mut bad = 0usize;
-    let f = match File::open(path) {
-        Ok(f) => f,
+    let mut r = match FileTransport::open(path) {
+        Ok(r) => r,
         Err(_) => return (flags, bad),
     };
-    let mut r = BufReader::with_capacity(READ_BUF, f);
     if r.seek(SeekFrom::Start(start)).is_err() {
         return (flags, bad);
     }
@@ -1734,41 +1741,6 @@ pub struct CompressedCsvReader {
     pub bad_rows: usize,
 }
 
-/// Wrap `path`'s file in the right streaming decoder for its extension. `.gz`
-/// needs feature `gzip`, `.zst`/`.zstd` need feature `zstd`; an unsupported
-/// (or feature-disabled) extension returns an actionable error.
-#[cfg(any(feature = "gzip", feature = "zstd"))]
-fn open_decoder(path: &str) -> Result<Box<dyn BufRead + Send>, String> {
-    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-    let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".gz") {
-        #[cfg(feature = "gzip")]
-        {
-            return Ok(Box::new(BufReader::with_capacity(
-                READ_BUF,
-                flate2::read::MultiGzDecoder::new(f),
-            )));
-        }
-        #[cfg(not(feature = "gzip"))]
-        return Err(format!(
-            "'{path}' is gzip-compressed; rebuild with `--features gzip`"
-        ));
-    }
-    if lower.ends_with(".zst") || lower.ends_with(".zstd") {
-        #[cfg(feature = "zstd")]
-        {
-            let dec = ruzstd::decoding::StreamingDecoder::new(f)
-                .map_err(|e| format!("cannot read zstd '{path}': {e}"))?;
-            return Ok(Box::new(BufReader::with_capacity(READ_BUF, dec)));
-        }
-        #[cfg(not(feature = "zstd"))]
-        return Err(format!(
-            "'{path}' is zstd-compressed; rebuild with `--features zstd`"
-        ));
-    }
-    Err(format!("'{path}' has no supported compression extension"))
-}
-
 #[cfg(any(feature = "gzip", feature = "zstd"))]
 impl CompressedCsvReader {
     /// Open `path`, wrap it in the right decoder, read the CSV header + a sample
@@ -1783,7 +1755,7 @@ impl CompressedCsvReader {
         dt_formats: &[(String, String)],
         delim: u8,
     ) -> Result<(Schema, CompressedCsvReader), String> {
-        let mut reader = open_decoder(path)?;
+        let mut reader = crate::transport::open_compressed(path)?;
 
         // Column names: a declared schema, else the header line, else c0,c1,….
         // A header line is consumed when `header` even if `declared` overrides.
@@ -1940,6 +1912,16 @@ impl CompressedCsvReader {
             return None;
         }
         Some(builders.iter_mut().map(ColBuilder::finish).collect())
+    }
+}
+
+/// Codec face (§28.5) for the single-pass compressed reader. It has no
+/// prefilter/parse-failure accounting (those are the seekable reader's), so it
+/// uses the trait defaults — matching the source's prior behavior for this path.
+#[cfg(any(feature = "gzip", feature = "zstd"))]
+impl crate::codec::Decoder for CompressedCsvReader {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
     }
 }
 
