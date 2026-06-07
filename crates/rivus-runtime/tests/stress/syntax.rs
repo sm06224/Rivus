@@ -35,6 +35,33 @@ fn fanout_merge_conserves_rows() {
     assert_eq!(merged_rows, rows + a, "fan-out/merge row conservation");
 }
 
+#[test]
+fn resource_literal_computed_column_renders_uri() {
+    // A `resource("uri")` literal evaluates end-to-end (parse -> IR -> eval) to a
+    // Resource-lane column whose cells render the uri (§28.1 / slice 1b-②).
+    let text = "name\naki\nben\n";
+    let f = TempCsv(gendata::write_temp_bytes("res_lit", text.as_bytes()));
+    let p = f.0.display();
+    let src = format!("F:\n open {p}\n |> (resource(\"file:///data/a.csv\")) as src\n;");
+    let res = run_src(&src, 4096);
+    let out = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("F"))
+        .expect("F output");
+    let mut rows = 0;
+    for c in &out.chunks {
+        // The projection keeps only the computed column, on the Resource lane.
+        assert_eq!(c.columns.len(), 1, "projection keeps only the computed col");
+        assert_eq!(c.columns[0].dtype().to_string(), "resource");
+        for r in 0..c.len {
+            assert_eq!(c.value(r, 0).to_string(), "file:///data/a.csv");
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 2);
+}
+
 /// Collect a column's per-row `Value::to_string()` across all chunks of the
 /// output labeled `label` (used to inspect the datetime lane's ISO rendering).
 #[test]

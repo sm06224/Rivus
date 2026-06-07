@@ -372,6 +372,11 @@ impl fmt::Display for Expr {
         match self {
             Expr::Field { name, access } => write!(f, "{}", Expr::field_src(name, *access)),
             Expr::Literal(Value::Str(s)) => write!(f, "\"{}\"", Expr::escape_string(s)),
+            // A resource literal round-trips its uri **only** — `size`/`mtime` are
+            // out of the determinism contract (§00 0.14), so they are never emitted.
+            Expr::Literal(Value::Resource(r)) => {
+                write!(f, "resource(\"{}\")", Expr::escape_string(r.uri()))
+            }
             Expr::Literal(v) => write!(f, "{v}"),
             Expr::Hole(name) => write!(f, "${name}"),
             Expr::Compare { left, op, right } => {
@@ -398,5 +403,26 @@ impl fmt::Display for Expr {
                 write!(f, " end")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Expr;
+    use rivus_core::{Resource, Value};
+
+    #[test]
+    fn resource_literal_to_source_is_uri_only() {
+        // `to_source` emits the uri only: `size`/`mtime` are out of the
+        // determinism contract (§00 0.14) and must never reach the source.
+        let with_meta = Expr::Literal(Value::Resource(Resource::with_meta(
+            "s3://b/k",
+            Some(1024),
+            Some(42),
+        )));
+        assert_eq!(with_meta.to_string(), "resource(\"s3://b/k\")");
+        // A uri with a quote is escaped just like a string literal.
+        let quoted = Expr::Literal(Value::Resource(Resource::new("file:///a\"b.csv")));
+        assert_eq!(quoted.to_string(), "resource(\"file:///a\\\"b.csv\")");
     }
 }

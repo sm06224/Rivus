@@ -438,6 +438,14 @@ Used in `|?` predicates and `(…)` computed columns.
 | deep / dynamic field | `$_..age` (recursive), `item("age")` (dynamic) |
 | parent scope field | `$_:1.country` (`$_:0` = current, `$_:1` = parent …) |
 | value hole | `$min` — a placeholder filled by a binding (`\| flow min=20`), §4 |
+| resource handle | `resource("file:///data/a.csv")` — a first-class I/O handle |
+
+> **Resource handle** (`resource("uri")`) is a first-class value identified by its
+> `uri` (`file://`, `s3://`, `http://`, `-` for stdin). It is the handle type that
+> provenance (`with source`) and discovery (`ls`/`glob`) build on. Only the uri is
+> the value's identity — any size/mtime metadata a discovery attaches is *not* part
+> of equality, ordering, or `to_source` (so results stay reproducible). Cast any
+> value to it with `expr:resource` (its text becomes the uri).
 
 **Functions**
 

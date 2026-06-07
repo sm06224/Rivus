@@ -422,6 +422,13 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 | 深い / 動的フィールド | `$_..age`（再帰）, `item("age")`（動的） |
 | 親スコープのフィールド | `$_:1.country`（`$_:0` = 現在、`$_:1` = 親 …） |
 | 値ホール | `$min` — 束縛（`\| flow min=20`）で埋める値の穴、§4 |
+| リソースハンドル | `resource("file:///data/a.csv")` — 第一級の I/O ハンドル |
+
+> **リソースハンドル**（`resource("uri")`）は `uri`（`file://` / `s3://` / `http://` /
+> stdin の `-`）で同一視される第一級の値です。来歴（`with source`）や探索（`ls`/`glob`）が
+> 土台にするハンドル型で、値の同一性は **uri のみ**。探索が付ける size/mtime は等価比較・
+> 整列・`to_source` に**含めません**（結果が再現可能なまま）。`expr:resource` で任意の値を
+> ハンドルに変換できます（テキストが uri になります）。
 
 **関数**
 
