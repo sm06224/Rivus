@@ -81,8 +81,11 @@ ls "logs/**/*.csv"                      # → Stream<Resource>（再帰 glob）
 - **有界/非有界（§00 0.13）**: `ls`/`glob` は**有界**（完了する）、`watch`/`subscribe` は
   **非有界**。型で区別し、非有界は背圧・窓の対象。
 - **`read`** verb: `Stream<Resource>` を受け、各 Resource を transport で開き codec で chunk 化、
-  **同一スキーマ前提**で 1 ストリームに連結（不一致は continue-first で warn）。**決定的順序**
-  （Resource を uri バイト昇順で）。
+  **`union-by-name` でスキーマを整合**して 1 ストリームに連結する。**「warn して継続」はしない**
+  — 列集合は名前で和（欠けは null・型は安全昇格）し、**整合不能な行/ファイル（型衝突・必須欠落
+  等）は `reject`/`quarantine` として error stream に surface**（never-silent・§13/§24）。
+  **決定的順序**（Resource を uri バイト昇順で連結）。dead-letter 先（`quarantine(sink)`）は §24
+  と整合。slice 3 の前提。
 
 ## 28.4 Transport（Resource → Bytes）
 
@@ -102,13 +105,22 @@ trait Transport { fn open(&self, r: &Resource) -> io::Result<Box<dyn ByteSource>
 形式を `Codec` トレイトに**直交化**。decode（読み）と encode（書き）は対。
 
 ```
-trait Decoder { fn decode(&mut self, bytes, schema_hint) -> Vec<Chunk>; … }
-trait Encoder { fn encode(&mut self, chunk) -> Vec<u8>; … }
+trait Decoder {
+    // §06 two-pass 推論を decode と分離して保持（下記）:
+    fn infer(&mut self, sample: &[u8]) -> Schema;          // 推論フェーズ（任意・宣言時は省略）
+    fn decode(&mut self, bytes: &[u8], schema: &Schema) -> Vec<Chunk>;  // 確定スキーマで chunk 化
+}
+trait Encoder { fn encode(&mut self, chunk: &Chunk) -> Vec<u8>; … }
 ```
 
 - 実装: csv/tsv（delim）・jsonl/json・binary・(feature) parquet。**null モデル（§26）・型推論
   （§06/§23）・continue-first は codec 内に閉じる**（現 `csv.rs`/`jsonl.rs` の中身を Decoder に
   移植）。①②と直交＝**全形式で null/型/エラーが一律**。
+- **§06 two-pass 推論を保持（🟡 slice 1a 必須）**: Decoder は**推論フェーズ（`infer`）と
+  decode を分離**する — 現 `CsvChunker` の two-pass グローバル推論（サンプルで lane 決定 →
+  確定スキーマで全体を decode）を**等価移植**し、宣言スキーマ時は `infer` を省略。これにより
+  typed-IR（§00 0.12）が codec の出力スキーマを静的に解け、かつ推論結果は既存テストで固定して
+  byte-identity を保つ。
 - **既存の正しさ保存**: CSV Decoder は現 `CsvChunker` のロジックを**移設のみ**（byte-identity・
   null・SWAR parse を保つ）。形式判定は拡張子/明示で `Codec` を選ぶ（現 `resolve_format` 相当）。
 
@@ -161,8 +173,9 @@ read as csv with source                 # 各行/chunk に由来 Resource を付
 
 | # | スライス | 主要素 | 正しさゲート |
 |---|---|---|---|
-| 1 | **`Resource` 値型 ＋ Codec/Transport トレイト抽出** | `DataType::Resource`/`Value::Resource`/`Column::Resource`；現 csv/jsonl/binary を Decoder/Transport に**移設のみ**；`Op::Source` 内部表現（既存構文は desugar、`to_source` 不変） | 全既存テスト緑・byte-identity 不変（純移設） |
-| 2 | **Provenance `with source`**（全形式・並列対応） | chunk に由来 Resource メタ；`source.uri` アクセサ；§27 slice 1 の機構を cherry-pick・並列で由来保持 | null/byte-identity 込み・`with filename` sugar 等価 |
+| **1a** | **Codec/Transport トレイト抽出（純移設）** | 現 csv/jsonl/binary を `Decoder`/`Transport` トレイト裏へ**移すだけ**（§06 two-pass 推論は `infer`/`decode` 分離で等価移植）。`Op::Open*` の内部表現は据え置き、IR/構文/`to_source` **不変**。値型は導入しない | **全既存テスト緑・byte-identity 完全不変**（純移設・挙動ゼロ変更） |
+| **1b** | **`Resource` 値型** | `DataType::Resource`/`Value::Resource`/`Column::Resource` 追加（=全 exhaustive match に新アーム・別 PR）。`Resource` リテラル/列・`to_source` 往復。決定性は §00 0.14（`uri`=契約内、`mtime`/`size`=契約外） | 新 match 緑・round-trip・既存挙動ゼロ回帰 |
+| 2 | **Provenance `with source`**（全形式・並列対応） | chunk に由来 Resource メタ；`source.uri` アクセサ；§27 slice 1（park）の機構を cherry-pick・並列で由来保持 | null/byte-identity 込み・`with filename` sugar 等価 |
 | 3 | **Discovery-as-flow（ローカル fs）** | `ls`/`glob`/再帰（std-only）→ `Stream<Resource>`；述語プッシュダウン；`read … with source` で多ファイル連結（§27.2 を吸収） | 決定的順序・continue-first・chunk-size 非依存 |
 | 4 | **動的/分割出力（route）**（§27.3/27.4 を吸収） | `save` の encode→route→transport 分解・`by key`・テンプレート | 決定的・byte-identity・分割 |
 | 5 | **非有界 transport の骨組み**（feature-gate） | `watch`/socket/http の Transport/Discovery 骨組み・背圧・窓の入口（§0.13）。サービス化の土台 | 有界部の byte-identity 不変・非有界は契約外明示 |
@@ -180,7 +193,8 @@ read as csv with source                 # 各行/chunk に由来 Resource を付
 ## MVP / 次 / 将来
 
 - **MVP（本書批准の対象）**: 直交4層・`Resource` 値型・段階スライス（28.10）の設計確定。
-- **次**: slice 1（`Resource`＋トレイト移設・byte-identity 純保存）→ 2（provenance）→ 3
-  （discovery）→ 4（route）→ 5（非有界骨組み）。
+- **次**: slice **1a**（Codec/Transport トレイト移設・byte-identity **完全不変**の純移設）→
+  **1b**（`Resource` 値型）→ 2（provenance `with source`・並列対応）→ 3（discovery-as-flow・
+  union-by-name）→ 4（route 出力）→ 5（非有界骨組み）。
 - **将来**: ピラー2（コンパイル backend、typed-IR を単型化）・ピラー3（分散＝transport を
   ネットワークに）・ピラー4（制御プレーン）。本書の `Resource`/typed-IR/決定性境界がその前提。

@@ -138,6 +138,10 @@ byte-identity を保証**する。
 - **決定的（契約内）**: 純粋・順序保存・結合性安全な op — filter/project/cast、exact レーン算術、
   順序非依存 agg（min/max/count/first/last/percentile・decimal/整数 sum/avg）、決定的キーの
   group/join/sort。reader は固定入力に対し決定的。
+- **`Resource`（handle）のフィールド決定性（§28 連携）**: `uri`/`scheme`（同一入力で安定）＝
+  **契約内**。`mtime`/`size` 等の**環境依存メタ＝契約外**（実行時刻・FS 状態で変わる）→ これらを
+  キー/出力に使うフローは決定的集合の外。discovery の `name`/`uri` ソートは決定的、`mtime` 順は
+  非決定的扱い。
 - **非決定的（契約外・明示）**: f64 の `sum/avg/std`（非結合・§0.10②で strict 化しても並列
   再結合は別結果）→ serial 維持 or exact レーンへ／超越関数（プラットフォーム差）／非有界＋
   時間（到着順）／乱数・時刻・環境依存。
