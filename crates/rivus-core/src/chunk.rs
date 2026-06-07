@@ -305,6 +305,11 @@ pub enum ColumnData {
     /// Time-of-day lane (i64 ticks since midnight; #58, MVP `Sec`).
     Time(Vec<i64>),
     Str(StrColumn),
+    /// I/O resource handle lane (design §28.1): uri-backed, like [`StrColumn`].
+    /// The uri is the in-contract identity; `size`/`mtime` (out of the
+    /// determinism contract, §00 0.14) ride on the scalar [`Value::Resource`]
+    /// when present and are not stored on the bulk lane.
+    Resource(StrColumn),
 }
 
 impl ColumnData {
@@ -319,6 +324,7 @@ impl ColumnData {
             ColumnData::Date(v) => v.len(),
             ColumnData::Time(v) => v.len(),
             ColumnData::Str(v) => v.len(),
+            ColumnData::Resource(v) => v.len(),
         }
     }
 
@@ -337,6 +343,7 @@ impl ColumnData {
             ColumnData::Date(_) => DataType::Date,
             ColumnData::Time(_) => DataType::Time,
             ColumnData::Str(_) => DataType::Str,
+            ColumnData::Resource(_) => DataType::Resource,
         }
     }
 
@@ -358,6 +365,7 @@ impl ColumnData {
                 crate::value::TimeUnit::Sec,
             )),
             ColumnData::Str(v) => Value::Str(v.get(row).to_string()),
+            ColumnData::Resource(v) => Value::Resource(crate::value::Resource::new(v.get(row))),
         }
     }
 
@@ -379,6 +387,7 @@ impl ColumnData {
             (ColumnData::Date(a), ColumnData::Date(b)) => a.extend_from_slice(b),
             (ColumnData::Time(a), ColumnData::Time(b)) => a.extend_from_slice(b),
             (ColumnData::Str(a), ColumnData::Str(b)) => a.append(b),
+            (ColumnData::Resource(a), ColumnData::Resource(b)) => a.append(b),
             _ => {}
         }
     }
@@ -431,6 +440,13 @@ impl ColumnData {
                 }
                 ColumnData::Str(out)
             }
+            ColumnData::Resource(v) => {
+                let mut out = StrColumn::with_capacity(indices.len(), 0);
+                for o in indices {
+                    out.push(o.map_or("", |i| v.get(i)));
+                }
+                ColumnData::Resource(out)
+            }
         }
     }
 
@@ -455,6 +471,7 @@ impl ColumnData {
             ColumnData::Date(v) => ColumnData::Date(indices.iter().map(|&i| v[i]).collect()),
             ColumnData::Time(v) => ColumnData::Time(indices.iter().map(|&i| v[i]).collect()),
             ColumnData::Str(v) => ColumnData::Str(v.gather(indices)),
+            ColumnData::Resource(v) => ColumnData::Resource(v.gather(indices)),
         }
     }
 }
@@ -578,6 +595,10 @@ impl Column {
     pub fn str(v: StrColumn) -> Self {
         ColumnData::Str(v).into()
     }
+    /// A resource-handle column (uri-backed; design §28.1).
+    pub fn resource(v: StrColumn) -> Self {
+        ColumnData::Resource(v).into()
+    }
 
     /// Gather selected rows, **carrying validity** so null positions survive
     /// filter/join/sort (design 26 §26.1).
@@ -677,7 +698,7 @@ impl Chunk {
 #[cfg(test)]
 mod tests {
     use super::{Column, ColumnData, StrColumn, Validity};
-    use crate::value::Value;
+    use crate::value::{DataType, Value};
 
     #[test]
     fn default_strcolumn_is_a_valid_empty_column() {
@@ -793,5 +814,31 @@ mod tests {
         assert_eq!(g.value_at(0), Value::I64(8));
         assert_eq!(g.value_at(1), Value::Null);
         assert_eq!(g.value_at(2), Value::I64(7));
+    }
+
+    #[test]
+    fn resource_column_lane_value_at_and_gather() {
+        // The uri-backed resource lane (§28.1): dtype, value_at, gather, and
+        // null-awareness all behave like the string lane it mirrors.
+        let uris: StrColumn = ["file:///a.csv", "s3://b/k", "http://h/x"]
+            .into_iter()
+            .collect();
+        let col = Column::resource(uris);
+        assert_eq!(col.dtype(), DataType::Resource);
+        assert_eq!(col.len(), 3);
+        assert_eq!(
+            col.value_at(1),
+            Value::Resource(crate::value::Resource::new("s3://b/k"))
+        );
+        // gather preserves order and uri identity.
+        let g = col.gather(&[2, 0]);
+        assert_eq!(
+            g.value_at(0),
+            Value::Resource(crate::value::Resource::new("http://h/x"))
+        );
+        assert_eq!(
+            g.value_at(1),
+            Value::Resource(crate::value::Resource::new("file:///a.csv"))
+        );
     }
 }

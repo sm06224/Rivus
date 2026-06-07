@@ -467,6 +467,8 @@ fn to_i64(v: Value) -> i64 {
             .or_else(|_| s.trim().parse::<f64>().map(|f| f as i64))
             .unwrap_or(0),
         Value::Null => 0,
+        // A resource handle is a uri, not a number.
+        Value::Resource(_) => 0,
     }
 }
 
@@ -483,6 +485,8 @@ fn to_f64(v: Value) -> f64 {
         Value::Bool(b) => b as i64 as f64,
         Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
         Value::Null => f64::NAN,
+        // A resource handle is a uri, not a number.
+        Value::Resource(_) => f64::NAN,
     }
 }
 
@@ -499,6 +503,7 @@ fn to_bool(v: Value) -> bool {
         Value::Time(t) => t.ticks != 0,
         Value::Str(s) => s.trim().eq_ignore_ascii_case("true") || s.trim() == "1",
         Value::Null => false,
+        Value::Resource(_) => false,
     }
 }
 
@@ -525,6 +530,9 @@ fn cast_value(v: Value, ty: DataType) -> Value {
         )),
         DataType::Bool => Value::Bool(to_bool(v)),
         DataType::Str => Value::Str(v.to_string()),
+        // Cast to resource treats the value's text as the uri (the in-contract
+        // identity); `resource->str` above recovers it via `Display`.
+        DataType::Resource => Value::Resource(rivus_core::Resource::new(v.to_string())),
         DataType::Null => Value::Null,
     }
 }
@@ -610,6 +618,14 @@ pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
                 s.push(&col.value_at(i).to_string());
             }
             ColumnData::Str(s)
+        }
+        // Cast to resource: each cell's text becomes the uri (uri-backed lane).
+        DataType::Resource => {
+            let mut s = StrColumn::with_capacity(n, n * 8);
+            for i in 0..n {
+                s.push(&col.value_at(i).to_string());
+            }
+            ColumnData::Resource(s)
         }
         DataType::Null => return col,
     };
@@ -835,6 +851,13 @@ fn const_column(v: &Value, n: usize) -> Column {
             }
             Column::str(c)
         }
+        Value::Resource(r) => {
+            let mut c = StrColumn::with_capacity(n, r.uri().len() * n);
+            for _ in 0..n {
+                c.push(r.uri());
+            }
+            Column::resource(c)
+        }
         // A constant `null` → an all-null column (validity = 0), not an
         // all-valid NaN column (design 26). Not reachable today — there is no
         // `null` literal in the syntax (§26.6) — but kept correct so a future
@@ -871,6 +894,13 @@ fn col_num_lane(col: Column) -> (Vec<f64>, bool) {
         // Time-of-day rides the integer tick lane too (#58).
         ColumnData::Time(v) => (v.iter().map(|&x| x as f64).collect(), true),
         ColumnData::Str(s) => {
+            let lane = (0..s.len())
+                .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
+                .collect();
+            (lane, false)
+        }
+        // A resource handle is a uri, not a number → NaN lane (like text).
+        ColumnData::Resource(s) => {
             let lane = (0..s.len())
                 .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
                 .collect();
@@ -1242,6 +1272,8 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
             ColumnData::Time(_) => None,
             ColumnData::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
             ColumnData::Str(_) => None,
+            // A resource handle is a uri, not a number.
+            ColumnData::Resource(_) => None,
         },
         _ => None,
     }

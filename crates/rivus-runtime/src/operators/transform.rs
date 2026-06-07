@@ -227,7 +227,9 @@ fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
         ColumnData::Date(v) => v[a].cmp(&v[b]),
         // Time-of-day: tick order is exact chronological order (#58).
         ColumnData::Time(v) => v[a].cmp(&v[b]),
-        ColumnData::Str(v) => v.get(a).cmp(v.get(b)),
+        // Resource sorts by uri (the in-contract identity; §00 0.14) — byte
+        // order, matching discovery's deterministic uri ordering (§28.3).
+        ColumnData::Str(v) | ColumnData::Resource(v) => v.get(a).cmp(v.get(b)),
     }
 }
 
@@ -528,6 +530,8 @@ fn parse_fill(value: &str, dtype: DataType) -> Value {
     let t = value.trim();
     match dtype {
         DataType::Str => Value::Str(value.to_string()),
+        // A resource fill literal is taken as the uri.
+        DataType::Resource => Value::Resource(rivus_core::Resource::new(value.to_string())),
         DataType::I64 => t.parse::<i64>().map(Value::I64).unwrap_or(Value::Null),
         DataType::F64 => t.parse::<f64>().map(Value::F64).unwrap_or(Value::Null),
         DataType::Bool => match t {

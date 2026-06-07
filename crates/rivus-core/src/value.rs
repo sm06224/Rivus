@@ -888,7 +888,7 @@ impl fmt::Display for TimeOfDay {
 
 #[cfg(test)]
 mod timeofday_tests {
-    use super::{TimeOfDay, TimeUnit};
+    use super::{DataType, Resource, TimeOfDay, TimeUnit, Value};
 
     #[test]
     fn parse_format_roundtrips_and_is_exact() {
@@ -931,6 +931,100 @@ mod timeofday_tests {
         assert_eq!(t.ticks, 1_250);
         assert_eq!(t.to_string(), "00:00:01.250");
     }
+
+    #[test]
+    fn resource_value_uri_identity_and_lane() {
+        let r = Resource::new("file:///data/a.csv");
+        // The value carries the Resource lane and renders its uri.
+        assert_eq!(Value::Resource(r.clone()).dtype(), DataType::Resource);
+        assert_eq!(Value::Resource(r.clone()).to_string(), "file:///data/a.csv");
+        assert_eq!(DataType::Resource.to_string(), "resource");
+        // A resource has no numeric view.
+        assert_eq!(Value::Resource(r).as_f64(), None);
+    }
+
+    #[test]
+    fn resource_equality_is_uri_only_meta_out_of_contract() {
+        // size/mtime are out of the determinism contract (§00 0.14): two handles
+        // to the same uri are equal regardless of them.
+        let bare = Resource::new("s3://b/k");
+        let with_meta = Resource::with_meta("s3://b/k", Some(123), Some(456));
+        assert_eq!(bare, with_meta, "equality must ignore size/mtime");
+        assert_eq!(with_meta.size(), Some(123));
+        assert_eq!(with_meta.mtime(), Some(456));
+        assert_ne!(bare, Resource::new("s3://b/other"));
+    }
+}
+
+/// A handle to an I/O resource (design §28.1): the first-class `Resource` value.
+///
+/// Its **identity is the `uri`** (the scheme is a pure function of it) — the
+/// in-contract, deterministic part (§00 0.14). `size`/`mtime` are optional,
+/// discovery-filled metadata that are **outside the determinism contract**: they
+/// take no part in equality (and, later, ordering / hashing / `to_source`), so
+/// byte-identity and reproducibility depend only on the uri. Bulk handles live
+/// on the `Resource` column lane ([`crate::ColumnData::Resource`], uri-backed).
+#[derive(Debug, Clone)]
+pub struct Resource {
+    uri: String,
+    /// Discovery-filled byte size, if known (out of the determinism contract).
+    size: Option<u64>,
+    /// Discovery-filled modification time as epoch ticks, if known (out of the
+    /// determinism contract).
+    mtime: Option<i64>,
+}
+
+impl Resource {
+    /// A handle to `uri` with no metadata (the common case: a literal / a single
+    /// `open` target). Metadata is filled later by discovery (slice 3).
+    pub fn new(uri: impl Into<String>) -> Self {
+        Resource {
+            uri: uri.into(),
+            size: None,
+            mtime: None,
+        }
+    }
+
+    /// A handle carrying discovery metadata (out-of-contract `size`/`mtime`).
+    pub fn with_meta(uri: impl Into<String>, size: Option<u64>, mtime: Option<i64>) -> Self {
+        Resource {
+            uri: uri.into(),
+            size,
+            mtime,
+        }
+    }
+
+    /// The uri — the in-contract identity.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// Discovery-filled byte size, if known (out of the determinism contract).
+    pub fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    /// Discovery-filled modification time (epoch ticks), if known (out of the
+    /// determinism contract).
+    pub fn mtime(&self) -> Option<i64> {
+        self.mtime
+    }
+}
+
+/// Equality is **uri-only**: `size`/`mtime` are out-of-contract metadata (§00
+/// 0.14), so two handles to the same uri are equal regardless of them. This is
+/// what keeps `Resource` deterministic and byte-identical across runs.
+impl PartialEq for Resource {
+    fn eq(&self, other: &Self) -> bool {
+        self.uri == other.uri
+    }
+}
+
+impl fmt::Display for Resource {
+    /// Renders the uri (the in-contract identity).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.uri)
+    }
 }
 
 /// A single scalar value. Used for literals, predicate evaluation and the
@@ -954,6 +1048,8 @@ pub enum Value {
     /// Time-of-day lane (i64 ticks since midnight; #58).
     Time(TimeOfDay),
     Str(String),
+    /// I/O resource handle lane (design §28.1).
+    Resource(Resource),
 }
 
 impl Value {
@@ -969,6 +1065,7 @@ impl Value {
             Value::Date(_) => DataType::Date,
             Value::Time(_) => DataType::Time,
             Value::Str(_) => DataType::Str,
+            Value::Resource(_) => DataType::Resource,
         }
     }
 
@@ -1005,6 +1102,7 @@ impl fmt::Display for Value {
             Value::Date(d) => write!(f, "{d}"),
             Value::Time(t) => write!(f, "{t}"),
             Value::Str(s) => write!(f, "{s}"),
+            Value::Resource(r) => write!(f, "{r}"),
         }
     }
 }
@@ -1036,6 +1134,9 @@ pub enum DataType {
     Time,
     /// Stream-based text (see design doc 09 "Text is stream").
     Str,
+    /// I/O resource handle lane (design §28.1): a uri-identified handle. The
+    /// meta (`size`/`mtime`) is out of the determinism contract (§00 0.14).
+    Resource,
 }
 
 impl fmt::Display for DataType {
@@ -1055,6 +1156,7 @@ impl fmt::Display for DataType {
             DataType::Date => f.write_str("date"),
             DataType::Time => f.write_str("time"),
             DataType::Str => f.write_str("str"),
+            DataType::Resource => f.write_str("resource"),
         }
     }
 }

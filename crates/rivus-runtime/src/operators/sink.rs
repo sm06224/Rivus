@@ -175,7 +175,8 @@ fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
                 rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec)
             );
         }
-        ColumnData::Str(s) => {
+        // A resource handle renders its uri (text), with the same CSV quoting.
+        ColumnData::Str(s) | ColumnData::Resource(s) => {
             let cell = s.get(row);
             // A real empty string is written **quoted** (`""`) so it round-trips
             // back to an empty string — an *unquoted* empty field is reserved for
@@ -466,7 +467,8 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
             out,
             &rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec).to_string(),
         ),
-        ColumnData::Str(s) => json_string(out, s.get(row)),
+        // A resource handle → its uri as a quoted JSON string.
+        ColumnData::Str(s) | ColumnData::Resource(s) => json_string(out, s.get(row)),
     }
 }
 

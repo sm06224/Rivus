@@ -118,6 +118,8 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
                 | ColumnData::Date(_)
                 | ColumnData::Time(_) => None,
                 ColumnData::Str(_) => None,
+                // A resource handle is a uri, not a number → off the f64 kernel.
+                ColumnData::Resource(_) => None,
             }
         }
         _ => None,
@@ -239,7 +241,8 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         | ColumnData::Duration(_)
         | ColumnData::Date(_)
         | ColumnData::Time(_)
-        | ColumnData::Str(_) => mask.fill(0),
+        | ColumnData::Str(_)
+        | ColumnData::Resource(_) => mask.fill(0),
     }
 }
 
@@ -339,7 +342,8 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         | ColumnData::Duration(_)
         | ColumnData::Date(_)
         | ColumnData::Time(_)
-        | ColumnData::Str(_) => mask.fill(0),
+        | ColumnData::Str(_)
+        | ColumnData::Resource(_) => mask.fill(0),
     }
 }
 
