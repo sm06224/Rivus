@@ -1,139 +1,121 @@
 # セッション・ハンドオーバー（次セッションの実装担当へ）
 
-最終更新: 2026-06-02（夜）／ ブランチ `claude/stream-native-runtime-design-tReOj`
-／ 版数 **`1.3.0-dev`**（次の開発版）。dev→main は**常に唯一の開いた PR**（直近は
-#75）。次セッションは**レビュアーの確認結果から**始まる。
+最終更新: 2026-06-07 ／ ブランチ `claude/stoic-cannon-D51Yl`（指定）／ 版数
+**`1.3.0-dev`**。dev→main は**常に唯一の開いた PR**・maintainer が squash/merge →
+こちらは `git fetch origin main && git reset --hard origin/main` して継続。
 
-> **2026-06-02（夜）追記 — 正はここ＋BENCHMARKS/CHANGELOG**:
-> - **#71 SIMD-native parse を 3 段 landed**（いずれも byte-identical・依存ゼロ・
->   等価性テスト先行）: ①AVX2 構造文字スキャン（32B/step、ランタイム検出、SWAR
->   フォールバック、1.72×）→②SWAR 整数 parse（exact i64、1.11–2.16×）→③SWAR 小数
->   parse（exact i128、共有 `rivus_core::numparse`、1.49–1.97×）。
-> - **#40 columnar を再活性化し初レバー landed**: 述語カーネルの実測支配項＝
->   selection-vector 構築を**分岐レス**化（50% 選択率で 7.31×、選択率不問で一定）。
->   compare 自体は帯域律速で SIMD 無勝（#39 で計測済み）。
-> - **#40 column-major fused build は measured-negative（+7.8%）→ revert 済み**
->   （`open` は parse 律速で dispatch/copy 律速でない。BENCHMARKS 参照）。再挑戦
->   するなら「1コピー版（read_line を chunk バッファへ直結）」だが期待は薄。
-> - **次の #40 レバー（本命）**: 生存行 materialize の `Column::gather` 分岐レス/
->   SIMD 化を、**gather 律速のワークロード**（cached 入力への多段重述語）で計測して
->   から採否。parse 律速の `open` では columnar は効かない（#40 当初結論を再確認）。
-> - **リリースは私（エージェント）がコントロール**（`docs/RELEASE.md`、maintainer
->   委任 2026-06-02）。版＝タグ。開発版は SemVer プレリリース `vX.Y.Z-dev.N`
->   （`release.yml` が `-` 付きタグを `--prerelease` 公開）。**既存の不整合リリース
->   `v1.2.0dev`（不正タグ・prerelease 誤フラグ・stable v1.2.0 より後に公開）は要削除
->   — 本セッションの MCP に release 削除手段が無く未実施、maintainer 側 UI 削除待ち**。
-> - 旧 §23.1 日時レーン、decimal/#41 解禁は landed 済み。doc23 §23.2 list集計 /
->   §23.3 pivot は未着手バックログ。下記 4–7 節は旧文脈、状況は本追記が正。
+> **現フォーカス＝§28 I/O サブストレート（ピラー1）の段階スライス。**
+> design は `docs/design/00-north-star.md`（正典）/ `docs/design/28-io-substrate.md`
+> （批准済）。レビュアー＝統括（人間）。各スライスは「**byte-identity 不変・
+> to_source 可逆・依存ゼロ**」を実測で裏取りして承認 → maintainer merge。
 
 ---
 
 ## 0. まず読むもの
-
-1. `CLAUDE.md`（運用契約・規律）— **拘束力あり**。特に「Tool & edit discipline」。
-2. `docs/design/README.md`（8つの物理法則）と該当設計ノート。
-3. 本ファイル（直近の文脈・未完タスク）。
+1. `CLAUDE.md`（運用契約・規律）— **拘束力あり**。特に「Tool & edit discipline」
+   （依存編集を並列発行しない／小バッチ＋都度ゲート／ディスク信頼）。
+2. `docs/design/00-north-star.md`・`docs/design/28-io-substrate.md`（§28.6/§28.8/§28.10）。
+3. 本ファイル（直近の文脈・次タスクの実装契約）。
 
 ---
 
-## 1. このセッションで完了・push したもの
+## 1. §28 で main にマージ済み（このセッション）
 
-| commit | 内容 | 状態 |
+| slice | 内容 | 主な成果物 |
 |---|---|---|
-| `c57c54c` | #39 述語カーネルを分岐なしバイトマスク化（~5%）。**手書きAVX2は計測で無効果と判明し不採用** | ✅ landed |
-| `f477825` | 〃 ROADMAP 反映 | ✅ |
-| `08abe66` | 設計ノート21（exact decimal）・22（GPU backend） | ✅ docs |
-| `c1f6839` | 設計ノート23（datetime・list集計・pivot） | ✅ docs |
-| `3997109` | **decimal型のコア実装**（`Value::Dec`/`Column::Dec`/`DataType::Decimal`、i128固定小数点、厳密加算）。既存挙動ゼロ回帰 | ✅ landed |
-| `29a310c` | 1GB速度プロファイル＋新要件をROADMAPに記録 | ✅ docs |
-| `e757168` | **BOM対応**（先頭UTF-8 BOMが第1列名を汚すバグ修正、全経路、テスト付き） | ✅ landed |
+| **1a** | Codec/Transport トレイト抽出（純移設・挙動ゼロ） | `crates/rivus-runtime/src/transport.rs`（`Scheme`/`FileTransport`/`read_whole`/`open_compressed`）・`codec.rs`（`trait Decoder`）。全 reader を裏へ移設、重複分類を `Scheme` に集約 |
+| **1b** | `Resource` 値型 ＋ `resource("uri")` リテラル | core `Resource{uri,size?,mtime?}`（**同一性は uri のみ**＝§0.14）・`Value/DataType/ColumnData::Resource`・`Column::resource`。parser `resource("uri")`→`Expr::Literal`、to_source 往復（uri のみ） |
+| **2-①** | provenance 配線（挙動ゼロ） | IR `Provenance{Off,Source,Filename}` を `Op::OpenCsv/OpenBinary/OpenJsonl` に追加。parser `with source`/`with filename`（全形式・`with`未知=Err）、to_source 可逆。**runtime は `..` で無視＝byte-identity 完全不変** |
 
-ゲートは各commitで全green（fmt / clippy default+all-features 0警告 / 15スイート /
-deny / gitleaks / 依存ゼロ）。
+ゲートは各 commit で全緑（fmt / clippy `--all-features -D warnings` 0 / 全テスト /
+stress serial==parallel==chunk-size / optimizer_equiv / 依存ゼロ）。
 
----
-
-## 2. レビュアーへの未解決の問い（#41）
-
-GitHub Issue #41 にコメント済み（要返答）:
-**並列 group-by を byte-identical にできるか** を試作で検証した結果、
-
-- ✅ 一致: `min/max/count/count_distinct/first/last/percentile`（順序・結合則非依存）
-- ❌ 一致しない: **f64 の `sum/avg/std`**（浮動小数加算が非結合 → 並列で最終ULPがズレる）
-- ✅ ただし**整数列・decimal型なら厳密一致**（統括の指摘で確認済み。`docs/BENCHMARKS.md`
-  と検証コードに記録）
-
-→ 統括方針: **decimal型（doc 21）を入れて「速度を犠牲にした正確性」をオプトインで
-担保**する。f64 の sum/avg/std だけ serial 維持 or `--exact` で decimal に倒す。
-この設計判断の最終承認待ち。**試作コードは堀（結果不変）を守るため破棄済み**、
-ブランチはクリーン。
+**リリース**：1a/1b/2-① マージ分の提案タグ **`v1.3.0-dev.6`** はカット待ち（カットは
+統括判断：`git tag v1.3.0-dev.6 && git push origin v1.3.0-dev.6`）。
 
 ---
 
-## 3. 計測で確定した「速度の真相」（最重要・次の本命）
+## 2. 次タスク＝slice 2-②（provenance 活性化）— **統括批准済の実装契約**
 
-統括の 1GB/30M行 ≈ 22秒（DuckDB 10秒）問題を実測（`docs/BENCHMARKS.md` 末尾に詳細）:
+`with source`/`with filename` を実際に効かせる。2-① で配線済（IR フラグ・parser・
+to_source）なので、**runtime 活性化 ＋ `source.uri` アクセサ**を入れる。
 
-| 処理 | 直列 busy_ms |
-|---|---:|
-| **open（CSVパース）** | **12,591** ← 支配的 |
-| save（書き出し） | 6,897 |
-| filter | 429（#39で既に安い） |
+### 2-②a（先）：アクセサ＋付与
+- **core**: `ChunkMeta.source: Option<Resource>`（既定 None・加算的）。`Chunk.meta` は
+  pub なので source operator が `c.meta.source = …` で設定。
+- **アクセサ（批准済表現）**: `source.uri` を **Resource 値への汎用フィールドアクセサ**
+  として実装する（**`.uri` を固定で焼き込まない**＝統括の強い要望・rework 回避）。
+  - `source` → `chunk.meta.source` の Resource 値に解決。
+  - `.uri`/`.scheme` → Resource 値への汎用アクセサ。**slice 3（`ls` の Resource 列）と
+    同一機構を共有**できる形にする（base=meta.source を base=Resource 列に一般化可能に）。
+  - **lexer 実測（重要）**: `word_part` は depth-aware（`crates/rivus-parser/src/lexer.rs:
+    425`）。**括弧内（式モード）では識別子は `[A-Za-z0-9_]+`＝`.` を含まない**ので、
+    `(source.uri)` は `Word("source") Dot Word("uri")` にトークン化される。よって
+    parser は bare `source` の `.field` 末尾を明示パースする（`$_` の `parse_field_tail`
+    が手本）。表現は `Expr::Field{name, access: Access::Source}`（新 `Access` 1モード＝
+    match 波及最小）か、`Resource` 値への汎用アクセサ Expr。統括は前者の `Access::Source`
+    を批准済だが、**`.uri`/`.scheme` を name に焼き込まず汎用化**すること。
+  - **§0.14**: uri/scheme＝契約内（決定的）、mtime/size＝契約外。アクセサに「契約外
+    フィールドは決定的集合の外」を内蔵（2-② は uri のみで可）。
+  - provenance 無し chunk → **null 列**（continue-first）。
+- **付与（最重要・byte-identity）**: `provenance != Off` 時、`Resource::new(path)` を
+  各 `chunk.meta.source` に設定。**serial と byte-range 並列ワーカを必ず同時に**付与する
+  （片方だけだと serial≠parallel で byte-identity が壊れる＝結合）。並列ワーカは各自 path
+  から同一 Resource を作る＝**パーティション非依存で一致**。
+  - 配線箇所: IR の `provenance` を `operators/mod.rs build` → `SourceCsv/SourceJsonl/
+    SourceBinary::new`、並列は `from_stream/from_chunker` ＋ `csv_range_source/
+    jsonl_range_source/bin_range_source`（`operators/mod.rs`・`operators/source.rs`、
+    plan は `engine.rs plan_parallel_source`）へ通す。各 range source は path を持つので
+    そこで `Resource::new(path)` を作って渡す。
+- **ゲート**: e2e（`open f with source |> (source.uri) as p` が path 列）＋ **stress で
+  serial==parallel==chunk-size の由来列一致**（`tests/stress/` に追加）＋ 既存全テスト
+  不変 ＋ 依存ゼロ。
 
-- **型を明示しても 12.5秒で不変** → 二度読み（推論）が原因では**ない**。
-  **フィールド分割＋数値parse そのもの**が重い。
-- 既定の並列で 16.9秒 → 6.8秒。DuckDB との差は**パース＋書き出しのスループット**。
-- **次の本命レバー**: SIMD デリミタ走査（`,`/`\n` を `core::arch`、依存ゼロ）＋
-  高速 int/float parse。次点で buffered 出力。**転送/実装の前後で必ず計測**。
-
----
-
-## 4. 設計ノート（実装の青写真。すべて push 済み）
-
-| doc | 内容 | 実装状況 |
-|---|---|---|
-| 21 exact-decimal | i128 固定小数点。`--exact`/`:decimal[(n)]`。avg/std は高精度で割って round-half-even | **コア型 landed**。リーダー/集計/並列は未着手 |
-| 22 gpu-backend | feature-gate任意・CPU fallback・既定依存ゼロ。`--accel`。転送込みで測ってから採用 | 設計のみ |
-| 23 datetime-and-reshape | 日時レーン（epoch整数、`yyMMddhhmmss`）/ list・set・join集計（配列化）/ pivot・unpivot | **日時レーン §23.1 landed**（コア型/リーダー/比較/関数/並列等価、`unit=Sec`・naive UTC）。list集計・pivot は未着手 |
-
----
-
-## 5. 未着手タスク（ROADMAP に全記録済み・優先度順の私見）
-
-1. **SIMD CSV スキャナ**（速度の本命。3節の計測が指す）— ROADMAP §E
-2. **decimal リーダー対応**（`(price:decimal)`/`--exact`）→ **並列集計#41を解禁** — §A, §G, doc21 §21.8
-3. ~~**日時レーンのリーダー対応**~~ ✅ **landed**（`(ts:datetime("fmt"))`、比較・
-   `year/month/day/hour/minute/second/trunc/format/diff`、直列＋並列、等価テスト）。
-   残: `--dates` 自動推論フラグ、sub-second `unit`、`tz`、専用ベンチ — doc23 §23.1
-4. **list集計 → pivot/unpivot** — §D, doc23（**次の本命**：日時レーンが行/列キーに乗る）
-5. **構文**（後方互換不要）: 任意の先頭`|`／フロー接頭辞`@Label`／**列生成+cast+rename を同一`|>`ブロックで** — §C
-6. **書き出し高速化**（buffered formatting）— §E
-7. GPU backend 骨組み — §F, doc22
-
----
-
-## 6. 地雷・規律（CLAUDE.md と重複するが特に重要）
-
-- **ツール乱発でセッションを壊した実績あり**。依存のある編集（Read→Edit→build,
-  commit→push）を**並列発行しない**。1論理ステップ/ターン。出力が乱れたら実ファイルを
-  Read で確認（記憶を信じない）。
-- **新 enum variant（Column/Value/DataType）は exhaustive match を全部割る**。
-  decimal で約8箇所直した。次に variant を足すなら `cargo build --workspace` の
-  E0004 を潰し切る。
-- **「速いは計測なしに主張しない」**。#39 の AVX2 はこれで不採用にした。各 perf PR は
-  `docs/BENCHMARKS.md` に before/after。
-- **push前に数値ゲート**: clippy警告=0, FAILED=0, 依存ゼロ（`cargo tree -p rivus-cli
-  --edges normal` が rivus-* のみ）。
-- commit メッセージは**ディスクにある事実だけ**（`git show HEAD:path` で確認できること）。
-- force-push 不可。壊れたら上に積んで fast-forward。
+### 2-②b（後）：sugar ＋ 衝突 ＋ ガイド
+- `with filename` ＝ `(source.uri) as filename` の sugar（材化）。
+- **衝突規則**: 材化列 `filename` が既存なら `filename_r`（§27 流儀）。アクセサ
+  `source.uri` は `source` 予約＋`.uri` 末尾で実列 `source` と判別。
+- **英日両ガイド**（`docs/GUIDE.md` / `GUIDE.ja.md` §6 付近）に provenance を追記。
 
 ---
 
-## 7. 環境メモ
+## 3. tracked（後続スライスの前に必ず）
+- 🟠 **slice 3 の前に `Op::Source` 統一**（§28.8）：`provenance` を3つの形式別変種に
+  足したが、discovery（slice 3）/route（slice 4）も同じ3変種に足すと**形式中心 I/O 結合
+  の再石化**。`Op::Source{discovery, transport, codec, provenance}` への統一を**専用
+  move-only スライス**として slice 3 の前に入れる（統括指示・注意1）。
+- 🟡 slice 3 で「**`ls` の Resource 列名が `source`**」の解決（実列優先 → provenance 別名）
+  を確定（注意2 の一般化）。
 
-- 4 vCPU。`gen` は6列固定スキーマ（id,name,age,score,country,active）。
-- 大ファイル: `./target/release/rivus gen clean --rows N --seed S > f.csv`
-  （30M行 ≈ 1.13GB）。
+## 4. 以降のスライス順（§28.10）
+2（provenance・**実装中**）→ \[Op::Source 統一\] → 3（discovery-as-flow・union-by-name）
+→ 4（route 出力）→ 5（非有界骨組み・feature-gate）。
+
+---
+
+## 5. ローカルゲート（push 前に必須・数値で確認）
+```sh
+cargo fmt --all -- --check
+RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features   # =0
+cargo test --workspace            # 既存挙動ゼロ回帰
+cargo test --workspace --all-features   # gzip/zstd オラクル・stress 含む
+# byte-identity: tests/stress（serial==parallel==chunk-size・null・provenance 列）
+# 依存ゼロ: cargo tree -p rivus-cli --edges normal  → rivus-* のみ
+```
+- 新 enum variant（`Value`/`DataType`/`ColumnData`/`Op` フィールド/`Access`）は
+  **`cargo build --workspace --all-targets` の E0004/E0027/E0063 を潰し切る**（公開
+  re-export の variant は dead-code 警告は出ない＝構築経路なしでも先行可）。
+- force-push 不可。`reset --hard origin/main` 後の push は merge commit 経由で FF。
+  上流 merge commit（committer `noreply@github.com`）は**amend しない**（公開済・乖離する）。
+
+## 6. 環境メモ
+- 4 vCPU。`gen` は6列固定（id,name,age,score,country,active）。
 - 並列強制/抑止: `RIVUS_PARALLEL_MIN_BYTES=0` / `RIVUS_NO_PARALLEL=1`。
-  CPU/RAM上書き: `RIVUS_CPUS` / `RIVUS_RAM_BYTES`。
 - ノード別 busy_ms: `rivus run f.riv --json 2>&1 | grep '"kind"'`。
+
+---
+
+## 旧文脈（§28 以前・参考）
+SIMD-native parse（#71）・columnar（#40）・decimal/#41・日時レーン（doc23 §23.1）は
+landed 済み。doc23 §23.2 list 集計 / §23.3 pivot は未着手バックログ。詳細は
+`docs/BENCHMARKS.md` 末尾と git 履歴（〜#112）。
