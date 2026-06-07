@@ -104,13 +104,23 @@ trait Transport { fn open(&self, r: &Resource) -> io::Result<Box<dyn ByteSource>
 
 形式を `Codec` トレイトに**直交化**。decode（読み）と encode（書き）は対。
 
-```
-trait Decoder {
-    // §06 two-pass 推論を decode と分離して保持（下記）:
-    fn infer(&mut self, sample: &[u8]) -> Schema;          // 推論フェーズ（任意・宣言時は省略）
-    fn decode(&mut self, bytes: &[u8], schema: &Schema) -> Vec<Chunk>;  // 確定スキーマで chunk 化
+> **実装同期（slice 1a-②③ landed）**: 当初スケッチは `decode(&[u8]) -> Vec<Chunk>`
+> だったが、現リーダーは**有界メモリのストリーミング pull**（全バイトを抱えない）なので、
+> Decoder は**chunk 単位の pull**として実装した。推論（§06 two-pass の pass 1）は各形式の
+> `open`/`plan_parallel` 側に残し（確定スキーマと decoder を返す）、本トレイトは pass 2 の
+> decode ＋ source が surface する診断を担う。dispatch は**行単位でなく chunk 単位**なので
+> パース hot path は monomorphic のまま（`rivus_runtime::codec`）。
+
+```rust
+trait Decoder {                                   // pass 2: streaming chunk-pull
+    fn decode_chunk(&mut self) -> Option<Vec<Column>>;   // None = stream/range 終端
+    // source が一度だけ surface する診断（形式により既定値）:
+    fn inferred(&self) -> &[(String, DataType, bool)] { &[] } // A4 推論結果
+    fn rows_prefiltered(&self) -> u64 { 0 }                    // pushdown で除外した行
+    fn parse_failures(&self) -> &[u64] { &[] }                 // null 化した parse 失敗数
 }
-trait Encoder { fn encode(&mut self, chunk: &Chunk) -> Vec<u8>; … }
+// 推論（pass 1）は形式側 open が担い、(Schema, Box<dyn Decoder>) を返す。
+trait Encoder { fn encode(&mut self, chunk: &Chunk) -> Vec<u8>; … }  // 出力は鏡像
 ```
 
 - 実装: csv/tsv（delim）・jsonl/json・binary・(feature) parquet。**null モデル（§26）・型推論
