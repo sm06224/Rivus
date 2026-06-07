@@ -524,6 +524,14 @@ impl JsonlChunker {
     }
 }
 
+/// Codec face (§28.5): the streaming JSONL reader *is* the decoder. It has no
+/// prefilter / parse-failure accounting, so it uses the trait defaults.
+impl crate::codec::Decoder for JsonlChunker {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
+    }
+}
+
 /// Plan a byte-range parallel read of a JSON-Lines file: the global schema and
 /// `nparts` newline-aligned ranges covering the file exactly once. Returns
 /// `None` for a top-level array (not splittable) — the caller stays serial.

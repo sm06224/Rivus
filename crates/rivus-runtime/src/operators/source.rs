@@ -323,7 +323,7 @@ pub(crate) struct SourceBinary {
     c_align: bool,
     chunk_size: usize,
     schema: Arc<Schema>,
-    chunker: Option<BinChunker>,
+    decoder: Option<Box<dyn crate::codec::Decoder>>,
     loaded: bool,
 }
 
@@ -342,7 +342,7 @@ impl SourceBinary {
             c_align,
             chunk_size: chunk_size.max(1),
             schema: Schema::empty(),
-            chunker: None,
+            decoder: None,
             loaded: false,
         }
     }
@@ -357,7 +357,7 @@ impl SourceBinary {
             c_align: false,
             chunk_size: 0,
             schema,
-            chunker: Some(chunker),
+            decoder: Some(Box::new(chunker)),
             loaded: true,
         }
     }
@@ -383,7 +383,7 @@ impl SourceBinary {
                     );
                 }
                 self.schema = Arc::new(schema);
-                self.chunker = Some(ch);
+                self.decoder = Some(Box::new(ch));
             }
             Err(e) => ctx.raise(
                 ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
@@ -401,8 +401,8 @@ impl Operator for SourceBinary {
         if !self.loaded {
             self.load(ctx);
         }
-        let ch = self.chunker.as_mut()?;
-        let columns = ch.next_columns()?;
+        let dec = self.decoder.as_mut()?;
+        let columns = dec.decode_chunk()?;
         let id = ctx.fresh_id();
         Some(Chunk::new(id, self.schema.clone(), columns))
     }
@@ -571,6 +571,14 @@ impl BinChunker {
     }
 }
 
+/// Codec face (§28.5): fixed-width binary needs no inference and has no
+/// prefilter / parse-failure accounting, so the decoder is just the chunk pull.
+impl crate::codec::Decoder for BinChunker {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
+    }
+}
+
 /// A streaming binary source over one record-aligned byte range, for the
 /// parallel executor (#49). On open error it yields nothing (continue-first).
 #[allow(clippy::too_many_arguments)]
@@ -642,9 +650,10 @@ pub(crate) struct SourceJsonl {
     path: String,
     chunk_size: usize,
     schema: Arc<Schema>,
-    /// Line-oriented JSONL streams in bounded memory; a top-level array can't be
-    /// streamed (an element may span lines) so it materializes via `jsonl::parse`.
-    chunker: Option<jsonl::JsonlChunker>,
+    /// Line-oriented JSONL streams in bounded memory via the codec decoder; a
+    /// top-level array can't be streamed (an element may span lines) so it
+    /// materializes via `jsonl::parse` into `columns` instead.
+    decoder: Option<Box<dyn crate::codec::Decoder>>,
     columns: Vec<Column>,
     cursor: usize,
     total: usize,
@@ -657,7 +666,7 @@ impl SourceJsonl {
             path,
             chunk_size: chunk_size.max(1),
             schema: Schema::empty(),
-            chunker: None,
+            decoder: None,
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -672,7 +681,7 @@ impl SourceJsonl {
             path: String::new(),
             chunk_size: 0,
             schema,
-            chunker: Some(chunker),
+            decoder: Some(Box::new(chunker)),
             columns: Vec::new(),
             cursor: 0,
             total: 0,
@@ -698,7 +707,7 @@ impl SourceJsonl {
                         );
                     }
                     self.schema = Arc::new(schema);
-                    self.chunker = Some(ch);
+                    self.decoder = Some(Box::new(ch));
                 }
                 Err(e) => ctx.raise(
                     ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
@@ -753,8 +762,8 @@ impl Operator for SourceJsonl {
         if !self.loaded {
             self.load(ctx);
         }
-        if let Some(ch) = &mut self.chunker {
-            let columns = ch.next_columns()?;
+        if let Some(dec) = self.decoder.as_mut() {
+            let columns = dec.decode_chunk()?;
             let id = ctx.fresh_id();
             return Some(Chunk::new(id, self.schema.clone(), columns));
         }
