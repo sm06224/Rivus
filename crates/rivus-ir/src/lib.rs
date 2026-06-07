@@ -10,7 +10,8 @@ pub mod graph;
 pub use expr::{Access, ArithOp, CmpOp, Expr, Func};
 pub use graph::{
     delim_for_path, delim_modifier_for, AggFunc, BinType, Disposition, Edge, EdgeKind, Endian,
-    FillMethod, Hook, HookAction, HookEvent, JoinKind, Node, NodeId, Op, PlanGraph, COMMA,
+    FillMethod, Hook, HookAction, HookEvent, JoinKind, Node, NodeId, Op, PlanGraph, Provenance,
+    COMMA,
 };
 
 #[cfg(test)]
@@ -30,6 +31,7 @@ mod tests {
             declared: None,
             dt_formats: Vec::new(),
             delim: b',',
+            provenance: Provenance::Off,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {
@@ -56,6 +58,7 @@ mod tests {
             declared: None,
             dt_formats: Vec::new(),
             delim: b',',
+            provenance: Provenance::Off,
         });
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {

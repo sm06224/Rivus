@@ -259,6 +259,33 @@ impl BinType {
     }
 }
 
+/// Source provenance mode (design §28.6): does a source attach its origin
+/// [`rivus_core::Resource`] to each chunk it produces?
+///
+/// `Off` by default (zero overhead). `Source` (`with source`) rides the handle
+/// on chunk metadata, reachable via the `source.uri` accessor. `Filename`
+/// (`with filename`) is the sugar alias that additionally materializes a
+/// `filename` column (= `source.uri`). Only the uri is the in-contract identity
+/// (§00 0.14), so provenance stays byte-identical across serial/parallel reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Provenance {
+    #[default]
+    Off,
+    Source,
+    Filename,
+}
+
+impl Provenance {
+    /// The trailing source modifier this renders to (`to_source`), or `""`.
+    pub fn modifier(self) -> &'static str {
+        match self {
+            Provenance::Off => "",
+            Provenance::Source => " with source",
+            Provenance::Filename => " with filename",
+        }
+    }
+}
+
 /// A flow operator. One enum spanning sources, transforms, fan-out/in and
 /// sinks — because in Rivus they are all just nodes in the same graph.
 #[derive(Debug, Clone)]
@@ -296,6 +323,8 @@ pub enum Op {
         /// `.tsv`/`.tab` file or `open f.x as tsv`. Std-only — the reader just
         /// splits on a different byte.
         delim: u8,
+        /// Source provenance (`with source` / `with filename`); design §28.6.
+        provenance: Provenance,
     },
     /// `readbin path [le|be] [packed|aligned] (name:type ...)` — fixed-width
     /// binary records (a C struct dump). `endian` selects byte order;
@@ -305,9 +334,15 @@ pub enum Op {
         fields: Vec<(String, BinType)>,
         endian: Endian,
         c_align: bool,
+        /// Source provenance (`with source` / `with filename`); design §28.6.
+        provenance: Provenance,
     },
     /// `open path.jsonl` — JSON Lines (one flat JSON object per line).
-    OpenJsonl { path: String },
+    OpenJsonl {
+        path: String,
+        /// Source provenance (`with source` / `with filename`); design §28.6.
+        provenance: Provenance,
+    },
     /// `stream X` — replay of a named flow (and, internally, a reference edge).
     StreamRef { name: String },
     /// `|? <pred>`
@@ -575,6 +610,7 @@ impl Op {
                 declared,
                 dt_formats,
                 delim,
+                provenance,
             } => {
                 let mut s = format!("open {path}");
                 if !header {
@@ -603,6 +639,7 @@ impl Op {
                         .collect();
                     s.push_str(&format!(" ({})", parts.join(" ")));
                 }
+                s.push_str(provenance.modifier());
                 if let Some(cols) = projection {
                     s.push_str(&format!("  # read-only: {}", cols.join(",")));
                 }
@@ -623,6 +660,7 @@ impl Op {
                 fields,
                 endian,
                 c_align,
+                provenance,
             } => {
                 let cols: Vec<String> = fields
                     .iter()
@@ -635,9 +673,15 @@ impl Op {
                 if *c_align {
                     mods.push_str("aligned ");
                 }
-                format!("readbin {path} {mods}({})", cols.join(" "))
+                format!(
+                    "readbin {path} {mods}({}){}",
+                    cols.join(" "),
+                    provenance.modifier()
+                )
             }
-            Op::OpenJsonl { path } => format!("open {path}"),
+            Op::OpenJsonl { path, provenance } => {
+                format!("open {path}{}", provenance.modifier())
+            }
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Validate { pred, disposition } => format!("|! {pred} {}", disposition.as_str()),

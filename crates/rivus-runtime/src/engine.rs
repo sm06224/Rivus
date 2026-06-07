@@ -748,7 +748,7 @@ fn concat_parts(final_path: &str, parts: &[String], jsonl: bool) -> std::io::Res
 /// The file path of a single-file source op (for the parallel size gate).
 fn source_path(op: &Op) -> Option<&str> {
     match op {
-        Op::OpenCsv { path, .. } | Op::OpenJsonl { path } | Op::OpenBinary { path, .. } => {
+        Op::OpenCsv { path, .. } | Op::OpenJsonl { path, .. } | Op::OpenBinary { path, .. } => {
             Some(path)
         }
         _ => None,
@@ -1626,7 +1626,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 },
             })
         }
-        Op::OpenJsonl { path } => {
+        Op::OpenJsonl { path, .. } => {
             if path == "-" {
                 return None;
             }
@@ -1645,6 +1645,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             fields,
             endian,
             c_align,
+            ..
         } => {
             if path == "-" {
                 return None;
