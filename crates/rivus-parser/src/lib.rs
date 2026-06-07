@@ -1294,22 +1294,26 @@ impl Parser {
                     access: Access::Dynamic,
                 })
             }
-            // `resource("uri")` — a Resource handle literal (design §28.1). The
-            // uri is the in-contract identity; `size`/`mtime` are discovery-filled
-            // later (§00 0.14), so the literal carries only the uri.
+            // `resource(EXPR)` — a Resource handle (design §28.1). A bare string
+            // literal stays a first-class Resource *literal* (uri = the string;
+            // `size`/`mtime` are discovery-filled later, §00 0.14). Any other
+            // expression (a column, a computed path) is a **cast to resource** —
+            // `resource(filepath)` ≡ `filepath:resource` — so a manifest column or
+            // a computed uri becomes a handle stream that `read` consumes (3c).
             Tok::Word(w) if w == "resource" => {
                 self.bump();
                 self.expect(&Tok::LParen)?;
-                let uri = match self.bump() {
-                    Tok::Str(s) => s,
-                    other => {
-                        return Err(
-                            self.err(format!("resource() expects a string uri, found {other:?}"))
-                        )
-                    }
-                };
+                let e = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;
-                Ok(Expr::Literal(Value::Resource(Resource::new(uri))))
+                Ok(match e {
+                    Expr::Literal(Value::Str(s)) => {
+                        Expr::Literal(Value::Resource(Resource::new(s)))
+                    }
+                    other => Expr::Cast {
+                        expr: Box::new(other),
+                        ty: DataType::Resource,
+                    },
+                })
             }
             // Scalar function call `func(args…)` — e.g. `upper(name)`,
             // `substr(name, 0, 3)`, `contains(city, "NY")`.
@@ -1434,6 +1438,9 @@ fn decl_type(s: &str) -> Option<DataType> {
         "float" | "f64" | "double" => DataType::F64,
         "str" | "string" | "text" => DataType::Str,
         "bool" | "boolean" => DataType::Bool,
+        // I/O resource handle (§28.1): enables the `expr:resource` cast (and so
+        // the `resource(EXPR)` computed form) and a `(col:resource)` declaration.
+        "resource" => DataType::Resource,
         _ => return None,
     })
 }
@@ -1719,6 +1726,44 @@ mod tests {
         let s = g.to_source();
         assert!(
             s.contains("resource(\"file:///data/a.csv\")"),
+            "resource literal lost in {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+    }
+
+    #[test]
+    fn resource_expr_is_a_cast_literal_stays_literal() {
+        // `resource(EXPR)` (§28.3, slice 3c): a string literal stays a Resource
+        // literal; any other expression is a cast to resource (`resource(col)` ≡
+        // `col:resource`) — for manifest / computed-path handle streams.
+        let g = parse(
+            "M:\n open m.csv\n |> (resource(filepath)) as path (resource(\"file:///x\")) as fixed\n;",
+        )
+        .unwrap();
+        let items = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::ProjectExpr { items } => Some(items),
+                _ => None,
+            })
+            .expect("computed projection");
+        // computed path → Cast(_, Resource); literal → Resource literal.
+        assert!(matches!(
+            &items[0].0,
+            Expr::Cast {
+                ty: DataType::Resource,
+                ..
+            }
+        ));
+        assert!(matches!(&items[1].0, Expr::Literal(Value::Resource(_))));
+        let s = g.to_source();
+        assert!(
+            s.contains(":resource"),
+            "computed resource cast lost in {s}"
+        );
+        assert!(
+            s.contains("resource(\"file:///x\")"),
             "resource literal lost in {s}"
         );
         assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");

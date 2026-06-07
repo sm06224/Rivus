@@ -509,7 +509,10 @@ Used in `|?` predicates and `(…)` computed columns.
 > provenance (`with source`) and discovery (`ls`/`glob`) build on. Only the uri is
 > the value's identity — any size/mtime metadata a discovery attaches is *not* part
 > of equality, ordering, or `to_source` (so results stay reproducible). Cast any
-> value to it with `expr:resource` (its text becomes the uri).
+> value to it with `expr:resource` (its text becomes the uri); `resource(EXPR)` is
+> the same thing — `resource("…")` is a literal, `resource(col)` /
+> `resource(concat("data/", region, ".csv"))` build a handle from a manifest
+> column or a computed path (a stream of handles for a future `read` to open).
 
 > **Provenance accessor** `source.<field>` reads a field of the chunk's origin
 > handle, set by `with source` (§3): `source.uri` is the path/uri the row was read

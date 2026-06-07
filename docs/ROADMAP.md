@@ -150,6 +150,7 @@ partitioned output → long-path / Unicode.
 | | item | note |
 |---|---|---|
 | 📋 | **Progressive / interactive input** | "ask for input as we go" — exploratory, so **design-doc first** (after themes 1–2 settle). Placeholder so it isn't lost; not yet scheduled. |
+| 📋 | **Control-plane target injection** | The control plane binds a flow's *inputs/targets* as arguments (the Resource set / glob / params read by `ls $pattern` / `read $resources`) — the evolution of §25.3 value-hole binding. discovery/`read` are source-agnostic (§28.3). Phase 4 (control plane, §00 0.7). |
 
 ---
 

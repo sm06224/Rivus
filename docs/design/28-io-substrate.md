@@ -86,6 +86,11 @@ ls "logs/**/*.csv"                      # → Stream<Resource>（再帰 glob）
   等）は `reject`/`quarantine` として error stream に surface**（never-silent・§13/§24）。
   **決定的順序**（Resource を uri バイト昇順で連結）。dead-letter 先（`quarantine(sink)`）は §24
   と整合。slice 3 の前提。
+- **供給元非依存（批准 2026-06-07）**：`read` が消費する Resource 列の供給元は問わない —
+  `ls`/glob・マニフェスト（`open m.csv |> (resource(filepath)) as path`）・計算パス
+  （`resource(式)`）・将来の sqlite/http discovery、さらに**制御プレーンからの引数注入**
+  （§0.7・値ホール束縛の発展）。read は既定 `path` 列、無ければ最初の `Resource` 型列を消費し、
+  transport は scheme でディスパッチ（file 前提を焼き込まない）。
 
 ## 28.4 Transport（Resource → Bytes）
 
