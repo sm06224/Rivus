@@ -14,7 +14,7 @@ use rivus_core::{
     Severity, StrColumn, TimeUnit, Validity, Value,
 };
 use rivus_ir::{
-    AggFunc, BinType, CmpOp, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
+    AggFunc, BinType, CmpOp, Codec, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -213,43 +213,58 @@ impl Operator for MemSource {
 /// sample-infer its schema (instant start) for sink-less preview runs.
 pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Box<dyn Operator> {
     match op {
-        Op::OpenCsv {
-            path,
-            projection,
-            prefilter,
-            str_prefilter,
-            header,
-            declared,
-            dt_formats,
-            delim,
+        // One source node; the codec picks which reader to build. The path comes
+        // from discovery (v1 single fixed resource); transport is path-derived.
+        Op::Source {
+            discovery,
+            codec,
             provenance,
-        } => Box::new(
-            SourceCsv::new(
-                path.clone(),
-                projection.clone(),
-                chunk_size,
-                preview,
-                prefilter.clone(),
-                str_prefilter.clone(),
-                *header,
-                declared.clone(),
-                dt_formats.clone(),
-                *delim,
-            )
-            .with_provenance(*provenance, path),
-        ),
-        Op::OpenBinary {
-            path,
-            fields,
-            endian,
-            c_align,
-            provenance,
-        } => Box::new(
-            SourceBinary::new(path.clone(), fields.clone(), *endian, *c_align, chunk_size)
-                .with_provenance(*provenance, path),
-        ),
-        Op::OpenJsonl { path, provenance } => {
-            Box::new(SourceJsonl::new(path.clone(), chunk_size).with_provenance(*provenance, path))
+            ..
+        } => {
+            let path = discovery.path();
+            match codec {
+                Codec::Csv {
+                    header,
+                    declared,
+                    dt_formats,
+                    delim,
+                    projection,
+                    prefilter,
+                    str_prefilter,
+                } => Box::new(
+                    SourceCsv::new(
+                        path.to_string(),
+                        projection.clone(),
+                        chunk_size,
+                        preview,
+                        prefilter.clone(),
+                        str_prefilter.clone(),
+                        *header,
+                        declared.clone(),
+                        dt_formats.clone(),
+                        *delim,
+                    )
+                    .with_provenance(*provenance, path),
+                ),
+                Codec::Binary {
+                    fields,
+                    endian,
+                    c_align,
+                } => Box::new(
+                    SourceBinary::new(
+                        path.to_string(),
+                        fields.clone(),
+                        *endian,
+                        *c_align,
+                        chunk_size,
+                    )
+                    .with_provenance(*provenance, path),
+                ),
+                Codec::Jsonl => Box::new(
+                    SourceJsonl::new(path.to_string(), chunk_size)
+                        .with_provenance(*provenance, path),
+                ),
+            }
         }
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),

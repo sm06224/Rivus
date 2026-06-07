@@ -9,9 +9,9 @@ pub mod graph;
 
 pub use expr::{Access, ArithOp, CmpOp, Expr, Func};
 pub use graph::{
-    delim_for_path, delim_modifier_for, AggFunc, BinType, Disposition, Edge, EdgeKind, Endian,
-    FillMethod, Hook, HookAction, HookEvent, JoinKind, Node, NodeId, Op, PlanGraph, Provenance,
-    COMMA,
+    delim_for_path, delim_modifier_for, AggFunc, BinType, Codec, Discovery, Disposition, Edge,
+    EdgeKind, Endian, FillMethod, Hook, HookAction, HookEvent, JoinKind, Node, NodeId, Op,
+    PlanGraph, Provenance, Transport, COMMA,
 };
 
 #[cfg(test)]
@@ -22,17 +22,7 @@ mod tests {
     #[test]
     fn topo_order_of_linear_chain() {
         let mut g = PlanGraph::new();
-        let a = g.add_node(Op::OpenCsv {
-            path: "users.csv".into(),
-            projection: None,
-            prefilter: Vec::new(),
-            str_prefilter: Vec::new(),
-            header: true,
-            declared: None,
-            dt_formats: Vec::new(),
-            delim: b',',
-            provenance: Provenance::Off,
-        });
+        let a = g.add_node(Op::source("users.csv", Codec::csv(b',')));
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {
                 left: Box::new(Expr::field("age")),
@@ -49,17 +39,7 @@ mod tests {
     #[test]
     fn reversible_source_roundtrips_shape() {
         let mut g = PlanGraph::new();
-        let a = g.add_node(Op::OpenCsv {
-            path: "users.csv".into(),
-            projection: None,
-            prefilter: Vec::new(),
-            str_prefilter: Vec::new(),
-            header: true,
-            declared: None,
-            dt_formats: Vec::new(),
-            delim: b',',
-            provenance: Provenance::Off,
-        });
+        let a = g.add_node(Op::source("users.csv", Codec::csv(b',')));
         let b = g.add_node(Op::Filter {
             pred: Expr::Compare {
                 left: Box::new(Expr::field("age")),
