@@ -368,3 +368,57 @@ fn decimal_filter_no_silent_rounding() {
         ]
     );
 }
+
+#[test]
+fn discovery_prefilter_preserves_results() {
+    // Slice 3b: the `ls` name-prefilter pushdown is a superset prune with the
+    // downstream filter authoritative, so optimized output == unoptimized.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("opt_ls_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for rel in ["2026/app.csv", "2026/other.csv", "2025/app.csv"] {
+        let p = base.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "x\n").unwrap();
+    }
+    let _d = Dir(base.clone());
+    let b = base.display();
+    // Each name predicate must be result-invariant under the pushdown.
+    for pred in [
+        "contains(name, \"app\")",
+        "name == \"app.csv\"",
+        "starts_with(name, \"app\")",
+    ] {
+        let (raw, opt) = fingerprints_both(&format!(
+            "L:\n ls \"{b}/**/*.csv\"\n |? {pred}\n |> path\n;"
+        ));
+        assert_eq!(raw, opt, "discovery pushdown changed results for `{pred}`");
+        assert_eq!(
+            opt.get("L").map(|v| v.len()).unwrap_or(0),
+            2,
+            "expected the two app.csv files for `{pred}`"
+        );
+    }
+    // The pushdown actually fires (report records it) for a name predicate.
+    let g = rivus_parser::parse(&format!(
+        "L:\n ls \"{b}/**/*.csv\"\n |? contains(name, \"app\")\n |> path\n;"
+    ))
+    .unwrap();
+    let (_g, report) = rivus_optimizer::optimize(g);
+    assert!(
+        report
+            .applied
+            .iter()
+            .any(|l| l.contains("discovery_prefilter")),
+        "name-predicate pushdown should fire, got {:?}",
+        report.applied
+    );
+}

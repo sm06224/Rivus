@@ -156,9 +156,10 @@ ls "logs/**/*.csv"            # 再帰グロブ → マッチ毎に1行
   | `size` | int | バイトサイズ |
   | `mtime` | datetime | 最終更新時刻 |
 
-- `size` / `mtime` は**決定性契約の外**（§0.14）：絞り込み/表示には便利ですが、それに
-  依存した結果は byte-identity / 並列の保証外です（実行間で変わり得る）。`path`/`name`
-  は決定的です。
+- `size` / `mtime` は**決定性契約の外**タグ付き（§0.14）。**同一 run 内は FS が固定**
+  なので直列/並列では byte-identity が成立します。タグが効くのは*別 run*間 —
+  `interpret == compile`（Phase 2・コンパイル時と実行時で `mtime` が変わり得る）と分散
+  実行です。`path`/`name` は決定的です。
 
 > **ハンドルのフィールドは computed column で。** `source.uri`（§6）のようなハンドル
 > アクセサは `|> (…)` の中に書きます（例 `|> (source.uri) as p`）。述語に裸の dotted

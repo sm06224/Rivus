@@ -900,12 +900,16 @@ impl Operator for SourceJsonl {
 /// **ordinary columns** `{ path: Resource, name: str, size: int, mtime: datetime }`,
 /// in `chunk_size` batches (so the stream is chunk-size independent). `path` is the
 /// composable handle (consumed by `read`, slice 3c); `name`/`size`/`mtime` are
-/// derived filter columns. `size`/`mtime` are out of the determinism contract
-/// (§00 0.14) — results that depend on them aren't byte-identity/parallel
-/// guaranteed; `path`/`name` order is deterministic. 0 matches → warn + empty
-/// stream (continue-first).
+/// derived filter columns. `size`/`mtime` are tagged out of the determinism
+/// contract (§00 0.14): within a single run the filesystem is fixed (so results
+/// stay byte-identical serial/parallel), but the tag matters across runs —
+/// `interpret == compile` (Phase 2) and distributed. `path`/`name` order is
+/// deterministic. 0 matches → warn + empty stream (continue-first).
 pub(crate) struct SourceDiscover {
     pattern: String,
+    /// Optimizer-pushed required filename substrings (slice 3b): the walk skips
+    /// non-matching entries before statting. Empty = no prune.
+    name_prefilter: Vec<String>,
     chunk_size: usize,
     loaded: bool,
     uris: Vec<String>,
@@ -914,7 +918,7 @@ pub(crate) struct SourceDiscover {
 }
 
 impl SourceDiscover {
-    pub(crate) fn new(pattern: String, chunk_size: usize) -> Self {
+    pub(crate) fn new(pattern: String, chunk_size: usize, name_prefilter: Vec<String>) -> Self {
         let schema = Arc::new(Schema::new(vec![
             Field::new("path".to_string(), DataType::Resource),
             Field::new("name".to_string(), DataType::Str),
@@ -928,6 +932,7 @@ impl SourceDiscover {
         ]));
         SourceDiscover {
             pattern,
+            name_prefilter,
             chunk_size: chunk_size.max(1),
             loaded: false,
             uris: Vec::new(),
@@ -950,7 +955,7 @@ impl Operator for SourceDiscover {
     fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
         if !self.loaded {
             self.loaded = true;
-            self.uris = crate::discovery::glob_paths(&self.pattern);
+            self.uris = crate::discovery::glob_paths(&self.pattern, &self.name_prefilter);
             if self.uris.is_empty() {
                 ctx.raise(
                     ErrorEvent::new(

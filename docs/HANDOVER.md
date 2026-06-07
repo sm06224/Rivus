@@ -29,7 +29,8 @@
 | **2-②a** | provenance 活性化（アクセサ＋付与） | core `ChunkMeta.source: Option<Resource>`（加算的）。ir `Access::Source`（field 名を焼き込まない汎用）・`Access::is_column()`・`Provenance::source(path)`・to_source `source.<field>`。parser `source.<field>`（`.field` が続く時だけ予約）。runtime eval `source.uri`/`source.scheme`＝`resource_field`（slice 3 の Resource 列と共有）・provenance 無し→null。source op が serial＋全並列ワーカで同一ハンドルを stamp＝**byte-identity（serial==parallel==chunk-size）**。optimizer の prefilter/projection pushdown は Access::Source を非列として除外 |
 | **2-②b** | `with filename` 材化 ＋ ガイド | `with filename`＝`(source.uri) as filename`：source op が行末に `filename` 列（=path・Str）を材化。衝突時 `filename_r`（join 規則）。`with source` は handle のみ（列ゼロ）。英日ガイド（§3 Sources＋§6 アクセサ）。stress: 材化・衝突・並列 byte-identity |
 | **Op::Source 統一** | 形式別3変種統一（move-only・#122 マージ済） | `Op::Source{discovery:Discovery::Fixed, transport:Transport::Local, codec:Csv/Jsonl/Binary, provenance}`。`OpenCsv/OpenJsonl/OpenBinary` を撤去。parser は `open`/`readcsv`/`readjson`/`readbin` を desugar、`to_source` は同一文字列を復元。**挙動ゼロ・byte-identity 不変**（注意1＝再石化回避） |
-| **3a** | discovery-as-flow（`ls`・**本PR**） | `ls "glob"`(+alias `gci`/`dir`)＝`Op::Source{Discovery::Glob, Codec::Discover}`。std 自前 glob（`**`/`*`/`?`/`[…]`・symlink 非追従・uri 昇順・0件→warn）。**bare-columns** `{path:Resource, name:str, size:int, mtime:datetime}`（accessor 不採用＝可逆性確保）。述語の dotted `word.field`（`source.uri` 含む）は明示エラー（never-silent＋可逆性ガード）。size/mtime は §0.14 契約外 |
+| **3a** | discovery-as-flow（`ls`・#123 マージ済） | `ls "glob"`(+alias `gci`/`dir`)＝`Op::Source{Discovery::Glob, Codec::Discover}`。std 自前 glob（`**`/`*`/`?`/`[…]`・symlink 非追従・uri 昇順・0件→warn）。**bare-columns** `{path:Resource, name:str, size:int, mtime:datetime}`（accessor 不採用＝可逆性確保）。述語の dotted `word.field`（`source.uri` 含む）は明示エラー（never-silent＋可逆性ガード）。size/mtime は §0.14 契約外 |
+| **3b** | discovery 述語プッシュダウン（**本PR**） | optimizer `discovery_prefilter`：`ls` の単一 FilterProject 消費者から `name` の必須サブ文字列（`==`/`contains`/`starts_with`/`ends_with`/`like` 先頭）を抽出し `Codec::Discover{name_prefilter}` へ。enumeration walk が **stat 前**に basename で枝刈り（大ディレクトリで syscall 節約）。superset prune＋filter 権威＝結果不変（optimizer_equiv 固定）。size/mtime は stat 必須で利得なしのため非対象。決定性文言を精緻化（同一 run 内 byte-identity 成立／契約外は interpret==compile・分散） |
 
 ゲートは各 commit で全緑（fmt / clippy `--all-features -D warnings` 0 / 全テスト /
 stress serial==parallel==chunk-size / optimizer_equiv / 依存ゼロ）。各 slice は CLI で
@@ -39,16 +40,13 @@ e2e 確認済（`open`/`readcsv`/`with source`/`with filename`/`ls`/`gci`/`expla
 語彙・短縮は alias（正名へ解決、to_source は正名）。
 
 **リリース**：提案タグは 2-② → **`v1.3.0-dev.7`**、Op::Source → **`v1.3.0-dev.8`**、
-3a → **`v1.3.0-dev.9`**（カットは統括判断：`git tag v1.3.0-dev.N && git push origin v1.3.0-dev.N`）。
+3a → **`v1.3.0-dev.9`**、3b → **`v1.3.0-dev.10`**（カットは統括判断：`git tag v1.3.0-dev.N && git push origin v1.3.0-dev.N`）。
 
 ---
 
-## 2. 次タスク＝slice 3b → 3c
+## 2. 次タスク＝slice 3c（read … 多ファイル union-by-name）
 
-slice 3a（`ls` discovery・bare-columns）は **done**（本PR）。次は同 §28.10 slice 3 の続き：
-- **3b：述語プッシュダウン** — `ls` の `name`/`size`/`mtime` 述語を列挙段へ押し下げて枝刈り
-  （決定的・副作用なし・大ディレクトリで効く）。optimizer が安全に押し下げ、`SourceDiscover`
-  が enumeration 中に評価。glob とパス述語の合成。
+slice 3a（`ls`）・3b（discovery 述語プッシュダウン）は **done**（3b は本PR）。次：
 - **3c：`read [as fmt] with source`** — `Stream<Resource>`（`ls` の `path` 列）→ 多ファイルを
   transport+codec で開き **union-by-name** 連結（§27.2 吸収）。🔴 スキーマ不一致は「warn して
   継続」不可＝名前整合＋不一致行/ファイルは **reject/quarantine を error stream に surface**

@@ -266,7 +266,11 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                 ),
                 // `ls` discovery: enumerate the glob (`path` is the pattern) into a
                 // Resource stream; no codec decode, no provenance.
-                Codec::Discover => Box::new(SourceDiscover::new(path.to_string(), chunk_size)),
+                Codec::Discover { name_prefilter } => Box::new(SourceDiscover::new(
+                    path.to_string(),
+                    chunk_size,
+                    name_prefilter.clone(),
+                )),
             }
         }
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
