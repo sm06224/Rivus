@@ -11,7 +11,7 @@ pub use expr::{Access, ArithOp, CmpOp, Expr, Func};
 pub use graph::{
     delim_for_path, delim_modifier_for, AggFunc, BinType, Codec, Discovery, Disposition, Edge,
     EdgeKind, Endian, FillMethod, Hook, HookAction, HookEvent, JoinKind, Node, NodeId, Op,
-    PlanGraph, Provenance, Transport, COMMA,
+    PlanGraph, Provenance, ReadFmt, Transport, COMMA,
 };
 
 #[cfg(test)]

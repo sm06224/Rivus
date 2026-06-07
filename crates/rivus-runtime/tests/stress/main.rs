@@ -94,6 +94,7 @@ mod io_formats;
 mod joins;
 mod null;
 mod provenance;
+mod read;
 mod real_etl;
 mod syntax;
 mod temporal;

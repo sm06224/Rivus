@@ -273,6 +273,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                 )),
             }
         }
+        Op::Read { fmt, provenance } => Box::new(Read::new(*fmt, *provenance, chunk_size)),
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Validate { pred, disposition } => Box::new(Validate {
@@ -348,6 +349,7 @@ pub fn jsonl_sink(path: String) -> Box<dyn Operator> {
 // --- Split operator modules (design 26 §26.8.1; move-only). ---
 mod aggregate;
 mod join;
+mod read;
 mod sink;
 mod source;
 mod transform;
@@ -356,6 +358,7 @@ mod transform;
 // dispatch/tests below see the submodules' items via these globs.
 use aggregate::*;
 use join::*;
+use read::*;
 use sink::*;
 use source::*;
 use transform::*;

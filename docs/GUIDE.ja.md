@@ -166,6 +166,29 @@ ls "logs/**/*.csv"            # 再帰グロブ → マッチ毎に1行
 > フィールド（`|? source.uri == …`）を書くのは**明示エラー**です（曖昧で可逆性も壊れる
 > ため）。`ls` では裸の列（`name`/`size`/`path`）をそのまま使ってください。
 
+### `read` — 多数のファイルを 1 ストリームへ
+
+`read [as FMT] [with source|filename]` は **`Resource` 列**（`ls` の `path`、または
+`resource(…)` 型の任意の列 — 既定 `path`、無ければ最初の Resource 列）を消費し、各ハンドルを
+開いて復号し、**名前で**連結して 1 ストリームにします：
+
+```
+ls "sales/2026/**/*.csv" |? size > 0  read as csv with source  |# country sum:amount
+
+# パスのマニフェストでも同じ（read は供給元を問わない）
+open manifest.csv |> (resource(filepath)) as path  read with source
+```
+
+- **union-by-name**：出力列は全ファイルの列の和（first-seen 出現順）。ある列を持たない
+  ファイルはその列が `null`。型は**広い方へ昇格**して切り捨てを防ぎます：`int ⊆ float ⊆
+  decimal`、混在は `str`（あるファイルで `int`・別で `float` の列は両方 `float` で読まれる）。
+- **`as FMT`** は全ファイルの形式を固定（`csv` / `tsv` / `jsonl`）。無ければ各ファイルの拡張子に
+  従います。（現状 CSV + JSONL、binary は後続。）
+- **never-silent**：開けない/壊れたハンドルは **quarantine** — error stream に surface して
+  スキップし、他のファイルは継続（continue-first）。ファイルは uri 昇順の決定的順で読みます。
+- **provenance**：`with source` は各ファイルのハンドルを行に載せ（`(source.uri)` がその行の
+  由来ファイル）、`with filename` はさらに `filename` 列を付与します。
+
 ---
 
 ## 4. 変換

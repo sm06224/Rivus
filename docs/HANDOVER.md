@@ -31,52 +31,53 @@
 | **Op::Source 統一** | 形式別3変種統一（move-only・#122 マージ済） | `Op::Source{discovery:Discovery::Fixed, transport:Transport::Local, codec:Csv/Jsonl/Binary, provenance}`。`OpenCsv/OpenJsonl/OpenBinary` を撤去。parser は `open`/`readcsv`/`readjson`/`readbin` を desugar、`to_source` は同一文字列を復元。**挙動ゼロ・byte-identity 不変**（注意1＝再石化回避） |
 | **3a** | discovery-as-flow（`ls`・#123 マージ済） | `ls "glob"`(+alias `gci`/`dir`)＝`Op::Source{Discovery::Glob, Codec::Discover}`。std 自前 glob（`**`/`*`/`?`/`[…]`・symlink 非追従・uri 昇順・0件→warn）。**bare-columns** `{path:Resource, name:str, size:int, mtime:datetime}`（accessor 不採用＝可逆性確保）。述語の dotted `word.field`（`source.uri` 含む）は明示エラー（never-silent＋可逆性ガード）。size/mtime は §0.14 契約外 |
 | **3b** | discovery 述語プッシュダウン（#124 マージ済） | optimizer `discovery_prefilter`：`ls` の単一 FilterProject 消費者から `name` の必須サブ文字列（`==`/`contains`/`starts_with`/`ends_with`/`like` 先頭）を抽出し `Codec::Discover{name_prefilter}` へ。enumeration walk が **stat 前**に basename で枝刈り（大ディレクトリで syscall 節約）。superset prune＋filter 権威＝結果不変（optimizer_equiv 固定）。size/mtime は stat 必須で利得なしのため非対象。決定性文言を精緻化 |
-| **3c-①** | `resource(式)`（**本PR**） | `resource(EXPR)`：文字列リテラルは Resource リテラル（1b 維持）、それ以外は **cast `EXPR:resource`** へ desugar（マニフェスト列 `(resource(filepath)) as path`・計算パス `resource(concat(...))`）。parser `decl_type` に `resource` を追加（1b の `:resource` cast の parser 欠落も同時に解消）。＋ canon メモ追記（§0.7 制御プレーンからの対象注入・§28.3 供給元非依存・ROADMAP 📋） |
+| **3c-①** | `resource(式)`（#125 マージ済） | `resource(EXPR)`：文字列リテラルは Resource リテラル（1b 維持）、それ以外は **cast `EXPR:resource`** へ desugar（マニフェスト列・計算パス）。parser `decl_type` に `resource` 追加（1b の `:resource` cast の parser 欠落も解消）。＋ canon メモ（§0.7/§28.3/ROADMAP） |
+| **3c-②** | `read` 多ファイル union-by-name（**本PR**） | `read [as fmt] [with source/filename]`＝`Op::Read{fmt, provenance}`。Resource 列（既定 `path`、無ければ最初の Resource 型列、無ければ Fatal）を消費し全ファイルを open+decode。**union-by-name**（first-seen 列順・欠損→null）・**数値 widening**（int⊆float⊆decimal⊆str＝無切捨て）。開けない/壊れ→**quarantine**（Recoverable surface・スキップ・継続）。bad_rows も surface。provenance で各ファイル handle を行に（`source.uri`/`filename` 行ごと）。uri 昇順・chunk-size 非依存・**MVP=serial**・CSV+JSONL。`operators/read.rs` |
 
 ゲートは各 commit で全緑（fmt / clippy `--all-features -D warnings` 0 / 全テスト /
 stress serial==parallel==chunk-size / optimizer_equiv / 依存ゼロ）。各 slice は CLI で
-e2e 確認済（`open`/`readcsv`/`with source`/`with filename`/`ls`/`gci`/`resource(式)`/`explain` 往復）。
+e2e 確認済（`open`/`ls`/`gci`/`resource(式)`/`read`/`with source`/`with filename`/`explain` 往復）。
 
 **Verb 命名ポリシー（恒久・§25.2a）**：Verb のみ・`Verb-Noun` 不採用・PowerShell 動詞/別名
 語彙・短縮は alias（正名へ解決、to_source は正名）。
 
 **リリース**：提案タグは 2-② → **`v1.3.0-dev.7`**、Op::Source → **`v1.3.0-dev.8`**、
-3a → **`v1.3.0-dev.9`**、3b → **`v1.3.0-dev.10`**、3c-① → **`v1.3.0-dev.11`**（カットは統括判断）。
+3a → **`v1.3.0-dev.9`**、3b → **`v1.3.0-dev.10`**、3c-① → **`v1.3.0-dev.11`**、
+3c-② → **`v1.3.0-dev.12`**（カットは統括判断）。
 
 ---
 
-## 2. 次タスク＝slice 3c-②（read … 多ファイル union-by-name）
+## 2. 次タスク＝slice 4（route 出力）＋ 3c フォローアップ
 
-slice 3a（`ls`）・3b（pushdown）・3c-①（`resource(式)`）は **done**（3c-① は本PR）。次：
-- **3c-②：`read [as fmt] with source`** — Resource 列（既定 `path`、無ければ最初の Resource 型列、
-  無ければ明示エラー）→ 多ファイルを transport(scheme dispatch・今は file)+codec で開き
-  **union-by-name** 連結。型突合＝数値 widening（int⊆float⊆decimal⊆str）・非数値 first-seen＋cast
-  surface。🔴 スキーマ不一致は「warn して継続」不可＝不一致行/ファイルは **reject/quarantine を
-  error stream に surface**
-  transport+codec で開き **union-by-name** 連結（§27.2 吸収）。🔴 スキーマ不一致は「warn して
-  継続」不可＝名前整合＋不一致行/ファイルは **reject/quarantine を error stream に surface**
-  （never-silent・§13/§24）。決定的順序（uri 昇順連結）。
+slice 3（discovery-as-flow）は **完了**：3a（`ls`）・3b（pushdown）・3c-①（`resource(式)`）・
+3c-②（`read` union-by-name・本PR）。§28.10 の次は **slice 4（動的/分割出力 route・§28.7/§27.3-4）**：
+`save` を encode→route→transport に分解、動的出力名・`by key` 分割、決定的・byte-identity。
+
+**3c フォローアップ（モデルはこのまま乗る・rework なし）**：
+- sqlite/http/s3 の Transport プラグイン（§28.4／slice 5）。`read` は scheme dispatch 前提。
+- パス→パーティション列 materialize（Hive 部分読み・gap B）。
+- binary codec で `read`、並列多ファイル＋bounded-memory streaming（現 MVP は serial・全 buffer）。
+- `read` の per-column cast 失敗 surface（現状 widening で原則発生せず・reader の bad_rows は surface 済）。
 
 実装の足場（本セッションで整えた共有機構）:
-- `Op::Source{discovery:Discovery::Glob, codec:Codec::Discover}` ＝ `ls`。3b は `Discovery`/
-  述語押し下げを、3c は `read` verb（`Stream<Resource>` 消費）を足す。
-- discovery の glob は `crates/rivus-runtime/src/discovery.rs`（std 自前・`glob_paths`）。
-- `path` 列は `Resource` 型（uri-backed）＝3c の `read` が消費する handle。
+- `Op::Source{Discovery::Glob, Codec::Discover}`＝`ls`、`Op::Read{fmt, provenance}`＝`read`。
+- discovery glob は `crates/rivus-runtime/src/discovery.rs`（std・`glob_paths`）。
+- `read` は `crates/rivus-runtime/src/operators/read.rs`（per-file decode は `csv::CsvChunker::open`/
+  `jsonl::JsonlChunker::open` を直接駆動＝Fatal-on-open を避け quarantine 化。widening は `widen()`）。
 
 ---
 
 ## 3. tracked
 - ✅ **`Op::Source` 統一（注意1）＝done**（#122）。
-- ✅ **3a の 🟡 列名問題は回避済**：discovery 列を `source` でなく **bare 列**（`path`/`name`/
-  `size`/`mtime`）にしたため provenance `source.*` と衝突しない。
+- ✅ **3a の 🟡 列名問題は回避済**（discovery は bare 列）。
 - 🟡 **handle field accessor は parens 内（computed column）限定**：flow-mode lexer が `a.b` を
-  1 識別子に畳むため、述語の dotted `word.field` は明示エラー（never-silent）。将来 `a.b` を
-  flow-mode でも解す or `read` の Resource 列消費で必要になれば再検討。
+  1 識別子に畳むため、述語の dotted `word.field` は明示エラー（never-silent）。
 - 🟡 `dedup_sources` は現状 **CSV のみ**（path キー）。全 `Op::Source` 一般化は follow-up。
+- 🟡 `read` MVP は **serial＋全ファイル buffer**。並列多ファイル＋bounded-memory は follow-up。
 
 ## 4. 以降のスライス順（§28.10）
-2（provenance・**done**）→ \[Op::Source 統一・**done**\] → 3（discovery-as-flow・
-**次**・union-by-name）→ 4（route 出力）→ 5（非有界骨組み・feature-gate）。
+2（provenance・**done**）→ \[Op::Source 統一・**done**\] → 3（discovery-as-flow・**done**：
+3a/3b/3c-①/3c-②）→ **4（route 出力・次）** → 5（非有界骨組み・feature-gate）。
 
 ---
 

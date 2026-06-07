@@ -168,6 +168,34 @@ ls "logs/**/*.csv"            # recursive glob → a row per match
 > would be ambiguous and wouldn't round-trip. For `ls`, just use the bare columns
 > (`name` / `size` / `path`).
 
+### `read` — open many files into one stream
+
+`read [as FMT] [with source|filename]` consumes a **`Resource` column** (the
+`path` from `ls`, or any `resource(…)`-typed column — default `path`, else the
+first resource column) and opens + decodes every handle, concatenating the files
+into one stream **by name**:
+
+```
+ls "sales/2026/**/*.csv" |? size > 0  read as csv with source  |# country sum:amount
+
+# a manifest of paths works the same — read is source-agnostic
+open manifest.csv |> (resource(filepath)) as path  read with source
+```
+
+- **union-by-name**: the output columns are the union of all files' columns (in
+  first-seen order); a file missing a column gets `null` for it. Column types
+  **widen** so nothing truncates: `int ⊆ float ⊆ decimal`, and anything mixed
+  becomes `str` (so an `int` column in one file and a `float` in another both read
+  as `float`).
+- **`as FMT`** forces a format for every file (`csv` / `tsv` / `jsonl`); without
+  it each file's format follows its extension. (CSV + JSONL today; binary later.)
+- **never-silent**: a handle that can't be opened or decoded is **quarantined** —
+  surfaced on the error stream and skipped, while the other files keep going
+  (continue-first). Files are read in deterministic uri order.
+- **provenance**: `with source` rides each file's handle on its rows (so
+  `(source.uri)` is the file that row came from); `with filename` also adds a
+  `filename` column.
+
 ---
 
 ## 4. Transforms
