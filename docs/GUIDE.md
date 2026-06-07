@@ -156,10 +156,11 @@ ls "logs/**/*.csv"            # recursive glob → a row per match
   | `size` | int | size in bytes |
   | `mtime` | datetime | last-modified time |
 
-- `size` / `mtime` are **outside the determinism contract** (§0.14): handy to
-  filter/display, but a result that depends on them isn't byte-identity /
-  parallel guaranteed (a file's size/mtime can change between runs). `path` and
-  `name` are deterministic.
+- `size` / `mtime` are tagged **outside the determinism contract** (§0.14).
+  Within a single run the filesystem is fixed, so results stay byte-identical
+  across serial/parallel; the tag matters across *different* runs — `interpret ==
+  compile` (Phase 2, where compile-time and run-time can see a changed `mtime`)
+  and distributed execution. `path` and `name` are deterministic.
 
 > **Handle fields go in a computed column.** A handle accessor like `source.uri`
 > (§6) must appear inside `|> (…)`, e.g. `|> (source.uri) as p`. Writing a dotted

@@ -375,11 +375,14 @@ pub enum Codec {
         c_align: bool,
     },
     /// **Discovery codec** (design §28.3): no bytes are decoded — the discovered
-    /// resources are emitted directly as a single `Resource` column named `path`.
-    /// This is the `ls` source (`Discovery::Glob` + `Codec::Discover`); fields of
-    /// each handle are read with the `path.uri` / `.name` / `.size` / `.mtime`
-    /// accessor. Slice 3c's `read` consumes such a resource stream to decode files.
-    Discover,
+    /// resources are emitted directly as ordinary file columns (`path`/`name`/
+    /// `size`/`mtime`). This is the `ls` source (`Discovery::Glob` +
+    /// `Codec::Discover`). `name_prefilter` carries required filename substrings
+    /// pushed down by the optimizer (`discovery_prefilter`): the enumeration walk
+    /// skips any entry whose name lacks one **before statting it** (a superset
+    /// pre-scan — the downstream filter stays authoritative, so results are
+    /// unchanged). Slice 3c's `read` consumes the resource stream to decode.
+    Discover { name_prefilter: Vec<String> },
 }
 
 impl Codec {
@@ -394,6 +397,13 @@ impl Codec {
             projection: None,
             prefilter: Vec::new(),
             str_prefilter: Vec::new(),
+        }
+    }
+
+    /// A fresh discovery codec (`ls`); no name pre-filter pushed yet.
+    pub fn discover() -> Codec {
+        Codec::Discover {
+            name_prefilter: Vec::new(),
         }
     }
 }
@@ -664,7 +674,7 @@ impl Op {
             // surface verb each desugars from).
             Op::Source { codec, .. } => match codec {
                 Codec::Binary { .. } => "readbin",
-                Codec::Discover => "ls",
+                Codec::Discover { .. } => "ls",
                 Codec::Csv { .. } | Codec::Jsonl => "open",
             },
             Op::StreamRef { .. } => "stream",
@@ -787,7 +797,14 @@ impl Op {
                     // `ls "glob"` — the path is the glob pattern; quote it so it
                     // re-lexes as one string token (reversible). Provenance is not
                     // applicable to a discovery source (it emits handles already).
-                    Codec::Discover => format!("ls {path:?}"),
+                    // A pushed name pre-filter is an inert `#` comment (like CSV).
+                    Codec::Discover { name_prefilter } => {
+                        let mut s = format!("ls {path:?}");
+                        if !name_prefilter.is_empty() {
+                            s.push_str(&format!("  # name-prefilter: {name_prefilter:?}"));
+                        }
+                        s
+                    }
                 }
             }
             Op::StreamRef { name } => format!("stream {name}"),

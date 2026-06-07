@@ -53,7 +53,109 @@ pub fn optimize(graph: PlanGraph) -> (PlanGraph, OptReport) {
     let graph = project_pushdown(graph, &mut report);
     let graph = filter_pushdown(graph, &mut report);
     let graph = string_prefilter(graph, &mut report);
+    let graph = discovery_prefilter(graph, &mut report);
     (graph, report)
+}
+
+/// **Discovery name-prefilter pushdown** (slice 3b). Annotate an `ls`
+/// (`Codec::Discover`) source with required filename substrings drawn from its
+/// single `FilterProject` consumer's predicates on the `name` column
+/// (`name == "S"`, `contains(name,"S")`, `starts_with`/`ends_with`, the leading
+/// literal run of `like`). The enumeration walk then skips a directory entry
+/// whose name lacks the substring *before* statting it (a syscall saved per
+/// pruned file in a large directory).
+///
+/// Safety: a **superset** prune (a name with the substring may still fail the
+/// real predicate; one lacking it can never pass), and the `FilterProject`
+/// re-checks every surviving row — so the result is unchanged (fixed by
+/// `optimizer_equiv`). Only top-level `and` conjuncts on `name` contribute.
+fn discovery_prefilter(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
+    let mut pushed = 0usize;
+    for sid in 0..graph.nodes.len() {
+        if !matches!(
+            &graph.nodes[sid].op,
+            Op::Source { codec: Codec::Discover { name_prefilter }, .. } if name_prefilter.is_empty()
+        ) {
+            continue;
+        }
+        let consumers = graph.outputs_of(sid);
+        if consumers.len() != 1 {
+            continue;
+        }
+        let preds = match &graph.nodes[consumers[0]].op {
+            Op::FilterProject { preds, .. } => preds.clone(),
+            _ => continue,
+        };
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        for p in &preds {
+            collect_conjuncts(p, &mut conjuncts);
+        }
+        let needles: Vec<String> = conjuncts
+            .into_iter()
+            .filter_map(name_substring_atom)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if needles.is_empty() {
+            continue;
+        }
+        if let Op::Source {
+            codec: Codec::Discover { name_prefilter },
+            ..
+        } = &mut graph.nodes[sid].op
+        {
+            *name_prefilter = needles;
+            pushed += 1;
+        }
+    }
+    if pushed > 0 {
+        report.applied.push(format!(
+            "discovery_prefilter: filename pre-scan on {pushed} `ls` source(s)"
+        ));
+    }
+    graph
+}
+
+/// A required substring of the **`name`** column implied by a predicate
+/// (`name == "S"`, `contains/starts_with/ends_with(name,"S")`, the leading run of
+/// `like(name,"S%…")`). Like [`literal_substring_atom`] but restricted to the
+/// `name` field, for discovery pushdown. `None` if none is guaranteed.
+fn name_substring_atom(e: &Expr) -> Option<String> {
+    let is_name = |x: &Expr| matches!(x, Expr::Field { name, access } if access.is_column() && name == "name");
+    if let Expr::Compare {
+        left,
+        op: CmpOp::Eq,
+        right,
+    } = e
+    {
+        if is_name(left) {
+            if let Expr::Literal(Value::Str(s)) = right.as_ref() {
+                return Some(s.clone());
+            }
+        }
+        if is_name(right) {
+            if let Expr::Literal(Value::Str(s)) = left.as_ref() {
+                return Some(s.clone());
+            }
+        }
+    }
+    if let Expr::Func { func, args } = e {
+        if !args.first().is_some_and(is_name) {
+            return None;
+        }
+        let lit = match args.get(1) {
+            Some(Expr::Literal(Value::Str(s))) => s.as_str(),
+            _ => return None,
+        };
+        return match func {
+            Func::Contains | Func::StartsWith | Func::EndsWith => Some(lit.to_string()),
+            Func::Like => {
+                let run: String = lit.chars().take_while(|&c| c != '%' && c != '_').collect();
+                (!run.is_empty()).then_some(run)
+            }
+            _ => None,
+        };
+    }
+    None
 }
 
 /// **String prefilter pushdown.** Annotate a CSV source with required literal

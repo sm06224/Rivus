@@ -855,7 +855,7 @@ impl Parser {
                 Ok(self.g.add_node(Op::Source {
                     discovery: Discovery::Glob(pattern),
                     transport: Transport::Local,
-                    codec: Codec::Discover,
+                    codec: Codec::discover(),
                     provenance: Provenance::Off,
                 }))
             }
@@ -1809,7 +1809,7 @@ mod tests {
             &g.nodes[0].op,
             Op::Source {
                 discovery: Discovery::Glob(p),
-                codec: Codec::Discover,
+                codec: Codec::Discover { .. },
                 ..
             } if p == "logs/**/*.csv"
         ));
@@ -1822,7 +1822,7 @@ mod tests {
             assert!(matches!(
                 &a.nodes[0].op,
                 Op::Source {
-                    codec: Codec::Discover,
+                    codec: Codec::Discover { .. },
                     ..
                 }
             ));

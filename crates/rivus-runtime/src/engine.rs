@@ -1700,7 +1700,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
         }
         // `ls` discovery is not a byte-range read — it runs on the serial path
         // (the enumerator already emits in deterministic, chunk-sized batches).
-        Codec::Discover => None,
+        Codec::Discover { .. } => None,
     }
 }
 

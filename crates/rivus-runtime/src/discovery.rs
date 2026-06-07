@@ -12,21 +12,33 @@ use std::path::Path;
 /// ascending and de-duplicated. A non-matching / empty result is an empty vec
 /// (the caller surfaces a "0 matches" warning — continue-first).
 ///
+/// `name_prefilter` is an optimizer-pushed superset prune (slice 3b): a matched
+/// file is kept only if its **name** (basename) contains every listed substring.
+/// The check runs *before* statting (`is_file`), so non-matching entries in a
+/// large directory cost no syscall. It is conservative (the downstream filter
+/// stays authoritative), so results are unchanged — empty `name_prefilter` keeps
+/// every match.
+///
 /// Glob vocabulary (shared with `like`/`glob` predicates): `*` matches any run
 /// within a path segment, `?` one char, `[…]` a char class (`[a-z]`, `[!…]`
 /// negation), and `**` matches zero or more whole path segments (recursion).
-pub(crate) fn glob_paths(pattern: &str) -> Vec<String> {
+pub(crate) fn glob_paths(pattern: &str, name_prefilter: &[String]) -> Vec<String> {
     let segs: Vec<&str> = pattern.split('/').collect();
     let mut out = Vec::new();
     if pattern.starts_with('/') {
         // Absolute: the leading split element is "" — start at the fs root.
-        walk(Path::new("/"), "/", &segs[1..], &mut out);
+        walk(Path::new("/"), "/", &segs[1..], name_prefilter, &mut out);
     } else {
-        walk(Path::new("."), "", &segs, &mut out);
+        walk(Path::new("."), "", &segs, name_prefilter, &mut out);
     }
     out.sort();
     out.dedup();
     out
+}
+
+/// The final path segment of a uri (the file's `name`).
+fn basename(uri: &str) -> &str {
+    uri.rsplit(['/', '\\']).next().unwrap_or(uri)
 }
 
 /// Join a uri base and a path segment without doubling separators.
@@ -43,10 +55,13 @@ fn join_uri(base: &str, seg: &str) -> String {
 /// Recursively match `segs` against the filesystem, tracking the on-disk path
 /// (`fs`) and the clean uri (`uri`, the form the user wrote). Matched **files**
 /// (not directories) are pushed to `out`.
-fn walk(fs: &Path, uri: &str, segs: &[&str], out: &mut Vec<String>) {
+fn walk(fs: &Path, uri: &str, segs: &[&str], name_prefilter: &[String], out: &mut Vec<String>) {
     let Some((seg, rest)) = segs.split_first() else {
-        // All segments consumed: this path is a match iff it's a real file.
-        if fs.is_file() {
+        // All segments consumed: keep iff the name passes the pushed pre-filter
+        // (checked first, so a pruned entry costs no `is_file` stat) AND it is a
+        // real file.
+        let nm = basename(uri);
+        if name_prefilter.iter().all(|s| nm.contains(s.as_str())) && fs.is_file() {
             out.push(uri.to_string());
         }
         return;
@@ -56,7 +71,7 @@ fn walk(fs: &Path, uri: &str, segs: &[&str], out: &mut Vec<String>) {
 
     if *seg == "**" {
         // `**` matches zero segments (try `rest` here) …
-        walk(fs, uri, rest, out);
+        walk(fs, uri, rest, name_prefilter, out);
         // … or one-or-more: recurse into each subdir with `**` still pending.
         if let Ok(rd) = std::fs::read_dir(read_root) {
             for e in rd.flatten() {
@@ -64,7 +79,7 @@ fn walk(fs: &Path, uri: &str, segs: &[&str], out: &mut Vec<String>) {
                 // `symlink_metadata` + is_dir avoids following symlinked dirs.
                 if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    walk(&child, &join_uri(uri, &name), segs, out);
+                    walk(&child, &join_uri(uri, &name), segs, name_prefilter, out);
                 }
             }
         }
@@ -73,7 +88,7 @@ fn walk(fs: &Path, uri: &str, segs: &[&str], out: &mut Vec<String>) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 if glob_match(seg, &name) {
-                    walk(&e.path(), &join_uri(uri, &name), rest, out);
+                    walk(&e.path(), &join_uri(uri, &name), rest, name_prefilter, out);
                 }
             }
         }
@@ -81,7 +96,7 @@ fn walk(fs: &Path, uri: &str, segs: &[&str], out: &mut Vec<String>) {
         // Literal segment: descend only if it exists (no directory scan).
         let child = read_root.join(seg);
         if child.exists() {
-            walk(&child, &join_uri(uri, seg), rest, out);
+            walk(&child, &join_uri(uri, seg), rest, name_prefilter, out);
         }
     }
 }
