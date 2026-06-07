@@ -219,6 +219,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             declared,
             dt_formats,
             delim,
+            ..
         } => Box::new(SourceCsv::new(
             path.clone(),
             projection.clone(),
@@ -236,6 +237,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             fields,
             endian,
             c_align,
+            ..
         } => Box::new(SourceBinary::new(
             path.clone(),
             fields.clone(),
@@ -243,7 +245,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             *c_align,
             chunk_size,
         )),
-        Op::OpenJsonl { path } => Box::new(SourceJsonl::new(path.clone(), chunk_size)),
+        Op::OpenJsonl { path, .. } => Box::new(SourceJsonl::new(path.clone(), chunk_size)),
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
         Op::Validate { pred, disposition } => Box::new(Validate {

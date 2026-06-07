@@ -28,7 +28,7 @@ use lexer::{Comment, Lexer, Tok};
 use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
     Access, AggFunc, ArithOp, BinType, CmpOp, Disposition, EdgeKind, Endian, Expr, FillMethod,
-    Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
+    Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph, Provenance,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -727,6 +727,31 @@ impl Parser {
         }
     }
 
+    /// Optional source-provenance modifier (design §28.6): `with source` (rides
+    /// the origin handle on chunk metadata) or `with filename` (sugar: also a
+    /// `filename` column). `with` is only used here, so an unrecognized follower
+    /// is an error rather than silently ignored.
+    fn parse_provenance(&mut self) -> Result<Provenance, RivusError> {
+        if !self.peek_is_word("with") {
+            return Ok(Provenance::Off);
+        }
+        match &self.toks[self.pos + 1].0 {
+            Tok::Word(w) if w == "source" => {
+                self.bump();
+                self.bump();
+                Ok(Provenance::Source)
+            }
+            Tok::Word(w) if w == "filename" => {
+                self.bump();
+                self.bump();
+                Ok(Provenance::Filename)
+            }
+            other => Err(self.err(format!(
+                "`with` expects `source` or `filename`, found {other:?}"
+            ))),
+        }
+    }
+
     /// upstream node.
     fn parse_body_head(&mut self, input: Option<NodeId>) -> Result<NodeId, RivusError> {
         match self.tok().clone() {
@@ -755,29 +780,37 @@ impl Parser {
                 } else {
                     (None, Vec::new())
                 };
+                // Optional `with source` / `with filename` (any format, §28.6).
+                let prov = self.parse_provenance()?;
                 let delim = resolve_delim(&path, explicit.as_deref());
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                 })?;
                 let mut op = fmt.into_op(path, delim);
-                if let Op::OpenCsv {
-                    header,
-                    declared,
-                    dt_formats,
-                    ..
-                } = &mut op
-                {
-                    if noheader {
-                        *header = false;
+                match &mut op {
+                    Op::OpenCsv {
+                        header,
+                        declared,
+                        dt_formats,
+                        provenance,
+                        ..
+                    } => {
+                        if noheader {
+                            *header = false;
+                        }
+                        *declared = decl;
+                        *dt_formats = dtf;
+                        *provenance = prov;
                     }
-                    *declared = decl;
-                    *dt_formats = dtf;
+                    Op::OpenJsonl { provenance, .. } => *provenance = prov,
+                    _ => {}
                 }
                 Ok(self.g.add_node(op))
             }
             Tok::Word(w) if w == "readcsv" => {
                 self.bump();
                 let path = norm_path(self.path_word()?);
+                let provenance = self.parse_provenance()?;
                 Ok(self.g.add_node(Op::OpenCsv {
                     delim: rivus_ir::delim_for_path(&path),
                     path,
@@ -787,12 +820,14 @@ impl Parser {
                     header: true,
                     declared: None,
                     dt_formats: Vec::new(),
+                    provenance,
                 }))
             }
             Tok::Word(w) if w == "readjson" => {
                 self.bump();
                 let path = norm_path(self.path_word()?);
-                Ok(self.g.add_node(Op::OpenJsonl { path }))
+                let provenance = self.parse_provenance()?;
+                Ok(self.g.add_node(Op::OpenJsonl { path, provenance }))
             }
             Tok::Word(w) if w == "stream" => {
                 self.bump();
@@ -840,11 +875,13 @@ impl Parser {
                 if fields.is_empty() {
                     return Err(self.err("readbin requires at least one field"));
                 }
+                let provenance = self.parse_provenance()?;
                 Ok(self.g.add_node(Op::OpenBinary {
                     path,
                     fields,
                     endian,
                     c_align,
+                    provenance,
                 }))
             }
             // Reference to a named scope → merge (`+`) or join (`&`).
@@ -1374,10 +1411,14 @@ impl Format {
                 declared: None,
                 dt_formats: Vec::new(),
                 delim,
+                provenance: Provenance::Off,
             },
             // The JSON reader accepts both NDJSON and a top-level array, so both
             // surface forms open the same source.
-            Format::Jsonl | Format::Json => Op::OpenJsonl { path },
+            Format::Jsonl | Format::Json => Op::OpenJsonl {
+                path,
+                provenance: Provenance::Off,
+            },
         }
     }
 
@@ -1640,6 +1681,30 @@ mod tests {
     }
 
     #[test]
+    fn provenance_modifiers_parse_and_round_trip() {
+        // `with source` / `with filename` parse on every format and survive
+        // source -> IR -> source (the modifier is inert until slice 2-②; here we
+        // fix the syntax + `to_source` reversibility). §28.6.
+        for (src, needle) in [
+            ("F:\n open a.csv with source\n |> id\n;", "with source"),
+            (
+                "F:\n open a.csv (id:int v:str) with filename\n |> id\n;",
+                "with filename",
+            ),
+            (
+                "F:\n readbin a.bin (x:i32) with source\n |> x\n;",
+                "with source",
+            ),
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert!(s.contains(needle), "missing `{needle}` in {s}");
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        }
+        // `with` followed by garbage is an error, not silently ignored.
+        assert!(parse("F:\n open a.csv with wat\n |> id\n;").is_err());
+    }
+
+    #[test]
     fn decimal_literal_is_preserved_exactly() {
         // A written decimal literal must survive to_source as itself (its exact
         // text), not as an f64 re-render — so a compare against a decimal column
@@ -1821,7 +1886,7 @@ mod tests {
         // stdin with an explicit format.
         assert!(matches!(
             &parse("F:\n open stdin as json\n;").unwrap().nodes[0].op,
-            Op::OpenJsonl { path } if path == "-"
+            Op::OpenJsonl { path, .. } if path == "-"
         ));
     }
 
