@@ -20,7 +20,9 @@ pub use chunk::{
 };
 pub use error::{ErrorEvent, ErrorScope, Result, RivusError, Severity};
 pub use schema::{Field, Schema};
-pub use value::{DataType, Date, DateTime, Decimal, Duration, TimeOfDay, TimeUnit, Value};
+pub use value::{
+    DataType, Date, DateTime, Decimal, Duration, Resource, TimeOfDay, TimeUnit, Value,
+};
 
 #[cfg(test)]
 mod tests {

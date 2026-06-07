@@ -25,7 +25,7 @@
 mod lexer;
 
 use lexer::{Comment, Lexer, Tok};
-use rivus_core::{DataType, Mode, RivusError, Severity, TimeUnit, Value};
+use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
     Access, AggFunc, ArithOp, BinType, CmpOp, Disposition, EdgeKind, Endian, Expr, FillMethod,
     Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
@@ -1229,6 +1229,23 @@ impl Parser {
                     access: Access::Dynamic,
                 })
             }
+            // `resource("uri")` — a Resource handle literal (design §28.1). The
+            // uri is the in-contract identity; `size`/`mtime` are discovery-filled
+            // later (§00 0.14), so the literal carries only the uri.
+            Tok::Word(w) if w == "resource" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let uri = match self.bump() {
+                    Tok::Str(s) => s,
+                    other => {
+                        return Err(
+                            self.err(format!("resource() expects a string uri, found {other:?}"))
+                        )
+                    }
+                };
+                self.expect(&Tok::RParen)?;
+                Ok(Expr::Literal(Value::Resource(Resource::new(uri))))
+            }
             // Scalar function call `func(args…)` — e.g. `upper(name)`,
             // `substr(name, 0, 3)`, `contains(city, "NY")`.
             Tok::Word(ref w)
@@ -1605,6 +1622,21 @@ mod tests {
         for needle in ["abs(", "round(", "floor(", "ceil(", "coalesce(", "replace("] {
             assert!(s.contains(needle), "missing {needle} in {s}");
         }
+    }
+
+    #[test]
+    fn resource_literal_round_trips_uri_only() {
+        // `resource("uri")` is a first-class handle literal (§28.1): it parses to
+        // a Resource value and survives source -> IR -> source as its uri (the uri
+        // is the in-contract identity; metadata is never emitted, §00 0.14).
+        let src = "F:\n open a.csv\n |> (resource(\"file:///data/a.csv\")) as src\n;";
+        let g = parse(src).unwrap();
+        let s = g.to_source();
+        assert!(
+            s.contains("resource(\"file:///data/a.csv\")"),
+            "resource literal lost in {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
     }
 
     #[test]
