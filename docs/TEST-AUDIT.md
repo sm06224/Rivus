@@ -54,15 +54,21 @@ at a sub-second `unit`; today datetime is `Sec` MVP — pair with the unit work.
 epoch ticks (`260601120000` → year 10228), and `(ts:datetime("yyMMddHHmmss"))` is
 a parse error. **Root cause.** `DataType::DateTime { unit }` carries no format —
 only the reader keeps `dt_formats` (a side table on the source op), so cast/eval
-have no format to parse with. **Fix plan (DESIGN drafted, awaiting ratification).**
-Carry the parse format on the **cast operation** (not the type): `Expr::Cast`
-gains `format: Option<Arc<str>>`, so `:datetime("fmt")` works uniformly in the
-reader schema, the `cast` verb, and a computed column, while `DataType` stays
-`Copy`/clean (format is a parse-time concern, not type identity). Full RFC with
-options, impact (`file:line`), and ratification points in
-`docs/design/23-datetime-and-reshape.md` §23.6. Implementation follows ratification.
-**Status: TRACKED** (design RFC in §23.6; ratify the representation + the
-`None`-on-`Str` `parse_auto` sub-decision before implementing).
+have no format to parse with. **Fix (DESIGN confirmed, maintainer-ratified
+2026-06-08; NO new type system).** The format's sole owner is the **schema
+declaration** (reader schema / `dt_formats`, unchanged — fastest, exact text
+path). The expression `cast` is a **different use** (change type mid-computation,
+**no format**, source-aware): it must parse `Str → DateTime/Date/Time` correctly
+(the same *meaning* as the reader; only the *path*/speed differs — same result by
+location is the byte-identity contract, and the current divergence IS BUG-D).
+Slice A: (1) make expr `cast` source-aware in `eval.rs` (`cast_value`/
+`cast_column`); (2) **never-silent** cast failures (null + surfaced on the error
+stream, serial == parallel, extensible to other lanes); (3) an **explicit format
+in expression position** (`cast x:datetime("fmt")`) becomes a **never-silent
+parse error** ("declare the format in the schema"); (4) `Expr::Cast` structure
+unchanged (no `format` field) — `to_source` round-trip unchanged. Full design in
+`docs/design/23-datetime-and-reshape.md` §23.6 (option B / new-type approaches
+rejected). **Status: TRACKED** (design confirmed; implementing Slice A).
 
 ### BUG-E (RESOLVED) · a leading UTF-8 BOM on the flow *script* breaks parsing
 **Repro.** A `.rivus` saved with a BOM → `unexpected character 'ï'` at line 1

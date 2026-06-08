@@ -220,124 +220,81 @@ open sales.csv (ts:datetime("yyMMddhhmmss") amount:decimal)
 各段は operator/eval 境界の裏（原則「Operator boundary stays thin」）、`cargo deny`
 緑・依存ゼロ維持、`docs/BENCHMARKS.md` に before/after。
 
-## 23.6 cast/式での datetime パース書式（BUG-D）— 批准用 RFC
+## 23.6 式 cast の source-aware 化と書式の所有者（BUG-D）— 確定方針
 
-> ステータス: **設計（批准待ち）**。実装はこの節の批准後に着手する（IR・構文を
-> 触るため design-doc 先行・批准制）。byte-identity / continue-first / IR 可逆 /
-> 依存ゼロ / 英日ガイド同時更新の不変条件下で行う。
+> ステータス: **設計確定（統括批准済み・2026-06-08）**。**型システムの新設は一切しない。**
+> 不変条件: byte-identity（serial==parallel==chunk-size）／ never-silent・continue-first
+> ／ IR 可逆（to_source round-trip＋optimizer_equiv）／ 依存ゼロ（既存 parse ヘルパ再利用）
+> ／ 英日ガイド同時更新。
 
 ### 問題（再現）
-`:datetime("fmt")` の **パース書式は reader schema 経路でしか効かない**。
-- ✅ `open f.csv (ts:datetime("yyMMddHHmmss"))` — 効く。書式は `Codec::Csv.dt_formats`
-  側テーブル（`crates/rivus-ir/src/graph.rs:362`）→ `build_dt_specs`
-  （`crates/rivus-runtime/src/csv.rs:1173`）→ `DtSpec`（`csv.rs:1165`）で `DtSpec::parse_opt`
-  に届く。
-- ❌ `cast ts:datetime("yyMMddHHmmss")` — **書式が黙って捨てられる**。パーサは
-  `finish_type` で `("fmt")` を `self.last_dt_fmt` に拾うが、cast 構築
-  （`crates/rivus-parser/src/lib.rs:1247-1260`）は `last_dt_fmt` を**回収しない**。
-  eval は `cast_value`（`crates/rivus-runtime/src/eval.rs:521`）で
-  `DateTime::new(to_i64(v), unit)` ＝ **値を生の epoch ticks 扱い**。`"260601120000"`
-  → ticks 260601120000 → 西暦 10228。
-- ❌ 計算列 `(ts:datetime("fmt")) as a` も同根で書式喪失。
+`:datetime("fmt")` の書式は **reader schema 経路でしか効かない**。式 cast は壊れている:
+- ✅ `open f.csv (ts:datetime("yyMMddHHmmss"))` — reader schema が書式を持ち、読み時に
+  exact text path でパース。`Codec::Csv.dt_formats`（`graph.rs:362`）→ `build_dt_specs`
+  （`csv.rs:1173`）→ `DtSpec::parse_opt`（`csv.rs:1165`）。**最速・byte-identity。ここは不変。**
+- ❌ `cast ts:datetime` / `(ts:datetime) as t` — `cast_value`（`eval.rs:521`）が
+  `DateTime::new(to_i64(v), unit)` ＝ **Str を to_i64→0**、数値を生 ticks 再解釈。
+  `"2026-06-01"` は 0（epoch）、`"260601120000"` は西暦 10228。**str→datetime が黙って壊れる。**
+- ❌ `cast ts:datetime("fmt")`（式位置の明示書式）— `finish_type` が `("fmt")` を
+  `last_dt_fmt` に拾うが cast 構築（`lib.rs:1247-1260`）が**回収せず黙って捨てる**。
 
-### 根因
-**`DataType::DateTime { unit }`（`value.rs:1124`）も `Expr::Cast { expr, ty }`
-（`expr.rs:256`）も書式を保持しない。** reader だけが列名→書式の側テーブルを別に
-持っているため、cast/eval 経路には書式が届かない非対称。
+### 確定方針 — 書式の唯一の所有者は「スキーマ宣言」（方針「い」）
+**書式（`datetime("yyMMdd")` 等）を持てるのは reader スキーマ宣言だけ。** 式 cast は
+**書式を持たない別用途**として許容する。両者は用途が完全に異なる:
 
-### 設計原則 — 書式は「型の同一性」ではなく「パース操作」の関心事
-パース後の datetime 列は `ticks + unit` のみ。**同じレーン**であり、由来の入力書式は
-保存・比較・出力に一切無関係。`DateTime{Sec,"yyMMdd"}` と `DateTime{Sec,"yyyy-MM-dd"}`
-は **同一の型**であるべき。したがって書式は **str→datetime の変換操作** に属し、
-**型（`DataType`）には載せない**。
-
-### 候補比較
-| 案 | 概要 | 評価 |
+| | スキーマ宣言 `(ts:datetime("fmt"))` | 式 cast `… cast ts:datetime` |
 |---|---|---|
-| **A: `DataType` に載せる** `DateTime{unit, format}` | 型に書式を持たせ cast も schema も同経路 | ❌ 型等価の意味論を壊す（同レーンが別型に）。`DataType` は `Copy`/`Eq`/`Hash` 前提で広く使われ（sort `make_cmp`・Field・最適化）、`String`/`Arc` 追加で `Copy` 喪失＝全域に波及。**却下** |
-| **B: cast 操作に載せる** `Expr::Cast{expr, ty, format: Option<Arc<str>>}` | 書式は cast ノードに同伴、`DataType` は不変 | ✅ 関心の所在が正しい・型は綺麗なまま・reader の側テーブルと同じ「型と書式の分離」を**インライン**で実現・to_source 可逆が自然。**推奨** |
-| C: 側テーブルを cast にも | reader と同じ列名→書式表を式側にも | ❌ 非対称の元凶（側テーブル）を増殖。却下 |
-| D: 専用関数 `parse_datetime(x,"fmt")` | cast と別の式関数 | △ cast の `:datetime("fmt")` と二系統に分裂。reader の `(ts:datetime("fmt"))` 構文と不一致。却下（一貫性優先） |
+| 用途 | データをその型に**読み込む/正規化** | 計算の途中で**その場で型を変える** |
+| 書式 | あり（明示／auto） | **なし**（auto のみ） |
+| 位置 | source の宣言スキーマ | 主に `\|>`、`\|?` でも可 |
+| 速度 | 最速（exact text path） | 劣後（行単位 eval）— **用途が違うので許容**（統括明言） |
 
-### 推奨表現（案B）
-```rust
-// crates/rivus-ir/src/expr.rs
-Expr::Cast {
-    expr: Box<Expr>,
-    ty: DataType,
-    format: Option<Arc<str>>,   // パース書式（現状 datetime のみ解釈）。None=現行どおり
-}
-```
-- `format` は **汎用の optional パース書式**（当面 datetime ターゲットのみが解釈、
-  将来 decimal/独自 date 書式へ拡張可）。`Arc<str>` は最適化での `Expr` clone を安価に。
-- `DataType` は無改変（`Copy`/`Eq`/`Hash` 維持、全域ゼロ波及）。
+プロジェクションは元来データ変換の場なので、そこで型を変えるのは自然。速度は劣後するが
+用途が違うため許容する。
 
-### 構文（reader と一貫）
-`:datetime("fmt")` を **reader schema・cast 動詞・計算列**で同一に通す:
-```
-open f.csv (ts:datetime("yyMMddHHmmss"))      # 既存（dt_formats 経由・不変）
-… cast ts:datetime("yyMMddHHmmss")            # 新規: Cast.format に載る
-… |> (ts:datetime("yyMMddHHmmss")) as t       # 新規: 計算列も同経路
-```
-パーサ変更は cast 構築点で `self.last_dt_fmt.take()` を `format` へ回収するだけ
-（`finish_type` の書式取得は既存・再利用）。
+### byte-identity 契約 — 2 つの cast は「意味同一・経路のみ差」
+同じ型変換は **どこで行っても結果バイトが同一**でなければならない（経路＝速度だけが違う）。
+場所で結果が変わるのは byte-identity 違反＝バグ。**今の BUG-D（reader では正しくパースされる
+str→datetime が、式 cast では 0/誤値になる）はまさにこれ**で、直す対象。式 cast の auto
+パースは方針「い」の既定として正しい（reader の auto 推論と同じ意味）。
 
-### eval セマンティクス
-`cast_value`/`cast_column` に `format: Option<&str>` を渡す。ターゲットが `DateTime{unit}` のとき:
-- **`format = Some(fmt)`（BUG-D 本丸）**: 値を文字列表現にして
-  `DateTime::parse_with_format(s, fmt, unit)`。失敗は **null（continue-first）**。
-  → `"260601120000"`（int でも str でも）を `yyMMddHHmmss` で正しく解釈。
-- **`format = None`**: **現行どおり**（数値→ticks 再解釈）で**挙動不変**＝既存
-  byte-identity 完全維持。
+### 却下（実装しない・蒸し返さない）
+- ✗ **案B**: `Expr::Cast` に `format` フィールド追加 → 不正状態（式に書式）を表現可能にし
+  シンプリシティを壊す。**却下**（旧 RFC を撤回）。
+- ✗ `ParseTemporal` 等の新 IR ノード → 構文と意味をねじる。却下。
+- ✗ `LaneCodec` trait 全面刷新 → 過剰。却下。
+- ✗ `type` キーワード / struct lane / UserDefinitionType の新設 → 不要。named 再利用は
+  既存 §25.4 flow-reuse ＋ 将来 `as Sale` の小追加（後続スライスB・任意）で賄う。
 
-> **批准サブ論点①（任意拡張）**: `format=None` かつ **入力が Str** のとき、reader と
-> 同様に `parse_auto`（`AUTO_FORMATS`）で解釈すべきか？ 現状は `to_i64`→0 で
-> 事実上壊れている（`cast str:datetime` 単体）。一貫性では「Str かつ None →
-> `parse_auto`」が望ましいが**挙動変更**。既定は **現行据え置き（None は不変）**とし、
-> 統括が一貫性拡張を望む場合のみ別途取り込む。
+### スライスA = BUG-D 本丸（最小・今回実装）
+1. **式 cast を source-aware に**（`eval.rs` `cast_value:511` / `cast_column`）:
+   ターゲットが `DateTime`/`Date`/`Time` で **source が Str → 正しくパース**（既存
+   `DateTime::parse_auto` / `Date::parse` / `TimeOfDay::parse_at` を再利用）。**数値 source は
+   現状の ticks 再解釈のまま**。これで `cast str:datetime` の silent-wrong が直る。
+2. **cast 失敗の never-silent surface**（統括裁定: silent はしない、原則。実装難度や
+   破壊的変更を理由に削らない）: パース/変換失敗 → **null（continue-first）＋ error stream に
+   surface**。配管を cast/eval 経路に通し、**datetime 系を第一実装**、他 lane（int/decimal 等の
+   失敗）も同じ配管で広げる方向。**serial==parallel で同一 ErrorEvent**（BUG-F と同じ作法）。
+3. **式位置の明示書式を never-silent エラー化**（parser `lib.rs:1247-1260` parse_cast）:
+   式/cast 位置で `:datetime("fmt")`（`last_dt_fmt` が Some）を検出したら黙って捨てず
+   **parse エラー**にし「書式は（reader）スキーマで宣言せよ」と案内。**reader スキーマ位置の
+   `(ts:datetime("fmt"))` は従来どおり有効（不変）**。
+4. **`Expr::Cast` の構造は不変**（`format` を足さない）→ `to_source` も現状 `{expr}:{ty}` の
+   まま、round-trip 不変。
 
-### continue-first / never-silent
-パース失敗セルは **null**（原則2）。なお **既存の cast（`cast x:int` 等）は失敗を
-黙って 0/null にしており**、cast 経路に error-stream チャネルが無いのは**既存仕様**。
-datetime cast の失敗 surface（reader の `parse_failures` 相当）は **本 BUG-D の範囲外・
-tracked follow-up**（cast 全般の never-silent 化として別途）。これにより BUG-D を最小に保つ。
+### 挙動変更の明示（doc 必須）
+`str→datetime`/`date`/`time` の式 cast 結果が「0/誤値 → 正しいパース値」に変わるのは
+**壊れの修正**だが、**既存挙動の変更**として GUIDE/CHANGELOG に明記する。byte-identity は
+serial==parallel==chunk-size で維持（行単位・決定的）。
 
-### 不変条件への影響
-- **byte-identity**: cast は決定的・行単位・浮動小数縮約なし → serial==parallel==
-  chunk-size を自明に満たす。`format` は IR に載り各 worker に clone される（差異なし）。
-- **IR 可逆（to_source）**: `Expr::Cast` の to_source（`expr.rs:409`）を、
-  `format=Some` のとき `{expr}:{ty}({fmt:?})`（reader の `to_src_line`
-  `graph.rs:780` と同じ `{:?}` クォート）で描画。`None` は現行 `{expr}:{ty}`。
-  再パースで `format` が復元され round-trip 一致。
-- **optimizer_equiv**: 最適化は cast を不透明に扱う。`format` はノードに同伴して
-  移動するので等価性不変。`Expr::Cast { .. }` の全 match 箇所はフィールド追加で
-  コンパイラ誘導により網羅更新（pushdown/dedup 等）。
-- **依存ゼロ**: 新規 crate なし。`parse_with_format` は既存 std 実装。
+### 受入テスト
+- 式 cast の str→datetime/date/time パース（**int/str 両入力・chunk-size 独立・byte-identity**）。
+- 失敗の **null＋surface**（**serial==parallel 同一 ErrorEvent**）。
+- **式位置の明示書式 `:datetime("fmt")` が never-silent エラー**。
+- **reader スキーマ位置 `(ts:datetime("fmt"))` は不変**（既存テスト緑）。
 
-### reader 整合（範囲外メモ）
-`dt_formats` 側テーブルはそのまま（動作中）。将来、宣言スキーマ表現に書式を畳んで
-側テーブルを退役させる統一は可能だが **BUG-D の範囲外**（別スライス）。
-
-### 影響範囲（file:line）
-1. `crates/rivus-ir/src/expr.rs:256` — `Expr::Cast` に `format` 追加。
-2. `crates/rivus-ir/src/expr.rs:409` — `to_source` で書式描画。
-3. `crates/rivus-parser/src/lib.rs:1247-1260` — cast 構築で `last_dt_fmt` 回収。
-4. `crates/rivus-runtime/src/eval.rs:511-538/585-633` — `cast_value`/`cast_column` が
-   `format` を受けて datetime を `parse_with_format`。
-5. `Expr::Cast { .. }` の全 match 箇所（optimizer 等）— フィールド追加対応（コンパイラ誘導）。
-6. テスト: `cast ts:datetime("fmt")` と計算列 `(ts:datetime("fmt")) as a` の
-   acceptance（round-trip＋eval 結果＋chunk-size 独立）、to_source 可逆、optimizer_equiv。
-7. `docs/TEST-AUDIT.md` BUG-D → RESOLVED、`docs/GUIDE.md`/`GUIDE.ja.md`（cast での書式指定）。
-
-### 段階実装（批准後）
-1. IR: `Expr::Cast.format` 追加 ＋ to_source ＋ 全 match 更新（コンパイル緑）。
-2. パーサ: cast での書式回収 ＋ round-trip テスト。
-3. eval: `format` を datetime パースに接続 ＋ acceptance テスト（int/str 両入力・
-   chunk-size 独立・byte-identity）。
-4. ドキュメント（TEST-AUDIT/GUIDE 英日）。
-
-### 批准ポイント（要・統括判断）
-1. **案B（`Expr::Cast.format`、書式は型でなく操作に載せる）**で進めてよいか。
-2. **サブ論点①**: `format=None` かつ Str 入力で `parse_auto` を効かせる一貫性拡張を
-   **入れる／据え置く**のいずれか（既定＝据え置き）。
-3. never-silent な cast 失敗 surface を **範囲外（tracked）**とする方針でよいか。
+### 後続（tracked・スライスA 範囲外）
+- **スライスB（任意）**: named schema 再利用 = 既存 §25.4 flow-reuse ＋ `as Sale` の小追加
+  （`type` 新設なし）。
+- **最適化メモ**: source 直後の cast を codec schema に畳む **pushdown**（式経路を exact text
+  path に縮約＝速度差を消す）。byte-identity 不変・before/after 必須。
