@@ -300,8 +300,12 @@ str→datetime が、式 cast では 0/誤値になる）はまさにこれ**で
   契約＝`parse_failures` / `validate_reject_parallel_summary_counts_sum_to_total` と同じ。
   単一の同一イベントではなく「総和一致」）。**受入テストはこの総和一致を最初に固定**して
   under-build を防ぐ。
-- スカラ経路（`|?` 述語の cast）は本スケッチと同じ `_acc` 配管で `eval`/`eval_predicate` に
-  拡張する（datetime を第一実装、同配管で他 lane・述語へ広げる）。
+- **スカラ経路（`|?` 述語・func 引数内の cast）も拡張済み（スライスA-2）**：`eval`→
+  `eval_acc`、`eval_predicate`→`eval_predicate_acc`（＋ `call_func`/`arith_value`/
+  `compare_fast` に `fails` を貫通）。`Filter`/`Validate`/`FilterProject` が予測詞内の
+  cast 失敗を finish で一度 surface（`「N value(s) could not be cast in |? <pred>; set to
+  null」`）。値は従来どおり null（continue-first）で並列は per-worker partial が serial 総和に
+  一致。`ProjectExpr` は func 引数/case 内の cast も同 accumulator で拾う。
 
 ### 挙動変更の明示（doc 必須）
 `str→datetime`/`date`/`time` の式 cast 結果が「0/誤値 → 正しいパース値」に変わるのは

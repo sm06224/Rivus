@@ -275,12 +275,16 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         }
         Op::Read { fmt, provenance } => Box::new(Read::new(*fmt, *provenance, chunk_size)),
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
-        Op::Filter { pred } => Box::new(Filter { pred: pred.clone() }),
+        Op::Filter { pred } => Box::new(Filter {
+            pred: pred.clone(),
+            cast_fails: 0,
+        }),
         Op::Validate { pred, disposition } => Box::new(Validate {
             pred: pred.clone(),
             disposition: *disposition,
             fails: 0,
             sample: None,
+            cast_fails: 0,
         }),
         Op::Take { n } => Box::new(Take { remaining: *n }),
         Op::Sort { keys } => Box::new(Sort::new(keys.clone())),
@@ -316,6 +320,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::FilterProject { preds, fields } => Box::new(FilterProject {
             preds: preds.clone(),
             fields: fields.clone(),
+            cast_fails: 0,
         }),
         Op::GroupBy { keys, aggs } => Box::new(GroupBy::new(keys.clone(), aggs.clone())),
         Op::Merge => Box::new(Merge),

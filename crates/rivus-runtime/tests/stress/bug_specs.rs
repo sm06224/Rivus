@@ -136,6 +136,52 @@ fn datetime_cast_in_expression_is_source_aware_bug_d() {
 }
 
 #[test]
+fn scalar_cast_failures_surface_bug_d_a2() {
+    // BUG-D Slice A-2: cast failures on the SCALAR path — a `|?` predicate and a
+    // function argument — are surfaced (never-silent), the value is null
+    // (continue-first → the row is filtered as the comparison is false), and the
+    // result is chunk-size independent.
+    let text = "id,ts\n1,2026-06-01T00:00:00\n2,BAD\n3,2026-06-03T00:00:00\n";
+    let f = TempCsv(gendata::write_temp_bytes("bug_d_a2", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1usize, 2, 4096] {
+        // Predicate cast: BAD → null → (null > x) false → row excluded; June-01 <
+        // June-02 excluded; June-03 kept. The failure is surfaced.
+        let pred = run_src(
+            &format!(
+                "F:\n open {p} (id:int ts:str)\n |? ts:datetime > \"2026-06-02T00:00:00\"\n |> id\n;"
+            ),
+            cs,
+        );
+        assert_eq!(
+            collect_i64(&pred, "F", "id"),
+            vec![3],
+            "only id 3 passes the predicate @cs={cs}"
+        );
+        assert!(
+            pred.errors
+                .iter()
+                .any(|e| e.message.contains("could not be cast")),
+            "predicate cast failure must surface @cs={cs}: {:?}",
+            pred.errors
+        );
+        // Function-argument cast: year(ts:datetime) — BAD → null inside the arg,
+        // surfaced via the projection.
+        let func = run_src(
+            &format!("G:\n open {p} (id:int ts:str)\n |> id (year(ts:datetime)) as y\n;"),
+            cs,
+        );
+        assert!(
+            func.errors
+                .iter()
+                .any(|e| e.message.contains("could not be cast")),
+            "func-arg cast failure must surface @cs={cs}: {:?}",
+            func.errors
+        );
+    }
+}
+
+#[test]
 fn datetime_parses_fractional_and_timezone_bug_c() {
     let text = "ts\n2024-06-03T14:30:00.5\n2024-06-03T14:30:00Z\n2024-06-03T14:30:00+09:00\n";
     let f = TempCsv(gendata::write_temp_bytes("bug_dtfmt", text.as_bytes()));

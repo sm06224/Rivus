@@ -14,12 +14,15 @@ All notable changes to Rivus. Format loosely follows
   formats — the same meaning as the reader's exact path, so `cast ts:datetime` is
   byte-identical to declaring `(ts:datetime)` at `open` (only the path/speed
   differs). A non-null cell that won't parse becomes `null` (continue-first) and
-  the per-column count is surfaced once on finish (never-silent; in parallel the
-  per-worker counts sum to the serial total). A **parse format stays
-  schema-only**: `cast ts:datetime("fmt")` is now a never-silent parse error
-  ("declare the format in the schema"); the reader form `(ts:datetime("fmt"))` is
-  unchanged. `Expr::Cast` is structurally unchanged, so `to_source` round-trips as
-  before. (`docs/design/23-datetime-and-reshape.md` §23.6)
+  the count is surfaced once on finish (never-silent; in parallel the per-worker
+  counts sum to the serial total). This holds on **every cast path** — the `cast`
+  verb and computed columns (`|>`), and now also a cast inside a `|?` **predicate**
+  or a **function argument** (the scalar interpreter carries the same failure
+  accumulator). A **parse format stays schema-only**: `cast ts:datetime("fmt")` is
+  now a never-silent parse error ("declare the format in the schema"); the reader
+  form `(ts:datetime("fmt"))` is unchanged. `Expr::Cast` is structurally unchanged,
+  so `to_source` round-trips as before. (`docs/design/23-datetime-and-reshape.md`
+  §23.6)
 - **`substr` is now 1-based (SQL/DuckDB convention) — breaking.** `substr(s, 1)`
   is the first char (was 0-based, which was misleading). The mapping is lenient
   — `start <= 1` clamps to the beginning — so an old `substr(s, 0, n)` call still

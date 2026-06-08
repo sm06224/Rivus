@@ -79,8 +79,14 @@ expression position (`cast x:datetime("fmt")`) is a **never-silent parse error**
 pointing at the schema (`datetime_format_in_expr_cast_is_rejected_BUG_D`); the
 reader schema `(ts:datetime("fmt"))` is unchanged. `Expr::Cast` is structurally
 unchanged (no `format` field) → `to_source` round-trip unchanged. Tracked
-follow-ups: surfacing on the scalar `|?`/func-arg path (same `_acc` plumbing), and
-a source-adjacent cast → codec-schema pushdown.
+follow-ups: a source-adjacent cast → codec-schema pushdown (and named-schema
+reuse). **Slice A-2 (done):** the scalar path now surfaces too — `eval`/
+`eval_predicate` carry the `fails` accumulator (`eval_acc`/`eval_predicate_acc`,
+threaded through `call_func`/`arith_value`/`compare_fast`), so a cast failure in a
+`|?` predicate or a function argument is surfaced by `Filter`/`Validate`/
+`FilterProject`/`ProjectExpr` (continue-first null; per-worker partials sum to the
+serial total). Pinned by `scalar_cast_failures_surface_BUG_D_a2` and
+`pred_cast_failures_sum_serial_eq_parallel`.
 
 ### BUG-E (RESOLVED) · a leading UTF-8 BOM on the flow *script* breaks parsing
 **Repro.** A `.rivus` saved with a BOM → `unexpected character 'ï'` at line 1
