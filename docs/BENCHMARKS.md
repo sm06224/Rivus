@@ -1160,3 +1160,29 @@ That cost is gated behind `has_nulls()` and never touches all-valid columns. The
 (correctness-first); they are gated by `has_nulls()`, so all-valid data skips
 them entirely, and they are a candidate for bit-twiddling once a null-heavy
 workload proves the win.
+
+### `sort` comparator hoist (PERF-G) — lane match + null check out of the inner loop
+
+`Sort::finish` compared rows with a `cmp_rows(col, a, b)` that did a `has_nulls()`
+check **and** a `match col.data()` lane dispatch on **every** comparison
+(~`n·log n` ≈ 20 M times for 1 M rows). PERF-G resolves each sort key's lane and
+null state **once** into a monotyped comparator closure (`make_cmp`); the
+`idx.sort_by` inner loop then does only the typed compare (and a null branch only
+when the column actually has nulls). **Byte-identical** to the old path — same
+lane order, NaN→Equal, nulls-last/§26.2b, uri order for resources, and stable
+tie-breaking (the existing sort stress/transform tests stay green).
+
+Measured (1 M rows, 23 MB CSV, release, best of 3; **sort-only** = wall − the
+0.151 s read+save baseline):
+
+| sort key | before | after | Δ |
+|---|---:|---:|---:|
+| `id` (int)   | 0.514 s | 0.483 s | −6.0 % |
+| `score` (f64)| 0.676 s | 0.632 s | −6.5 % |
+| `name` (str) | 0.711 s | 0.650 s | −8.6 % |
+
+The remaining cost is dominated by **cache misses on random row access**
+(`v[a]`/`v[b]` into the full column), which the hoist does not change. The next
+lever — extracting each key into contiguous `(key, idx)` pairs and sorting those
+(cache-coherent, monomorphic, no dyn call) — is tracked as a follow-up
+(`docs/TEST-AUDIT.md` PERF-G), to be landed with its own before/after.

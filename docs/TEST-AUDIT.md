@@ -76,15 +76,19 @@ header). Test: row count preserved with schema + first-line-data (`#[ignore]`).
 **Status: TRACKED** (light fix; ratify (a) vs (b)). Guide §3 documents the
 current behavior (`add noheader when the first line is data`).
 
-### PERF-G · `sort` is ~10× DuckDB (per-compare type dispatch)
+### PERF-G (RESOLVED, hoist) · `sort` per-compare type dispatch
 **Repro (1M rows, release).** sort id(int) 0.72 s / score(f64) 0.91 s / name(str)
-1.17 s. **Root cause.** `cmp_rows` (`operators/transform.rs`) does a `has_nulls()`
+1.17 s. **Root cause.** `cmp_rows` (`operators/transform.rs`) did a `has_nulls()`
 check + `match col.data()` lane dispatch + random access on **every** comparison
-(~20 M). **Fix plan.** Hoist the lane `match` and null check out of the
-comparator: resolve each key column once into a monotyped accessor closure, then
-`sort_by` on those. **Byte-identity preserved** (same order, nulls-last, stable);
-before/after in `docs/BENCHMARKS.md`. **Status: TRACKED** (perf-only, result
-unchanged).
+(~20 M). **Fix (landed).** `make_cmp` resolves each key's lane + null state once
+into a monotyped comparator; the `sort_by` loop does only the typed compare (and
+a null branch only when needed). **Byte-identity preserved** (same order,
+nulls-last/§26.2b, desc-reverses-the-whole-order, stable) — pinned by
+`sort_nulls_last_asc_first_desc_byte_identical` and the existing chunk-size
+sort tests. Sort-only Δ ≈ −6…−9 % (`docs/BENCHMARKS.md`).
+**Follow-up (tracked):** the dominant cost is cache misses on random row access;
+extract each key into contiguous `(key, idx)` pairs and sort those (monomorphic,
+cache-coherent, no dyn call) for the bigger win — its own PR with before/after.
 
 ## 2. Coverage map (GUIDE feature → tests → status)
 

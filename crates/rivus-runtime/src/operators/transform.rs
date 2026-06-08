@@ -196,40 +196,58 @@ impl Sort {
     }
 }
 
-/// Compare two rows of one column for ordering (NaN treated as equal).
-fn cmp_rows(col: &Column, a: usize, b: usize) -> std::cmp::Ordering {
+/// A resolved per-key row comparator (PERF-G): compares two row indices of one
+/// already-bound column lane, `(a, b) -> Ordering`.
+type RowCmp<'a> = Box<dyn Fn(usize, usize) -> std::cmp::Ordering + 'a>;
+
+/// Build a **monotyped row comparator** for one sort key, resolving the column's
+/// lane `match` and its null state **once** (PERF-G) instead of on every
+/// comparison. The returned closure does only the typed compare (plus a null
+/// branch when, and only when, the column actually has nulls), so the
+/// `idx.sort_by` inner loop is branch-light and cache-coherent. Byte-identical to
+/// the old per-compare `cmp_rows`: same lane order, NaN→Equal, **nulls last**
+/// (§26.2b), and uri order for the resource lane (§28.3).
+fn make_cmp(col: &Column) -> RowCmp<'_> {
     use std::cmp::Ordering;
-    // Null model §26.2b: a null sorts as the largest value → **nulls last** on an
-    // ascending sort (and first on descending, since the caller reverses). null
-    // == null is Equal (the stable sort then keeps source order). Gated by
-    // has_nulls → zero cost for all-valid columns.
-    if col.has_nulls() {
-        match (col.is_null(a), col.is_null(b)) {
-            (true, true) => return Ordering::Equal,
-            (true, false) => return Ordering::Greater,
-            (false, true) => return Ordering::Less,
-            (false, false) => {}
+    // Wrap a lane's element comparison with the null rule (hoisted: the all-valid
+    // column gets a closure with no null branch at all).
+    fn wrap<'a, T, F>(col: &'a Column, v: &'a T, cmp: F) -> RowCmp<'a>
+    where
+        T: ?Sized + 'a,
+        F: Fn(&T, usize, usize) -> Ordering + 'a,
+    {
+        if col.has_nulls() {
+            // Null model §26.2b: null sorts greatest → nulls last on ascending
+            // (the caller reverses for descending). null == null → Equal (stable).
+            Box::new(move |a, b| match (col.is_null(a), col.is_null(b)) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => cmp(v, a, b),
+            })
+        } else {
+            Box::new(move |a, b| cmp(v, a, b))
         }
     }
     match col.data() {
-        ColumnData::Bool(v) => v[a].cmp(&v[b]),
-        ColumnData::I64(v) => v[a].cmp(&v[b]),
-        ColumnData::F64(v) => v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal),
-        // One column shares a scale, so the unscaled i128 order is the exact
-        // value order — no precision loss in the sort key (design doc 21).
-        ColumnData::Dec(d) => d.unscaled[a].cmp(&d.unscaled[b]),
-        // One column shares a unit, so the integer tick order is the exact
-        // chronological order.
-        ColumnData::DateTime(d) => d.ticks[a].cmp(&d.ticks[b]),
-        // Duration shares a unit too → exact i64 magnitude order (#57).
-        ColumnData::Duration(d) => d.ticks[a].cmp(&d.ticks[b]),
-        // Date: epoch-day order is exact chronological order (#58).
-        ColumnData::Date(v) => v[a].cmp(&v[b]),
-        // Time-of-day: tick order is exact chronological order (#58).
-        ColumnData::Time(v) => v[a].cmp(&v[b]),
-        // Resource sorts by uri (the in-contract identity; §00 0.14) — byte
-        // order, matching discovery's deterministic uri ordering (§28.3).
-        ColumnData::Str(v) | ColumnData::Resource(v) => v.get(a).cmp(v.get(b)),
+        ColumnData::Bool(v) => wrap(col, v, |v: &Vec<bool>, a, b| v[a].cmp(&v[b])),
+        ColumnData::I64(v) => wrap(col, v, |v: &Vec<i64>, a, b| v[a].cmp(&v[b])),
+        ColumnData::F64(v) => wrap(col, v, |v: &Vec<f64>, a, b| {
+            v[a].partial_cmp(&v[b]).unwrap_or(Ordering::Equal)
+        }),
+        // One column shares a scale, so the unscaled i128 order is the exact value
+        // order — no precision loss in the sort key (design doc 21).
+        ColumnData::Dec(d) => wrap(col, &d.unscaled, |v: &Vec<i128>, a, b| v[a].cmp(&v[b])),
+        // Shared unit → integer tick order is exact chronological order.
+        ColumnData::DateTime(d) => wrap(col, &d.ticks, |v: &Vec<i64>, a, b| v[a].cmp(&v[b])),
+        ColumnData::Duration(d) => wrap(col, &d.ticks, |v: &Vec<i64>, a, b| v[a].cmp(&v[b])),
+        ColumnData::Date(v) => wrap(col, v, |v: &Vec<i32>, a, b| v[a].cmp(&v[b])),
+        ColumnData::Time(v) => wrap(col, v, |v: &Vec<i64>, a, b| v[a].cmp(&v[b])),
+        // Resource sorts by uri (the in-contract identity; §00 0.14) — byte order,
+        // matching discovery's deterministic uri ordering (§28.3).
+        ColumnData::Str(v) | ColumnData::Resource(v) => {
+            wrap(col, v, |v: &StrColumn, a, b| v.get(a).cmp(v.get(b)))
+        }
     }
 }
 
@@ -279,10 +297,16 @@ impl Operator for Sort {
 
         let mut idx: Vec<usize> = (0..total).collect();
         if !key_cols.is_empty() {
+            // Resolve each key's lane + null state once (PERF-G), then compare via
+            // the monotyped closures in the hot loop.
+            let cmps: Vec<(RowCmp, bool)> = key_cols
+                .iter()
+                .map(|&(ki, desc)| (make_cmp(&cols[ki]), desc))
+                .collect();
             idx.sort_by(|&a, &b| {
-                for &(ki, desc) in &key_cols {
-                    let o = cmp_rows(&cols[ki], a, b);
-                    let o = if desc { o.reverse() } else { o };
+                for (cmp, desc) in &cmps {
+                    let o = cmp(a, b);
+                    let o = if *desc { o.reverse() } else { o };
                     if o != std::cmp::Ordering::Equal {
                         return o;
                     }
