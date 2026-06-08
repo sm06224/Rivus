@@ -183,6 +183,14 @@ impl SourceCsv {
                             .at_node(ctx.label.clone()),
                         );
                     }
+                    // BUG-F: never-silent notice when a column-naming schema
+                    // without `noheader` consumed a data-looking first line.
+                    if let Some(w) = &chunker.header_warning {
+                        ctx.raise(
+                            ErrorEvent::new(Severity::Warn, ErrorScope::Item, w.clone())
+                                .at_node(ctx.label.clone()),
+                        );
+                    }
                     self.schema = Arc::new(schema);
                     self.decoder = Some(Box::new(chunker));
                 }

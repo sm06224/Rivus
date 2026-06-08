@@ -135,6 +135,10 @@ pub struct CsvChunker {
     inference: Vec<(String, DataType, bool)>,
     /// Field delimiter byte (`b','` for CSV, `b'\t'` for TSV).
     delim: u8,
+    /// (BUG-F) Set when a column-naming schema without `noheader` consumed a
+    /// first line that *looks like data* — surfaced once by the source operator
+    /// so the dropped row is never silent. `None` = no header was at risk.
+    pub header_warning: Option<String>,
 }
 
 /// Codec face (§28.5): the streaming CSV reader *is* the decoder — every method
@@ -194,7 +198,7 @@ impl CsvChunker {
         let mut r = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         // `r` is left positioned at the first data row (after the header, or at
         // byte 0 for a header-less file).
-        let (names, data_start) = read_header(&mut r, header, declared, delim)?;
+        let (names, data_start, header_warning) = read_header(&mut r, header, declared, delim)?;
         let ncols = names.len();
         if ncols == 0 {
             return Err("CSV has no columns".to_string());
@@ -268,6 +272,7 @@ impl CsvChunker {
                 pos: 0,
                 limit: None,
                 delim,
+                header_warning,
             },
         ))
     }
@@ -288,7 +293,8 @@ impl CsvChunker {
     ) -> Result<(Schema, CsvChunker), String> {
         let mut reader =
             FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-        let (names, data_start) = read_header(&mut reader, header, declared, delim)?;
+        let (names, data_start, header_warning) =
+            read_header(&mut reader, header, declared, delim)?;
         let ncols = names.len();
         if ncols == 0 {
             return Err("CSV has no columns".to_string());
@@ -352,6 +358,7 @@ impl CsvChunker {
                 pos: 0,
                 limit: None,
                 delim,
+                header_warning,
             },
         ))
     }
@@ -396,6 +403,9 @@ impl CsvChunker {
             pos: start,
             limit: Some(end),
             delim,
+            // A parallel worker streams a pre-inferred range — the header was
+            // already read (and any BUG-F notice raised) by `plan_parallel`.
+            header_warning: None,
         })
     }
 
@@ -502,6 +512,10 @@ pub struct CsvParallelPlan {
     pub ncols: usize,
     pub ranges: Vec<(u64, u64)>,
     pub bad_rows: usize,
+    /// (BUG-F) Set when a column-naming schema without `noheader` consumed a
+    /// first line that looks like data — surfaced once by the engine so the
+    /// parallel path reports it exactly like the serial reader.
+    pub header_warning: Option<String>,
     /// Compiled pushed-down prefilter (raw col index, op, rhs) for each worker.
     pub prefilter: Vec<PreCmp>,
     /// Required literal substrings for the raw-line pre-scan (#35): each worker
@@ -531,7 +545,7 @@ pub fn plan_parallel(
 
     // Header → column names, kept indices, and the first data byte offset.
     let mut r = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
-    let (names, data_start) = read_header(&mut r, header, declared, delim)?;
+    let (names, data_start, header_warning) = read_header(&mut r, header, declared, delim)?;
     let ncols = names.len();
     if ncols == 0 {
         return Err("CSV has no columns".to_string());
@@ -583,6 +597,7 @@ pub fn plan_parallel(
         ncols,
         ranges,
         bad_rows: bad,
+        header_warning,
         prefilter: pre,
         str_prefilter: str_prefilter.to_vec(),
     })
@@ -665,7 +680,7 @@ fn read_header(
     header: bool,
     declared: Option<&[(String, Option<DataType>)]>,
     delim: u8,
-) -> Result<(Vec<String>, u64), String> {
+) -> Result<(Vec<String>, u64, Option<String>), String> {
     let mut first = String::new();
     let n = r.read_line(&mut first).map_err(|e| e.to_string())?;
     if n == 0 {
@@ -679,23 +694,72 @@ fn read_header(
     if let Some(d) = declared {
         let names = d.iter().map(|(nm, _)| nm.clone()).collect();
         if header {
-            Ok((names, n as u64)) // consume the header line, but use declared names
+            // consume the header line, but use declared names. BUG-F: when `d`
+            // already names the columns, that first line is dropped — if it
+            // actually looks like *data*, surface a never-silent notice so the
+            // loss isn't silent (fix (a), maintainer-ratified 2026-06-08).
+            let warn = declared_header_looks_like_data(first_trimmed, d, delim);
+            Ok((names, n as u64, warn))
         } else {
             // Header-less + declared names: the first line is data. Seek past a
             // BOM if present so it doesn't corrupt the first cell of row 0.
             let start = bom_len(&first) as u64;
             r.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-            Ok((names, start))
+            Ok((names, start, None))
         }
     } else if header {
-        Ok((split_owned(trim_eol(first_trimmed), delim), n as u64))
+        Ok((split_owned(trim_eol(first_trimmed), delim), n as u64, None))
     } else {
         let ncols = split_owned(trim_eol(first_trimmed), delim).len();
         let names = (0..ncols).map(|i| format!("c{i}")).collect();
         let start = bom_len(&first) as u64;
         r.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-        Ok((names, start))
+        Ok((names, start, None))
     }
+}
+
+/// (BUG-F) When a column-naming schema is given *without* `noheader`, the first
+/// line is consumed as a header (renaming the file's own header). If that line
+/// was actually data it is silently dropped. Returns `Some(notice)` when the
+/// consumed line **looks like data** under the declared schema — a real header
+/// (column-name strings) would not parse in a numeric/decimal/date lane.
+///
+/// Conservative on both sides: only lanes where a name reliably fails to parse
+/// (`int`/`float`/`decimal`/`date`) vote, so an all-text/untyped rename never
+/// false-warns; and *every* such typed cell must parse as data before we warn.
+fn declared_header_looks_like_data(
+    header_line: &str,
+    declared: &[(String, Option<DataType>)],
+    delim: u8,
+) -> Option<String> {
+    let line = trim_eol(header_line);
+    let cells = split_owned(line, delim);
+    let mut any_distinguishing = false;
+    for ((_, ty), cell) in declared.iter().zip(cells.iter()) {
+        let Some(t) = ty else { continue };
+        let c = cell.trim();
+        let parses = match t {
+            DataType::I64 => parse_i64_fast(c).is_some() || c.parse::<i64>().is_ok(),
+            DataType::F64 => c.parse::<f64>().is_ok(),
+            DataType::Decimal { scale } => Decimal::parse_scaled(c, *scale).is_some(),
+            DataType::Date => rivus_core::Date::parse(c).is_some(),
+            // bool/str/datetime/duration/time/resource: a header name can parse
+            // (or needs format context), so they don't distinguish header vs data.
+            _ => continue,
+        };
+        any_distinguishing = true;
+        if !parses {
+            return None; // a typed cell that isn't a value → it really is a header
+        }
+    }
+    if !any_distinguishing {
+        return None;
+    }
+    let shown: String = line.chars().take(60).collect();
+    let ell = if line.chars().count() > 60 { "…" } else { "" };
+    Some(format!(
+        "schema names the columns but `noheader` was not given; the first line ('{shown}{ell}') looks like data and was consumed as a header — add `noheader` if it is data"
+    ))
 }
 
 /// Length in bytes of a leading UTF-8 BOM (`EF BB BF`), else 0.
