@@ -312,7 +312,8 @@ fn regex_literal(args: &[Expr]) -> Option<&str> {
 #[cfg(feature = "regex")]
 fn regexp_column(args: &[Expr], chunk: &Chunk) -> Column {
     let pat = regex_literal(args).unwrap_or("");
-    let col = eval_column(&args[0], chunk);
+    let mut _f = 0u64; // a cast nested in a regex arg parses; surfacing is the |? follow-up
+    let col = eval_column(&args[0], chunk, &mut _f);
     with_regex(pat, |re| match re {
         Some(re) => Column::bool(
             (0..chunk.len)
@@ -507,8 +508,54 @@ fn to_bool(v: Value) -> bool {
     }
 }
 
-/// Cast a value to a target lane.
-fn cast_value(v: Value, ty: DataType) -> Value {
+/// Parse a *string* cell to a temporal lane `Value` using the auto formats
+/// (BUG-D §23.6). The reader schema owns explicit formats; an expression `cast`
+/// carries no format, so it auto-parses — the same *meaning* as the reader's
+/// auto inference. `None` for a non-temporal target or a parse failure.
+fn parse_temporal_str(s: &str, ty: DataType) -> Option<Value> {
+    match ty {
+        DataType::DateTime { unit } => {
+            rivus_core::DateTime::parse_auto(s, unit).map(Value::DateTime)
+        }
+        DataType::Date => rivus_core::Date::parse(s).map(Value::Date),
+        DataType::Time => {
+            rivus_core::TimeOfDay::parse_at(s, rivus_core::TimeUnit::Sec).map(Value::Time)
+        }
+        _ => None,
+    }
+}
+
+/// Is `ty` a temporal lane (datetime/date/time)? Such a target parses a string
+/// source instead of reinterpreting it as ticks (BUG-D).
+fn is_temporal(ty: DataType) -> bool {
+    matches!(
+        ty,
+        DataType::DateTime { .. } | DataType::Date | DataType::Time
+    )
+}
+
+/// Cast a value to a target lane. `fails` counts a **non-null string** that
+/// fails to parse into a temporal lane (→ `null`, continue-first); the operator
+/// surfaces the total (never-silent, BUG-D §23.6).
+fn cast_value(v: Value, ty: DataType, fails: &mut u64) -> Value {
+    // Source-aware temporal parse: a *string* cast to datetime/date/time is
+    // parsed (auto formats), not reinterpreted as ticks. A null stays null
+    // (not a failure); a non-null string that won't parse → null + counted.
+    if is_temporal(ty) {
+        match &v {
+            Value::Null => return Value::Null,
+            Value::Str(s) => {
+                return match parse_temporal_str(s, ty) {
+                    Some(val) => val,
+                    None => {
+                        *fails += 1;
+                        Value::Null
+                    }
+                };
+            }
+            _ => {} // numeric source → ticks reinterpret below
+        }
+    }
     match ty {
         DataType::I64 => Value::I64(to_i64(v)),
         DataType::F64 => Value::F64(to_f64(v)),
@@ -516,14 +563,14 @@ fn cast_value(v: Value, ty: DataType) -> Value {
         // round-half-even to the target scale (the reader has an exact text
         // path; this covers computed casts). Design doc 21.
         DataType::Decimal { scale } => Value::Dec(f64_to_decimal(to_f64(v), scale)),
-        // Cast to datetime treats the value as epoch ticks at the target unit
-        // (the reader has an exact text path; this covers computed casts).
+        // Numeric source → epoch ticks at the target unit (a string source is
+        // parsed above). The reader has the exact text path for declared schemas.
         DataType::DateTime { unit } => Value::DateTime(rivus_core::DateTime::new(to_i64(v), unit)),
         // Cast to duration treats the value as a raw tick span at the unit.
         DataType::Duration { unit } => Value::Duration(rivus_core::Duration::new(to_i64(v), unit)),
-        // Cast to date treats the value as an epoch-day (i32).
+        // Numeric source → epoch-day (i32); a string source is parsed above.
         DataType::Date => Value::Date(rivus_core::Date::new(to_i64(v) as i32)),
-        // Cast to time treats the value as ticks-since-midnight (MVP Sec).
+        // Numeric source → ticks-since-midnight (MVP Sec); a string is parsed above.
         DataType::Time => Value::Time(rivus_core::TimeOfDay::new(
             to_i64(v),
             rivus_core::TimeUnit::Sec,
@@ -581,9 +628,69 @@ pub(crate) fn pow10_i128(n: u8) -> Option<i128> {
     Some(p)
 }
 
+/// Parse a *string* column to a temporal lane per cell (BUG-D §23.6): a non-null
+/// cell that fails to parse becomes `null` (continue-first) and increments
+/// `fails`; a null cell stays null (not a failure). Returns the temporal column
+/// with the parse-aware validity. Caller guarantees `ty` is temporal.
+fn cast_str_column_temporal(
+    s: &StrColumn,
+    col: &Column,
+    n: usize,
+    ty: DataType,
+    fails: &mut u64,
+) -> Column {
+    let mut bits = Vec::with_capacity(n);
+    macro_rules! parse_lane {
+        ($push_default:expr, $parse:expr, $wrap:expr) => {{
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                if col.is_null(i) {
+                    out.push($push_default);
+                    bits.push(false);
+                } else if let Some(parsed) = $parse(s.get(i)) {
+                    out.push(parsed);
+                    bits.push(true);
+                } else {
+                    out.push($push_default);
+                    bits.push(false);
+                    *fails += 1;
+                }
+            }
+            Column::new($wrap(out), Validity::from_bits(&bits))
+        }};
+    }
+    match ty {
+        DataType::DateTime { unit } => parse_lane!(
+            0i64,
+            |c| rivus_core::DateTime::parse_auto(c, unit).map(|d| d.ticks),
+            |ticks| ColumnData::DateTime(rivus_core::DtColumn { ticks, unit })
+        ),
+        DataType::Date => parse_lane!(
+            0i32,
+            |c| rivus_core::Date::parse(c).map(|d| d.epoch_day),
+            ColumnData::Date
+        ),
+        DataType::Time => parse_lane!(
+            0i64,
+            |c| rivus_core::TimeOfDay::parse_at(c, rivus_core::TimeUnit::Sec).map(|t| t.ticks),
+            ColumnData::Time
+        ),
+        _ => unreachable!("cast_str_column_temporal called with a non-temporal type"),
+    }
+}
+
 /// Cast a whole column to a target lane (columnar path for computed columns).
-pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
+/// `fails` counts non-null string cells that fail a temporal parse (→ `null`,
+/// continue-first); the operator surfaces the total (never-silent, BUG-D §23.6).
+pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column {
     let n = col.len();
+    // Source-aware temporal parse: a *string* column cast to datetime/date/time
+    // is parsed per cell (auto formats), not reinterpreted as ticks.
+    if is_temporal(ty) {
+        if let ColumnData::Str(s) = col.data() {
+            return cast_str_column_temporal(s, &col, n, ty, fails);
+        }
+    }
     // Null in → null out (design 26 §26.2c): a null row stays null after a cast
     // (its backing is the lane default; validity, carried from the input, keeps
     // it null). All-valid input stays all-valid (zero cost).
@@ -636,7 +743,7 @@ pub(crate) fn cast_column(col: Column, ty: DataType) -> Column {
 /// rows (the columnar path used by computed-column projection). A `Field` is the
 /// underlying column; a `Literal` is a constant column; arithmetic combines
 /// numeric lanes; boolean-valued expressions become a `Bool` column.
-pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
+pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
     match expr {
         // `source.<field>` (Access::Source) → provenance, not a data column.
         Expr::Field {
@@ -649,8 +756,8 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk) -> Column {
             None => Column::f64(vec![f64::NAN; chunk.len]),
         },
         Expr::Literal(v) => const_column(v, chunk.len),
-        Expr::Cast { expr, ty } => cast_column(eval_column(expr, chunk), *ty),
-        Expr::Arith { left, op, right } => eval_arith(left, *op, right, chunk),
+        Expr::Cast { expr, ty } => cast_column(eval_column(expr, chunk, fails), *ty, fails),
+        Expr::Arith { left, op, right } => eval_arith(left, *op, right, chunk, fails),
         Expr::Func { func, args } => {
             let n = chunk.len;
             match func {
@@ -996,9 +1103,9 @@ fn temporal_op(l: &Value, op: ArithOp, r: &Value) -> Option<Value> {
     }
 }
 
-fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk) -> Column {
-    let lc = eval_column(left, chunk);
-    let rc = eval_column(right, chunk);
+fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
+    let lc = eval_column(left, chunk, fails);
+    let rc = eval_column(right, chunk, fails);
     let n = chunk.len;
     // Typed temporal arithmetic (exact i64; #57) when either side is a datetime
     // or duration lane. Peek row 0: if the combination isn't a temporal op (e.g.
@@ -1093,7 +1200,14 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
             Value::Bool(eval_predicate(a, chunk, row) || eval_predicate(b, chunk, row))
         }
         Expr::Arith { left, op, right } => arith_value(left, *op, right, chunk, row),
-        Expr::Cast { expr, ty } => cast_value(eval(expr, chunk, row), *ty),
+        // Source-aware parse (BUG-D): a row-wise cast parses a string into a
+        // temporal lane (correct result + byte-identity). Surfacing the failure
+        // count on the scalar `|?` path reuses the columnar `_acc` plumbing and
+        // lands next; here the failure still becomes null (continue-first).
+        Expr::Cast { expr, ty } => {
+            let mut _f = 0u64;
+            cast_value(eval(expr, chunk, row), *ty, &mut _f)
+        }
         Expr::Func { func, args } => call_func(*func, args, chunk, row),
         Expr::Case { branches, default } => {
             for (cond, val) in branches {

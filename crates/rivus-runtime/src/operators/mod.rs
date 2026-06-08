@@ -303,10 +303,12 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Drop { cols } => Box::new(Drop { cols: cols.clone() }),
         Op::Cast { casts } => Box::new(Cast {
             casts: casts.clone(),
+            fails: Default::default(),
         }),
         Op::Reorder { cols } => Box::new(Reorder { cols: cols.clone() }),
         Op::ProjectExpr { items } => Box::new(ProjectExpr {
             items: items.clone(),
+            fails: Default::default(),
         }),
         Op::Project { fields } => Box::new(Project {
             fields: fields.clone(),

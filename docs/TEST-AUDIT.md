@@ -68,7 +68,19 @@ in expression position** (`cast x:datetime("fmt")`) becomes a **never-silent
 parse error** ("declare the format in the schema"); (4) `Expr::Cast` structure
 unchanged (no `format` field) — `to_source` round-trip unchanged. Full design in
 `docs/design/23-datetime-and-reshape.md` §23.6 (option B / new-type approaches
-rejected). **Status: TRACKED** (design confirmed; implementing Slice A).
+rejected). **Status: RESOLVED (Slice A).** The expression `cast` is source-aware
+(`cast_value`/`cast_column` parse a `Str` → `DateTime`/`Date`/`Time` via the auto
+formats), so `cast str:datetime` now matches the reader's exact path byte-for-byte
+(pinned by `datetime_cast_in_expression_is_source_aware_BUG_D`). A non-null cell
+that won't parse → `null` (continue-first) and is **surfaced** once per column on
+finish (never-silent); in parallel the per-worker counts sum to the serial total
+(`cast_datetime_failures_sum_serial_eq_parallel`). An explicit format in
+expression position (`cast x:datetime("fmt")`) is a **never-silent parse error**
+pointing at the schema (`datetime_format_in_expr_cast_is_rejected_BUG_D`); the
+reader schema `(ts:datetime("fmt"))` is unchanged. `Expr::Cast` is structurally
+unchanged (no `format` field) → `to_source` round-trip unchanged. Tracked
+follow-ups: surfacing on the scalar `|?`/func-arg path (same `_acc` plumbing), and
+a source-adjacent cast → codec-schema pushdown.
 
 ### BUG-E (RESOLVED) · a leading UTF-8 BOM on the flow *script* breaks parsing
 **Repro.** A `.rivus` saved with a BOM → `unexpected character 'ï'` at line 1

@@ -1061,6 +1061,32 @@ impl Operator for Drop {
 /// skipped. Stateless and streaming.
 pub(crate) struct Cast {
     pub(crate) casts: Vec<(String, DataType)>,
+    /// Per-column count of non-null cells that failed a temporal parse (→ null);
+    /// surfaced once on finish (never-silent, BUG-D §23.6).
+    pub(crate) fails: std::collections::BTreeMap<String, (DataType, u64)>,
+}
+
+/// Surface accumulated cast-failure totals once on finish (never-silent, BUG-D
+/// §23.6), one summary per column. The count is a total → chunk-size independent;
+/// in the parallel path each worker surfaces its partition's partial and the
+/// counts **sum** to the serial total (the same contract as the reader's
+/// parse-failure summary / `validate` reject summary).
+fn surface_cast_failures(
+    fails: &std::collections::BTreeMap<String, (DataType, u64)>,
+    ctx: &mut OpCtx,
+) {
+    for (col, (ty, n)) in fails {
+        if *n > 0 {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Recoverable,
+                    ErrorScope::Item,
+                    format!("{n} value(s) in '{col}' could not be cast to {ty}; set to null"),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+    }
 }
 
 impl Operator for Cast {
@@ -1071,7 +1097,11 @@ impl Operator for Cast {
         for (name, ty) in &self.casts {
             match chunk.schema.index_of(name) {
                 Some(i) => {
-                    columns[i] = eval::cast_column(columns[i].clone(), *ty);
+                    let mut f = 0u64;
+                    columns[i] = eval::cast_column(columns[i].clone(), *ty, &mut f);
+                    if f > 0 {
+                        self.fails.entry(name.clone()).or_insert((*ty, 0)).1 += f;
+                    }
                     fields[i] = Field::new(name.clone(), *ty);
                     changed = true;
                 }
@@ -1093,6 +1123,11 @@ impl Operator for Cast {
         let mut out = Chunk::new(chunk.meta.id, schema, columns);
         out.meta = chunk.meta.clone();
         vec![out]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        surface_cast_failures(&self.fails, ctx);
+        Vec::new()
     }
 }
 
@@ -1144,6 +1179,9 @@ impl Operator for Reorder {
 /// and emitted under its output name. Stateless and row-count preserving.
 pub(crate) struct ProjectExpr {
     pub(crate) items: Vec<(Expr, String)>,
+    /// Per-output-column count of cast failures within the item's expression
+    /// (→ null); surfaced once on finish (never-silent, BUG-D §23.6).
+    pub(crate) fails: std::collections::BTreeMap<String, (DataType, u64)>,
 }
 
 impl Operator for ProjectExpr {
@@ -1167,7 +1205,14 @@ impl Operator for ProjectExpr {
                     );
                 }
             }
-            let col = eval::eval_column(expr, &chunk);
+            let mut f = 0u64;
+            let col = eval::eval_column(expr, &chunk, &mut f);
+            if f > 0 {
+                self.fails
+                    .entry(alias.clone())
+                    .or_insert((col.dtype(), 0))
+                    .1 += f;
+            }
             fields.push(Field::new(alias.clone(), col.dtype()));
             cols.push(col);
         }
@@ -1175,6 +1220,11 @@ impl Operator for ProjectExpr {
         let mut out = Chunk::new(chunk.meta.id, schema, cols);
         out.meta = chunk.meta.clone(); // preserve mode / telemetry
         vec![out]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        surface_cast_failures(&self.fails, ctx);
+        Vec::new()
     }
 }
 

@@ -91,6 +91,51 @@ fn headerless_schema_surfaces_consumed_data_row_bug_f() {
 }
 
 #[test]
+fn datetime_cast_in_expression_is_source_aware_bug_d() {
+    // BUG-D (fix): an expression `cast` to a temporal lane PARSES a string source
+    // (auto formats) — the same *meaning* as the reader's exact path; only the
+    // path (speed) differs. A non-null cell that won't parse → null
+    // (continue-first) and is surfaced (never-silent). Chunk-size independent.
+    let text = "ts\n2026-06-01T14:30:00\n2026-06-02T09:00:00\nBADVALUE\n2026-06-03\n";
+    let f = TempCsv(gendata::write_temp_bytes("bug_dcast", text.as_bytes()));
+    let p = f.0.display();
+    for cs in [1usize, 2, 4096] {
+        // The "two casts, same meaning" contract: reading `(ts:datetime)` (exact
+        // path) and `(ts:str)` + `cast ts:datetime` (expression path) must yield
+        // byte-identical datetime values.
+        let reader = run_src(&format!("R:\n open {p} (ts:datetime)\n;"), cs);
+        let cast = run_src(&format!("C:\n open {p} (ts:str)\n cast ts:datetime\n;"), cs);
+        assert_eq!(
+            collect_strings(&reader, "R", "ts"),
+            collect_strings(&cast, "C", "ts"),
+            "reader exact path and expression cast must be byte-identical @cs={cs}"
+        );
+        // Continue-first: all 4 rows survive (the bad one → null).
+        assert_eq!(cast.total_rows_out(), 4, "rows preserved @cs={cs}");
+        // Never-silent: the unparseable cell is surfaced.
+        assert!(
+            cast.errors
+                .iter()
+                .any(|e| e.message.contains("could not be cast to datetime")),
+            "cast failure must surface (never-silent) @cs={cs}: {:?}",
+            cast.errors
+        );
+    }
+    // The same source-aware parse via a computed column `(ts:datetime) as t`.
+    let proj = run_src(
+        &format!("P:\n open {p} (ts:str)\n |> (ts:datetime) as t\n;"),
+        4096,
+    );
+    assert!(
+        proj.errors
+            .iter()
+            .any(|e| e.message.contains("could not be cast to datetime")),
+        "computed-column cast failure must surface: {:?}",
+        proj.errors
+    );
+}
+
+#[test]
 fn datetime_parses_fractional_and_timezone_bug_c() {
     let text = "ts\n2024-06-03T14:30:00.5\n2024-06-03T14:30:00Z\n2024-06-03T14:30:00+09:00\n";
     let f = TempCsv(gendata::write_temp_bytes("bug_dtfmt", text.as_bytes()));

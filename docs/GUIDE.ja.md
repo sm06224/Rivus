@@ -571,18 +571,31 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 > ください。
 
 **型キャスト** — `expr:type` は値のレーンを再解釈（`int`/`i64`, `float`/`f64`,
-`str`/`string`, `bool`, `decimal(N)`）、最も強く結合：
+`str`/`string`, `bool`, `decimal(N)`、および時刻系 `datetime`/`date`/`time`）、
+最も強く結合：
 
 ```
 |? age:int >= 20            # *文字列* 列を数値として比較
 |> id (price:f64 * 1.1) as gross
 |> (age:str) as age_text    # add-property キャスト（3 つ目の型付け方法）
+|> (ts:datetime) as t       # *文字列* を datetime レーンにパース
 cast age:int price:f64      # cast 動詞：列をその場で再型付け
+cast ts:datetime            # 文字列列をその場で datetime にパース
 ```
 
 **`cast COL:type [COL:type …]`** 動詞は名前付き列をその場で再型付けする糖衣です
 （位置・名前は保持）、例 `cast age:int price:f64`。未知の列は警告してスキップ。
 `to_source` で round-trip します（型名は正規化、`int` → `i64`）。
+
+時刻系（`datetime`/`date`/`time`）へのキャストは文字列を auto 書式で**パース**します
+— reader と同じ意味なので `cast ts:datetime` は `open` 時の `(ts:datetime)` 宣言と
+**バイト一致**の値になり（経路＝速度だけが違う。reader の exact text path が速い）、
+パースできない値は `null` になりその件数を error stream に **surface**（never-silent）
+します。**パース書式はスキーマの所有物で、式キャストでは指定できません**：
+`cast ts:datetime("fmt")`（や `(ts:datetime("fmt"))`）は parse エラーです — 書式は
+source で `open f.csv (ts:datetime("fmt"))` と宣言し、下流では裸でキャストしてください。
+（挙動変更：文字列→`datetime`/`date`/`time` の式キャストは以前 epoch-0／誤値でしたが、
+正しくパースするようになりました。）
 
 数値の算術は両辺が整数なら整数のまま（`/` は常に浮動小数、SQL/pandas 同様）。
 文字列は算術が必要なときベストエフォートで数値解釈。0 除算/剰余は crash せず

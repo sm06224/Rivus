@@ -604,19 +604,33 @@ tighter than `+ -`; nest with parens.
 > computed expression in `( … )`.
 
 **Type casts** — `expr:type` reinterprets a value's lane (`int`/`i64`,
-`float`/`f64`, `str`/`string`, `bool`, `decimal(N)`), binding tightest:
+`float`/`f64`, `str`/`string`, `bool`, `decimal(N)`, and the temporal lanes
+`datetime`/`date`/`time`), binding tightest:
 
 ```
 |? age:int >= 20            # compare a *string* column numerically
 |> id (price:f64 * 1.1) as gross
 |> (age:str) as age_text    # the add-property cast (3rd way to type a column)
+|> (ts:datetime) as t       # parse a *string* into the datetime lane
 cast age:int price:f64      # the `cast` verb: re-type columns in place
+cast ts:datetime            # parse a string column into datetime in place
 ```
 
 The **`cast COL:type [COL:type …]`** verb is sugar for re-typing named columns
 in place (position and name kept), e.g. `cast age:int price:f64`. Unknown
 columns warn and are skipped; it round-trips through `to_source` (type names
 render canonically, `int` → `i64`).
+
+A cast **to a temporal lane** (`datetime`/`date`/`time`) *parses* a string source
+with the auto formats — the same meaning as the reader, so `cast ts:datetime`
+gives byte-identical values to declaring `(ts:datetime)` at `open`; only the speed
+differs (the reader's exact text path is faster). A value that won't parse becomes
+`null` and the count is **surfaced** on the error stream (never-silent). A **parse
+format belongs to the schema, not an expression cast**: `cast ts:datetime("fmt")`
+(or `(ts:datetime("fmt"))`) is a parse error — declare the format at the source,
+`open f.csv (ts:datetime("fmt"))`, and cast bare downstream. (Behavior change: a
+string→`datetime`/`date`/`time` expression cast previously produced epoch-0 /
+garbage; it now parses correctly.)
 
 Numeric arithmetic stays integer when both sides are integers (except `/`,
 which is always float, like SQL/pandas). Strings are parsed best-effort to a
