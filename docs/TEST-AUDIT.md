@@ -54,11 +54,15 @@ at a sub-second `unit`; today datetime is `Sec` MVP — pair with the unit work.
 epoch ticks (`260601120000` → year 10228), and `(ts:datetime("yyMMddHHmmss"))` is
 a parse error. **Root cause.** `DataType::DateTime { unit }` carries no format —
 only the reader keeps `dt_formats` (a side table on the source op), so cast/eval
-have no format to parse with. **Fix plan (needs ratification).** Carry the parse
-format on the cast/eval path too (the IR/syntax needs a representation that holds
-the format for a `:datetime("fmt")` cast). Tests: a cast and a computed-column
-case are added `#[ignore]` until the representation is ratified.
-**Status: TRACKED** (separate slice; ratify the format-carrying representation).
+have no format to parse with. **Fix plan (DESIGN drafted, awaiting ratification).**
+Carry the parse format on the **cast operation** (not the type): `Expr::Cast`
+gains `format: Option<Arc<str>>`, so `:datetime("fmt")` works uniformly in the
+reader schema, the `cast` verb, and a computed column, while `DataType` stays
+`Copy`/clean (format is a parse-time concern, not type identity). Full RFC with
+options, impact (`file:line`), and ratification points in
+`docs/design/23-datetime-and-reshape.md` §23.6. Implementation follows ratification.
+**Status: TRACKED** (design RFC in §23.6; ratify the representation + the
+`None`-on-`Str` `parse_auto` sub-decision before implementing).
 
 ### BUG-E (RESOLVED) · a leading UTF-8 BOM on the flow *script* breaks parsing
 **Repro.** A `.rivus` saved with a BOM → `unexpected character 'ï'` at line 1
