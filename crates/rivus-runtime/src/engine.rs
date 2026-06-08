@@ -686,6 +686,12 @@ fn try_streaming_parallel(
             .at_node(label_of(graph, src_id)),
         );
     }
+    if let Some(w) = &plan.header_warning {
+        src_errors.push(
+            ErrorEvent::new(Severity::Warn, ErrorScope::Item, w.clone())
+                .at_node(label_of(graph, src_id)),
+        );
+    }
     let mut res = merge_results(graph, results, src_errors, false);
 
     // Concatenate each sink's part files in source order into its final path.
@@ -1491,6 +1497,10 @@ struct ParPlan {
     ranges: Vec<(u64, u64)>,
     path: String,
     bad_rows: usize,
+    /// (BUG-F) Never-silent notice when a column-naming schema without
+    /// `noheader` consumed a data-looking first line; surfaced once like the
+    /// serial reader so the parallel error stream matches.
+    header_warning: Option<String>,
     src: ParSource,
     /// Provenance mode of the source op (design §28.6): each byte-range worker
     /// derives the same origin handle from `path`, so provenance is partition-
@@ -1627,6 +1637,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 ranges: plan.ranges,
                 path: path.to_string(),
                 bad_rows: plan.bad_rows,
+                header_warning: plan.header_warning,
                 src: ParSource::Csv {
                     dtypes: plan.dtypes,
                     dt_specs: plan.dt_specs,
@@ -1651,6 +1662,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 ranges,
                 path: path.to_string(),
                 bad_rows,
+                header_warning: None,
                 src: ParSource::Jsonl { names, dtypes },
                 provenance,
             })
@@ -1689,6 +1701,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 ranges,
                 path: path.to_string(),
                 bad_rows: len % rec_size,
+                header_warning: None,
                 src: ParSource::Binary {
                     fields: fields.clone(),
                     offsets,

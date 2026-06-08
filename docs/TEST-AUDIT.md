@@ -66,15 +66,21 @@ case are added `#[ignore]` until the representation is ratified.
 strips a leading `\u{FEFF}` before lexing (covers file / stdin / `-c` uniformly).
 Test `leading_bom_on_flow_script_is_stripped` (green). Guide §2 updated.
 
-### BUG-F · headerless + schema silently consumes the first data row as a header
+### BUG-F (RESOLVED, fix (a) surface) · headerless + schema consumed the first data row silently
 **Repro.** `open data.csv (id:int name:str)` (no `noheader`) over a file whose
-first line is data → the first line is treated as a header and **silently
-dropped** (2 rows → 1). **Fix plan (needs ratification).** Either (a) surface
-"treated the first line as a header" when a schema names the columns, or (b) have
-a column-naming schema imply `noheader` (reconciled with typing an existing
-header). Test: row count preserved with schema + first-line-data (`#[ignore]`).
-**Status: TRACKED** (light fix; ratify (a) vs (b)). Guide §3 documents the
-current behavior (`add noheader when the first line is data`).
+first line is data → the first line is treated as a header and dropped (2 rows →
+1). The drop was **silent** (never-silent violation). **Fix (a), maintainer-
+ratified 2026-06-08.** The semantics are unchanged (a column-naming schema still
+renames an existing header), but the consumption is now surfaced: when the
+consumed first line **looks like data** under the declared schema — i.e. every
+*typed* cell parses in its lane (`int`/`float`/`decimal`/`date`; a real header of
+column-name strings would not) — a never-silent `Warn` is raised on the error
+stream pointing at `noheader` as the remedy. Conservative both ways (an
+all-text/untyped rename never false-warns; a real header is never flagged), and
+fired identically on the serial and parallel readers (byte-identity of the error
+stream). Spec `headerless_schema_surfaces_consumed_data_row_BUG_F` (green,
+includes the no-false-positive real-header case). Guide §3 (en+ja) updated.
+**Status: RESOLVED.**
 
 ### PERF-G (RESOLVED, hoist) · `sort` per-compare type dispatch
 **Repro (1M rows, release).** sort id(int) 0.72 s / score(f64) 0.91 s / name(str)

@@ -105,7 +105,10 @@ verbs when you want it obvious at a glance.
 name:str age:int)` gives a headerless file both column **names and types** in one
 schema (the first line is read as data). A schema *without* `noheader` treats the
 first line as a **header and consumes it** — so add `noheader` when the first
-line is already data, or you'll lose that row.
+line is already data, or you'll lose that row. Rivus helps here: if the consumed
+first line *looks like data* under your declared types, it raises a never-silent
+warning telling you to add `noheader` (a real header is left alone, so renaming
+an existing header stays quiet).
 
 **Supported formats today:** CSV (with quoted-field handling), JSON Lines
 (one object per line) and JSON arrays (`[ {...}, {...} ]`), and fixed-width
