@@ -251,6 +251,106 @@ fn make_cmp(col: &Column) -> RowCmp<'_> {
     }
 }
 
+/// Decorate-sort one key (PERF-G follow-up). Extract the key into a **contiguous
+/// `(key, idx)` array** and sort that, so the hot loop reads dense, cache-local
+/// key bytes instead of chasing random rows through the full column on every one
+/// of the ~`n·log n` comparisons (the dominant cost the bare `make_cmp` hoist
+/// couldn't reach). Monomorphic in `K` (one instantiation per lane), so there is
+/// no dyn call either.
+///
+/// **Byte-identical** to the `make_cmp` comparator path: same `slice::sort_by`
+/// (stable), the same comparator return values for the same key values, and the
+/// same initial `0..n` order, so the algorithm makes identical decisions and
+/// yields the identical permutation — including NaN→Equal, the null rule, and
+/// `desc` (which reverses the whole comparison, not the stable tie-break, so ties
+/// keep ascending source order for both directions).
+fn argsort_one<K>(
+    n: usize,
+    key: impl Fn(usize) -> K,
+    has_nulls: bool,
+    is_null: impl Fn(usize) -> bool,
+    desc: bool,
+    cmp: impl Fn(&K, &K) -> std::cmp::Ordering,
+) -> Vec<usize> {
+    use std::cmp::Ordering;
+    if has_nulls {
+        // Carry the null flag in the pair so the sort never touches the validity
+        // bitmap. Null rule §26.2b: null is greatest (nulls last on ascending),
+        // null == null → Equal (stable tie); `desc` reverses the whole compare.
+        let mut pairs: Vec<(bool, K, usize)> = (0..n).map(|i| (is_null(i), key(i), i)).collect();
+        pairs.sort_by(|a, b| {
+            let o = match (a.0, b.0) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => cmp(&a.1, &b.1),
+            };
+            if desc {
+                o.reverse()
+            } else {
+                o
+            }
+        });
+        pairs.into_iter().map(|p| p.2).collect()
+    } else {
+        let mut pairs: Vec<(K, usize)> = (0..n).map(|i| (key(i), i)).collect();
+        pairs.sort_by(|a, b| {
+            let o = cmp(&a.0, &b.0);
+            if desc {
+                o.reverse()
+            } else {
+                o
+            }
+        });
+        pairs.into_iter().map(|p| p.1).collect()
+    }
+}
+
+/// Dispatch the lane once (PERF-G follow-up), then decorate-sort the key into a
+/// contiguous monotyped array. Lane order matches `make_cmp` exactly (Resource
+/// sorts by uri, §28.3).
+fn argsort_single(col: &Column, desc: bool) -> Vec<usize> {
+    use std::cmp::Ordering;
+    let n = col.len();
+    let nulls = col.has_nulls();
+    match col.data() {
+        ColumnData::Bool(v) => argsort_one(n, |i| v[i], nulls, |i| col.is_null(i), desc, bool::cmp),
+        ColumnData::I64(v) => argsort_one(n, |i| v[i], nulls, |i| col.is_null(i), desc, i64::cmp),
+        ColumnData::F64(v) => argsort_one(
+            n,
+            |i| v[i],
+            nulls,
+            |i| col.is_null(i),
+            desc,
+            |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        ),
+        ColumnData::Dec(d) => argsort_one(
+            n,
+            |i| d.unscaled[i],
+            nulls,
+            |i| col.is_null(i),
+            desc,
+            i128::cmp,
+        ),
+        ColumnData::DateTime(d) => {
+            argsort_one(n, |i| d.ticks[i], nulls, |i| col.is_null(i), desc, i64::cmp)
+        }
+        ColumnData::Duration(d) => {
+            argsort_one(n, |i| d.ticks[i], nulls, |i| col.is_null(i), desc, i64::cmp)
+        }
+        ColumnData::Date(v) => argsort_one(n, |i| v[i], nulls, |i| col.is_null(i), desc, i32::cmp),
+        ColumnData::Time(v) => argsort_one(n, |i| v[i], nulls, |i| col.is_null(i), desc, i64::cmp),
+        ColumnData::Str(v) | ColumnData::Resource(v) => argsort_one(
+            n,
+            |i| v.get(i),
+            nulls,
+            |i| col.is_null(i),
+            desc,
+            |a: &&str, b: &&str| a.cmp(b),
+        ),
+    }
+}
+
 impl Operator for Sort {
     fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
         if !chunk.is_empty() {
@@ -295,10 +395,21 @@ impl Operator for Sort {
             }
         }
 
-        let mut idx: Vec<usize> = (0..total).collect();
-        if !key_cols.is_empty() {
-            // Resolve each key's lane + null state once (PERF-G), then compare via
-            // the monotyped closures in the hot loop.
+        let idx: Vec<usize> = if key_cols.len() == 1 {
+            // Single key — the common case, and every sort benchmark. Decorate:
+            // extract the key into a contiguous (key, idx) array and sort that
+            // (cache-local, monomorphic, no dyn call). Byte-identical to the
+            // comparator path below (PERF-G follow-up).
+            let (ki, desc) = key_cols[0];
+            argsort_single(&cols[ki], desc)
+        } else if key_cols.is_empty() {
+            (0..total).collect()
+        } else {
+            // Multi-key: resolve each key's lane + null state once (PERF-G), then
+            // compare via the monotyped closures in the hot loop. (A composite
+            // decorated key would need a memcomparable encoding per lane — kept as
+            // a further follow-up so byte-identity stays certain here.)
+            let mut idx: Vec<usize> = (0..total).collect();
             let cmps: Vec<(RowCmp, bool)> = key_cols
                 .iter()
                 .map(|&(ki, desc)| (make_cmp(&cols[ki]), desc))
@@ -313,7 +424,8 @@ impl Operator for Sort {
                 }
                 std::cmp::Ordering::Equal
             });
-        }
+            idx
+        };
 
         let sorted: Vec<Column> = cols.iter().map(|c| c.gather(&idx)).collect();
         vec![Chunk::new(ctx.fresh_id(), schema, sorted)]

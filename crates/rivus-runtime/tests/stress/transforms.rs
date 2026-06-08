@@ -625,6 +625,104 @@ fn multi_key_sort_orders_by_each_key_chunk_size_independent() {
     }
 }
 
+// Collect (id, v) row order of `sort v` over an `(id:int v:float)` CSV, where v
+// is collected as the finite value (None for NaN or the null blank).
+fn sort_f64_by_v(p: &std::path::Path, asc: bool, cs: usize) -> Vec<(i64, Option<f64>)> {
+    let dir = if asc { "" } else { " desc" };
+    let res = run_src(
+        &format!(
+            "S:\n open {} (id:int v:float)\n sort v{dir}\n;",
+            p.display()
+        ),
+        cs,
+    );
+    let out = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("S"))
+        .unwrap();
+    let mut rows = Vec::new();
+    for c in &out.chunks {
+        let (ii, vi) = (
+            c.schema.index_of("id").unwrap(),
+            c.schema.index_of("v").unwrap(),
+        );
+        for r in 0..c.len {
+            let id = c.value(r, ii).as_f64().unwrap() as i64;
+            let v = if c.columns[vi].is_null(r) {
+                None
+            } else {
+                c.value(r, vi).as_f64().filter(|x| x.is_finite())
+            };
+            rows.push((id, v));
+        }
+    }
+    rows
+}
+
+#[test]
+fn sort_f64_lane_with_nulls_orders_ascending_nulls_last() {
+    // The single-key decorate-sort owns the f64 lane (PERF-G follow-up). With real
+    // values + nulls (no NaN), it must order exactly like the int lane: ascending
+    // values, then nulls last (§26.2b), stable, chunk-size independent.
+    let data = "id,v\n1,3.5\n2,\n3,1.5\n4,2.5\n5,\n6,0.5\n7,4.5\n8,2.0\n".as_bytes();
+    let f = TempCsv(gendata::write_temp_bytes("stress_sort_f64", data));
+    for cs in [1usize, 3, 5, 64] {
+        let asc = sort_f64_by_v(&f.0, true, cs);
+        // 0.5,1.5,2.0,2.5,3.5,4.5 (ids 6,3,8,4,1,7) then nulls (ids 2,5 stable).
+        let want: Vec<(i64, Option<f64>)> = vec![
+            (6, Some(0.5)),
+            (3, Some(1.5)),
+            (8, Some(2.0)),
+            (4, Some(2.5)),
+            (1, Some(3.5)),
+            (7, Some(4.5)),
+            (2, None),
+            (5, None),
+        ];
+        assert_eq!(asc, want, "f64 asc nulls-last @cs={cs}");
+        // desc reverses the whole order → nulls first, values descending.
+        let desc = sort_f64_by_v(&f.0, false, cs);
+        let want_desc: Vec<(i64, Option<f64>)> = vec![
+            (2, None),
+            (5, None),
+            (7, Some(4.5)),
+            (1, Some(3.5)),
+            (4, Some(2.5)),
+            (8, Some(2.0)),
+            (3, Some(1.5)),
+            (6, Some(0.5)),
+        ];
+        assert_eq!(desc, want_desc, "f64 desc nulls-first @cs={cs}");
+    }
+}
+
+#[test]
+fn sort_f64_with_nan_is_chunk_size_independent() {
+    // NaN→Equal is an intentionally inconsistent order (it matches the old
+    // comparator), so the finite values are NOT guaranteed sorted when NaN is
+    // interspersed — but the invariant that matters still holds: the *whole* order
+    // is identical for every chunk size (serial == parallel), no row is dropped,
+    // and it never panics. (Byte-identity vs the pre-follow-up comparator path is
+    // verified out-of-band by diffing 1M-row outputs.)
+    let data =
+        "id,v\n1,3.5\n2,NaN\n3,\n4,1.5\n5,NaN\n6,2.5\n7,\n8,0.5\n9,4.5\n10,NaN\n11,\n12,2.0\n"
+            .as_bytes();
+    let f = TempCsv(gendata::write_temp_bytes("stress_sort_nan", data));
+    let mut reference: Option<Vec<i64>> = None;
+    for cs in [1usize, 3, 5, 64] {
+        let ids: Vec<i64> = sort_f64_by_v(&f.0, true, cs)
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(ids.len(), 12, "no rows lost @cs={cs}");
+        match &reference {
+            None => reference = Some(ids),
+            Some(want) => assert_eq!(&ids, want, "NaN/null order chunk-size independent @cs={cs}"),
+        }
+    }
+}
+
 #[test]
 fn distinct_dedups_chunk_size_independent() {
     let rows = 20_000;
