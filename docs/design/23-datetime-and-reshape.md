@@ -282,6 +282,27 @@ str→datetime が、式 cast では 0/誤値になる）はまさにこれ**で
 4. **`Expr::Cast` の構造は不変**（`format` を足さない）→ `to_source` も現状 `{expr}:{ty}` の
    まま、round-trip 不変。
 
+### never-silent 配管（実装スケッチ）— 唯一の非自明点
+現状 `cast_value`/`cast_column` は error channel を持たない純粋関数。失敗を operator まで
+運んで raise する機構を最小で足す:
+- **cast 関数に失敗カウンタを out-param で渡す**: `cast_column(col, ty, fails: &mut u64)` /
+  `cast_value(v, ty, fails: &mut u64)`。**非 null 入力がパース/変換失敗 → null（validity=0、
+  continue-first）＋ `*fails += 1`**。null 入力は null のまま（カウントしない）。
+- **列指向経路の配管**: `eval_column` は公開シグネチャを温存し（`fails` を捨てる薄い
+  wrapper）、内部実装 `eval_column_acc(expr, chunk, &mut fails)` が再帰（Cast/Arith/Func）と
+  `cast_column` に `fails` を通す。`ProjectExpr` は `_acc` 版を使い、出力列（alias）ごとに
+  失敗総数を**チャンクをまたいで蓄積**。`cast` 動詞 operator は `cast_column` を直接呼ぶので
+  そのまま蓄積。
+- **finish で一度だけ surface**（chunk-size 独立）: reader の `parse_failures` と同作法で
+  `「N value(s) in '<col>' could not be cast to <type>; set to null」`（`Severity::Recoverable`）。
+- **serial==parallel の契約**: per-row のカウントなので、**並列では各 worker が自分の
+  partition の partial を surface し、その総和が serial の総数に一致**する（既存の never-silent
+  契約＝`parse_failures` / `validate_reject_parallel_summary_counts_sum_to_total` と同じ。
+  単一の同一イベントではなく「総和一致」）。**受入テストはこの総和一致を最初に固定**して
+  under-build を防ぐ。
+- スカラ経路（`|?` 述語の cast）は本スケッチと同じ `_acc` 配管で `eval`/`eval_predicate` に
+  拡張する（datetime を第一実装、同配管で他 lane・述語へ広げる）。
+
 ### 挙動変更の明示（doc 必須）
 `str→datetime`/`date`/`time` の式 cast 結果が「0/誤値 → 正しいパース値」に変わるのは
 **壊れの修正**だが、**既存挙動の変更**として GUIDE/CHANGELOG に明記する。byte-identity は
