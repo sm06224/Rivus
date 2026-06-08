@@ -72,6 +72,15 @@ stderr にフォールバック）。
 rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' | sort
 ```
 
+### Windows でフローを実行する（引用符・文字コード）
+
+- `datetime("yyMMddHHmmss")` のように `"` を含むフローを `-c` で実行すると
+  `cmd`/PowerShell が内側の `"` を取り除き、`datetime(yyMMddHHmmss)` と解釈されて
+  `expected a quoted format string` になります。**フローはファイルに保存して
+  `rivus run flow.rivus`** で実行してください（あるいはシェル向けに `"` をエスケープ）。
+- フロー*スクリプト*の先頭 UTF-8 **BOM は問題ありません**（Rivus が剥がします）。CSV データの
+  BOM はそのままで構いません。
+
 ---
 
 ## 3. ソース（フローの先頭）
@@ -92,6 +101,11 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 
 形式判定は拡張子を **過信しません**。拡張子が嘘をつくときは `open data.dat as json`、
 ひと目で分かるようにしたいときは `readcsv`/`readjson` 動詞を使ってください。
+
+**ヘッダ無しファイル：名前と型を同時に。** `open data.csv noheader (id:int name:str
+age:int)` で列名と型を同時に与えられます（先頭行はデータとして読まれます）。`noheader`
+無しでスキーマだけ与えると**先頭行がヘッダ扱いで消費**されます。先頭行が既にデータなら
+`noheader` を付けてください（付けないとその行を失います）。
 
 **対応形式（現状）:** CSV（引用フィールド対応）、JSON Lines（1 行 1 オブジェクト）、
 JSON 配列（`[ {...}, {...} ]`）、固定長バイナリ。JSON/JSONL/NDJSON は同じリーダを

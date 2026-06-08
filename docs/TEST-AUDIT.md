@@ -48,6 +48,44 @@ column unit) and a trailing `Z` / `±HH:mm` offset (normalised to UTC ticks). Ke
 each new format equivalence-tested against an oracle. (Sub-second needs the lane
 at a sub-second `unit`; today datetime is `Sec` MVP — pair with the unit work.)
 
+### BUG-D · `datetime("fmt")` is ignored in a cast / computed-column (only the reader schema works)
+**Repro (Linux).** `open f.csv (ts:datetime("yyMMddHHmmss"))` works; but
+`cast ts:datetime("yyMMddHHmmss")` ignores the format and treats the field as raw
+epoch ticks (`260601120000` → year 10228), and `(ts:datetime("yyMMddHHmmss"))` is
+a parse error. **Root cause.** `DataType::DateTime { unit }` carries no format —
+only the reader keeps `dt_formats` (a side table on the source op), so cast/eval
+have no format to parse with. **Fix plan (needs ratification).** Carry the parse
+format on the cast/eval path too (the IR/syntax needs a representation that holds
+the format for a `:datetime("fmt")` cast). Tests: a cast and a computed-column
+case are added `#[ignore]` until the representation is ratified.
+**Status: TRACKED** (separate slice; ratify the format-carrying representation).
+
+### BUG-E (RESOLVED) · a leading UTF-8 BOM on the flow *script* breaks parsing
+**Repro.** A `.rivus` saved with a BOM → `unexpected character 'ï'` at line 1
+(data CSV BOM is stripped, but the script wasn't). **Fix.** `rivus_parser::parse`
+strips a leading `\u{FEFF}` before lexing (covers file / stdin / `-c` uniformly).
+Test `leading_bom_on_flow_script_is_stripped` (green). Guide §2 updated.
+
+### BUG-F · headerless + schema silently consumes the first data row as a header
+**Repro.** `open data.csv (id:int name:str)` (no `noheader`) over a file whose
+first line is data → the first line is treated as a header and **silently
+dropped** (2 rows → 1). **Fix plan (needs ratification).** Either (a) surface
+"treated the first line as a header" when a schema names the columns, or (b) have
+a column-naming schema imply `noheader` (reconciled with typing an existing
+header). Test: row count preserved with schema + first-line-data (`#[ignore]`).
+**Status: TRACKED** (light fix; ratify (a) vs (b)). Guide §3 documents the
+current behavior (`add noheader when the first line is data`).
+
+### PERF-G · `sort` is ~10× DuckDB (per-compare type dispatch)
+**Repro (1M rows, release).** sort id(int) 0.72 s / score(f64) 0.91 s / name(str)
+1.17 s. **Root cause.** `cmp_rows` (`operators/transform.rs`) does a `has_nulls()`
+check + `match col.data()` lane dispatch + random access on **every** comparison
+(~20 M). **Fix plan.** Hoist the lane `match` and null check out of the
+comparator: resolve each key column once into a monotyped accessor closure, then
+`sort_by` on those. **Byte-identity preserved** (same order, nulls-last, stable);
+before/after in `docs/BENCHMARKS.md`. **Status: TRACKED** (perf-only, result
+unchanged).
+
 ## 2. Coverage map (GUIDE feature → tests → status)
 
 | GUIDE area | tests | status |
