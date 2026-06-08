@@ -851,6 +851,72 @@ fn auto_inferred_temporal_lanes_parallel_byte_identical() {
 }
 
 #[test]
+fn cast_datetime_failures_sum_serial_eq_parallel() {
+    // BUG-D never-silent contract: an expression `cast` to datetime surfaces a
+    // per-column failure summary. In parallel each worker emits its partition's
+    // partial and the counts must SUM to the serial total (same contract as
+    // parse_failures / validate reject), and the cast output stays byte-identical
+    // serial vs parallel. Forced parallel with a >1 MiB file + MemoryPref::Fast +
+    // a file sink (no env vars → no cross-test races; cf. parallel_decimal).
+    let rows = 120_000usize; // ~2.5 MiB → crosses the Fast 1 MiB floor
+    let mut text = String::from("id,ts\n");
+    let mut fails = 0u64;
+    for i in 0..rows {
+        if i % 50 == 0 {
+            text.push_str(&format!("{i},BAD\n")); // unparseable → null + counted
+            fails += 1;
+        } else {
+            text.push_str(&format!("{i},2026-06-01T00:00:00\n")); // valid ISO
+        }
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_castpar", text.as_bytes()));
+    let p = f.0.display();
+    let run_to_file = |pref: rivus_runtime::MemoryPref, out: &std::path::Path| {
+        let src = format!(
+            "C:\n open {p} (id:int ts:str)\n cast ts:datetime\n |> id ts\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run")
+    };
+    let sum_fails = |res: &rivus_runtime::RunResult| -> u64 {
+        res.errors
+            .iter()
+            .filter(|e| e.message.contains("could not be cast to datetime"))
+            .filter_map(|e| e.message.split_whitespace().next()?.parse::<u64>().ok())
+            .sum()
+    };
+    let ser_out = TempCsv(gendata::write_temp_bytes("castpar_serial", b""));
+    let ser = run_to_file(rivus_runtime::MemoryPref::Low, &ser_out.0);
+    assert_eq!(sum_fails(&ser), fails, "serial cast-failure total");
+
+    let par_out = TempCsv(gendata::write_temp_bytes("castpar_parallel", b""));
+    let par = run_to_file(rivus_runtime::MemoryPref::Fast, &par_out.0);
+    assert!(
+        !par.workers.is_empty(),
+        "byte-range parallel reader must engage"
+    );
+    // Per-worker partials must sum to the serial total (never-silent).
+    assert_eq!(
+        sum_fails(&par),
+        fails,
+        "parallel cast-failure counts must sum to the total"
+    );
+    // Output is byte-identical serial vs parallel (parts concatenated in order).
+    let a = std::fs::read_to_string(&ser_out.0).expect("read serial");
+    let b = std::fs::read_to_string(&par_out.0).expect("read parallel");
+    assert_eq!(a, b, "cast output identical serial vs parallel");
+}
+
+#[test]
 fn validate_reject_parallel_summary_counts_sum_to_total() {
     // In parallel each byte-range/partition worker emits its own validate
     // summary; the counts must SUM to the true total (never-silent), while the

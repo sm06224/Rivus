@@ -54,11 +54,33 @@ at a sub-second `unit`; today datetime is `Sec` MVP — pair with the unit work.
 epoch ticks (`260601120000` → year 10228), and `(ts:datetime("yyMMddHHmmss"))` is
 a parse error. **Root cause.** `DataType::DateTime { unit }` carries no format —
 only the reader keeps `dt_formats` (a side table on the source op), so cast/eval
-have no format to parse with. **Fix plan (needs ratification).** Carry the parse
-format on the cast/eval path too (the IR/syntax needs a representation that holds
-the format for a `:datetime("fmt")` cast). Tests: a cast and a computed-column
-case are added `#[ignore]` until the representation is ratified.
-**Status: TRACKED** (separate slice; ratify the format-carrying representation).
+have no format to parse with. **Fix (DESIGN confirmed, maintainer-ratified
+2026-06-08; NO new type system).** The format's sole owner is the **schema
+declaration** (reader schema / `dt_formats`, unchanged — fastest, exact text
+path). The expression `cast` is a **different use** (change type mid-computation,
+**no format**, source-aware): it must parse `Str → DateTime/Date/Time` correctly
+(the same *meaning* as the reader; only the *path*/speed differs — same result by
+location is the byte-identity contract, and the current divergence IS BUG-D).
+Slice A: (1) make expr `cast` source-aware in `eval.rs` (`cast_value`/
+`cast_column`); (2) **never-silent** cast failures (null + surfaced on the error
+stream, serial == parallel, extensible to other lanes); (3) an **explicit format
+in expression position** (`cast x:datetime("fmt")`) becomes a **never-silent
+parse error** ("declare the format in the schema"); (4) `Expr::Cast` structure
+unchanged (no `format` field) — `to_source` round-trip unchanged. Full design in
+`docs/design/23-datetime-and-reshape.md` §23.6 (option B / new-type approaches
+rejected). **Status: RESOLVED (Slice A).** The expression `cast` is source-aware
+(`cast_value`/`cast_column` parse a `Str` → `DateTime`/`Date`/`Time` via the auto
+formats), so `cast str:datetime` now matches the reader's exact path byte-for-byte
+(pinned by `datetime_cast_in_expression_is_source_aware_BUG_D`). A non-null cell
+that won't parse → `null` (continue-first) and is **surfaced** once per column on
+finish (never-silent); in parallel the per-worker counts sum to the serial total
+(`cast_datetime_failures_sum_serial_eq_parallel`). An explicit format in
+expression position (`cast x:datetime("fmt")`) is a **never-silent parse error**
+pointing at the schema (`datetime_format_in_expr_cast_is_rejected_BUG_D`); the
+reader schema `(ts:datetime("fmt"))` is unchanged. `Expr::Cast` is structurally
+unchanged (no `format` field) → `to_source` round-trip unchanged. Tracked
+follow-ups: surfacing on the scalar `|?`/func-arg path (same `_acc` plumbing), and
+a source-adjacent cast → codec-schema pushdown.
 
 ### BUG-E (RESOLVED) · a leading UTF-8 BOM on the flow *script* breaks parsing
 **Repro.** A `.rivus` saved with a BOM → `unexpected character 'ï'` at line 1

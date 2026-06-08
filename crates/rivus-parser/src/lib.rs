@@ -588,6 +588,7 @@ impl Parser {
                         self.expect(&Tok::Colon)?;
                         let tyword = self.word()?;
                         let ty = self.finish_type(&tyword)?;
+                        self.reject_expr_dt_format()?;
                         casts.push((name, ty));
                     }
                     if casts.is_empty() {
@@ -753,6 +754,21 @@ impl Parser {
         } else {
             decl_type(word).ok_or_else(|| self.err(format!("unknown column type '{word}'")))
         }
+    }
+
+    /// (BUG-D §23.6) A datetime parse format belongs to a **schema declaration**,
+    /// not an expression / `cast`-verb cast (which has no format — it auto-parses).
+    /// If `finish_type` just captured one in expression position, reject it
+    /// never-silently instead of dropping it; point the user at the schema.
+    fn reject_expr_dt_format(&mut self) -> Result<(), RivusError> {
+        if self.last_dt_fmt.take().is_some() {
+            return Err(self.err(
+                "a datetime parse format is only valid in a schema declaration \
+                 (e.g. `open f.csv (ts:datetime(\"yyMMddHHmmss\"))`), not in a cast — \
+                 declare the format at the source, then cast bare here",
+            ));
+        }
+        Ok(())
     }
 
     /// Optional source-provenance modifier (design §28.6): `with source` (rides
@@ -1247,12 +1263,16 @@ impl Parser {
         let e = self.parse_primary()?;
         if self.at(&Tok::Colon) {
             if let Tok::Word(w) = self.toks[self.pos + 1].0.clone() {
-                // A recognized lane word, or `decimal` (which carries a `(N)`
-                // suffix), turns `:` into a cast; otherwise leave `:` for the caller.
-                if decl_type(&w).is_some() || w.eq_ignore_ascii_case("decimal") {
+                // Any cast-type word turns `:` into a cast (incl. the temporal and
+                // decimal lanes, which `finish_type` handles); otherwise leave `:`
+                // for the caller. A temporal cast carries no format here — an
+                // explicit `:datetime("fmt")` is rejected by `reject_expr_dt_format`
+                // (BUG-D §23.6: the format belongs to a schema declaration).
+                if is_cast_type_word(&w) {
                     self.bump(); // ':'
                     self.bump(); // type word
                     let ty = self.finish_type(&w)?;
+                    self.reject_expr_dt_format()?;
                     return Ok(Expr::Cast {
                         expr: Box::new(e),
                         ty,
@@ -1459,6 +1479,18 @@ impl Parser {
 /// Normalize a source/sink path: `stdin` / `stdout` / `-` all map to the `-`
 /// sentinel (read stdin / write stdout, direction inferred from source vs sink).
 /// Map a declared column type name to a `DataType` lane.
+/// Does `w` name a type usable in an `expr:type` cast? Covers the plain lanes
+/// (`decl_type`) plus the lanes `finish_type` parses with a suffix/format
+/// (`decimal(N)`, `datetime`/`date`/`time`/`duration`). Gates `parse_cast` so an
+/// inline temporal cast (`x:datetime`, `(ts:date) as d`) is recognized, not left
+/// as a stray `:` (BUG-D §23.6).
+fn is_cast_type_word(w: &str) -> bool {
+    decl_type(w).is_some()
+        || ["decimal", "datetime", "date", "time", "duration"]
+            .iter()
+            .any(|t| w.eq_ignore_ascii_case(t))
+}
+
 fn decl_type(s: &str) -> Option<DataType> {
     Some(match s.to_ascii_lowercase().as_str() {
         "int" | "i64" | "integer" => DataType::I64,
@@ -2025,6 +2057,27 @@ mod tests {
         }
         // A non-string format argument is a clear error, not a silent default.
         assert!(parse("F:\n open s.csv (a:datetime(123))\n;").is_err());
+    }
+
+    #[test]
+    fn datetime_format_in_expr_cast_is_rejected_bug_d() {
+        // BUG-D §23.6: a parse format belongs to a schema *declaration*, not an
+        // expression / `cast`-verb cast — an explicit format in cast position is a
+        // never-silent parse error (not silently dropped).
+        assert!(parse("F:\n open log.csv\n cast ts:datetime(\"yyMMddHHmmss\")\n;").is_err());
+        assert!(parse("F:\n open log.csv\n |> (ts:datetime(\"yyMMddHHmmss\")) as t\n;").is_err());
+        // The reader-schema form stays valid (unchanged).
+        assert!(parse("F:\n open log.csv (ts:datetime(\"yyMMddHHmmss\"))\n;").is_ok());
+        // A bare expression cast (no format) is valid and round-trips — incl. the
+        // temporal lanes that the expr cast now recognizes (date/time/datetime).
+        for src in [
+            "F:\n open log.csv\n cast ts:datetime\n;",
+            "F:\n open log.csv\n |> (ts:date) as d\n;",
+            "F:\n open log.csv\n |> (t:time) as tm\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        }
     }
 
     #[test]

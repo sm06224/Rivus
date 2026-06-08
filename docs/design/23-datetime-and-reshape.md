@@ -219,3 +219,103 @@ open sales.csv (ts:datetime("yyMMddhhmmss") amount:decimal)
 
 各段は operator/eval 境界の裏（原則「Operator boundary stays thin」）、`cargo deny`
 緑・依存ゼロ維持、`docs/BENCHMARKS.md` に before/after。
+
+## 23.6 式 cast の source-aware 化と書式の所有者（BUG-D）— 確定方針
+
+> ステータス: **設計確定（統括批准済み・2026-06-08）**。**型システムの新設は一切しない。**
+> 不変条件: byte-identity（serial==parallel==chunk-size）／ never-silent・continue-first
+> ／ IR 可逆（to_source round-trip＋optimizer_equiv）／ 依存ゼロ（既存 parse ヘルパ再利用）
+> ／ 英日ガイド同時更新。
+
+### 問題（再現）
+`:datetime("fmt")` の書式は **reader schema 経路でしか効かない**。式 cast は壊れている:
+- ✅ `open f.csv (ts:datetime("yyMMddHHmmss"))` — reader schema が書式を持ち、読み時に
+  exact text path でパース。`Codec::Csv.dt_formats`（`graph.rs:362`）→ `build_dt_specs`
+  （`csv.rs:1173`）→ `DtSpec::parse_opt`（`csv.rs:1165`）。**最速・byte-identity。ここは不変。**
+- ❌ `cast ts:datetime` / `(ts:datetime) as t` — `cast_value`（`eval.rs:521`）が
+  `DateTime::new(to_i64(v), unit)` ＝ **Str を to_i64→0**、数値を生 ticks 再解釈。
+  `"2026-06-01"` は 0（epoch）、`"260601120000"` は西暦 10228。**str→datetime が黙って壊れる。**
+- ❌ `cast ts:datetime("fmt")`（式位置の明示書式）— `finish_type` が `("fmt")` を
+  `last_dt_fmt` に拾うが cast 構築（`lib.rs:1247-1260`）が**回収せず黙って捨てる**。
+
+### 確定方針 — 書式の唯一の所有者は「スキーマ宣言」（方針「い」）
+**書式（`datetime("yyMMdd")` 等）を持てるのは reader スキーマ宣言だけ。** 式 cast は
+**書式を持たない別用途**として許容する。両者は用途が完全に異なる:
+
+| | スキーマ宣言 `(ts:datetime("fmt"))` | 式 cast `… cast ts:datetime` |
+|---|---|---|
+| 用途 | データをその型に**読み込む/正規化** | 計算の途中で**その場で型を変える** |
+| 書式 | あり（明示／auto） | **なし**（auto のみ） |
+| 位置 | source の宣言スキーマ | 主に `\|>`、`\|?` でも可 |
+| 速度 | 最速（exact text path） | 劣後（行単位 eval）— **用途が違うので許容**（統括明言） |
+
+プロジェクションは元来データ変換の場なので、そこで型を変えるのは自然。速度は劣後するが
+用途が違うため許容する。
+
+### byte-identity 契約 — 2 つの cast は「意味同一・経路のみ差」
+同じ型変換は **どこで行っても結果バイトが同一**でなければならない（経路＝速度だけが違う）。
+場所で結果が変わるのは byte-identity 違反＝バグ。**今の BUG-D（reader では正しくパースされる
+str→datetime が、式 cast では 0/誤値になる）はまさにこれ**で、直す対象。式 cast の auto
+パースは方針「い」の既定として正しい（reader の auto 推論と同じ意味）。
+
+### 却下（実装しない・蒸し返さない）
+- ✗ **案B**: `Expr::Cast` に `format` フィールド追加 → 不正状態（式に書式）を表現可能にし
+  シンプリシティを壊す。**却下**（旧 RFC を撤回）。
+- ✗ `ParseTemporal` 等の新 IR ノード → 構文と意味をねじる。却下。
+- ✗ `LaneCodec` trait 全面刷新 → 過剰。却下。
+- ✗ `type` キーワード / struct lane / UserDefinitionType の新設 → 不要。named 再利用は
+  既存 §25.4 flow-reuse ＋ 将来 `as Sale` の小追加（後続スライスB・任意）で賄う。
+
+### スライスA = BUG-D 本丸（最小・今回実装）
+1. **式 cast を source-aware に**（`eval.rs` `cast_value:511` / `cast_column`）:
+   ターゲットが `DateTime`/`Date`/`Time` で **source が Str → 正しくパース**（既存
+   `DateTime::parse_auto` / `Date::parse` / `TimeOfDay::parse_at` を再利用）。**数値 source は
+   現状の ticks 再解釈のまま**。これで `cast str:datetime` の silent-wrong が直る。
+2. **cast 失敗の never-silent surface**（統括裁定: silent はしない、原則。実装難度や
+   破壊的変更を理由に削らない）: パース/変換失敗 → **null（continue-first）＋ error stream に
+   surface**。配管を cast/eval 経路に通し、**datetime 系を第一実装**、他 lane（int/decimal 等の
+   失敗）も同じ配管で広げる方向。**serial==parallel で同一 ErrorEvent**（BUG-F と同じ作法）。
+3. **式位置の明示書式を never-silent エラー化**（parser `lib.rs:1247-1260` parse_cast）:
+   式/cast 位置で `:datetime("fmt")`（`last_dt_fmt` が Some）を検出したら黙って捨てず
+   **parse エラー**にし「書式は（reader）スキーマで宣言せよ」と案内。**reader スキーマ位置の
+   `(ts:datetime("fmt"))` は従来どおり有効（不変）**。
+4. **`Expr::Cast` の構造は不変**（`format` を足さない）→ `to_source` も現状 `{expr}:{ty}` の
+   まま、round-trip 不変。
+
+### never-silent 配管（実装スケッチ）— 唯一の非自明点
+現状 `cast_value`/`cast_column` は error channel を持たない純粋関数。失敗を operator まで
+運んで raise する機構を最小で足す:
+- **cast 関数に失敗カウンタを out-param で渡す**: `cast_column(col, ty, fails: &mut u64)` /
+  `cast_value(v, ty, fails: &mut u64)`。**非 null 入力がパース/変換失敗 → null（validity=0、
+  continue-first）＋ `*fails += 1`**。null 入力は null のまま（カウントしない）。
+- **列指向経路の配管**: `eval_column` は公開シグネチャを温存し（`fails` を捨てる薄い
+  wrapper）、内部実装 `eval_column_acc(expr, chunk, &mut fails)` が再帰（Cast/Arith/Func）と
+  `cast_column` に `fails` を通す。`ProjectExpr` は `_acc` 版を使い、出力列（alias）ごとに
+  失敗総数を**チャンクをまたいで蓄積**。`cast` 動詞 operator は `cast_column` を直接呼ぶので
+  そのまま蓄積。
+- **finish で一度だけ surface**（chunk-size 独立）: reader の `parse_failures` と同作法で
+  `「N value(s) in '<col>' could not be cast to <type>; set to null」`（`Severity::Recoverable`）。
+- **serial==parallel の契約**: per-row のカウントなので、**並列では各 worker が自分の
+  partition の partial を surface し、その総和が serial の総数に一致**する（既存の never-silent
+  契約＝`parse_failures` / `validate_reject_parallel_summary_counts_sum_to_total` と同じ。
+  単一の同一イベントではなく「総和一致」）。**受入テストはこの総和一致を最初に固定**して
+  under-build を防ぐ。
+- スカラ経路（`|?` 述語の cast）は本スケッチと同じ `_acc` 配管で `eval`/`eval_predicate` に
+  拡張する（datetime を第一実装、同配管で他 lane・述語へ広げる）。
+
+### 挙動変更の明示（doc 必須）
+`str→datetime`/`date`/`time` の式 cast 結果が「0/誤値 → 正しいパース値」に変わるのは
+**壊れの修正**だが、**既存挙動の変更**として GUIDE/CHANGELOG に明記する。byte-identity は
+serial==parallel==chunk-size で維持（行単位・決定的）。
+
+### 受入テスト
+- 式 cast の str→datetime/date/time パース（**int/str 両入力・chunk-size 独立・byte-identity**）。
+- 失敗の **null＋surface**（**serial==parallel 同一 ErrorEvent**）。
+- **式位置の明示書式 `:datetime("fmt")` が never-silent エラー**。
+- **reader スキーマ位置 `(ts:datetime("fmt"))` は不変**（既存テスト緑）。
+
+### 後続（tracked・スライスA 範囲外）
+- **スライスB（任意）**: named schema 再利用 = 既存 §25.4 flow-reuse ＋ `as Sale` の小追加
+  （`type` 新設なし）。
+- **最適化メモ**: source 直後の cast を codec schema に畳む **pushdown**（式経路を exact text
+  path に縮約＝速度差を消す）。byte-identity 不変・before/after 必須。

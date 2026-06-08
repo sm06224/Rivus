@@ -7,6 +7,19 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **Expression `cast` to a temporal lane now parses a string source (BUG-D) —
+  behavior change.** `cast ts:datetime` / `(ts:datetime) as t` (and `date`/`time`)
+  previously reinterpreted a string as raw epoch ticks (`"2026-06-01"` → epoch-0,
+  `"260601120000"` → year 10228). It now *parses* the string with the auto
+  formats — the same meaning as the reader's exact path, so `cast ts:datetime` is
+  byte-identical to declaring `(ts:datetime)` at `open` (only the path/speed
+  differs). A non-null cell that won't parse becomes `null` (continue-first) and
+  the per-column count is surfaced once on finish (never-silent; in parallel the
+  per-worker counts sum to the serial total). A **parse format stays
+  schema-only**: `cast ts:datetime("fmt")` is now a never-silent parse error
+  ("declare the format in the schema"); the reader form `(ts:datetime("fmt"))` is
+  unchanged. `Expr::Cast` is structurally unchanged, so `to_source` round-trips as
+  before. (`docs/design/23-datetime-and-reshape.md` §23.6)
 - **`substr` is now 1-based (SQL/DuckDB convention) — breaking.** `substr(s, 1)`
   is the first char (was 0-based, which was misleading). The mapping is lenient
   — `start <= 1` clamps to the beginning — so an old `substr(s, 0, n)` call still

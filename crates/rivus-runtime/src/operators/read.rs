@@ -235,6 +235,10 @@ impl Operator for Read {
             let handle = self.provenance.source(uri);
             for cols in chunks {
                 let len = cols.first().map(|c| c.len()).unwrap_or(0);
+                // union-by-name widening is a lane coercion (int⊆float⊆…⊆str), not
+                // a user temporal cast — a parse never fails here, so the cast
+                // failure count is discarded.
+                let mut _widen_fails = 0u64;
                 let rcols: Vec<Column> = union
                     .iter()
                     .map(|f| {
@@ -242,12 +246,15 @@ impl Operator for Read {
                             str_repeat(uri, len)
                         } else {
                             match schema.index_of(&f.name) {
-                                Some(i) => eval::cast_column(cols[i].clone(), f.dtype),
+                                Some(i) => {
+                                    eval::cast_column(cols[i].clone(), f.dtype, &mut _widen_fails)
+                                }
                                 // Missing column in this file → an all-null column
                                 // of the union type (continue-first).
                                 None => eval::cast_column(
                                     eval::column_from_values(vec![Value::Null; len]),
                                     f.dtype,
+                                    &mut _widen_fails,
                                 ),
                             }
                         }
