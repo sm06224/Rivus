@@ -69,6 +69,16 @@ straight into a shell pipeline:
 rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' | sort
 ```
 
+### Running flows on Windows (quoting & encoding)
+
+- An inline `-c` flow that contains double quotes — e.g. a format string like
+  `datetime("yyMMddHHmmss")` — can break in `cmd`/PowerShell, which strips the
+  inner `"`. The parser then sees `datetime(yyMMddHHmmss)` and reports `expected a
+  quoted format string`. **Put the flow in a file and run `rivus run flow.rivus`**
+  instead of `-c` (or escape the quotes for your shell).
+- A leading UTF-8 **BOM on the flow script is fine** — Rivus strips it. (Data CSVs
+  keep their own BOM regardless.)
+
 ---
 
 ## 3. Sources (the head of a flow)
@@ -90,6 +100,12 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 Format detection deliberately **does not over-trust the extension**: use
 `open data.dat as json` when the extension lies, or the `readcsv`/`readjson`
 verbs when you want it obvious at a glance.
+
+**Headerless files: names + types together.** `open data.csv noheader (id:int
+name:str age:int)` gives a headerless file both column **names and types** in one
+schema (the first line is read as data). A schema *without* `noheader` treats the
+first line as a **header and consumes it** — so add `noheader` when the first
+line is already data, or you'll lose that row.
 
 **Supported formats today:** CSV (with quoted-field handling), JSON Lines
 (one object per line) and JSON arrays (`[ {...}, {...} ]`), and fixed-width

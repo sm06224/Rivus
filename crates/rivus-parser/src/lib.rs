@@ -33,6 +33,11 @@ use rivus_ir::{
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
+    // Strip a leading UTF-8 BOM (BUG-E): editors on Windows often save a flow
+    // script with a `\u{FEFF}` prefix, which would otherwise lex as an
+    // `unexpected character` on line 1. The flow *script* is BOM-tolerant; data
+    // files handle their own BOM in the reader.
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let (toks, comments) = Lexer::new(src).tokenize().map_err(RivusError::Parse)?;
     let mut p = Parser {
         toks,
@@ -1929,6 +1934,15 @@ mod tests {
             assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
         }
         assert!(parse("R:\n ls \"*.csv\"\n read as toml\n;").is_err());
+    }
+
+    #[test]
+    fn leading_bom_on_flow_script_is_stripped() {
+        // BUG-E: a UTF-8 BOM (`\u{FEFF}`) at the start of a flow script must not
+        // break parsing (Windows editors add it). The script is BOM-tolerant.
+        let plain = "F:\n open a.csv\n |> id\n;";
+        let g = parse(&format!("\u{feff}{plain}")).expect("BOM-prefixed flow must parse");
+        assert_eq!(g.to_source(), parse(plain).unwrap().to_source());
     }
 
     #[test]
