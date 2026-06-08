@@ -549,6 +549,38 @@ fn sort_orders_rows_chunk_size_independent() {
 }
 
 #[test]
+fn sort_nulls_last_asc_first_desc_byte_identical() {
+    // PERF-G pins the comparator hoist's null rule (§26.2b): nulls sort **last**
+    // on ascending; descending reverses the whole order so nulls sort **first**;
+    // ties keep source order (stable). Must hold for every chunk size.
+    let data = "id,v\n1,30\n2,\n3,10\n4,\n5,20\n".as_bytes(); // v is null on rows 2,4
+    let f = TempCsv(gendata::write_temp_bytes("stress_sort_null", data));
+    let p = f.0.display();
+    for cs in [1usize, 2, 64] {
+        // asc: 10,20,30 (ids 3,5,1) then nulls (ids 2,4 in source order).
+        let asc = run_src(
+            &format!("S:\n open {p} (id:int v:int)\n sort v\n |> id\n;"),
+            cs,
+        );
+        assert_eq!(
+            collect_i64(&asc, "S", "id"),
+            vec![3, 5, 1, 2, 4],
+            "nulls last on asc, stable @cs={cs}"
+        );
+        // desc: nulls first (ids 2,4 stable), then 30,20,10 (ids 1,5,3).
+        let desc = run_src(
+            &format!("S:\n open {p} (id:int v:int)\n sort v desc\n |> id\n;"),
+            cs,
+        );
+        assert_eq!(
+            collect_i64(&desc, "S", "id"),
+            vec![2, 4, 1, 5, 3],
+            "nulls first on desc, stable @cs={cs}"
+        );
+    }
+}
+
+#[test]
 fn multi_key_sort_orders_by_each_key_chunk_size_independent() {
     // `sort team score desc` orders by team ascending, then by score descending
     // within a team. Build rows with deliberate team ties so the secondary key
