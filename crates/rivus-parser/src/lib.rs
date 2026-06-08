@@ -29,7 +29,7 @@ use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value
 use rivus_ir::{
     Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery, Disposition, EdgeKind, Endian,
     Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
-    Provenance, Transport,
+    Provenance, ReadFmt, Transport,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -441,6 +441,28 @@ impl Parser {
                     let node = self.g.add_node(Op::Take { n });
                     self.g.add_edge(current, node, EdgeKind::Stream);
                     current = node;
+                }
+                // `read [as csv|tsv|jsonl] [with source|filename]` — open+decode
+                // every handle in the upstream Resource column, union-by-name
+                // (§28.3, slice 3c). `as FMT` forces a format; else per extension.
+                Tok::Word(w) if w == "read" => {
+                    self.bump();
+                    let fmt = if self.peek_is_word("as") {
+                        self.bump();
+                        let f = self.word()?;
+                        Some(match f.to_ascii_lowercase().as_str() {
+                            "csv" => ReadFmt::Csv,
+                            "tsv" => ReadFmt::Tsv,
+                            "jsonl" | "ndjson" | "json" => ReadFmt::Jsonl,
+                            _ => return Err(self.err(format!("read: unknown format '{f}'"))),
+                        })
+                    } else {
+                        None
+                    };
+                    let provenance = self.parse_provenance()?;
+                    let n = self.g.add_node(Op::Read { fmt, provenance });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
                 }
                 // `sort KEY [asc|desc] [KEY [asc|desc] ...]` — order by one or
                 // more keys, each with its own direction (default ascending).
@@ -1523,6 +1545,10 @@ fn is_keyword(w: &str) -> bool {
             | "readbin"
             | "readcsv"
             | "readjson"
+            | "read"
+            | "ls"
+            | "gci"
+            | "dir"
             | "as"
             | "noheader"
             | "writecsv"
@@ -1872,6 +1898,37 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn read_verb_parses_and_round_trips() {
+        // `read [as FMT] [with …]` (§28.3, slice 3c) parses to `Op::Read` and
+        // round-trips; an unknown format is an explicit error.
+        for (src, want) in [
+            ("R:\n ls \"*.csv\"\n read\n;", None),
+            (
+                "R:\n ls \"*.csv\"\n read as csv with source\n;",
+                Some(ReadFmt::Csv),
+            ),
+            (
+                "R:\n ls \"*.x\"\n read as jsonl with filename\n;",
+                Some(ReadFmt::Jsonl),
+            ),
+        ] {
+            let g = parse(src).unwrap();
+            let fmt = g
+                .nodes
+                .iter()
+                .find_map(|n| match &n.op {
+                    Op::Read { fmt, .. } => Some(*fmt),
+                    _ => None,
+                })
+                .expect("read op");
+            assert_eq!(fmt, want, "fmt for {src}");
+            let s = g.to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        }
+        assert!(parse("R:\n ls \"*.csv\"\n read as toml\n;").is_err());
     }
 
     #[test]

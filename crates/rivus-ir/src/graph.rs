@@ -408,6 +408,27 @@ impl Codec {
     }
 }
 
+/// Format selector for the multi-file `read` (design §28.3, slice 3c). `None`
+/// (no `as FMT`) infers per file from its extension; otherwise every file is
+/// forced to this format. `Tsv` is CSV with a tab delimiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFmt {
+    Csv,
+    Tsv,
+    Jsonl,
+}
+
+impl ReadFmt {
+    /// The `as …` word for `to_source` (and the `read as …` parser).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadFmt::Csv => "csv",
+            ReadFmt::Tsv => "tsv",
+            ReadFmt::Jsonl => "jsonl",
+        }
+    }
+}
+
 /// A flow operator. One enum spanning sources, transforms, fan-out/in and
 /// sinks — because in Rivus they are all just nodes in the same graph.
 #[derive(Debug, Clone)]
@@ -431,6 +452,19 @@ pub enum Op {
         discovery: Discovery,
         transport: Transport,
         codec: Codec,
+        provenance: Provenance,
+    },
+    /// `read [as FMT] [with source|filename]` — discovery-as-flow's reader stage
+    /// (design §28.3, slice 3c): consume a **`Resource` column** from upstream
+    /// (default `path`, else the first `Resource`-typed column) and open+decode
+    /// every handle, concatenating the files **by name** (union-by-name) in
+    /// deterministic uri order. `fmt` forces a format for every file; `None`
+    /// infers per file from its extension. `provenance` attaches each file's
+    /// handle to its rows (so `source.uri` / `filename` work per row). The
+    /// supplier is source-agnostic: `ls`, a manifest (`resource(col)`), or a
+    /// computed path all feed it (§28.3).
+    Read {
+        fmt: Option<ReadFmt>,
         provenance: Provenance,
     },
     /// `stream X` — replay of a named flow (and, internally, a reference edge).
@@ -677,6 +711,7 @@ impl Op {
                 Codec::Discover { .. } => "ls",
                 Codec::Csv { .. } | Codec::Jsonl => "open",
             },
+            Op::Read { .. } => "read",
             Op::StreamRef { .. } => "stream",
             Op::Filter { .. } => "filter",
             Op::Validate { .. } => "validate",
@@ -806,6 +841,14 @@ impl Op {
                         s
                     }
                 }
+            }
+            Op::Read { fmt, provenance } => {
+                let mut s = "read".to_string();
+                if let Some(f) = fmt {
+                    s.push_str(&format!(" as {}", f.as_str()));
+                }
+                s.push_str(provenance.modifier());
+                s
             }
             Op::StreamRef { name } => format!("stream {name}"),
             Op::Filter { pred } => format!("|? {pred}"),
