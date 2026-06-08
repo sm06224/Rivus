@@ -1184,5 +1184,46 @@ Measured (1 M rows, 23 MB CSV, release, best of 3; **sort-only** = wall − the
 The remaining cost is dominated by **cache misses on random row access**
 (`v[a]`/`v[b]` into the full column), which the hoist does not change. The next
 lever — extracting each key into contiguous `(key, idx)` pairs and sorting those
-(cache-coherent, monomorphic, no dyn call) — is tracked as a follow-up
-(`docs/TEST-AUDIT.md` PERF-G), to be landed with its own before/after.
+(cache-coherent, monomorphic, no dyn call) — landed as the decorate-sort below.
+
+### `sort` decorate-sort (PERF-G follow-up) — sort contiguous `(key, idx)` pairs
+
+The hoist removed the per-compare dispatch but the comparator still chased random
+rows — `v[idx[a]]`/`v[idx[b]]` into the **full** column on every one of the
+~`n·log n` comparisons — so the dominant cost stayed cache misses. The follow-up
+**decorates**: for a single key (the common case, and every sort benchmark) it
+extracts the key into a contiguous `Vec<(key, idx)>` and sorts *that*. The keys
+travel **with** their indices, so the sort reads dense, cache-local key bytes
+(and the closure is monomorphic in the lane type — no dyn call). The multi-key
+path keeps the hoisted comparator unchanged (a composite decorated key needs a
+memcomparable encoding per lane, deferred so byte-identity stays certain there).
+
+**Byte-identical** — same `slice::sort_by` (stable), the same comparator return
+values for the same key values, and the same initial `0..n` order, so the
+algorithm makes the identical decisions and yields the identical permutation.
+Verified by diffing full 1M-row outputs of the pre-/post-follow-up binaries
+across every lane (int / f64 / str), the error-heavy (quarantine) and mixed-type
+regimes, **and** the unchanged multi-key path — all byte-identical, including the
+NaN→Equal inconsistent-order artifact.
+
+Measured (1 M rows, release, **best of 7 interleaved**; `before` = the PERF-G
+hoist above; **sort-only** = wall − the read+save baseline, which is identical in
+both binaries so the wall delta is purely the sort):
+
+| regime | key | before | after | Δ sort-only |
+|---|---|---:|---:|---:|
+| large (`clean`)      | `id` (int, pre-sorted) | 0.56 s | 0.55 s | ≈ flat |
+| large (`clean`)      | `age` (int, random)    | 0.71 s | 0.66 s | **−7 %** |
+| large (`clean`)      | `score` (f64, random)  | 0.91 s | 0.76 s | **−17 %** |
+| large (`clean`)      | `name` (str)           | 0.79 s | 0.72 s | **−8 %** |
+| error-heavy (0.3)    | `score` (f64)          | 0.60 s | 0.51 s | **−14 %** |
+| error-heavy (0.3)    | `name` (str)           | 0.52 s | 0.51 s | −3 % |
+| mixed-type (0.2)     | `value` (str fallback) | 0.41 s | 0.38 s | **−8 %** |
+| mixed-type (0.2)     | `id` (int, pre-sorted) | 0.24 s | 0.25 s | ≈ flat |
+
+The win tracks the comparison/cache cost: biggest on the random **f64** key
+(−14…−17 %), solid on **str** and random **int** (−7…−8 %). The only non-win is a
+**pre-sorted integer** column (`id` = `0,1,2,…`): the sort detects the existing
+run and does almost no work, so there is nothing for the extraction to amortise —
+it lands within noise (±3 %). On this shared container the absolute numbers carry
+a few-percent run-to-run jitter; the interleaved before/after cancels the drift.

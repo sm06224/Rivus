@@ -86,9 +86,17 @@ a null branch only when needed). **Byte-identity preserved** (same order,
 nulls-last/§26.2b, desc-reverses-the-whole-order, stable) — pinned by
 `sort_nulls_last_asc_first_desc_byte_identical` and the existing chunk-size
 sort tests. Sort-only Δ ≈ −6…−9 % (`docs/BENCHMARKS.md`).
-**Follow-up (tracked):** the dominant cost is cache misses on random row access;
-extract each key into contiguous `(key, idx)` pairs and sort those (monomorphic,
-cache-coherent, no dyn call) for the bigger win — its own PR with before/after.
+**Follow-up: DONE (decorate-sort).** The dominant cost was cache misses on random
+row access; the single-key path now extracts the key into a contiguous
+`Vec<(key, idx)>` and sorts *that* (monomorphic, cache-coherent, no dyn call).
+Sort-only Δ on top of the hoist: **−17 % f64**, −7…−8 % random int / str, ≈ flat
+only on a pre-sorted int key (`docs/BENCHMARKS.md`). Byte-identity verified by
+diffing full 1M-row outputs of the pre-/post binaries across every lane, the
+error-heavy + mixed regimes, and the (unchanged) multi-key path; pinned by
+`sort_f64_lane_with_nulls_orders_ascending_nulls_last` and
+`sort_f64_with_nan_is_chunk_size_independent` alongside the existing sort tests.
+Multi-key keeps the hoisted comparator (a composite memcomparable key is a
+further follow-up).
 
 ## 2. Coverage map (GUIDE feature → tests → status)
 
