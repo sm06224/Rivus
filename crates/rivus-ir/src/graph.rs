@@ -739,22 +739,28 @@ impl Op {
         }
     }
 
-    /// Does this op **buffer** its input and emit mainly on `finish` (so it can
-    /// look "stuck" mid-run while it accumulates rows)? The live dashboard uses
-    /// this to show a "buffering N rows" working state instead of a stalled-
-    /// looking `0` for a blocking operator (UX-J). The display only activates
-    /// when the op is actually accumulating (`rows_in > rows_out && !finished`),
-    /// so a streaming op (e.g. `distinct` first-occurrence) never false-shows it.
+    /// Does this op **buffer/accumulate its whole input and emit only on
+    /// `finish`** (so it shows `rows_out == 0` mid-run and can look "stuck" while
+    /// it works)? The live dashboard uses this to show a "buffering N rows"
+    /// working state for such a node (UX-J). The indicator only lights when the
+    /// op is actually accumulating (`rows_in > rows_out && !finished`).
+    ///
+    /// **Streaming ops are excluded** even when stateful: `distinct` emits each
+    /// first-occurrence immediately, `ffill` carries forward and emits per chunk,
+    /// a constant `fill` rewrites in place — their `rows_out` tracks `rows_in`, so
+    /// they never look stuck. Audited against the operators: `sort` / `group` /
+    /// `describe` / `join` (buffers both sides) and the `fill` variants that need
+    /// the whole input first — `bfill` (replays backward on finish) and
+    /// `mean`/`median` (need the global statistic) — emit only on `finish`.
     pub fn is_blocking(&self) -> bool {
-        matches!(
-            self,
-            Op::Sort { .. }
-                | Op::GroupBy { .. }
-                | Op::Distinct { .. }
-                | Op::Describe
-                | Op::Join { .. }
-                | Op::Fill { .. }
-        )
+        match self {
+            Op::Sort { .. } | Op::GroupBy { .. } | Op::Describe | Op::Join { .. } => true,
+            Op::Fill { method, .. } => matches!(
+                method,
+                FillMethod::Bfill | FillMethod::Mean | FillMethod::Median
+            ),
+            _ => false,
+        }
     }
 
     /// Render this op as the pipeline fragment that produced it.

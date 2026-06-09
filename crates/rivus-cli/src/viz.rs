@@ -621,4 +621,39 @@ mod ux_j_tests {
             "script text missing: {json}"
         );
     }
+
+    // UX-J review fix: only ops that buffer their whole input and emit on finish
+    // are "blocking". A streaming op (distinct, ffill, constant fill) must NOT
+    // false-show a "buffering" state.
+    #[test]
+    fn blocking_flag_excludes_streaming_ops() {
+        let blocks = |src: &str| -> bool {
+            let g = rivus_parser::parse(src).expect("parse");
+            render_graph_json(&g).contains("\"blocking\":true")
+        };
+        // Streaming (stateful but emits as it goes) → not blocking.
+        assert!(
+            !blocks("S:\n open d.csv\n distinct id\n;"),
+            "distinct streams"
+        );
+        assert!(
+            !blocks("S:\n open d.csv\n fill name ffill\n;"),
+            "ffill streams"
+        );
+        assert!(
+            !blocks("S:\n open d.csv\n |? age >= 1\n;"),
+            "filter streams"
+        );
+        // Buffer-the-whole-input → blocking.
+        assert!(blocks("S:\n open d.csv\n sort id\n;"), "sort blocks");
+        assert!(blocks("S:\n open d.csv\n |# id sum:age\n;"), "group blocks");
+        assert!(
+            blocks("S:\n open d.csv\n fill name bfill\n;"),
+            "bfill blocks"
+        );
+        assert!(
+            blocks("S:\n open d.csv\n fill age mean\n;"),
+            "mean fill blocks"
+        );
+    }
 }
