@@ -1058,6 +1058,11 @@ struct Flags {
     all_datetime: bool,
     all_date: bool,
     all_time: bool,
+    /// Move-to-front hint for the datetime probe (#135): the `AUTO_FORMATS`
+    /// index that matched the previous cell, tried first next time. Per-`Flags`
+    /// (hence per-worker during parallel inference); `merge` leaves it inert
+    /// since it only affects trial order, never the inferred type.
+    dt_hint: usize,
 }
 
 impl Flags {
@@ -1070,6 +1075,7 @@ impl Flags {
             all_datetime: true,
             all_date: true,
             all_time: true,
+            dt_hint: 0,
         }
     }
 
@@ -1083,7 +1089,10 @@ impl Flags {
         // columns clear these on their first cell (a number isn't a date/time),
         // and `resolve` gives numeric precedence, so an integer is never
         // mis-inferred as a date. Cheap: a flag, once false, is never re-probed.
-        if self.all_datetime && rivus_core::DateTime::parse_auto(c, TimeUnit::Sec).is_none() {
+        if self.all_datetime
+            && rivus_core::DateTime::parse_auto_sticky(c, TimeUnit::Sec, &mut self.dt_hint)
+                .is_none()
+        {
             self.all_datetime = false;
         }
         if self.all_date && rivus_core::Date::parse(c).is_none() {
@@ -1213,13 +1222,22 @@ impl DtSpec {
     /// default-on-parse-failure the int/float/decimal lanes use, now equally
     /// observable (continue-first + Observable First; design 23, #80).
     #[inline]
-    fn parse_opt(&self, cell: &str) -> Option<i64> {
+    fn parse_opt(&self, cell: &str, hint: &mut usize) -> Option<i64> {
         // Normalise a trailing ISO timezone / fractional second (#93) so the
         // reader accepts the same variants as `DateTime::parse_auto`. For an
         // explicit fixed-width format the digit-only cell is unchanged.
         let (s, offset_secs) = DateTime::normalize_iso(cell);
-        for fmt in &self.formats {
-            if let Some(dt) = DateTime::parse_with_format(s, fmt, self.unit) {
+        // Move-to-front: try the format that matched the previous cell of this
+        // column first, then the rest in order. The auto list is the mutually
+        // disjoint `AUTO_FORMATS`, so the trial order is perf-only — byte
+        // identical, with a full fallback on a miss (#135). `hint` lives in the
+        // per-column `Lane` (one per worker), so serial == parallel holds. An
+        // explicit single-format spec has `formats.len() == 1` → hint is inert.
+        let n = self.formats.len();
+        let h = (*hint).min(n - 1);
+        for i in std::iter::once(h).chain((0..n).filter(|&i| i != h)) {
+            if let Some(dt) = DateTime::parse_with_format(s, &self.formats[i], self.unit) {
+                *hint = i;
                 return Some(dt.ticks - offset_secs * self.unit.per_sec());
             }
         }
@@ -1235,8 +1253,11 @@ enum Lane {
     /// Exact fixed-point lane: unscaled i128 values at a fixed column scale.
     Dec(Vec<i128>, u8),
     /// Datetime lane: epoch ticks at the spec's unit, parsed via the spec's
-    /// candidate formats (design 23).
-    DateTime(Vec<i64>, Arc<DtSpec>),
+    /// candidate formats (design 23). The trailing `usize` is the per-column
+    /// move-to-front parse hint (#135): the index of the format that matched the
+    /// previous cell, tried first next time. Lives here (one per `ColBuilder`,
+    /// hence one per worker) so the sticky state is never shared across threads.
+    DateTime(Vec<i64>, Arc<DtSpec>, usize),
     /// Duration lane: signed tick spans at a fixed unit, parsed from the human
     /// `[-][Nd ]HH:MM:SS[.frac]` form (design 23 / #57).
     Duration(Vec<i64>, TimeUnit),
@@ -1281,6 +1302,7 @@ impl ColBuilder {
             DataType::DateTime { unit } => Lane::DateTime(
                 Vec::with_capacity(cap),
                 dt_spec.unwrap_or_else(|| Arc::new(DtSpec::auto(unit))),
+                0,
             ),
             DataType::Duration { unit } => Lane::Duration(Vec::with_capacity(cap), unit),
             DataType::Date => Lane::Date(Vec::with_capacity(cap)),
@@ -1365,7 +1387,7 @@ impl ColBuilder {
             },
             // Datetime text → epoch ticks; a malformed non-empty cell → null,
             // reported on the error stream, matching the other lanes (#80).
-            Lane::DateTime(v, spec) => match spec.parse_opt(cell) {
+            Lane::DateTime(v, spec, hint) => match spec.parse_opt(cell, hint) {
                 Some(ticks) => {
                     v.push(ticks);
                     (true, false)
@@ -1433,7 +1455,7 @@ impl ColBuilder {
                 unscaled: std::mem::take(v),
                 scale: *scale,
             }),
-            Lane::DateTime(v, spec) => ColumnData::DateTime(DtColumn {
+            Lane::DateTime(v, spec, _) => ColumnData::DateTime(DtColumn {
                 ticks: std::mem::take(v),
                 unit: spec.unit,
             }),

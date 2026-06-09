@@ -662,11 +662,17 @@ fn cast_str_column_temporal(
         }};
     }
     match ty {
-        DataType::DateTime { unit } => parse_lane!(
-            0i64,
-            |c| rivus_core::DateTime::parse_auto(c, unit).map(|d| d.ticks),
-            |ticks| ColumnData::DateTime(rivus_core::DtColumn { ticks, unit })
-        ),
+        DataType::DateTime { unit } => {
+            // Per-column move-to-front hint (#135): byte-identical, but a uniform
+            // non-ISO column parses each cell after the first in one attempt.
+            // Local to this cast (one column at a time), so it is thread-safe.
+            let mut hint = 0usize;
+            parse_lane!(
+                0i64,
+                |c| rivus_core::DateTime::parse_auto_sticky(c, unit, &mut hint).map(|d| d.ticks),
+                |ticks| ColumnData::DateTime(rivus_core::DtColumn { ticks, unit })
+            )
+        }
         DataType::Date => parse_lane!(
             0i32,
             |c| rivus_core::Date::parse(c).map(|d| d.epoch_day),

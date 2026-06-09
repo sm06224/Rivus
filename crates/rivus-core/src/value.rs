@@ -355,16 +355,49 @@ impl DateTime {
     ///
     /// [`AUTO_FORMATS`]: DateTime::AUTO_FORMATS
     pub fn parse_auto(s: &str, unit: TimeUnit) -> Option<DateTime> {
+        // Stateless callers (scalar casts, comparison coercion) start every
+        // cell from the canonical order; column-level loops thread a `hint`
+        // through `parse_auto_sticky` for the move-to-front fast path.
+        let mut hint = 0;
+        Self::parse_auto_sticky(s, unit, &mut hint)
+    }
+
+    /// Like [`parse_auto`] but tries `AUTO_FORMATS[*hint]` **first** — the
+    /// format that matched the previous cell of this column — then the rest in
+    /// canonical order, updating `*hint` to whichever index matched. For a
+    /// uniform non-ISO column (e.g. `yyMMddHHmmss`) every cell after the first
+    /// parses in a single attempt instead of re-paying the failed trials for
+    /// the leading ISO formats; the dominant real-world case is non-ISO, so
+    /// this is a constant cost on every datetime flow today (see #135).
+    ///
+    /// **Byte-identical to [`parse_auto`].** [`AUTO_FORMATS`] is mutually
+    /// disjoint — separators and full-consumption digit counts make at most one
+    /// entry match any input (pinned by the `auto_formats_disjoint` test) — so
+    /// reordering the trial cannot change *which* format matches, only how many
+    /// attempts it takes. On a miss it still scans every format (full
+    /// fallback), so a mixed-format column degrades to the canonical behaviour,
+    /// never to wrong or dropped values. Callers hold one `hint` per column per
+    /// worker (never shared across threads), so serial == parallel is preserved.
+    ///
+    /// [`AUTO_FORMATS`]: DateTime::AUTO_FORMATS
+    pub fn parse_auto_sticky(s: &str, unit: TimeUnit, hint: &mut usize) -> Option<DateTime> {
         let s = s.trim();
         // #93: accept ISO variants the base formats don't encode — a trailing
         // timezone (`Z` or `±HH:mm`, normalised to UTC) and fractional seconds
         // (truncated to the column's unit; the MVP `Sec` lane drops them; full
         // sub-second preservation pairs with the datetime-unit work in #58).
         let (base, offset_secs) = Self::normalize_iso(s);
-        Self::AUTO_FORMATS
-            .iter()
-            .find_map(|f| Self::parse_with_format(base, f, unit))
-            .map(|dt| DateTime::new(dt.ticks - offset_secs * unit.per_sec(), unit))
+        let n = Self::AUTO_FORMATS.len();
+        let h = (*hint).min(n - 1);
+        std::iter::once(h)
+            .chain((0..n).filter(move |&i| i != h))
+            .find_map(|i| {
+                Self::parse_with_format(base, Self::AUTO_FORMATS[i], unit).map(|dt| (i, dt))
+            })
+            .map(|(i, dt)| {
+                *hint = i;
+                DateTime::new(dt.ticks - offset_secs * unit.per_sec(), unit)
+            })
     }
 
     /// Strip a trailing ISO-8601 timezone (`Z` / `±HH:mm`) and fractional-second
@@ -1559,6 +1592,99 @@ mod decimal_tests {
         assert!(DateTime::parse_with_format("2020-01-01x", "yyyy-MM-dd", TimeUnit::Sec).is_none());
         // Non-digit where a digit is required.
         assert!(DateTime::parse_with_format("20-0a-01", "yy-MM-dd", TimeUnit::Sec).is_none());
+    }
+
+    /// Inputs exercising every `AUTO_FORMATS` shape plus adversarial
+    /// near-misses, shared by the move-to-front pins below (#135).
+    fn auto_format_corpus() -> Vec<String> {
+        let mut v: Vec<String> = [
+            // One valid sample per AUTO_FORMATS entry (all six shapes).
+            "2024-06-03T14:30:00",
+            "2024-06-03 14:30:00",
+            "2024-06-03",
+            "20240603143000",
+            "240603143000",
+            "20240603",
+            // ISO variants normalised before the trial (#93).
+            "2024-06-03T14:30:00Z",
+            "2024-06-03T14:30:00.123",
+            "2024-06-03T14:30:00+09:00",
+            "  2024-06-03T14:30:00  ", // surrounding whitespace
+            // Two-digit-year pivot boundary (00–68 → 20xx, 69–99 → 19xx).
+            "680101000000",
+            "690101000000",
+            // Near-misses / garbage → None for every format.
+            "",
+            "not-a-date",
+            "2024-13-03", // month out of range
+            "2024-06-32", // day out of range
+            "2024/06/03", // wrong separator
+            "99999999",   // 8 digits, invalid MMdd
+            "12",
+            "2024-06-03T14:30", // truncated
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // A deterministic sweep of pure-digit strings at each length the formats
+        // care about (6/8/10/12/14), to surface any cross-format ambiguity.
+        for len in [6usize, 8, 10, 12, 14] {
+            for seed in [0u64, 1, 7, 13, 42] {
+                let mut s = String::new();
+                let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(len as u64);
+                for _ in 0..len {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    s.push((b'0' + ((x >> 33) % 10) as u8) as char);
+                }
+                v.push(s);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn auto_formats_disjoint() {
+        // Byte-identity of the move-to-front trial (#135) rests on this: at most
+        // one AUTO_FORMATS entry may match any input, so reordering the trial
+        // cannot change which format wins. If a future format overlaps an
+        // existing one this fails loudly — keep AUTO_FORMATS mutually disjoint
+        // (separators + full-consumption digit counts; design 23).
+        for unit in [TimeUnit::Sec, TimeUnit::Milli] {
+            for s in auto_format_corpus() {
+                let (base, _) = DateTime::normalize_iso(s.trim());
+                let matches = DateTime::AUTO_FORMATS
+                    .iter()
+                    .filter(|f| DateTime::parse_with_format(base, f, unit).is_some())
+                    .count();
+                assert!(
+                    matches <= 1,
+                    "ambiguous input {s:?} matched {matches} formats"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_auto_sticky_byte_identical() {
+        // The move-to-front parse (#135) must equal the canonical first-match
+        // parse for EVERY starting hint — the sticky-vs-not and serial==parallel
+        // byte-identity guarantee. Starting hints past the end exercise the
+        // defensive clamp; on a match the hint must land in range so the next
+        // cell's fast path is valid.
+        let n = DateTime::AUTO_FORMATS.len();
+        for unit in [TimeUnit::Sec, TimeUnit::Milli] {
+            for s in auto_format_corpus() {
+                let canonical = DateTime::parse_auto(&s, unit);
+                for start in 0..=n + 3 {
+                    let mut hint = start;
+                    let got = DateTime::parse_auto_sticky(&s, unit, &mut hint);
+                    assert_eq!(got, canonical, "input {s:?} start-hint {start}");
+                    if got.is_some() {
+                        assert!(hint < n, "hint {hint} out of range for {s:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
