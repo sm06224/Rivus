@@ -9,6 +9,30 @@ use super::*;
 
 pub(crate) struct Filter {
     pub(crate) pred: Expr,
+    /// Cast failures inside the predicate (BUG-D §23.6) — surfaced once on finish.
+    pub(crate) cast_fails: u64,
+}
+
+/// Surface predicate cast failures once on finish (never-silent, BUG-D §23.6):
+/// a `Str` cast inside a `|?` predicate that won't parse → null (so the row's
+/// comparison is false), counted and reported with the predicate for context.
+/// Per-worker partials sum to the serial total in parallel (cf. `parse_failures`).
+fn surface_pred_cast_fails(n: u64, preds: &[&Expr], ctx: &mut OpCtx) {
+    if n > 0 {
+        let txt = preds
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        ctx.raise(
+            ErrorEvent::new(
+                Severity::Recoverable,
+                ErrorScope::Item,
+                format!("{n} value(s) could not be cast in `|? {txt}`; set to null"),
+            )
+            .at_node(ctx.label.clone()),
+        );
+    }
 }
 
 impl Operator for Filter {
@@ -16,9 +40,14 @@ impl Operator for Filter {
         // Vectorized numeric path when possible; else the row-wise interpreter.
         let keep = match kernel::compile(&[&self.pred], &chunk) {
             Some(plan) => kernel::run(&plan, &chunk),
-            None => (0..chunk.len)
-                .filter(|&row| eval::eval_predicate(&self.pred, &chunk, row))
-                .collect(),
+            None => {
+                let mut f = 0u64;
+                let keep: Vec<usize> = (0..chunk.len)
+                    .filter(|&row| eval::eval_predicate_acc(&self.pred, &chunk, row, &mut f))
+                    .collect();
+                self.cast_fails += f;
+                keep
+            }
         };
         if keep.is_empty() {
             return Vec::new();
@@ -27,6 +56,11 @@ impl Operator for Filter {
             return vec![chunk];
         }
         vec![chunk.gather(&keep)]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        surface_pred_cast_fails(self.cast_fails, &[&self.pred], ctx);
+        Vec::new()
     }
 }
 
@@ -42,14 +76,16 @@ pub(crate) struct Validate {
     pub(crate) disposition: Disposition,
     pub(crate) fails: u64,
     pub(crate) sample: Option<String>,
+    /// Cast failures inside the predicate (BUG-D §23.6) — surfaced once on finish.
+    pub(crate) cast_fails: u64,
 }
 
 impl Validate {
-    fn passing(&self, chunk: &Chunk) -> Vec<usize> {
+    fn passing(&self, chunk: &Chunk, cast_fails: &mut u64) -> Vec<usize> {
         match kernel::compile(&[&self.pred], chunk) {
             Some(plan) => kernel::run(&plan, chunk),
             None => (0..chunk.len)
-                .filter(|&row| eval::eval_predicate(&self.pred, chunk, row))
+                .filter(|&row| eval::eval_predicate_acc(&self.pred, chunk, row, cast_fails))
                 .collect(),
         }
     }
@@ -70,7 +106,9 @@ impl Validate {
 
 impl Operator for Validate {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let keep = self.passing(&chunk);
+        let mut cf = 0u64;
+        let keep = self.passing(&chunk, &mut cf);
+        self.cast_fails += cf;
         let n_fail = chunk.len - keep.len();
         if n_fail == 0 {
             return vec![chunk];
@@ -121,6 +159,9 @@ impl Operator for Validate {
     }
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        // A cast inside the predicate that failed to parse (BUG-D §23.6) is
+        // surfaced too — separately from the validation summary.
+        surface_pred_cast_fails(self.cast_fails, &[&self.pred], ctx);
         // warn/reject surface one Recoverable summary on exhaustion (never silent;
         // halt already raised its fatal). The count is chunk-size independent.
         if self.fails > 0 && !matches!(self.disposition, Disposition::Halt) {
@@ -1264,6 +1305,8 @@ impl Operator for Project {
 pub(crate) struct FilterProject {
     pub(crate) preds: Vec<Expr>,
     pub(crate) fields: Option<Vec<String>>,
+    /// Cast failures inside the predicates (BUG-D §23.6) — surfaced once on finish.
+    pub(crate) cast_fails: u64,
 }
 
 impl Operator for FilterProject {
@@ -1273,13 +1316,18 @@ impl Operator for FilterProject {
         let pred_refs: Vec<&Expr> = self.preds.iter().collect();
         let keep = match kernel::compile(&pred_refs, &chunk) {
             Some(plan) => kernel::run(&plan, &chunk),
-            None => (0..chunk.len)
-                .filter(|&row| {
-                    self.preds
-                        .iter()
-                        .all(|p| eval::eval_predicate(p, &chunk, row))
-                })
-                .collect(),
+            None => {
+                let mut f = 0u64;
+                let keep: Vec<usize> = (0..chunk.len)
+                    .filter(|&row| {
+                        self.preds
+                            .iter()
+                            .all(|p| eval::eval_predicate_acc(p, &chunk, row, &mut f))
+                    })
+                    .collect();
+                self.cast_fails += f;
+                keep
+            }
         };
         if keep.is_empty() {
             return Vec::new();
@@ -1325,5 +1373,11 @@ impl Operator for FilterProject {
         let mut out = Chunk::new(chunk.meta.id, schema, columns);
         out.meta = chunk.meta.clone(); // preserve provenance (id, mode, warnings)
         vec![out]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let refs: Vec<&Expr> = self.preds.iter().collect();
+        surface_pred_cast_fails(self.cast_fails, &refs, ctx);
+        Vec::new()
     }
 }

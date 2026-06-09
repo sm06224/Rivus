@@ -17,10 +17,13 @@ use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func};
 use std::cmp::Ordering;
 
 /// Apply a scalar function to argument values for one row.
-fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
-    let arg = |i: usize| {
+fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut u64) -> Value {
+    // All argument evaluation routes through `arg` so a cast failure anywhere in
+    // an argument increments `fails` (never-silent, BUG-D §23.6). `arg` is FnMut
+    // (it borrows `fails`), so every sub-eval below must go through it.
+    let mut arg = |i: usize| {
         args.get(i)
-            .map(|e| eval(e, chunk, row))
+            .map(|e| eval_acc(e, chunk, row, fails))
             .unwrap_or(Value::Null)
     };
     match func {
@@ -46,10 +49,10 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize) -> Value {
         Func::Substr => {
             let s = arg(0).to_string();
             let start = arg(1).as_f64().unwrap_or(1.0);
-            let take = args
-                .get(2)
-                .map(|e| eval(e, chunk, row).as_f64().unwrap_or(0.0) as usize)
-                .unwrap_or(usize::MAX);
+            let take = match args.get(2) {
+                Some(_) => arg(2).as_f64().unwrap_or(0.0) as usize,
+                None => usize::MAX,
+            };
             Value::Str(substr_1based(&s, start, take))
         }
         Func::Like => {
@@ -310,10 +313,9 @@ fn regex_literal(args: &[Expr]) -> Option<&str> {
 
 /// Columnar `regexp` with a literal pattern: compile once, test every row.
 #[cfg(feature = "regex")]
-fn regexp_column(args: &[Expr], chunk: &Chunk) -> Column {
+fn regexp_column(args: &[Expr], chunk: &Chunk, fails: &mut u64) -> Column {
     let pat = regex_literal(args).unwrap_or("");
-    let mut _f = 0u64; // a cast nested in a regex arg parses; surfacing is the |? follow-up
-    let col = eval_column(&args[0], chunk, &mut _f);
+    let col = eval_column(&args[0], chunk, fails);
     with_regex(pat, |re| match re {
         Some(re) => Column::bool(
             (0..chunk.len)
@@ -326,7 +328,7 @@ fn regexp_column(args: &[Expr], chunk: &Chunk) -> Column {
 }
 
 #[cfg(not(feature = "regex"))]
-fn regexp_column(_args: &[Expr], chunk: &Chunk) -> Column {
+fn regexp_column(_args: &[Expr], chunk: &Chunk, _fails: &mut u64) -> Column {
     Column::bool(vec![false; chunk.len])
 }
 
@@ -772,18 +774,19 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
                 | Func::Second
                 | Func::Weekday => Column::i64(
                     (0..n)
-                        .map(|r| to_i64(call_func(*func, args, chunk, r)))
+                        .map(|r| to_i64(call_func(*func, args, chunk, r, fails)))
                         .collect(),
                 ),
                 // `trunc` stays on the datetime lane (truncated ticks, same unit).
                 Func::Trunc => {
-                    let vals: Vec<Value> =
-                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    let vals: Vec<Value> = (0..n)
+                        .map(|r| call_func(*func, args, chunk, r, fails))
+                        .collect();
                     column_from_values(vals)
                 }
                 // `regexp(col, "literal")` compiles the pattern once for the
                 // whole chunk (per-row compilation is catastrophic — ~10× slower).
-                Func::Regexp if regex_literal(args).is_some() => regexp_column(args, chunk),
+                Func::Regexp if regex_literal(args).is_some() => regexp_column(args, chunk, fails),
                 Func::Contains
                 | Func::StartsWith
                 | Func::EndsWith
@@ -792,28 +795,32 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
                 | Func::Regexp
                 | Func::IsWeekend => Column::bool(
                     (0..n)
-                        .map(|r| matches!(call_func(*func, args, chunk, r), Value::Bool(true)))
+                        .map(|r| {
+                            matches!(call_func(*func, args, chunk, r, fails), Value::Bool(true))
+                        })
                         .collect(),
                 ),
                 // Numeric / coalesce funcs produce a value whose lane depends on
                 // the data (e.g. `round` is integral, `coalesce` may be text),
                 // so pick the narrowest fitting lane per chunk.
                 Func::Abs | Func::Round | Func::Floor | Func::Ceil | Func::Coalesce => {
-                    let vals: Vec<Value> =
-                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    let vals: Vec<Value> = (0..n)
+                        .map(|r| call_func(*func, args, chunk, r, fails))
+                        .collect();
                     column_from_values(vals)
                 }
                 // `date(x)`/`time(x)` → the exact date/time lane
                 // (column_from_values keeps the all-Date / all-Time result). #58.
                 Func::Date | Func::Time => {
-                    let vals: Vec<Value> =
-                        (0..n).map(|r| call_func(*func, args, chunk, r)).collect();
+                    let vals: Vec<Value> = (0..n)
+                        .map(|r| call_func(*func, args, chunk, r, fails))
+                        .collect();
                     column_from_values(vals)
                 }
                 _ => {
                     let mut s = StrColumn::with_capacity(n, n * 8);
                     for r in 0..n {
-                        s.push(&call_func(*func, args, chunk, r).to_string());
+                        s.push(&call_func(*func, args, chunk, r, fails).to_string());
                     }
                     Column::str(s)
                 }
@@ -823,7 +830,9 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
         // from the resulting values (all-int → I64, all-numeric → F64,
         // all-bool → Bool, otherwise Str — mirroring schema inference).
         Expr::Case { .. } => {
-            let vals: Vec<Value> = (0..chunk.len).map(|r| eval(expr, chunk, r)).collect();
+            let vals: Vec<Value> = (0..chunk.len)
+                .map(|r| eval_acc(expr, chunk, r, fails))
+                .collect();
             column_from_values(vals)
         }
         // Compare / And / Or are predicates → a boolean column.
@@ -1175,15 +1184,29 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, fails: &mut
 
 /// Evaluate a predicate expression for a single row.
 pub fn eval_predicate(expr: &Expr, chunk: &Chunk, row: usize) -> bool {
+    let mut fails = 0;
+    eval_predicate_acc(expr, chunk, row, &mut fails)
+}
+
+/// Predicate eval that accumulates cast failures (`fails`) so the operator can
+/// surface them (never-silent, BUG-D §23.6). Mirrors [`eval_predicate`].
+pub fn eval_predicate_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> bool {
     match expr {
-        Expr::Compare { left, op, right } => compare_fast(left, *op, right, chunk, row),
-        Expr::And(a, b) => eval_predicate(a, chunk, row) && eval_predicate(b, chunk, row),
-        Expr::Or(a, b) => eval_predicate(a, chunk, row) || eval_predicate(b, chunk, row),
-        other => matches!(eval(other, chunk, row), Value::Bool(true)),
+        Expr::Compare { left, op, right } => compare_fast(left, *op, right, chunk, row, fails),
+        Expr::And(a, b) => {
+            eval_predicate_acc(a, chunk, row, fails) && eval_predicate_acc(b, chunk, row, fails)
+        }
+        Expr::Or(a, b) => {
+            eval_predicate_acc(a, chunk, row, fails) || eval_predicate_acc(b, chunk, row, fails)
+        }
+        other => matches!(eval_acc(other, chunk, row, fails), Value::Bool(true)),
     }
 }
 
-pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
+/// Row eval that accumulates cast failures (`fails`): a `Str` cast to a temporal
+/// lane that won't parse → `null` (continue-first) and `*fails += 1`, so the
+/// operator can surface the count (never-silent, BUG-D §23.6). Mirrors [`eval`].
+pub fn eval_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> Value {
     match expr {
         Expr::Literal(v) => v.clone(),
         // An unbound `$x` hole should have been bound before execution; if one
@@ -1191,32 +1214,27 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
         Expr::Hole(_) => Value::Null,
         Expr::Field { name, access } => eval_field(name, *access, chunk, row),
         Expr::Compare { left, op, right } => {
-            Value::Bool(compare_fast(left, *op, right, chunk, row))
+            Value::Bool(compare_fast(left, *op, right, chunk, row, fails))
         }
-        Expr::And(a, b) => {
-            Value::Bool(eval_predicate(a, chunk, row) && eval_predicate(b, chunk, row))
-        }
-        Expr::Or(a, b) => {
-            Value::Bool(eval_predicate(a, chunk, row) || eval_predicate(b, chunk, row))
-        }
-        Expr::Arith { left, op, right } => arith_value(left, *op, right, chunk, row),
-        // Source-aware parse (BUG-D): a row-wise cast parses a string into a
-        // temporal lane (correct result + byte-identity). Surfacing the failure
-        // count on the scalar `|?` path reuses the columnar `_acc` plumbing and
-        // lands next; here the failure still becomes null (continue-first).
-        Expr::Cast { expr, ty } => {
-            let mut _f = 0u64;
-            cast_value(eval(expr, chunk, row), *ty, &mut _f)
-        }
-        Expr::Func { func, args } => call_func(*func, args, chunk, row),
+        Expr::And(a, b) => Value::Bool(
+            eval_predicate_acc(a, chunk, row, fails) && eval_predicate_acc(b, chunk, row, fails),
+        ),
+        Expr::Or(a, b) => Value::Bool(
+            eval_predicate_acc(a, chunk, row, fails) || eval_predicate_acc(b, chunk, row, fails),
+        ),
+        Expr::Arith { left, op, right } => arith_value(left, *op, right, chunk, row, fails),
+        // Source-aware parse (BUG-D §23.6): a row-wise `Str` cast to a temporal
+        // lane is parsed; a non-null cell that won't parse → null + counted.
+        Expr::Cast { expr, ty } => cast_value(eval_acc(expr, chunk, row, fails), *ty, fails),
+        Expr::Func { func, args } => call_func(*func, args, chunk, row, fails),
         Expr::Case { branches, default } => {
             for (cond, val) in branches {
-                if eval_predicate(cond, chunk, row) {
-                    return eval(val, chunk, row);
+                if eval_predicate_acc(cond, chunk, row, fails) {
+                    return eval_acc(val, chunk, row, fails);
                 }
             }
             match default {
-                Some(d) => eval(d, chunk, row),
+                Some(d) => eval_acc(d, chunk, row, fails),
                 None => Value::Str(String::new()),
             }
         }
@@ -1226,9 +1244,16 @@ pub fn eval(expr: &Expr, chunk: &Chunk, row: usize) -> Value {
 /// Row-wise arithmetic, kept consistent with the columnar [`eval_arith`]:
 /// integer lanes stay integer (except `/`), anything else is float, and a
 /// non-numeric operand yields `Null` (continue-first).
-fn arith_value(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, row: usize) -> Value {
-    let lv = eval(left, chunk, row);
-    let rv = eval(right, chunk, row);
+fn arith_value(
+    left: &Expr,
+    op: ArithOp,
+    right: &Expr,
+    chunk: &Chunk,
+    row: usize,
+    fails: &mut u64,
+) -> Value {
+    let lv = eval_acc(left, chunk, row, fails);
+    let rv = eval_acc(right, chunk, row, fails);
     // Typed temporal arithmetic (exact i64; #57), consistent with the columnar
     // `eval_arith` so the two stay byte-identical.
     if let Some(v) = temporal_op(&lv, op, &rv) {
@@ -1338,7 +1363,14 @@ fn field_is_null(e: &Expr, chunk: &Chunk, row: usize) -> bool {
     matches!(e, Expr::Field { name, access } if access.is_column() && chunk.column(name).is_some_and(|c| c.is_null(row)))
 }
 
-fn compare_fast(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk, row: usize) -> bool {
+fn compare_fast(
+    left: &Expr,
+    op: CmpOp,
+    right: &Expr,
+    chunk: &Chunk,
+    row: usize,
+    fails: &mut u64,
+) -> bool {
     // Null model (design 26 §26.2a): a comparison with a `null` operand is
     // **false** (a null is neither equal to nor ordered against anything). This
     // is checked *before* the fast paths below, which read the type-default
@@ -1361,8 +1393,8 @@ fn compare_fast(left: &Expr, op: CmpOp, right: &Expr, chunk: &Chunk, row: usize)
         return cmp_ord(a.partial_cmp(&b), op);
     }
     // General fallback for mixed / null operands: owned-Value comparison.
-    let l = eval(left, chunk, row);
-    let r = eval(right, chunk, row);
+    let l = eval_acc(left, chunk, row, fails);
+    let r = eval_acc(right, chunk, row, fails);
     compare(&l, op, &r)
 }
 
