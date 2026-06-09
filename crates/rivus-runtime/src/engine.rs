@@ -87,8 +87,16 @@ impl RunResult {
     }
 }
 
+/// Cadence for live-progress snapshots (TUI / `--serve`): publish **at most**
+/// this often, time-based, on both the serial loop and the parallel coordinator.
+/// Observation overhead is then bounded by wall-clock — not chunk count — so a
+/// fast run with many small chunks never pays a snapshot build + JSON + publish
+/// on the hot path for every few chunks (PERF-H). The browser interpolates
+/// between frames, so ~10 fps is smooth.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
+
 /// A live-progress subscriber: called with a [`RuntimeSnapshot`] periodically as
-/// a (serial) run streams. The base for live TUI / HTTP dashboards (Pillar B).
+/// a run streams. The base for live TUI / HTTP dashboards (Pillar B).
 /// `None` everywhere is the default and costs nothing (no snapshot is built).
 pub type ProgressHook<'a> = &'a mut dyn FnMut(&RuntimeSnapshot);
 
@@ -97,8 +105,10 @@ pub fn run(graph: &PlanGraph, opts: RunOptions) -> Result<RunResult, RivusError>
 }
 
 /// Like [`run`], but with an optional live-progress hook (Observability §14.4 /
-/// Epic #30 A5). The hook fires on the serial path only — the parallel path runs
-/// workers silently and reports per-worker telemetry in the final `RunResult`.
+/// Epic #30 A5). Observable First: a hook **never forces the serial path** — the
+/// parallel paths feed it an aggregate cross-worker snapshot via `ParProgress`,
+/// so observing a run never throttles it (PERF-H). Snapshots are time-based
+/// ([`SNAPSHOT_INTERVAL`]) on every path.
 pub fn run_with_progress(
     graph: &PlanGraph,
     opts: RunOptions,
@@ -134,7 +144,8 @@ fn run_dispatch(
     // size, and surface the rationale (Observability §13). The decision is
     // *measured* — the byte-range parallel reader is both faster and
     // bounded-memory (see `analytics`), so `Auto`/`Fast` attempt it and `Low`
-    // forces single-thread. A live hook always forces serial (coherent stream).
+    // forces single-thread. A live hook does NOT change the strategy (Observable
+    // First): the parallel paths observe via an aggregate snapshot (`ParProgress`).
     let env = crate::analytics::Analytics::probe();
     let src_size = single_file_source_size(graph);
     let min_parallel = parallel_min_bytes_for(opts.memory);
@@ -312,10 +323,11 @@ fn drive(
     // (hook is mutated in place via as_mut() to publish snapshots)
     let n = graph.nodes.len();
     let topo = graph.topo_order().expect("acyclic (checked by caller)");
-    // Publish a live snapshot every `SNAPSHOT_EVERY` source chunks when a hook
-    // is attached (cheap, O(nodes), and only when subscribed).
-    const SNAPSHOT_EVERY: u64 = 8;
-    let mut chunks_pulled: u64 = 0;
+    // Publish a live snapshot at most every `SNAPSHOT_INTERVAL` (time-based, not
+    // per-chunk) when a hook is attached, so the snapshot build + JSON + publish
+    // on the hot path is bounded by wall-clock, not by chunk count / throughput
+    // (PERF-H). `None` until the first publish, which paints immediately.
+    let mut last_pub: Option<Instant> = None;
 
     // Only a sink-less, non-blocking flow may stop the source early on a cap.
     let must_drain = must_drain(graph);
@@ -385,10 +397,16 @@ fn drive(
                             rows_seen += chunk.len as u64;
                             produced.push(chunk);
                             prog.tick(rows_seen);
-                            // A5: publish a periodic live snapshot to a subscriber.
-                            chunks_pulled += 1;
+                            // A5: publish a periodic live snapshot to a subscriber,
+                            // time-based so a high chunk rate can't flood the hot
+                            // path (PERF-H); the first chunk paints immediately.
                             if let Some(h) = hook.as_mut() {
-                                if chunks_pulled.is_multiple_of(SNAPSHOT_EVERY) {
+                                let due = match last_pub {
+                                    None => true,
+                                    Some(t) => t.elapsed() >= SNAPSHOT_INTERVAL,
+                                };
+                                if due {
+                                    last_pub = Some(Instant::now());
                                     h(&build_snapshot(
                                         run_start.elapsed(),
                                         rows_seen,
@@ -859,8 +877,9 @@ fn final_snapshot(res: &RunResult, src_id: NodeId, elapsed: Duration) -> Runtime
     build_snapshot(elapsed, rows_seen, res.final_mode, &res.telemetry)
 }
 
-/// How often the coordinator samples cross-worker progress for the live hook.
-const PAR_SAMPLE: Duration = Duration::from_millis(100);
+/// How often the coordinator samples cross-worker progress for the live hook —
+/// the same time-based cadence as the serial loop ([`SNAPSHOT_INTERVAL`]).
+const PAR_SAMPLE: Duration = SNAPSHOT_INTERVAL;
 
 /// Cross-worker live progress for a parallel run. Observing a run (TUI /
 /// `--serve`) must **not** force it onto the serial path — that would let the
