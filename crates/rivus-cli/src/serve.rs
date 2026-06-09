@@ -86,15 +86,19 @@ impl Hub {
 pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rivus live</title>
 <style>
- :root{--bg:#0b0e14;--fg:#cdd6f4;--mut:#a6adc8;--blue:#89b4fa;--grn:#a6e3a1;--red:#f38ba8;--pan:#11151f;--brd:#313244}
+ :root{--bg:#0b0e14;--fg:#cdd6f4;--mut:#a6adc8;--blue:#89b4fa;--grn:#a6e3a1;--red:#f38ba8;--amb:#f9e2af;--pan:#11151f;--brd:#313244}
  *{box-sizing:border-box} body{font:13px/1.4 ui-sans-serif,system-ui,sans-serif;margin:0;background:var(--bg);color:var(--fg)}
  header{display:flex;align-items:baseline;gap:1rem;padding:.7rem 1rem;border-bottom:1px solid var(--brd);position:sticky;top:0;background:var(--bg);z-index:2}
  h1{font-size:1rem;color:var(--blue);margin:0;font-weight:700;letter-spacing:.03em}
  #meta{color:var(--mut)} #meta b{color:var(--fg);font-weight:600}
  #status{margin-left:auto;font-size:11px;color:var(--mut);border:1px solid var(--brd);border-radius:999px;padding:2px 10px}
- #wrap{padding:1rem;overflow:auto} svg{display:block;max-width:100%;height:auto}
+ #main{display:flex;align-items:flex-start} #wrap{flex:1;padding:1rem;overflow:auto} svg{display:block;max-width:100%;height:auto}
+ #side{width:300px;max-width:42vw;border-left:1px solid var(--brd);padding:.7rem 1rem;align-self:stretch}
+ #side h2{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:.2rem 0 .4rem}
+ #script{font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);white-space:pre;overflow:auto;max-height:80vh;margin:0}
  .node text{font-family:ui-sans-serif,system-ui,sans-serif}
  .lab{fill:var(--fg);font-weight:600;font-size:12.5px} .knd{fill:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.07em}
+ .src{fill:var(--blue);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;opacity:.85}
  .num{fill:var(--blue);font-size:12px;font-variant-numeric:tabular-nums}
  .estream{fill:none;stroke:#2a3147;stroke-width:2} .eerror{fill:none;stroke:#5a2a37;stroke-width:1.5;stroke-dasharray:4 5}
  .part{fill:var(--blue)}
@@ -102,46 +106,56 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
  .legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px}
 </style></head><body>
 <header><h1>RIVUS</h1><span id="meta">connecting…</span><span id="status">● live</span></header>
-<div id="wrap"><svg id="cv" xmlns="http://www.w3.org/2000/svg"></svg></div>
+<div id="main">
+ <div id="wrap"><svg id="cv" xmlns="http://www.w3.org/2000/svg"></svg></div>
+ <aside id="side"><h2>flow source</h2><pre id="script">…</pre></aside>
+</div>
 <div class="legend">
  <span><i style="background:#89b4fa"></i>flowing</span>
+ <span><i style="background:#f9e2af"></i>buffering (blocking op)</span>
  <span><i style="background:#a6e3a1"></i>done</span>
  <span><i style="background:#f38ba8"></i>errors</span>
  <span>moving dots = live throughput</span>
 </div>
 <script>
 const NS='http://www.w3.org/2000/svg';
-const NW=164,NH=52,COLW=236,ROWH=80,MX=24,MY=24;
+// Vertical layout (UX-J): depth runs top→down (matching the script order), so a
+// linear flow is a single readable column; branches step out horizontally.
+const NW=210,NH=66,VSTEP=112,HSTEP=240,MX=26,MY=22;
 const fmt=n=>(n||0).toLocaleString();
 const cv=document.getElementById('cv');
 let N={},E=[];
 const mk=(t,a)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;};
-const cut=s=>{s=s||'';return s.length>22?s.slice(0,21)+'…':s;};
+const cut=(s,n)=>{s=s||'';n=n||28;return s.length>n?s.slice(0,n-1)+'…':s;};
 
 function layout(g){
- N={};(g.nodes||[]).forEach(n=>N[n.node_id]={id:n.node_id,label:n.label,kind:n.kind,ro:0,err:0,fin:false,prev:0,act:0});
+ N={};(g.nodes||[]).forEach(n=>N[n.node_id]={id:n.node_id,label:n.label,kind:n.kind,src:n.src||'',blocking:!!n.blocking,ro:0,ri:0,err:0,fin:false,buf:false,prevO:0,prevI:0,act:0});
  const adj={},indeg={};Object.keys(N).forEach(i=>{adj[i]=[];indeg[i]=0;});
  (g.edges||[]).forEach(e=>{if(N[e.from]!=null&&N[e.to]!=null){adj[e.from].push(e.to);indeg[e.to]++;}});
  const depth={},din=Object.assign({},indeg);let q=Object.keys(N).filter(i=>indeg[i]===0);q.forEach(i=>depth[i]=0);
  while(q.length){const u=q.shift();for(const v of adj[u]){depth[v]=Math.max(depth[v]||0,(depth[u]||0)+1);if(--din[v]===0)q.push(v);}}
- const cols={};let maxd=0;Object.keys(N).forEach(i=>{const d=depth[i]||0;(cols[d]=cols[d]||[]).push(+i);maxd=Math.max(maxd,d);});
- let maxr=1;for(const d in cols){cols[d].sort((a,b)=>a-b);maxr=Math.max(maxr,cols[d].length);}
- const W=MX*2+maxd*COLW+NW,H=MY*2+maxr*ROWH;
+ const rows={};let maxd=0;Object.keys(N).forEach(i=>{const d=depth[i]||0;(rows[d]=rows[d]||[]).push(+i);maxd=Math.max(maxd,d);});
+ let maxw=1;for(const d in rows){rows[d].sort((a,b)=>a-b);maxw=Math.max(maxw,rows[d].length);}
+ const W=MX*2+(maxw-1)*HSTEP+NW,H=MY*2+maxd*VSTEP+NH;
  cv.setAttribute('viewBox',`0 0 ${W} ${H}`);cv.setAttribute('width',W);cv.setAttribute('height',H);
- for(const d in cols){const c=cols[d],off=(maxr-c.length)/2;c.forEach((id,i)=>{N[id].x=MX+d*COLW;N[id].y=MY+(off+i)*ROWH;});}
+ // depth → y (down the page); breadth-within-depth → x (centered, branches out).
+ for(const d in rows){const c=rows[d],off=(maxw-c.length)/2;c.forEach((id,i)=>{N[id].x=MX+(off+i)*HSTEP;N[id].y=MY+d*VSTEP;});}
  const gE=mk('g'),gP=mk('g'),gN=mk('g');E=[];
  (g.edges||[]).forEach(e=>{const a=N[e.from],b=N[e.to];if(!a||!b)return;
-  const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2,dx=Math.max(40,(x2-x1)*0.5);
-  const p=mk('path',{d:`M${x1},${y1} C${x1+dx},${y1} ${x2-dx},${y2} ${x2},${y2}`,class:e.kind==='error'?'eerror':'estream'});
+  const x1=a.x+NW/2,y1=a.y+NH,x2=b.x+NW/2,y2=b.y,dy=Math.max(28,(y2-y1)*0.45);
+  const p=mk('path',{d:`M${x1},${y1} C${x1},${y1+dy} ${x2},${y2-dy} ${x2},${y2}`,class:e.kind==='error'?'eerror':'estream'});
   gE.appendChild(p);const parts=[];
   if(e.kind!=='error')for(let k=0;k<3;k++){const c=mk('circle',{r:3,class:'part'});c.style.opacity=0;gP.appendChild(c);parts.push({c,t:k/3});}
   E.push({src:e.from,dst:e.to,kind:e.kind,path:p,len:1,parts});});
  Object.values(N).forEach(o=>{const grp=mk('g',{class:'node',transform:`translate(${o.x},${o.y})`});
   o.rect=mk('rect',{width:NW,height:NH,rx:9,fill:'#11151f',stroke:'#313244','stroke-width':1.5});
-  const lab=mk('text',{x:12,y:21,class:'lab'});lab.textContent=cut(o.label);
-  const knd=mk('text',{x:12,y:38,class:'knd'});knd.textContent=o.kind;
-  o.num=mk('text',{x:NW-12,y:38,'text-anchor':'end',class:'num'});o.num.textContent='0';
-  grp.append(o.rect,lab,knd,o.num);gN.appendChild(grp);});
+  const lab=mk('text',{x:12,y:20,class:'lab'});lab.textContent=cut(o.label,22);
+  const knd=mk('text',{x:12,y:35,class:'knd'});knd.textContent=o.kind;
+  // The IR source line — *what* this node does (UX-J); full text on hover.
+  const src=mk('text',{x:12,y:53,class:'src'});src.textContent=cut(o.src,30);
+  const tip=mk('title');tip.textContent=o.src||o.kind;
+  o.num=mk('text',{x:NW-12,y:20,'text-anchor':'end',class:'num'});o.num.textContent='0';
+  grp.append(o.rect,lab,knd,src,o.num,tip);gN.appendChild(grp);});
  cv.replaceChildren(gE,gP,gN);
  E.forEach(e=>{try{e.len=e.path.getTotalLength()||1;}catch(_){}});
 }
@@ -149,15 +163,21 @@ function layout(g){
 function onSnap(s){
  document.getElementById('meta').innerHTML=`<b>${fmt(s.rows_seen)}</b> rows · <b>${(s.elapsed_ms/1000).toFixed(1)}s</b> · ${s.mode}`;
  for(const n of (s.nodes||[])){const o=N[n.node_id];if(!o)continue;
-  if(n.rows_out>o.prev)o.act=1;o.prev=n.rows_out;o.ro=n.rows_out;o.err=n.errors;o.fin=n.finished;
-  o.num.textContent=fmt(n.rows_out);}
+  // A blocking op (sort/group/…) that is still accumulating (rows_in grew but
+  // rows_out hasn't, and it isn't finished) is "buffering", not stuck (UX-J).
+  o.buf=o.blocking&&!n.finished&&n.rows_in>n.rows_out;
+  if(n.rows_out>o.prevO||(o.buf&&n.rows_in>o.prevI))o.act=1;
+  o.prevO=n.rows_out;o.prevI=n.rows_in;o.ro=n.rows_out;o.ri=n.rows_in;o.err=n.errors;o.fin=n.finished;
+  o.num.textContent=o.buf?('⏳ '+fmt(n.rows_in-n.rows_out)):fmt(n.rows_out);}
 }
 
 let last=performance.now();
 function frame(now){const dt=Math.min(64,now-last);last=now;
  for(const id in N){const o=N[id];o.act*=Math.pow(0.94,dt/16);
+  if(o.buf)o.act=Math.max(o.act,0.5); // keep a blocking buffer visibly working
   let st='#313244',sw=1.5,fl='#11151f';
-  if(o.act>0.05){st='#89b4fa';sw=1.5+o.act*1.8;fl='#1a2335';}
+  if(o.buf){st='#f9e2af';sw=2;fl='#1f1d16';}      // amber: buffering / working
+  else if(o.act>0.05){st='#89b4fa';sw=1.5+o.act*1.8;fl='#1a2335';}
   else if(o.fin){st='#a6e3a1';}
   if(o.err>0)st='#f38ba8';
   o.rect.setAttribute('stroke',st);o.rect.setAttribute('stroke-width',sw.toFixed(2));o.rect.setAttribute('fill',fl);}
@@ -170,7 +190,9 @@ function frame(now){const dt=Math.min(64,now-last);last=now;
  requestAnimationFrame(frame);
 }
 
-fetch('/graph').then(r=>r.json()).then(g=>{layout(g);requestAnimationFrame(frame);
+fetch('/graph').then(r=>r.json()).then(g=>{layout(g);
+ document.getElementById('script').textContent=g.script||'(no source)';
+ requestAnimationFrame(frame);
  const es=new EventSource('/events');
  es.onmessage=e=>{try{onSnap(JSON.parse(e.data))}catch(_){}};
  es.onerror=()=>{const st=document.getElementById('status');st.textContent='● finished';st.style.color='#a6e3a1';es.close();};

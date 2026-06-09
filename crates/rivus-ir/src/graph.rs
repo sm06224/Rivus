@@ -739,8 +739,26 @@ impl Op {
         }
     }
 
+    /// Does this op **buffer** its input and emit mainly on `finish` (so it can
+    /// look "stuck" mid-run while it accumulates rows)? The live dashboard uses
+    /// this to show a "buffering N rows" working state instead of a stalled-
+    /// looking `0` for a blocking operator (UX-J). The display only activates
+    /// when the op is actually accumulating (`rows_in > rows_out && !finished`),
+    /// so a streaming op (e.g. `distinct` first-occurrence) never false-shows it.
+    pub fn is_blocking(&self) -> bool {
+        matches!(
+            self,
+            Op::Sort { .. }
+                | Op::GroupBy { .. }
+                | Op::Distinct { .. }
+                | Op::Describe
+                | Op::Join { .. }
+                | Op::Fill { .. }
+        )
+    }
+
     /// Render this op as the pipeline fragment that produced it.
-    fn to_src_line(&self) -> String {
+    pub fn to_src_line(&self) -> String {
         match self {
             // A source renders by codec back to its v1 surface form (reversible),
             // using the discovery path and the top-level provenance modifier. The
