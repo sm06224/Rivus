@@ -14,7 +14,8 @@
 //! transform  := '|?' expr | '|>' proj+ | '|#' field (AGG ':' field)*
 //!             | ('take'|'limit'|'head') INT | 'sort' IDENT ('asc'|'desc')?
 //!             | 'distinct' IDENT* | '|' 'map' block
-//!   proj     := IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT  // computed cols
+//!   proj     := IDENT (':' IDENT)? (':' TYPE)?   // §29.2 definition chain
+//!             | IDENT 'as' IDENT | '(' expr ')' 'as' IDENT     // computed cols
 //!   expr     := … cmp over add(+,-) over mul(*,/,%) over primary; '(' expr ')'
 //!               AGG := 'sum' | 'avg' | 'min' | 'max'   (count is always emitted)
 //! branch     := '->' IDENT ':' body ';'
@@ -27,9 +28,9 @@ mod lexer;
 use lexer::{Comment, Lexer, Tok};
 use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
-    Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery, Disposition, EdgeKind, Endian,
-    Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op, PlanGraph,
-    Provenance, ReadFmt, Transport,
+    is_type_word, Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery, Disposition,
+    EdgeKind, Endian, Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op,
+    PlanGraph, Provenance, ReadFmt, Transport,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -1037,7 +1038,8 @@ impl Parser {
         }
     }
 
-    /// Parse a `|>` projection list. Items are bare fields (`name`), renames
+    /// Parse a `|>` projection list. Items are bare fields (`name`), `:`
+    /// definition chains (`name [:alias] [:type]`, §29.2), renames
     /// (`name as alias`), or computed columns (`(expr) as alias`). When every
     /// item is a bare field this lowers to the pure-selection `Op::Project`
     /// (so existing fusion/pushdown are untouched); otherwise to `ProjectExpr`.
@@ -1057,13 +1059,16 @@ impl Parser {
                     items.push((e, alias));
                     all_bare = false;
                 }
-                // `name` or `name as alias`.
+                // `name`, `name as alias`, or a `:` definition chain.
                 Tok::Word(w) if !is_keyword(&w) => {
                     self.bump();
                     if self.peek_is_word("as") {
                         self.bump();
                         let alias = self.word()?;
                         items.push((Expr::field(&w), alias));
+                        all_bare = false;
+                    } else if self.at(&Tok::Colon) {
+                        items.push(self.parse_colon_chain(&w)?);
                         all_bare = false;
                     } else {
                         items.push((Expr::field(&w), w));
@@ -1081,6 +1086,54 @@ impl Parser {
         } else {
             Ok(Op::ProjectExpr { items })
         }
+    }
+
+    /// Parse the tail of a `:` definition chain (§29.2) after its column word:
+    /// `col :alias`, `col :type(arg)`, or `col :alias :type(arg)` — definitions
+    /// stack left→right, light→heavy (rename before cast). After `:` a type
+    /// word always means a cast (the disjointness rule that keeps `to_source`
+    /// reversible); to rename a column *to* a type-word name, use the
+    /// parenthesized escape hatch `(col) as int`. Lowers to a plain
+    /// `ProjectExpr` item — rename is just the alias, cast is `Expr::Cast` —
+    /// so the IR and byte-identity are exactly those of the parenthesized
+    /// forms.
+    fn parse_colon_chain(&mut self, col: &str) -> Result<(Expr, String), RivusError> {
+        self.expect(&Tok::Colon)?;
+        let first = self.word()?;
+        let (alias, ty) = if is_type_word(&first) {
+            (col.to_string(), Some(self.finish_type(&first)?))
+        } else if self.eat(&Tok::Colon) {
+            let tyword = self.word()?;
+            if !is_type_word(&tyword) {
+                return Err(self.err(format!(
+                    "`{col} :{first} :{tyword}`: a `:` chain is `col [:alias] [:type]` — \
+                     after the rename `:{first}`, `:{tyword}` must be a type \
+                     (e.g. int, decimal(2), datetime)"
+                )));
+            }
+            (first, Some(self.finish_type(&tyword)?))
+        } else {
+            (first, None)
+        };
+        if ty.is_some() {
+            // A datetime parse format belongs to the source schema, not a cast
+            // (§23.6) — same rule as the cast verb and expression casts.
+            self.reject_expr_dt_format()?;
+            if self.at(&Tok::Colon) {
+                return Err(self.err(format!(
+                    "`{col} :…`: a `:` chain is at most `col :alias :type` \
+                     (rename first, then cast — nothing follows the type)"
+                )));
+            }
+        }
+        let mut expr = Expr::field(col);
+        if let Some(ty) = ty {
+            expr = Expr::Cast {
+                expr: Box::new(expr),
+                ty,
+            };
+        }
+        Ok((expr, alias))
     }
 
     fn skip_block(&mut self) -> Result<(), RivusError> {
@@ -1752,6 +1805,166 @@ mod tests {
             s1.contains("($_.age + (2 * 10)) as v"),
             "unexpected reversed source: {s1}"
         );
+    }
+
+    #[test]
+    fn colon_chain_lowers_to_plain_project_expr_items() {
+        // §29.2: `col [:alias] [:type]` stacks definitions left→right and
+        // lowers to ordinary ProjectExpr items — rename is just the alias,
+        // cast is Expr::Cast — so the IR (and byte-identity) is exactly that
+        // of the parenthesized forms.
+        match nth_op(
+            "F:\n open a.csv\n |> amount :amt :decimal(2) qty :int note :memo plain\n;",
+            1,
+        ) {
+            Op::ProjectExpr { items } => {
+                assert_eq!(items.len(), 4);
+                assert_eq!(items[0].1, "amt");
+                assert!(matches!(
+                    &items[0].0,
+                    Expr::Cast {
+                        ty: DataType::Decimal { scale: 2 },
+                        ..
+                    }
+                ));
+                // A bare cast keeps the column name as its alias.
+                assert_eq!(items[1].1, "qty");
+                assert!(matches!(
+                    &items[1].0,
+                    Expr::Cast {
+                        ty: DataType::I64,
+                        ..
+                    }
+                ));
+                assert_eq!(items[2].1, "memo");
+                assert!(matches!(&items[2].0, Expr::Field { .. }));
+                assert_eq!(items[3].1, "plain");
+            }
+            other => panic!("expected ProjectExpr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colon_chain_is_the_canonical_form_and_round_trips() {
+        // The chain re-parses to the same source, and the older parenthesized
+        // spellings canonicalize to it (alias → one canonical form, §25.2a).
+        let src = "F:\n open a.csv\n |> amount :amt :decimal(2) qty :int note :memo\n;";
+        let s1 = parse(src).unwrap().to_source();
+        // Type names normalize (`int` → `i64`), like the cast verb.
+        assert!(
+            s1.contains("|> amount :amt :decimal(2) qty :i64 note :memo"),
+            "chain is not the canonical rendering: {s1}"
+        );
+        assert_eq!(
+            s1,
+            parse(&s1).unwrap().to_source(),
+            "chain not reversible: {s1}"
+        );
+        let sugar =
+            "F:\n open a.csv\n |> (amount:decimal(2)) as amt (qty:int) as qty (note) as memo\n;";
+        assert_eq!(
+            parse(sugar).unwrap().to_source(),
+            s1,
+            "parenthesized forms must canonicalize to the chain"
+        );
+    }
+
+    #[test]
+    fn alias_colliding_with_a_type_word_keeps_the_parenthesized_form() {
+        // `|> (amount) as int` renames to a type-word name. `to_source` must
+        // not emit `amount :int` — that re-parses as a cast — so the
+        // parenthesized escape hatch is the stable spelling (§29.5-4).
+        let src = "F:\n open a.csv\n |> (amount) as int\n;";
+        let s = parse(src).unwrap().to_source();
+        // (Expression fields render as `$_.name` inside parens.)
+        assert!(
+            s.contains("($_.amount) as int"),
+            "expected escape hatch in {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        match nth_op(&s, 1) {
+            Op::ProjectExpr { items } => {
+                assert_eq!(items[0].1, "int");
+                assert!(
+                    matches!(&items[0].0, Expr::Field { .. }),
+                    "must stay a rename, not become a cast: {:?}",
+                    items[0].0
+                );
+            }
+            other => panic!("expected ProjectExpr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colon_chain_misordered_or_overlong_is_an_explicit_error() {
+        // Definitions stack light→heavy: rename first, then cast, nothing
+        // after the type (§29.2). Violations are explicit errors, never a
+        // silent reinterpretation.
+        for src in [
+            "F:\n open a.csv\n |> amount :int :amt\n;",
+            "F:\n open a.csv\n |> amount :amt :decimal(2) :int\n;",
+        ] {
+            let e = parse(src).unwrap_err();
+            assert!(
+                format!("{e:?}").contains("nothing follows the type"),
+                "missing order hint for {src}: {e:?}"
+            );
+        }
+        // A second definition that isn't a type gets the chain shape hint.
+        let e = parse("F:\n open a.csv\n |> amount :amt :foo\n;").unwrap_err();
+        assert!(
+            format!("{e:?}").contains("must be a type"),
+            "missing type hint: {e:?}"
+        );
+    }
+
+    #[test]
+    fn colon_chain_datetime_format_is_rejected_like_other_casts() {
+        // BUG-D §23.6: a datetime parse format belongs to the source schema;
+        // chain casts follow the same never-silent rule as the cast verb.
+        let e = parse("F:\n open a.csv\n |> ts :datetime(\"yyMMddHHmmss\")\n;").unwrap_err();
+        assert!(
+            format!("{e:?}").contains("schema declaration"),
+            "missing schema hint: {e:?}"
+        );
+    }
+
+    #[test]
+    fn every_type_word_casts_in_a_colon_chain() {
+        // Locks `rivus_ir::is_type_word` to the parser's type tables: every
+        // word the predicate accepts must finish as a cast — never fall back
+        // to a rename, never error as an unknown type.
+        for w in [
+            "int",
+            "i64",
+            "integer",
+            "float",
+            "f64",
+            "double",
+            "str",
+            "string",
+            "text",
+            "bool",
+            "boolean",
+            "resource",
+            "decimal(2)",
+            "datetime",
+            "duration",
+            "date",
+            "time",
+        ] {
+            let src = format!("F:\n open a.csv\n |> amount :{w}\n;");
+            match nth_op(&src, 1) {
+                Op::ProjectExpr { items } => {
+                    assert_eq!(items[0].1, "amount", "alias must stay the column for :{w}");
+                    assert!(
+                        matches!(items[0].0, Expr::Cast { .. }),
+                        ":{w} must lower to a cast"
+                    );
+                }
+                other => panic!("expected ProjectExpr for :{w}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
