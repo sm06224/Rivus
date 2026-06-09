@@ -146,16 +146,25 @@ the snapshot gains `rows_in` / an accumulating `busy` state so `sort`/group show
 identical with/without `--serve`), zero-dep, en+ja guide updates. Priority: UX-J
 first (high felt impact, low risk).
 
-### PERF-H (TRACKED) · `--serve` is sometimes slow (real-user report)
+### PERF-H (RESOLVED) · `--serve` is sometimes slow (real-user report)
 With a live hook attached, `build_snapshot` (`O(nodes)`) + JSON encode + Hub
 publish ride the hot path; the `engine.rs:100` "hook = serial only" vs `:150`
 "observation must not throttle" tension means the route varies by graph. Plan:
 **(1)** time-based snapshot **sampling** (every ~N ms, not every chunk); **(2)**
 guarantee observation **never throttles** execution or downgrades parallel→serial
 (uphold the `:150` intent on every path); **(3)** decouple publish from the hot
-path (worker→Hub best-effort, drop when full). Gate: `docs/BENCHMARKS.md`
-before/after for `--serve` on/off across the three regimes; byte-identity
-unchanged (output identical regardless of observation). After UX-J.
+path (worker→Hub best-effort, drop when full).
+**Fixed.** (1) The serial loop now publishes at most every `SNAPSHOT_INTERVAL =
+100 ms` (was every 8 chunks), so observation overhead is bounded by wall-clock,
+not chunk count — measured **−80…−96 %** at a tiny chunk-size (12.6 → 2.4 ms
+large, 4.9 → 1.0 ms error-heavy), negligible at normal chunk sizes (no
+regression; `docs/BENCHMARKS.md`). (2) Confirmed a hook **never forces serial** —
+the parallel paths observe via the aggregate `ParProgress` snapshot (already
+time-based at 100 ms); the stale `engine.rs` comments that claimed "hook = serial
+only" / "forces serial" are corrected. (3) Already decoupled: `Hub::publish`
+overwrites-latest under a brief mutex and every SSE connection runs on its own
+thread (serve.rs), so the engine never waits on socket I/O. byte-identity
+unchanged (output identical with/without a hook).
 
 ## 2. Coverage map (GUIDE feature → tests → status)
 

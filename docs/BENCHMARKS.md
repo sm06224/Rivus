@@ -1227,3 +1227,35 @@ The win tracks the comparison/cache cost: biggest on the random **f64** key
 run and does almost no work, so there is nothing for the extraction to amortise —
 it lands within noise (±3 %). On this shared container the absolute numbers carry
 a few-percent run-to-run jitter; the interleaved before/after cancels the drift.
+
+## Live observation — time-based snapshot sampling (PERF-H)
+
+A live hook (`--tui` / `--serve`) published a `RuntimeSnapshot` every **8 source
+chunks** on the serial path, so the snapshot build (`O(nodes)`) + JSON encode +
+`Hub` publish rode the hot path at a rate set by **chunk count / throughput** —
+unbounded as chunks get smaller or the source gets faster. PERF-H makes the
+serial path **time-based** (publish at most every `SNAPSHOT_INTERVAL = 100 ms`,
+matching the parallel coordinator's already-time-based `PAR_SAMPLE`), so the
+overhead is bounded by wall-clock (≈ `run_secs × 10` snapshots) regardless of
+chunk count. (The parallel path already sampled at 100 ms via `ParProgress`, and
+a hook never forces the serial path — Observable First.)
+
+Measured live-observation overhead = `--tui` wall − no-hook wall (serial,
+`--memory low`, 1 M rows, best of 5; `--tui` isolates the engine cost without the
+`--serve` server's ~2 s grace). Amplified with `--chunk-size 64` (~15 625 chunks
+→ ~1 953 snapshots before, ~4 after):
+
+| regime (chunk-size 64) | before | after |
+|---|---:|---:|
+| large (`clean`)      | 12.6 ms | 2.4 ms |
+| error-heavy (0.3)    | 4.9 ms  | 1.0 ms |
+| mixed-type (0.2)     | 10.0 ms | ≈ 0 ms |
+| fan-out (2 sinks)    | ≈ 0 ms  | ≈ 0 ms |
+
+At a normal `--chunk-size 4096` (~244 chunks → ~30 snapshots before) the overhead
+is already a few ms and the difference is within noise — **no regression**, the
+fix only removes the unbounded tail. byte-identity is unchanged (output is
+identical with or without a hook; serial == parallel == chunk-size). The absolute
+numbers are small here (a 4-node graph, ~0.36 s run); the cost — and so the
+saving — grows with node count (`build_snapshot`/JSON are `O(nodes)`) and with
+snapshot frequency, which is exactly what the cap bounds.
