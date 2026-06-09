@@ -104,21 +104,34 @@ open sales.csv |> amount :amt :decimal(2) ;
 | `col :decimal(2)` | `(Expr::Cast(Column("col"), Decimal(2)), "col")` |
 | `col :amt :decimal(2)` | `(Expr::Cast(Column("col"), Decimal(2)), "amt")` |
 
-**cast / rename の独立 verb は同じ `(Expr, alias)` へ desugar** する（parser 段で `Op::ProjectExpr`
-に畳む）。よって IR・runtime・optimizer は一切変わらない。`Expr::Cast` の構造は **不変**
+IR・runtime・optimizer は一切変わらない。`Expr::Cast` の構造は **不変**
 （`format` フィールドを足さない＝§23.6 案B却下と整合）。書式が要る型変換（datetime 書式）は
 **reader スキーマ宣言**が唯一の所有者のまま（§23.6 方針「い」）。
 
-### `to_source` 可逆性（§29.5-4 で批准する規則の要点）
-`:` の後続トークンの文脈解決を **互いに素**に固定する:
+### verb は desugar **しない**（s1 実装で確定・doc 当初案を修正）
+当初案は「cast/rename verb も `Op::ProjectExpr` へ desugar」だったが、**意味が保存できない**ため
+撤回する：verb（`rename OLD NEW`／`cast COL:type`）は**全列保持の in-place 演算**
+（`Op::Rename`/`Op::Cast`）であり、`ProjectExpr` は**列選択**（列挙した列だけ残る）。パース時に
+スキーマは未知なので、通過列を列挙する形に書き換えられない。よって:
 
-- 後続が **型語**（既知の型名集合に属す）→ cast。
-- 後続が **`{ … }`** → 構造ビュー（§29.3）。
+- **verb は現行どおり**（`Op::Rename`/`Op::Cast`・全列保持・上位互換）。
+- **収束の実体は `|>` 内の `:` チェーン**：projection の文脈では select / rename / cast / compute
+  が一箇所で書け、そこが正規形になる。verb は「行全体を保ったまま少数列を直す」用途に残る
+  （重複ではなく semantics が違う）。
+
+### `to_source` 可逆性（§29.5-4・s1 実装で確定）
+`:` の後続トークンの文脈解決を **互いに素**に固定した（`rivus_ir::is_type_word` が単一の真偽源）:
+
+- 後続が **型語**（`is_type_word`：`int`/`i64`/…/`decimal`/`datetime` 等、別名込み）→ **常に cast**。
+- 後続が **`{ … }`** → 構造ビュー（§29.3・s2、未実装）。
 - それ以外の**識別子** → 改名。
+- 順序は厳格に**「改名 → cast」**（軽→重）。cast の後に続く `:` は明示エラー（never-silent）。
 
-「列名が型語と衝突する」場合（例：`int` という名の列を別名 `int` にする）の曖昧性解消規則を
-**§29.5-4 で確定**する（候補：rename 側を明示する小記号／型語は予約語として列別名に使えない、等。
-未確定）。`to_source` は正規形（`:` チェーン）を出し、round-trip 不変をゲートする。
+「別名が型語と衝突する」場合（例：列を `int` という名に改名）はチェーンでは表せず、**括弧形
+`(col) as int` がエスケープハッチ**。`to_source` も同じ述語でガードし、衝突別名は括弧形で出す
+（`:int` と出すと cast に再パースされるため）。正規形は `:` チェーン（型名は正規化 `int`→`i64`）、
+旧綴り（`(col:type) as x`・`(col) as x`）は同一 IR ゆえ正規形へ収束し、round-trip をテストで固定
+（`colon_chain_is_the_canonical_form_and_round_trips` ほか）。
 
 ---
 
@@ -235,11 +248,12 @@ open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11
    - **可変長フィールド**（length-prefixed・delimiter 区切り）を扱うか／本スライスの範囲外とするか。
    - 構造体複合の `char[N]` サブ型追加（§29.4）の null 表現（全 padding を null とみなすか）。
 
-4. **「`:`」チェーンの `to_source` 完全可逆**
-   - `:` の後続が **識別子（改名）／型語（cast）／`{…}`（構造）** の **3 文脈を互いに素に固定**する
-     規則。特に「列名が型語と衝突」する場合の曖昧性解消（型語を別名に使えない予約とするか、
-     改名側を明示する小記号を置くか）。
-   - `optimizer_equiv` バイト不変 ＋ round-trip（trivia 含む）をゲート。
+4. **「`:`」チェーンの `to_source` 完全可逆 — 確定（s1 実装済・§29.2 参照）**
+   - 後続は **型語（cast・常に優先）／`{…}`（構造・s2）／識別子（改名）** で互いに素。順序は
+     「改名 → cast」固定・超過は明示エラー。型語衝突の別名は**括弧形 `(col) as int` が
+     エスケープハッチ**（`to_source` も同述語でガード）。単一の真偽源は `rivus_ir::is_type_word`
+     （parser の型表とテストで同期固定）。
+   - `optimizer_equiv` バイト不変 ＋ round-trip をテストでゲート済み。
 
 5. **書式 / ロケール拡張**（**別スライス s3・依存ゼロ**）
    - 曜日 `ddd`・`[ja-jp]` 等**ロケール**・**サブ秒** `nnnnnn` の追加。日本語曜日は **std-only な
@@ -268,7 +282,7 @@ open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11
 
 | # | スライス | 主要素 | 正しさゲート |
 |---|---|---|---|
-| **s1** | **「`:`」定義チェーン＋cast/rename verb 糖衣化** | `:` チェーンを `Op::ProjectExpr` の `(Expr, alias)` へ lower。cast/rename verb を同 IR へ desugar。`to_source` 正規形＋後方互換往復。`Expr::Cast` 構造不変 | **byte-identity 不変**（IR=既存 ProjectExpr）・round-trip・optimizer_equiv・既存テスト緑 |
+| **s1** | **「`:`」定義チェーン（landed）** | `:` チェーンを `Op::ProjectExpr` の `(Expr, alias)` へ lower。`to_source` 正規形＋後方互換往復。`Expr::Cast` 構造不変。**verb は desugar しない**（in-place 全列保持で semantics が別・§29.2 で確定） | **byte-identity 不変**（IR=既存 ProjectExpr）・round-trip・optimizer_equiv・既存テスト緑 |
 | **s2** | **共用体ビュー**（オフセットサブフィールド・zero-copy・§28 binary 統合） | 「物理1列＋多重論理ビュー」。オフセット/index サブビュー（char/byte）。§28 `Codec::Binary`/`BinType`/`Endian` に統合（`char[N]` サブ型追加）。`.` アクセサ参照（式文脈・§29.5-1 確定） | UTF-8 境界不割・zero-copy・null（§26）・serial==parallel==chunk-size・round-trip |
 | **s3** | **書式 / ロケール拡張**（曜日 / ロケール / サブ秒・互いに素性再検証） | `ddd`・`[ja-jp]`・`nnnnnn`。日本語曜日は std-only テーブル。`AUTO_FORMATS` 互いに素性を再検証。非 UTF-8 は範囲を批准 | `auto_formats_disjoint` 再固定・byte-identity・**依存ゼロ** |
 | **s4** | **`~` / regex リテラル / `\|!` 複数検証 / `{}` サブフロー** | `~`（中置）・`'…'`（regex リテラル）・`$_[i]`・複数検証＋`{}`サブフロー。regex は **feature-gate を崩さない** | 既定ビルド依存ゼロ（regex feature off）・never-silent・round-trip |
