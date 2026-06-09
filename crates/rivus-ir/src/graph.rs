@@ -739,8 +739,32 @@ impl Op {
         }
     }
 
+    /// Does this op **buffer/accumulate its whole input and emit only on
+    /// `finish`** (so it shows `rows_out == 0` mid-run and can look "stuck" while
+    /// it works)? The live dashboard uses this to show a "buffering N rows"
+    /// working state for such a node (UX-J). The indicator only lights when the
+    /// op is actually accumulating (`rows_in > rows_out && !finished`).
+    ///
+    /// **Streaming ops are excluded** even when stateful: `distinct` emits each
+    /// first-occurrence immediately, `ffill` carries forward and emits per chunk,
+    /// a constant `fill` rewrites in place — their `rows_out` tracks `rows_in`, so
+    /// they never look stuck. Audited against the operators: `sort` / `group` /
+    /// `describe` / `join` (buffers both sides) and the `fill` variants that need
+    /// the whole input first — `bfill` (replays backward on finish) and
+    /// `mean`/`median` (need the global statistic) — emit only on `finish`.
+    pub fn is_blocking(&self) -> bool {
+        match self {
+            Op::Sort { .. } | Op::GroupBy { .. } | Op::Describe | Op::Join { .. } => true,
+            Op::Fill { method, .. } => matches!(
+                method,
+                FillMethod::Bfill | FillMethod::Mean | FillMethod::Median
+            ),
+            _ => false,
+        }
+    }
+
     /// Render this op as the pipeline fragment that produced it.
-    fn to_src_line(&self) -> String {
+    pub fn to_src_line(&self) -> String {
         match self {
             // A source renders by codec back to its v1 surface form (reversible),
             // using the discovery path and the top-level provenance modifier. The

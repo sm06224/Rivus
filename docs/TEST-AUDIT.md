@@ -132,6 +132,31 @@ error-heavy + mixed regimes, and the (unchanged) multi-key path; pinned by
 Multi-key keeps the hoisted comparator (a composite memcomparable key is a
 further follow-up).
 
+### UX-J (TRACKED, in progress) · `--serve` dashboard readability (real-user report)
+Three asks, all viz-only (no IR/syntax/I-O change → no design-doc gate; embedded
+HTML/JS/SVG only, zero-dep): **(a)** a linear / near-linear DAG renders too wide
+(`depth × COLW` in one row) → default a **vertical (top→down)** layout matching
+the script order, branches stepping out, with zoom-to-fit / scroll; **(b)** nodes
+don't show *what* they do → add each node's **IR `to_source` line** (sort key /
+filter predicate / cast type …) to `render_graph_json` and show it, plus the
+**full original script** on the dashboard (cheap because the IR is reversible —
+honors "IR is the single currency"); **(c)** a blocking operator looks *stuck* →
+the snapshot gains `rows_in` / an accumulating `busy` state so `sort`/group show
+"working (buffering N rows)" while they buffer. Invariants: byte-identity (output
+identical with/without `--serve`), zero-dep, en+ja guide updates. Priority: UX-J
+first (high felt impact, low risk).
+
+### PERF-H (TRACKED) · `--serve` is sometimes slow (real-user report)
+With a live hook attached, `build_snapshot` (`O(nodes)`) + JSON encode + Hub
+publish ride the hot path; the `engine.rs:100` "hook = serial only" vs `:150`
+"observation must not throttle" tension means the route varies by graph. Plan:
+**(1)** time-based snapshot **sampling** (every ~N ms, not every chunk); **(2)**
+guarantee observation **never throttles** execution or downgrades parallel→serial
+(uphold the `:150` intent on every path); **(3)** decouple publish from the hot
+path (worker→Hub best-effort, drop when full). Gate: `docs/BENCHMARKS.md`
+before/after for `--serve` on/off across the three regimes; byte-identity
+unchanged (output identical regardless of observation). After UX-J.
+
 ## 2. Coverage map (GUIDE feature → tests → status)
 
 | GUIDE area | tests | status |

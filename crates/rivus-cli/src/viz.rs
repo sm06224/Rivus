@@ -128,7 +128,13 @@ pub fn render_graph_json(graph: &PlanGraph) -> String {
         json_escape_into(&mut s, &label);
         s.push_str(",\"kind\":");
         json_escape_into(&mut s, n.op.kind_str());
-        s.push('}');
+        // The op's IR source line (UX-J): shows *what* the node does — the sort
+        // key, filter predicate, cast type, etc. Cheap because the IR is
+        // reversible (the single source of truth, surfaced in the viz).
+        s.push_str(",\"src\":");
+        json_escape_into(&mut s, &n.op.to_src_line());
+        // Blocking ops (sort/group/…) get a "buffering" working state (UX-J).
+        s.push_str(&format!(",\"blocking\":{}}}", n.op.is_blocking()));
     }
     s.push_str("],\"edges\":[");
     for (i, e) in graph.edges.iter().enumerate() {
@@ -144,7 +150,11 @@ pub fn render_graph_json(graph: &PlanGraph) -> String {
             e.from, e.to
         ));
     }
-    s.push_str("]}");
+    // The full reversible script (UX-J): the dashboard shows it verbatim so the
+    // viz is grounded in the exact flow the user wrote.
+    s.push_str("],\"script\":");
+    json_escape_into(&mut s, &graph.to_source());
+    s.push('}');
     s
 }
 
@@ -571,4 +581,79 @@ pub fn render_explain(graph: &PlanGraph) -> String {
         s.push_str(&format!("  {line}\n"));
     }
     s
+}
+
+#[cfg(test)]
+mod ux_j_tests {
+    use super::*;
+
+    // UX-J: the static graph JSON must carry each node's IR `to_source` line, a
+    // `blocking` flag (sort/group/…), and the full reversible script, so the
+    // dashboard can show *what* each node does and render the source verbatim.
+    #[test]
+    fn graph_json_carries_src_blocking_and_script() {
+        let g = rivus_parser::parse("F:\n open data.csv\n |? age >= 20\n sort age desc\n;")
+            .expect("parse");
+        let json = render_graph_json(&g);
+        // Per-node IR source line (the predicate / sort key are visible).
+        assert!(json.contains("\"src\":"), "missing per-node src: {json}");
+        assert!(
+            json.contains("age >= 20"),
+            "filter predicate not surfaced: {json}"
+        );
+        assert!(
+            json.contains("sort age desc"),
+            "sort key not surfaced: {json}"
+        );
+        // The blocking flag is present and true for `sort`, false for `filter`.
+        assert!(
+            json.contains("\"blocking\":true"),
+            "sort must be blocking: {json}"
+        );
+        assert!(
+            json.contains("\"blocking\":false"),
+            "filter must not block: {json}"
+        );
+        // The full reversible script is embedded.
+        assert!(json.contains("\"script\":"), "missing script: {json}");
+        assert!(
+            json.contains("open data.csv"),
+            "script text missing: {json}"
+        );
+    }
+
+    // UX-J review fix: only ops that buffer their whole input and emit on finish
+    // are "blocking". A streaming op (distinct, ffill, constant fill) must NOT
+    // false-show a "buffering" state.
+    #[test]
+    fn blocking_flag_excludes_streaming_ops() {
+        let blocks = |src: &str| -> bool {
+            let g = rivus_parser::parse(src).expect("parse");
+            render_graph_json(&g).contains("\"blocking\":true")
+        };
+        // Streaming (stateful but emits as it goes) → not blocking.
+        assert!(
+            !blocks("S:\n open d.csv\n distinct id\n;"),
+            "distinct streams"
+        );
+        assert!(
+            !blocks("S:\n open d.csv\n fill name ffill\n;"),
+            "ffill streams"
+        );
+        assert!(
+            !blocks("S:\n open d.csv\n |? age >= 1\n;"),
+            "filter streams"
+        );
+        // Buffer-the-whole-input → blocking.
+        assert!(blocks("S:\n open d.csv\n sort id\n;"), "sort blocks");
+        assert!(blocks("S:\n open d.csv\n |# id sum:age\n;"), "group blocks");
+        assert!(
+            blocks("S:\n open d.csv\n fill name bfill\n;"),
+            "bfill blocks"
+        );
+        assert!(
+            blocks("S:\n open d.csv\n fill age mean\n;"),
+            "mean fill blocks"
+        );
+    }
 }

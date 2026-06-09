@@ -1006,6 +1006,14 @@ Ids:
   open the printed URL for a live browser dashboard (`GET /`), poll `GET
   /snapshot`, or subscribe to `GET /events` (Server-Sent Events). Heavy drawing
   is in the browser; Rust ships only JSON snapshots — no extra dependencies.
+  **Reading it:** the graph flows **top→down** (matching the script order; a
+  linear pipeline is one readable column, branches step out sideways). Each node
+  shows its **IR source line** — the sort key, filter predicate, cast type — so
+  you see *what* it does at a glance (full text on hover), and the **flow source**
+  panel shows the whole reversible script. A **blocking** operator (`sort`,
+  `group`, `join`, …) that is still accumulating shows an amber **`⏳ N`**
+  "buffering N rows" state rather than a stalled-looking `0`, so a sort buffering
+  before it emits reads as *working*, not stuck.
   A live view (`--tui`/`--serve`) honours `--memory` but always runs **serial**
   so the stream stays coherent (one ordered chunk sequence, not interleaved
   workers); when the autotuner would otherwise have gone parallel the surfaced
