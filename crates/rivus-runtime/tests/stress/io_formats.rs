@@ -77,6 +77,58 @@ fn binary_c_alignment_decodes() {
 }
 
 #[test]
+fn binary_char_field_decodes_to_text() {
+    // `char[N]` (§29.4): N raw bytes decoded as UTF-8, padding kept as value
+    // (§29.5-3). Record: i32 id + char[8] name. Chunk-size independent; UTF-8
+    // multi-byte is decoded whole.
+    let names: [&[u8]; 3] = [
+        b"Alice\0\0\0",
+        b"Bob\0\0\0\0\0",
+        "\u{3042}\u{3044}\0\0".as_bytes(),
+    ];
+    let mut bytes = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(name.len(), 8, "fixture record must be 8 bytes");
+        bytes.extend_from_slice(&((i as i32) + 1).to_le_bytes());
+        bytes.extend_from_slice(name);
+    }
+    let f = TempCsv(gendata::write_temp_bytes("bin_char", &bytes));
+    let p = f.0.display();
+    for cs in [1usize, 2, 4096] {
+        let res = run_src(
+            &format!("F:\n readbin {p} (id:i32 name:char[8])\n |> id name\n;"),
+            cs,
+        );
+        assert!(
+            res.errors.is_empty(),
+            "char[N] decode should not error @cs={cs}"
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("F"))
+            .unwrap();
+        let mut got = Vec::new();
+        for c in &o.chunks {
+            let ci = c.schema.index_of("name").unwrap();
+            for r in 0..c.len {
+                got.push(c.value(r, ci).to_string());
+            }
+        }
+        assert_eq!(got.len(), 3, "@cs={cs}");
+        // Text prefix decoded; trailing NUL padding kept as value (not trimmed).
+        assert_eq!(got[0].trim_end_matches('\0'), "Alice", "@cs={cs}");
+        assert_eq!(got[1].trim_end_matches('\0'), "Bob", "@cs={cs}");
+        assert_eq!(
+            got[2].trim_end_matches('\0'),
+            "\u{3042}\u{3044}",
+            "@cs={cs}"
+        );
+        assert!(got[0].contains('\0'), "padding kept as value @cs={cs}");
+    }
+}
+
+#[test]
 fn jsonl_source_matches_oracle() {
     // JSON Lines source: filter on a numeric field must match an oracle that
     // replays the generator's PRNG, across chunk sizes. `.jsonl` extension

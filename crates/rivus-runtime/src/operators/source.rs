@@ -560,6 +560,17 @@ fn decode_bin_batch(
                 DataType::F64 => {
                     Column::f64((0..n).map(|r| decode_f64(cell(r), *t, endian)).collect())
                 }
+                // `char[N]` (§29.4): decode the N raw bytes as UTF-8 text, keeping
+                // every byte as the value (trailing NUL / padding included —
+                // §29.5-3). Invalid sequences become U+FFFD (never a panic).
+                DataType::Str => {
+                    let mut s = StrColumn::with_capacity(n, n * sz);
+                    for r in 0..n {
+                        let txt = String::from_utf8_lossy(cell(r));
+                        s.push(&txt);
+                    }
+                    Column::str(s)
+                }
                 _ => Column::i64((0..n).map(|r| decode_int(cell(r), *t, endian)).collect()),
             }
         })
@@ -724,7 +735,9 @@ fn decode_int(b: &[u8], t: BinType, e: Endian) -> i64 {
         BinType::I64 => from_bytes!(i64, b, e, 8),
         // u64 above i64::MAX wraps; documented limitation until a u64 lane exists.
         BinType::U64 => from_bytes!(u64, b, e, 8) as i64,
-        BinType::F32 | BinType::F64 => 0, // not an integer lane
+        // Not integer lanes: floats decode via `decode_f64`, `char[N]` via the
+        // Str lane in `decode_bin_batch` — never routed here.
+        BinType::F32 | BinType::F64 | BinType::Char(_) => 0,
     }
 }
 

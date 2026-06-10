@@ -942,8 +942,30 @@ impl Parser {
                     let name = self.word()?;
                     self.expect(&Tok::Colon)?;
                     let ty = self.word()?;
-                    let bt = BinType::parse(&ty)
-                        .ok_or_else(|| self.err(format!("unknown binary type '{ty}'")))?;
+                    // `char[N]` — a fixed-width text field (§29.4): N raw bytes
+                    // decoded as UTF-8. Carries its byte width, so it is parsed
+                    // here rather than via the word-keyed `BinType::parse`.
+                    let bt = if ty == "char" {
+                        if !self.eat(&Tok::LBracket) {
+                            return Err(self.err(
+                                "binary `char` needs a byte width: write `char[N]`, \
+                                 e.g. `name:char[16]`",
+                            ));
+                        }
+                        let n = match self.bump() {
+                            Tok::Int(v) if v >= 0 => v as u32,
+                            other => {
+                                return Err(self.err(format!(
+                                    "char[N]: N must be a non-negative integer, found {other:?}"
+                                )))
+                            }
+                        };
+                        self.expect(&Tok::RBracket)?;
+                        BinType::Char(n)
+                    } else {
+                        BinType::parse(&ty)
+                            .ok_or_else(|| self.err(format!("unknown binary type '{ty}'")))?
+                    };
                     fields.push((name, bt));
                 }
                 self.expect(&Tok::RParen)?;
@@ -2102,6 +2124,33 @@ mod tests {
         for src in bad {
             assert!(parse(src).is_err(), "should have rejected: {src}");
         }
+    }
+
+    #[test]
+    fn readbin_char_field_parses_and_round_trips() {
+        // `char[N]` binary field (§29.4): parses to `BinType::Char(N)`, renders
+        // back as `name:char[N]`, and re-parses to the same IR (reversible).
+        let src = "R:\n readbin f.bin (id:i32 name:char[16])\n |> id name\n;";
+        let g = parse(src).unwrap();
+        match &g.nodes[0].op {
+            Op::Source {
+                codec: rivus_ir::Codec::Binary { fields, .. },
+                ..
+            } => {
+                assert_eq!(fields[1].0, "name");
+                assert_eq!(fields[1].1, rivus_ir::BinType::Char(16));
+            }
+            other => panic!("expected a binary Source, got {other:?}"),
+        }
+        let s = g.to_source();
+        assert!(s.contains("name:char[16]"), "char[N] not in source: {s}");
+        assert_eq!(
+            s,
+            parse(&s).unwrap().to_source(),
+            "char[N] not reversible: {s}"
+        );
+        // A bare `char` with no width is a never-silent error.
+        assert!(parse("R:\n readbin f.bin (id:i32 x:char)\n;").is_err());
     }
 
     #[test]

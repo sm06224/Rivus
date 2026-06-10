@@ -122,7 +122,11 @@ B: readbin dump.bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
 
 `le`/`be` choose byte order (default little-endian); `packed` (default) vs
 `aligned` choose C `repr(C)` natural-alignment padding. Field types:
-`i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`.
+`i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`, plus **`char[N]`** — a fixed
+`N`-byte text field (a C `char[N]`) decoded as UTF-8. All `N` bytes are kept as
+the value (trailing NUL / padding included; `char[N]` aligns to 1 byte), so
+`name:char[16]` reads a 16-byte name field. e.g.
+`readbin people.bin (id:i32 name:char[16])`.
 
 ### Provenance — `with source` / `with filename`
 

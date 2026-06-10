@@ -221,6 +221,11 @@ pub enum BinType {
     F32,
     F64,
     Bool,
+    /// Fixed-width text field `char[N]` (§29.4, s2 follow-up): `N` raw bytes
+    /// decoded as UTF-8 text. Rides the `Str` lane; byte width `N`, 1-byte
+    /// alignment (a C `char[]`). All `N` bytes are kept as the value (trailing
+    /// NUL / padding included — §29.5-3), so a binary record has no empty cell.
+    Char(u32),
 }
 
 impl BinType {
@@ -248,13 +253,17 @@ impl BinType {
             BinType::I16 | BinType::U16 => 2,
             BinType::I32 | BinType::U32 | BinType::F32 => 4,
             BinType::I64 | BinType::U64 | BinType::F64 => 8,
+            BinType::Char(n) => *n as usize,
         }
     }
 
-    /// Natural alignment in bytes (for C `repr(C)` layout). For these
-    /// primitives alignment equals size.
+    /// Natural alignment in bytes (for C `repr(C)` layout). For the numeric
+    /// primitives alignment equals size; a `char[N]` is a byte array (align 1).
     pub fn align(&self) -> usize {
-        self.size()
+        match self {
+            BinType::Char(_) => 1,
+            _ => self.size(),
+        }
     }
 
     /// Which columnar execution lane this decodes into.
@@ -262,23 +271,27 @@ impl BinType {
         match self {
             BinType::Bool => DataType::Bool,
             BinType::F32 | BinType::F64 => DataType::F64,
+            BinType::Char(_) => DataType::Str,
             _ => DataType::I64,
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
+    /// Source spelling of the field type (`char[N]` carries its width, so this
+    /// returns an owned `String` rather than a `&'static str`).
+    pub fn label(&self) -> String {
         match self {
-            BinType::I8 => "i8",
-            BinType::I16 => "i16",
-            BinType::I32 => "i32",
-            BinType::I64 => "i64",
-            BinType::U8 => "u8",
-            BinType::U16 => "u16",
-            BinType::U32 => "u32",
-            BinType::U64 => "u64",
-            BinType::F32 => "f32",
-            BinType::F64 => "f64",
-            BinType::Bool => "bool",
+            BinType::I8 => "i8".to_string(),
+            BinType::I16 => "i16".to_string(),
+            BinType::I32 => "i32".to_string(),
+            BinType::I64 => "i64".to_string(),
+            BinType::U8 => "u8".to_string(),
+            BinType::U16 => "u16".to_string(),
+            BinType::U32 => "u32".to_string(),
+            BinType::U64 => "u64".to_string(),
+            BinType::F32 => "f32".to_string(),
+            BinType::F64 => "f64".to_string(),
+            BinType::Bool => "bool".to_string(),
+            BinType::Char(n) => format!("char[{n}]"),
         }
     }
 }
@@ -871,7 +884,7 @@ impl Op {
                     } => {
                         let cols: Vec<String> = fields
                             .iter()
-                            .map(|(n, t)| format!("{n}:{}", t.as_str()))
+                            .map(|(n, t)| format!("{n}:{}", t.label()))
                             .collect();
                         let mut mods = String::new();
                         if *endian == Endian::Big {
