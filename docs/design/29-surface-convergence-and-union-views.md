@@ -158,16 +158,19 @@ IR・runtime・optimizer は一切変わらない。`Expr::Cast` の構造は **
 - **CSV 固定長 ID**（文字オフセット）と **binary C-struct**（バイトオフセット）を**統一的**に扱える。
 - ビューは静的に解決でき（typed-IR・§00 0.12）、実行時は zero-copy スライス。
 
-定義の候補形（**確定ではない・§29.5-1/2 で批准**）:
+定義形（**統括批准 2026-06-10・issue #137**）— 範囲形 `@start..end`（半開区間）:
 
 ```
-# 全体ビュー string(27) に、サブビューを { オフセット:長さ } で重ねる（候補）
-open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11:16 } ;
+# 全体ビュー string(27) に、サブビューを { @start..end } 範囲で重ねる
+open ids.csv |> complexId :string(27) :{ cls@0..3 departmentId@3..11 equipmentId@11..27 } ;
 ```
 
 - `:string(27)` … 全体プリミティブ（ビュー a）。
-- `:{ … }` … サブビュー束（ビュー b）。`@offset:len`（または index）で物理位置を指定。
-- 全体ビューとサブビューは**同一物理列**を指す union（どちらでも参照可）。
+- `:{ … }` … サブビュー束（ビュー b）。**`@start..end`（半開区間 `[start, end)`）** で物理位置を指定。
+  `:` は定義記号（§29 記号原則）ゆえ offset/len 区切りには使わず、既存 `Tok::DotDot` の範囲形を用いる
+  （lexer 変更ほぼゼロ）。端点規約（半開・単位は型族自動）は s2 design で明記。
+- 全体ビューとサブビューは**同一物理列**を指す union（どちらでも参照可）。**重なり許容・全幅網羅不要**
+  （隙間＝padding 可）。
 
 ### 参照記法 — `.` アクセサ採用（統括批准 2026-06-09）
 サブフィールドの参照は **`.` アクセサ（`complexId.cls`）** を採用する。`.` は本質的に可逆不能では
@@ -212,19 +215,20 @@ open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11
 - `Codec::Binary { fields: Vec<(String, BinType)>, endian: Endian, c_align: bool }`（`graph.rs:372`）。
 - `BinType`（`graph.rs:188`：`I8..F64` / `Bool`）。`Endian { Little, Big }`（`graph.rs:23`）。
 - **現状 `BinType` に固定長文字列サブ型（`char[N]`）が無い**ため、構造体複合のサブ型として
-  `char[N]`（生バイト→テキストデコード）を**追加**する（§29.5-3 で null/可変長と併せて批准）。
+  `char[N]`（生バイト→テキストデコード）を**追加**する（§29.5-3 で確定：全 padding は値保持・可変長は範囲外）。
   `c_align`（C `repr(C)` 自然アラインメント）と `endian` は既存フィールドをそのまま使う。
 
 ### テキストモードは UTF-8 境界を割らない
 文字列複合は **char / byte 境界を明示**し、**UTF-8 のコードポイント境界を割らない**
 （全角/半角・マルチバイトを跨ぐオフセットは never-silent でエラー化＝continue-first）。
-オフセット単位（char か byte か）の指定方法は §29.5-2 で批准する。
+オフセット単位（char か byte か）は §29.5-2 で確定（型族から自動導出・綴りは範囲形 `@start..end`）。
 
 ---
 
 ## 29.5 統括に批准させる分岐（design doc で列挙）
 
-> 以下は **確定ではない**。各項に候補を併記するが、最終形は統括の批准で確定する。
+> **批准済（統括裁定 2026-06-10・issue #137）。** 当初は候補併記だったが、裁定結果を本節へ反映済み。
+> ②③が確定したため **s2 着手可**（⑤＝s3・⑥＝s4 着手時の前提）。
 
 1. **共用体ビューの参照記法 — 確定：式文脈の `.` アクセサ（統括批准 2026-06-09）**
    - `complexId.cls` を **式文脈（`|> ( … )`）** で使う。`source.uri`（§28.6）と同一機構で
@@ -236,17 +240,22 @@ open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11
      糖衣（`|> complexId.{cls departmentId}` を `(complexId.cls) (complexId.departmentId)` へ
      desugar するか）の要否。
 
-2. **オフセット単位（char / byte）の指定方法・サブフィールドの重なり可否/網羅の要否**
-   - 単位：文字列複合は **char**、構造体複合は **byte** が既定だが、明示する綴り（`@`／`bytes`／
-     `chars` 修飾など）を確定。
-   - **重なり可否**：サブビューが物理範囲を重複してよいか（union/overlay の本質は重なり許容だが、
-     検証・最適化の都合で制限するか）。
-   - **全体網羅の要否**：サブビューが全幅を覆い切る必要があるか（隙間 padding を許すか）。
+2. **オフセット単位・重なり・網羅 — 確定（統括批准 2026-06-10・issue #137）**
+   - **単位は型族から自動導出**：文字列複合（CSV 固定長）＝**char**、構造体複合（binary C-struct）
+     ＝**byte**。明示綴りは増やさない（型から自明な情報の二重指定を避ける）。
+   - **綴りは範囲形 `@start..end`（半開区間 `[start, end)`）**。`@offset:len` は不採用——`:` は定義記号
+     （§29 記号原則）であり offset/len 区切りとの二重役を避ける。lexer には既に `Tok::DotDot` があり
+     追加コストはほぼゼロ。端点規約（半開・char/byte 単位での端点）は s2 design で明記。
+   - **重なり許容**（サブビューが物理範囲を重複してよい＝union/overlay の核）。
+   - **全幅網羅は不要**（サブビューが全幅を覆わなくてよい・隙間＝padding 可）。
+   - char 単位で UTF-8 コードポイント境界を割るオフセットは **never-silent エラー**（§29.4）。
 
-3. **null / 可変長フィールドの扱い**
-   - 固定長前提のサブビューに **null**（validity=0・§26 null モデル）をどう載せるか。
-   - **可変長フィールド**（length-prefixed・delimiter 区切り）を扱うか／本スライスの範囲外とするか。
-   - 構造体複合の `char[N]` サブ型追加（§29.4）の null 表現（全 padding を null とみなすか）。
+3. **null / 可変長 / `char[N]` の null 表現 — 確定（統括批准 2026-06-10・issue #137）**
+   - **可変長フィールド**（length-prefixed・delimiter 区切り）は **s2 範囲外**（固定長サブビューのみ・
+     将来スライス）。zero-copy ＋ 静的オフセットの足場を崩さないため。
+   - 固定長サブビューの **null** は §26 null モデル（validity）に従い、全体列の validity を継承。
+   - 構造体複合の `char[N]` サブ型（§29.4）の **全 padding は値として保持**（null にしない）。**空セルのみ**
+     §26 null。「空という値」と「null」の二義性を避け byte-identity / round-trip を保つため。
 
 4. **「`:`」チェーンの `to_source` 完全可逆 — 確定（s1 実装済・§29.2 参照）**
    - 後続は **型語（cast・常に優先）／`{…}`（構造・s2）／識別子（改名）** で互いに素。順序は
@@ -255,18 +264,23 @@ open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11
      （parser の型表とテストで同期固定）。
    - `optimizer_equiv` バイト不変 ＋ round-trip をテストでゲート済み。
 
-5. **書式 / ロケール拡張**（**別スライス s3・依存ゼロ**）
+5. **書式 / ロケール / タイムゾーン拡張 — 確定（統括批准 2026-06-10・issue #137）**（別スライス s3・依存ゼロ）
    - 曜日 `ddd`・`[ja-jp]` 等**ロケール**・**サブ秒** `nnnnnn` の追加。日本語曜日は **std-only な
-     小テーブル**等で依存ゼロを死守。
+     小テーブル**で依存ゼロを死守。
+   - **タイムゾーンも s3 範囲に含める**（統括明言「ロケールも TZ もありあり」）。固定オフセット
+     （`+09:00`）は **#93 で既に正規化済み**。named zone（IANA）を扱う場合、フル tzdata は依存・
+     データサイズの供給網判断（§SUPPLY-CHAIN チェックリスト）が要る——**std-only の範囲（固定
+     オフセット＋限定的な既知略称テーブル等）か tzdata 取り込みかは s3 design で選択肢＋推奨を提示して
+     再確認**する。
    - **`AUTO_FORMATS` 互いに素性の再検証**（§23.1 不変条件・`auto_formats_disjoint` テスト）を
-     書式追加のたびに行う。
-   - **非 UTF-8（SJIS 等）**は範囲と依存を要設計（**既定ビルド std-only を死守**）。範囲に含めるか
-     どうかを批准。
+     書式追加のたびに行う（必須）。
+   - **非 UTF-8（SJIS 等）は s3 範囲外**（将来・encoding 依存の判断を別途／**既定ビルド std-only を死守**）。
 
-6. **新演算子 / リテラル**
+6. **新演算子 / リテラル — 確定（統括批准 2026-06-10・issue #137）**
    - `~`（regex 中置）・`'…'`（regex リテラル）・`$_[i]`（位置参照）・`|!` 複数検証 ＋ `{}` サブフロー。
-   - **regex は既存 feature-gate を崩さない**（既定ビルド依存ゼロ）。regex リテラルを入れても
-     既定ビルドが regex crate を引かない構成（feature 無効時は明示エラー or 不可）を確定。
+   - **`~` / `'…'` regex リテラルの parse / to_source は常時 std**（IR に保持・可逆＝§04）。**評価のみ**
+     off-by-default の `regex` feature を必須とし、**feature off 時は never-silent エラー**（実行不可を
+     明示）。＝**既存 `Func::Regexp` と同一構成**。既定ビルドは regex crate を引かない＝依存ゼロ。
 
 7. **「どこまで厳密にするか」の段階**
    - (1) その場 ad-hoc な `:type{…}`（無名・即席）→ (2) **名前付き再利用 / 外部 DSL 流用**。
@@ -283,9 +297,9 @@ open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11
 | # | スライス | 主要素 | 正しさゲート |
 |---|---|---|---|
 | **s1** | **「`:`」定義チェーン（landed）** | `:` チェーンを `Op::ProjectExpr` の `(Expr, alias)` へ lower。`to_source` 正規形＋後方互換往復。`Expr::Cast` 構造不変。**verb は desugar しない**（in-place 全列保持で semantics が別・§29.2 で確定） | **byte-identity 不変**（IR=既存 ProjectExpr）・round-trip・optimizer_equiv・既存テスト緑 |
-| **s2** | **共用体ビュー**（オフセットサブフィールド・zero-copy・§28 binary 統合） | 「物理1列＋多重論理ビュー」。オフセット/index サブビュー（char/byte）。§28 `Codec::Binary`/`BinType`/`Endian` に統合（`char[N]` サブ型追加）。`.` アクセサ参照（式文脈・§29.5-1 確定） | UTF-8 境界不割・zero-copy・null（§26）・serial==parallel==chunk-size・round-trip |
-| **s3** | **書式 / ロケール拡張**（曜日 / ロケール / サブ秒・互いに素性再検証） | `ddd`・`[ja-jp]`・`nnnnnn`。日本語曜日は std-only テーブル。`AUTO_FORMATS` 互いに素性を再検証。非 UTF-8 は範囲を批准 | `auto_formats_disjoint` 再固定・byte-identity・**依存ゼロ** |
-| **s4** | **`~` / regex リテラル / `\|!` 複数検証 / `{}` サブフロー** | `~`（中置）・`'…'`（regex リテラル）・`$_[i]`・複数検証＋`{}`サブフロー。regex は **feature-gate を崩さない** | 既定ビルド依存ゼロ（regex feature off）・never-silent・round-trip |
+| **s2** | **共用体ビュー**（範囲形オフセットサブフィールド・zero-copy・§28 binary 統合）【批准済 #137】 | 「物理1列＋多重論理ビュー」。**範囲形 `@start..end`（半開）** サブビュー（単位は型族自動＝char/byte・重なり許容・全幅網羅不要）。§28 `Codec::Binary`/`BinType`/`Endian` に統合（`char[N]` サブ型追加・**全 padding は値保持**・可変長は範囲外）。`.` アクセサ参照（式文脈・§29.5-1 確定） | UTF-8 境界不割（never-silent）・zero-copy・null（§26）・serial==parallel==chunk-size・round-trip |
+| **s3** | **書式 / ロケール / TZ 拡張**（曜日 / ロケール / サブ秒 / タイムゾーン・互いに素性再検証）【批准済 #137】 | `ddd`・`[ja-jp]`・`nnnnnn` ＋ **TZ**（固定オフセットは #93 済・named zone は std-only か tzdata 取込かを s3 design で再確認）。日本語曜日は std-only テーブル。`AUTO_FORMATS` 互いに素性を再検証。非 UTF-8 は範囲外 | `auto_formats_disjoint` 再固定・byte-identity・**依存ゼロ** |
+| **s4** | **`~` / regex リテラル / `\|!` 複数検証 / `{}` サブフロー**【批准済 #137】 | `~`（中置）・`'…'`（regex リテラル）・`$_[i]`・複数検証＋`{}`サブフロー。**parse/to_source は常時 std（IR 可逆）・評価のみ `regex` feature**（off＝never-silent エラー）＝`Func::Regexp` と同構成 | 既定ビルド依存ゼロ（regex feature off）・never-silent・round-trip |
 
 ---
 
@@ -306,7 +320,7 @@ open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11
 ## 29.8 段取り
 
 1. **本 §29 design doc を 1 本起こして PR 化**（本 PR）。
-2. **統括批准**（§29.5 の各分岐を確定）。
+2. **統括批准**（§29.5 の各分岐を確定）— ②③⑤⑥ **批准済 2026-06-10・issue #137**。
 3. **s1 から単一 PR ずつ**。各 PR は **レビュアー（私）が実機検証 → COMMENT**、**統括が
    squash-merge**。
 4. 各 PR は §29.7 の不変条件を実測で裏取りして承認 → merge。
@@ -323,6 +337,14 @@ open ids.csv |> complexId :string(27) :{ cls@0:3 departmentId@3:8 equipmentId@11
 - **共用体サブフィールド参照は式文脈の `.` アクセサ**（`source.uri` と同一機構で可逆・統括批准
   2026-06-09）。裸 flow 位置の `.` はファイルパス字面と衝突するため明示エラーのまま（never-silent・
   `lib.rs:1413`）。
+- **共用体サブビューの綴りは範囲形 `@start..end`（半開）**・単位は型族自動（char/byte）・重なり許容・
+  全幅網羅不要（統括批准 2026-06-10・issue #137）。`@offset:len` は不採用（`:` 二重役回避・`Tok::DotDot` 流用）。
+- **`char[N]` の全 padding は値として保持**（null にしない・空セルのみ §26 null）。可変長サブビューは
+  s2 範囲外（統括批准 2026-06-10・issue #137）。
+- **s3 にタイムゾーンを含む**（固定オフセットは #93 済・named zone は std-only か tzdata かを s3 design で
+  再確認）。非 UTF-8（SJIS 等）は s3 範囲外（統括批准 2026-06-10・issue #137）。
+- **regex（`~` / `'…'`）は IR 常時 std・可逆／評価のみ `regex` feature**（off＝never-silent エラー・
+  `Func::Regexp` と同構成・統括批准 2026-06-10・issue #137）。
 - **却下（実装しない）**：`Expr::Cast.format`（案B・§23.6）／`ParseTemporal` 新 IR ノード／
   `LaneCodec` trait 全面刷新／`type` キーワード・UserDefinedType 新設（§23.6 却下）。
 
