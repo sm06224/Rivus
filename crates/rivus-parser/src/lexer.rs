@@ -26,6 +26,7 @@ pub enum Tok {
     Slash,            // /   (expression mode only)
     Percent,          // %   (expression mode only)
     Amp,              // &
+    At,               // @   (union sub-view offset, e.g. `cls@0..3` — §29.3 s2)
     Arrow,            // ->
     Dot,              // .
     DotDot,           // ..
@@ -265,6 +266,11 @@ impl<'a> Lexer<'a> {
                 b'.' => {
                     self.bump();
                     Tok::Dot
+                }
+                // `@` — union sub-view offset separator (`cls@0..3`, §29.3 s2).
+                b'@' => {
+                    self.bump();
+                    Tok::At
                 }
                 // Expression-mode arithmetic operators (only inside parens, so
                 // they never shadow `->`, merge `+`, or path words like `a/b`).

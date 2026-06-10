@@ -453,6 +453,9 @@ fn collect_fields(e: &Expr, out: &mut Vec<String>) {
                 push_unique(out, name)
             }
         }
+        // A union sub-view `base.name` (§29.3, s2) reads the physical column
+        // `base`, so keep `base` live for projection pushdown.
+        Expr::SubView { base, .. } => push_unique(out, base),
         // A value hole references no column.
         Expr::Literal(_) | Expr::Hole(_) => {}
         Expr::Compare { left, right, .. } => {

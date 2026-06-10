@@ -228,6 +228,18 @@ pub enum Expr {
         name: String,
         access: Access,
     },
+    /// `base.name` — a **union sub-view** (§29.3, s2): a zero-copy char slice
+    /// `[start, end)` of fixed-width string column `base`, named `name`. Defined
+    /// by a `col :string(W) :{ name@start..end … }` block (carried on
+    /// `Op::ProjectExpr.views`); referenced in expression context with the same
+    /// `.` accessor as `source.uri`. `start`/`end` are **character** offsets
+    /// (half-open); evaluation borrows the slice and never copies the substring.
+    SubView {
+        base: String,
+        name: String,
+        start: u32,
+        end: u32,
+    },
     Literal(Value),
     /// A `$x` **value hole** (§25.3): a named placeholder for a value, filled by
     /// a binding (`| clean min=0`) or a scope parameter. It is bound at the
@@ -291,7 +303,7 @@ impl Expr {
                 Some(v) => Expr::Literal(v.clone()),
                 None => Expr::Hole(name.clone()),
             },
-            Expr::Field { .. } | Expr::Literal(_) => self.clone(),
+            Expr::Field { .. } | Expr::SubView { .. } | Expr::Literal(_) => self.clone(),
             Expr::Compare { left, op, right } => Expr::Compare {
                 left: Box::new(left.bind_holes(bindings)),
                 op: *op,
@@ -333,7 +345,7 @@ impl Expr {
     pub fn collect_holes(&self, out: &mut Vec<String>) {
         match self {
             Expr::Hole(name) => out.push(name.clone()),
-            Expr::Field { .. } | Expr::Literal(_) => {}
+            Expr::Field { .. } | Expr::SubView { .. } | Expr::Literal(_) => {}
             Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
                 left.collect_holes(out);
                 right.collect_holes(out);
@@ -390,6 +402,9 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Field { name, access } => write!(f, "{}", Expr::field_src(name, *access)),
+            // `base.name` — union sub-view accessor (§29.3, s2), same `.` form as
+            // the `source.uri` provenance accessor.
+            Expr::SubView { base, name, .. } => write!(f, "{base}.{name}"),
             Expr::Literal(Value::Str(s)) => write!(f, "\"{}\"", Expr::escape_string(s)),
             // A resource literal round-trips its uri **only** — `size`/`mtime` are
             // out of the determinism contract (§00 0.14), so they are never emitted.
