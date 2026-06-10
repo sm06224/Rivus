@@ -1259,3 +1259,41 @@ identical with or without a hook; serial == parallel == chunk-size). The absolut
 numbers are small here (a 4-node graph, ~0.36 s run); the cost — and so the
 saving — grows with node count (`build_snapshot`/JSON are `O(nodes)`) and with
 snapshot frequency, which is exactly what the cap bounds.
+
+## datetime auto-parse — move-to-front AUTO_FORMATS trial (#135)
+
+Real-world datetime is predominantly **non-ISO** (compact `yyMMddHHmmss`,
+`yyyyMMdd`, log forms), but `DateTime::AUTO_FORMATS` lists the ISO forms first
+and tries them in order (first match wins). So every cell of a non-ISO column
+re-paid the failed ISO trials — a constant cost on *every* datetime flow, not a
+narrow case. `parse_auto_sticky` remembers the format that matched the previous
+cell of the column and tries it first (move-to-front); on a miss it still scans
+every format (full fallback). A uniform column parses each cell after the first
+in one attempt. The hint lives per-column / per-worker (never shared), so
+serial == parallel is preserved.
+
+**Byte-identical.** `AUTO_FORMATS` is mutually disjoint (separators +
+full-consumption digit counts → at most one entry matches any input), so
+reordering the trial cannot change which format wins. Verified two ways:
+the `auto_formats_disjoint` / `parse_auto_sticky_byte_identical` unit pins, and
+a before-vs-after `cmp` of the full 1 M-row output on every dataset below —
+**all IDENTICAL**.
+
+Full-flow wall (read + parse + save, 1 M rows, best-of-15 interleaved on a shared
+container; the interleave cancels drift):
+
+| dataset (1 M rows) | reader `:datetime` | expr `cast` |
+|---|---:|---:|
+| uniform ISO (`yyyy-MM-ddTHH:mm:ss`)    | ≈ flat (−1 %) | ≈ flat (+0.5 %) |
+| **uniform non-ISO (`yyMMddHHmmss`)**   | **−22 %**     | **−16 %**       |
+| realistic mixed (non-ISO runs, ~1 % ISO) | −16 %       | −12 %           |
+| synthetic 50/50 alternation (worst case) | +5 %        | +9 %            |
+
+The win is broad: any column with format **locality** — uniform (every real
+column from a single source) or mostly-uniform with a sparse minority — gets it.
+Uniform **ISO** is flat because the baseline already matched on the first trial
+(sticky is a no-op there). The only regression is a **synthetic** column that
+strictly alternates two datetime formats every row: move-to-front mispredicts on
+every cell and pays one extra trial — that is the inherent move-to-front
+trade-off, and it is not a shape real datetime columns take (a column comes from
+one producer with one format). byte-identity holds in every case.

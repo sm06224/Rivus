@@ -34,9 +34,22 @@ Tz       = Naive | Utc | FixedOffset(i32 sec)  // MVP は Naive/Utc
 - **書式指定**: `open log.csv (ts:datetime("yyMMddhhmmss"))`。`strptime` 風の
   最小トークン集合（`yyyy yy MM dd HH mm ss SSS`）を std だけで実装（依存ゼロ）。
 - **自動推論**: フラグ `--dates` または列注釈 `:datetime` で、よくある書式
-  （ISO8601 `yyyy-MM-ddTHH:mm:ss`、`yyMMddhhmmss`、`yyyyMMdd`）を順に試す。
+  （`DateTime::AUTO_FORMATS` = ISO8601 `yyyy-MM-ddTHH:mm:ss`、`yyMMddhhmmss`、
+  `yyyyMMdd` 等）を順に試す（first match wins）。
   どれにも一致しない値は **warning + Null 相当（既定 epoch 0）で継続**（原則2）。
 - 2 桁年 `yy` のピボット規約（例 00–68→20xx, 69–99→19xx）を明示・固定（決定的）。
+- **不変条件：`AUTO_FORMATS` は互いに素**（区切り文字＋全消費の桁数で、任意入力に
+  一致する書式は高々1つ）。`parse_with_format` が末尾までの完全消費を要求するため、
+  桁数の異なる純数字書式（8/12/14桁）も区切り付き書式も互いに重ならない。これは
+  byte-identity の前提：高々1書式しか一致しないので**試行順は結果を変えない**。
+  書式を追加するときはこの不変条件を維持すること（`auto_formats_disjoint` テストが固定）。
+- **最適化：move-to-front（#135）**。実世界の datetime は非ISOが主流（`yyMMddHHmmss`・
+  `yyyyMMdd`・ログ系）で、ISO 先頭の試行順だと非ISO列は毎行 ISO 形式の失敗試行を払う。
+  `parse_auto_sticky` は「直前にヒットした書式」を次回最初に試し、外れたら従来どおり
+  全書式 fallback する。列内が均一書式なら2行目以降1試行に縮む。上の互いに素不変条件
+  により **byte-identical**（試行順のみ変化）。状態（hint）は**列ごと・worker ごと**に
+  持ち（スレッド間で共有しない）、serial == parallel を維持。均一列で win、強い交互
+  混在のみ move-to-front の宿命で僅かに不利（実列は均一なので実害なし、`BENCHMARKS`）。
 
 ### 演算
 | 操作 | 構文（案） | 意味 |
