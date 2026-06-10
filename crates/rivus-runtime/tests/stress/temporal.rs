@@ -62,6 +62,83 @@ fn datetime_column_parses_and_is_chunk_size_independent() {
 }
 
 #[test]
+fn datetime_ddd_locale_and_subsecond_chunk_size_independent() {
+    // §29 s3: a `[ja-jp]` format with a validated `ddd` weekday and a 6-digit
+    // `nnnnnn` sub-second run. The run derives the Micro tick unit, every digit
+    // is preserved (Display renders the full-width fraction), a weekday name
+    // that contradicts its date is a counted parse failure (never silently
+    // accepted), and none of it may depend on chunk size.
+    let text = "ts,id\n\
+                2026年06月10日(水) 12:00:00.123456,1\n\
+                2026年06月10日(月) 12:00:00.000001,2\n\
+                garbage,3\n\
+                2026年06月11日(木) 00:00:00.999999,4\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_dt_ja", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "D:\n open {p} (ts:datetime(\"[ja-jp]yyyy年MM月dd日(ddd) HH:mm:ss.nnnnnn\") id:int)\n \
+         |> ts (format(ts, \"[ja-jp]ddd\")) as w id\n;"
+    );
+    let want_ts = vec![
+        "2026-06-10T12:00:00.123456".to_string(),
+        "".to_string(), // (月) on a Wednesday → weekday-validated parse failure
+        "".to_string(), // garbage → parse failure
+        "2026-06-11T00:00:00.999999".to_string(),
+    ];
+    let want_w = vec![
+        "水".to_string(),
+        "".to_string(),
+        "".to_string(),
+        "木".to_string(),
+    ];
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert!(
+            !res.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+            "ja datetime parse must never raise a fatal (cz={cz})"
+        );
+        assert!(
+            !res.errors.is_empty(),
+            "the 2 bad cells must surface on the error stream (cz={cz})"
+        );
+        assert_eq!(collect_strings(&res, "D", "ts"), want_ts, "cz={cz}");
+        assert_eq!(collect_strings(&res, "D", "w"), want_w, "cz={cz}");
+        assert_eq!(collect_i64(&res, "D", "id"), vec![1, 2, 3, 4], "cz={cz}");
+    }
+}
+
+#[test]
+fn tz_abbreviations_normalize_and_ambiguous_surface() {
+    // §29 s3 / #140 (a): unambiguous abbreviations (JST/UTC/…) normalize to the
+    // same UTC instant on the reader path; an ambiguous one (CST — US Central /
+    // China / Cuba) is a counted parse failure (never guessed). Chunk-size
+    // independent.
+    let text = "ts,id\n\
+                2026-06-10 21:00:00 JST,1\n\
+                2026-06-10 12:00:00 UTC,2\n\
+                2026-06-10 12:00:00Z,3\n\
+                2026-06-10 12:00:00 CST,4\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_tz", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("D:\n open {p} (ts:datetime id:int)\n |> ts id\n;");
+    let want = vec![
+        "2026-06-10T12:00:00".to_string(), // 21:00 JST = 12:00 UTC
+        "2026-06-10T12:00:00".to_string(),
+        "2026-06-10T12:00:00".to_string(),
+        "".to_string(), // ambiguous CST → null + counted (never-silent)
+    ];
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow, cz);
+        assert!(
+            !res.errors.is_empty(),
+            "the ambiguous-CST cell must surface (cz={cz})"
+        );
+        assert_eq!(collect_strings(&res, "D", "ts"), want, "cz={cz}");
+        assert_eq!(collect_i64(&res, "D", "id"), vec![1, 2, 3, 4], "cz={cz}");
+    }
+}
+
+#[test]
 fn date_column_parses_chunk_size_independent_and_surfaces_bad() {
     // `:date` reads ISO yyyy-MM-dd into the exact i32 epoch-day lane (#58). An
     // invalid date (2024-02-30) is continue-first (epoch 0) AND surfaced on the

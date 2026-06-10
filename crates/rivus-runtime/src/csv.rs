@@ -1174,6 +1174,11 @@ impl Flags {
 pub struct DtSpec {
     unit: TimeUnit,
     formats: Vec<String>,
+    /// Does the (explicit) format consume sub-second digits itself (`n…n`,
+    /// §29 s3)? Then `parse_opt` must not pre-strip the cell's fraction (#93
+    /// normalization) — the format's own run reads it. Always `false` for the
+    /// auto list (no auto format has an `n` token).
+    subsec: bool,
 }
 
 /// Build the per-kept-column datetime parse specs (design 23): `Some` for each
@@ -1192,6 +1197,7 @@ fn build_dt_specs(
                 let spec = match dt_formats.iter().find(|(c, _)| *c == names[ci]) {
                     Some((_, fmt)) => DtSpec {
                         unit,
+                        subsec: DateTime::format_has_subsec(fmt),
                         formats: vec![fmt.clone()],
                     },
                     None => DtSpec::auto(unit),
@@ -1207,6 +1213,7 @@ impl DtSpec {
     fn auto(unit: TimeUnit) -> Self {
         DtSpec {
             unit,
+            subsec: false,
             // The canonical auto-infer list lives in core, so the reader and the
             // predicate-literal path agree on what a given text means (design 23).
             formats: DateTime::AUTO_FORMATS
@@ -1225,8 +1232,14 @@ impl DtSpec {
     fn parse_opt(&self, cell: &str, hint: &mut usize) -> Option<i64> {
         // Normalise a trailing ISO timezone / fractional second (#93) so the
         // reader accepts the same variants as `DateTime::parse_auto`. For an
-        // explicit fixed-width format the digit-only cell is unchanged.
-        let (s, offset_secs) = DateTime::normalize_iso(cell);
+        // explicit fixed-width format the digit-only cell is unchanged. A
+        // format with its own `n…n` sub-second run (§29 s3) keeps the fraction
+        // — only the zone is stripped — so the run reads the declared digits.
+        let (s, offset_secs) = if self.subsec {
+            DateTime::strip_zone(cell)
+        } else {
+            DateTime::normalize_iso(cell)
+        };
         // Move-to-front: try the format that matched the previous cell of this
         // column first, then the rest in order. The auto list is the mutually
         // disjoint `AUTO_FORMATS`, so the trial order is perf-only — byte

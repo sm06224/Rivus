@@ -307,6 +307,88 @@ fn strip_fraction(s: &str) -> &str {
     }
 }
 
+/// Timezone-abbreviation table (§29 s3 / issue #140, ratified **(a) std-only**):
+/// each entry is an **unambiguous alias for one fixed offset** — never a
+/// DST-rule conversion (named zones like `Asia/Tokyo` are out of scope; IANA
+/// tzdata would make results depend on an external, versioned dataset).
+/// Core per the ruling: `UTC`/`GMT`/`JST`; plus `MST`/`HST`, which are
+/// unambiguous in wild data (MST's other use, Sonora, is the same −7; HST is
+/// Hawaii only). The criterion is **"is the abbreviation ambiguous in wild
+/// cells?"**, not "is it an IANA zone name" — so `EST` is out (Australian
+/// Eastern Standard Time is +10; tzdata 2017a renamed the Australian
+/// abbreviations to `AEST` etc. precisely over this clash — silently applying
+/// −5 would be a 15-hour skew). **Deliberately excluded as ambiguous**
+/// (never-silent: a cell carrying one fails its format and is counted, never
+/// guessed): `CST` (US Central / China / Cuba), `IST` (India / Israel /
+/// Ireland), `BST` (British Summer / Bangladesh), `PST` (US Pacific /
+/// Philippine), `EST` (US Eastern / Australian Eastern), `AST`, `CDT`
+/// (US / Cuba), and the other DST-pair names.
+const TZ_ABBREV: &[(&str, i64)] = &[
+    ("UTC", 0),
+    ("GMT", 0),
+    ("JST", 9 * 3600),
+    ("MST", -7 * 3600),
+    ("HST", -10 * 3600),
+];
+
+/// Split a trailing timezone **abbreviation** (`… JST`: uppercase, separated by
+/// exactly one space) off a datetime string, returning the remainder and the
+/// fixed offset in seconds (UTC = local − offset). Only [`TZ_ABBREV`] entries
+/// match; anything else (ambiguous `CST`, lowercase `jst`, unknown words) is
+/// left in place, so the cell fails its format never-silently instead of being
+/// silently guessed.
+fn strip_zone_abbrev(s: &str) -> Option<(&str, i64)> {
+    let (name, off) = TZ_ABBREV
+        .iter()
+        .find(|(name, _)| s.ends_with(name))
+        .copied()?;
+    let base = s[..s.len() - name.len()].strip_suffix(' ')?;
+    Some((base, off))
+}
+
+/// Weekday-name table for the `ddd` format token (§29 s3), Monday-first like
+/// ISO ([`Date::weekday`]). English short names (the default locale).
+const DDD_EN: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+/// Japanese single-kanji weekday names (`[ja-jp]`), Monday-first.
+const DDD_JA: [&str; 7] = ["月", "火", "水", "木", "金", "土", "日"];
+
+/// Locale for locale-sensitive format tokens (`ddd`), selected by a leading
+/// `[tag]` on the format string (e.g. `"[ja-jp]yyyy年MM月dd日(ddd)"`). The
+/// tables are **std-only** consts (§29.5-5: zero dependencies for locale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DtLocale {
+    En,
+    Ja,
+}
+
+impl DtLocale {
+    fn ddd(self) -> &'static [&'static str; 7] {
+        match self {
+            DtLocale::En => &DDD_EN,
+            DtLocale::Ja => &DDD_JA,
+        }
+    }
+}
+
+/// Split a leading `[tag]` locale off a format string. An unknown tag is left
+/// in place (it would only ever match itself as literal bytes); program-level
+/// format strings are gated by [`DateTime::validate_format`] at declaration, so
+/// a typo'd tag is a parse error there, never a silent literal.
+fn split_locale(fmt: &str) -> (DtLocale, &str) {
+    if let Some(rest) = fmt.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let tag = &rest[..end];
+            if tag.eq_ignore_ascii_case("ja-jp") {
+                return (DtLocale::Ja, &rest[end + 1..]);
+            }
+            if tag.eq_ignore_ascii_case("en-us") {
+                return (DtLocale::En, &rest[end + 1..]);
+            }
+        }
+    }
+    (DtLocale::En, fmt)
+}
+
 /// A timestamp on the **datetime lane** (design 23): integer `ticks` since the
 /// Unix epoch in `unit` resolution (UTC; no timezone yet). The integer form is
 /// exact and associative — like the decimal lane — so `min`/`max`/`count`/`first`/
@@ -400,12 +482,13 @@ impl DateTime {
             })
     }
 
-    /// Strip a trailing ISO-8601 timezone (`Z` / `±HH:mm`) and fractional-second
-    /// suffix from a datetime string, returning the bare `…HH:mm:ss` text and the
-    /// UTC offset in seconds (UTC = local − offset). Shared by `parse_auto` and
-    /// the reader's `DtSpec` so both accept the same ISO variants. #93.
+    /// Strip a trailing timezone (`Z` / `±HH:mm` — #93 — or an unambiguous
+    /// abbreviation like ` JST` — §29 s3 / #140) and fractional-second suffix
+    /// from a datetime string, returning the bare `…HH:mm:ss` text and the UTC
+    /// offset in seconds (UTC = local − offset). Shared by `parse_auto` and the
+    /// reader's `DtSpec` so both accept the same variants.
     pub fn normalize_iso(s: &str) -> (&str, i64) {
-        let (base, off) = strip_iso_zone(s.trim());
+        let (base, off) = Self::strip_zone(s);
         (strip_fraction(base), off)
     }
 
@@ -436,14 +519,22 @@ impl DateTime {
         DateTime::new(secs * self.unit.per_sec(), self.unit)
     }
 
-    /// Parse `s` with a `strptime`-style `fmt` (tokens `yyyy`/`yy`/`MM`/`dd`/`HH`
-    /// or `hh`/`mm`/`ss`; any other char is a literal that must match) into a
-    /// `DateTime` at `unit`. `None` on any mismatch (the reader routes a bad cell
-    /// to the error stream / epoch-0, continue-first).
+    /// Parse `s` with a `strptime`-style `fmt` (tokens `yyyy`/`yy`/`MM`/`dd`/
+    /// `ddd`/`HH` or `hh`/`mm`/`ss`/`n…n`; any other char is a literal that must
+    /// match) into a `DateTime` at `unit`. A leading `[ja-jp]`/`[en-us]` tag
+    /// selects the `ddd` weekday table (§29 s3). `ddd` is **validated**: a cell
+    /// whose weekday name contradicts its civil date is a mismatch — corrupt
+    /// data is never silently accepted. An `n…n` run of length k reads exactly
+    /// k fractional-second digits, scaled to `unit` ticks. `None` on any
+    /// mismatch (the reader routes a bad cell to the error stream / epoch-0,
+    /// continue-first).
     pub fn parse_with_format(s: &str, fmt: &str, unit: TimeUnit) -> Option<DateTime> {
+        let (locale, fmt) = split_locale(fmt);
         let (sb, fb) = (s.as_bytes(), fmt.as_bytes());
         let (mut si, mut fi) = (0usize, 0usize);
         let (mut y, mut mo, mut d, mut h, mut mi, mut se) = (1970i64, 1i64, 1i64, 0i64, 0i64, 0i64);
+        let mut claimed_dow: Option<u8> = None;
+        let mut frac: Option<(i64, u32)> = None;
         // Read `n` ASCII digits from `s` at `si`, advancing it.
         let read = |sb: &[u8], si: &mut usize, n: usize| -> Option<i64> {
             let mut v = 0i64;
@@ -458,10 +549,23 @@ impl DateTime {
             Some(v)
         };
         while fi < fb.len() {
-            let rest = &fmt[fi..];
-            if let Some(tok) = ["yyyy", "yy", "MM", "dd", "HH", "hh", "mm", "ss"]
+            // Byte slice, never `&fmt[fi..]`: literal matching advances `fi`
+            // one byte at a time, so inside a multi-byte literal (e.g. `年`)
+            // `fi` is not a char boundary and a str slice would panic.
+            let rest = &fb[fi..];
+            // `ddd` must be tried before the token table — `dd` is its prefix
+            // and would otherwise win, leaving a stray `d` literal.
+            if rest.starts_with(b"ddd") {
+                let names = locale.ddd();
+                let idx = names
+                    .iter()
+                    .position(|n| sb[si..].starts_with(n.as_bytes()))?;
+                claimed_dow = Some(idx as u8);
+                si += names[idx].len();
+                fi += 3;
+            } else if let Some(tok) = ["yyyy", "yy", "MM", "dd", "HH", "hh", "mm", "ss"]
                 .into_iter()
-                .find(|t| rest.starts_with(t))
+                .find(|t| rest.starts_with(t.as_bytes()))
             {
                 let n = tok.len();
                 let v = read(sb, &mut si, n)?;
@@ -478,6 +582,17 @@ impl DateTime {
                     _ => unreachable!(),
                 }
                 fi += n;
+            } else if fb[fi] == b'n' {
+                // `n…n` sub-second run (§29 s3): k tokens read exactly k digits.
+                // `validate_format` caps runs at 9 for program-level strings;
+                // cap defensively here too (10^k must fit the scaling math).
+                let k = rest.iter().take_while(|&&b| b == b'n').count();
+                if k > 9 {
+                    return None;
+                }
+                let v = read(sb, &mut si, k)?;
+                frac = Some((v, k as u32));
+                fi += k;
             } else {
                 // Literal byte must match.
                 if sb.get(si) != fb.get(fi) {
@@ -490,19 +605,40 @@ impl DateTime {
         if si != sb.len() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
             return None;
         }
-        let secs = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
-        Some(DateTime::new(secs * unit.per_sec(), unit))
+        let day = days_from_civil(y, mo, d);
+        if let Some(c) = claimed_dow {
+            // `ddd` is a checked claim, not decoration: 1970-01-01 was Thursday
+            // (=3), same convention as `Date::weekday` (0 = Mon … 6 = Sun).
+            if ((day + 3).rem_euclid(7)) as u8 != c {
+                return None;
+            }
+        }
+        let mut ticks = (day * 86400 + h * 3600 + mi * 60 + se) * unit.per_sec();
+        if let Some((v, k)) = frac {
+            // k digits → ticks at `unit` (i128 intermediate: v < 10^9, per_sec
+            // ≤ 10^9). Digits finer than the unit truncate deterministically.
+            ticks += ((v as i128 * unit.per_sec() as i128) / 10i128.pow(k)) as i64;
+        }
+        Some(DateTime::new(ticks, unit))
     }
 
-    /// Render with a `strftime`-style `fmt` (same tokens as `parse_with_format`).
+    /// Render with a `strftime`-style `fmt` (same tokens as `parse_with_format`,
+    /// including `ddd` weekday names — locale via a leading `[ja-jp]` tag — and
+    /// `n…n` sub-second digits, §29 s3).
     pub fn format(&self, fmt: &str) -> String {
+        let (locale, fmt) = split_locale(fmt);
         let (y, mo, d, h, mi, se) = self.fields();
         let fb = fmt.as_bytes();
         let mut out = String::with_capacity(fmt.len() + 8);
         let mut fi = 0usize;
         while fi < fb.len() {
             let rest = &fmt[fi..];
-            if let Some(tok) = ["yyyy", "yy", "MM", "dd", "HH", "hh", "mm", "ss"]
+            // `ddd` before the token table (`dd` is its prefix).
+            if rest.starts_with("ddd") {
+                let day = self.ticks.div_euclid(self.unit.per_sec()).div_euclid(86400);
+                out.push_str(locale.ddd()[((day + 3).rem_euclid(7)) as usize]);
+                fi += 3;
+            } else if let Some(tok) = ["yyyy", "yy", "MM", "dd", "HH", "hh", "mm", "ss"]
                 .into_iter()
                 .find(|t| rest.starts_with(t))
             {
@@ -532,20 +668,140 @@ impl DateTime {
                     _ => unreachable!(),
                 }
                 fi += tok.len();
+            } else if fb[fi] == b'n' {
+                // `n…n` (§29 s3): the fraction of a second at this value's unit,
+                // rendered to exactly k digits (coarser units pad with zeros).
+                use std::fmt::Write as _;
+                let k = rest.bytes().take_while(|&b| b == b'n').count().min(9);
+                let ps = self.unit.per_sec() as i128;
+                let f = self.ticks.rem_euclid(self.unit.per_sec()) as i128;
+                let v = f * 10i128.pow(k as u32) / ps;
+                let _ = write!(out, "{v:0width$}", width = k);
+                fi += k;
             } else {
-                out.push(fb[fi] as char);
-                fi += 1;
+                // Copy the literal char whole — a multi-byte literal (e.g. `年`
+                // in a `[ja-jp]` format) must not be pushed byte-by-byte.
+                let ch = fmt[fi..].chars().next().unwrap_or('\u{fffd}');
+                out.push(ch);
+                fi += ch.len_utf8();
             }
         }
         out
     }
+
+    /// Validate a format string at **declaration** time (§29 s3, never-silent):
+    /// a leading `[tag]` must be a known locale (`[ja-jp]`/`[en-us]`), and at
+    /// most one `n…n` sub-second run of 1..=9 digits is allowed. Cell-level
+    /// mismatches stay per-cell (continue-first); this catches *program*
+    /// mistakes — a typo'd tag must not silently become a literal.
+    pub fn validate_format(fmt: &str) -> Result<(), String> {
+        if let Some(rest) = fmt.strip_prefix('[') {
+            match rest.find(']') {
+                Some(end) => {
+                    let tag = &rest[..end];
+                    if !tag.eq_ignore_ascii_case("ja-jp") && !tag.eq_ignore_ascii_case("en-us") {
+                        return Err(format!(
+                            "unknown locale tag '[{tag}]' in datetime format \
+                             (supported: [ja-jp], [en-us])"
+                        ));
+                    }
+                }
+                None => {
+                    return Err(
+                        "unclosed locale tag '[' at the start of a datetime format".to_string()
+                    )
+                }
+            }
+        }
+        let (_, body) = split_locale(fmt);
+        let b = body.as_bytes();
+        let (mut i, mut runs) = (0usize, 0usize);
+        while i < b.len() {
+            if b[i] == b'n' {
+                let k = b[i..].iter().take_while(|&&c| c == b'n').count();
+                if k > 9 {
+                    return Err(format!(
+                        "sub-second run of {k} `n` is too long (1..=9 digits: \
+                         nnn = milliseconds … nnnnnnnnn = nanoseconds)"
+                    ));
+                }
+                runs += 1;
+                i += k;
+            } else {
+                i += 1;
+            }
+        }
+        if runs > 1 {
+            return Err(
+                "a datetime format may contain at most one `n…n` sub-second run".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The tick resolution a format needs (§29 s3): its `n…n` sub-second run
+    /// decides — none → `Sec`, 1–3 digits → `Milli`, 4–6 → `Micro`, 7–9 →
+    /// `Nano`. The reader stores the column at this unit, so every declared
+    /// digit is preserved exactly (integer ticks — no float rounding).
+    pub fn unit_for_format(fmt: &str) -> TimeUnit {
+        let (_, body) = split_locale(fmt);
+        let b = body.as_bytes();
+        let (mut i, mut longest) = (0usize, 0usize);
+        while i < b.len() {
+            if b[i] == b'n' {
+                let k = b[i..].iter().take_while(|&&c| c == b'n').count();
+                longest = longest.max(k);
+                i += k;
+            } else {
+                i += 1;
+            }
+        }
+        match longest {
+            0 => TimeUnit::Sec,
+            1..=3 => TimeUnit::Milli,
+            4..=6 => TimeUnit::Micro,
+            _ => TimeUnit::Nano,
+        }
+    }
+
+    /// Does this format consume sub-second digits itself (an `n…n` run)? The
+    /// reader must then *not* pre-strip the cell's fraction (#93 normalization)
+    /// — the format's own run reads it. Locale-tag aware (`[en-us]` contains an
+    /// `n` that must not count).
+    pub fn format_has_subsec(fmt: &str) -> bool {
+        split_locale(fmt).1.bytes().any(|b| b == b'n')
+    }
+
+    /// Strip only a trailing zone — an ISO `Z`/`±HH:mm` (#93) or an unambiguous
+    /// abbreviation from [`TZ_ABBREV`] (` JST`, §29 s3 / #140) — keeping any
+    /// fractional seconds, for specs whose format consumes the fraction itself.
+    pub fn strip_zone(s: &str) -> (&str, i64) {
+        let s = s.trim();
+        if let Some(hit) = strip_zone_abbrev(s) {
+            return hit;
+        }
+        strip_iso_zone(s)
+    }
 }
 
 impl fmt::Display for DateTime {
-    /// Default ISO-8601 (`yyyy-MM-ddTHH:mm:ss`); sub-second ticks are truncated to
-    /// the whole second in this rendering.
+    /// Default ISO-8601 (`yyyy-MM-ddTHH:mm:ss`). A sub-second lane (`Milli`/
+    /// `Micro`/`Nano`, §29 s3) appends its full-width fraction (`.SSS` /
+    /// `.SSSSSS` / `.SSSSSSSSS`) so declared precision is never silently
+    /// dropped on output; the `Sec` rendering is unchanged (no fraction).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.format("yyyy-MM-ddTHH:mm:ss"))
+        f.write_str(&self.format("yyyy-MM-ddTHH:mm:ss"))?;
+        let ps = self.unit.per_sec();
+        if ps > 1 {
+            let width = match self.unit {
+                TimeUnit::Milli => 3,
+                TimeUnit::Micro => 6,
+                TimeUnit::Nano => 9,
+                TimeUnit::Sec => unreachable!(),
+            };
+            write!(f, ".{:0width$}", self.ticks.rem_euclid(ps), width = width)?;
+        }
+        Ok(())
     }
 }
 
@@ -1539,6 +1795,133 @@ mod decimal_tests {
     }
 
     #[test]
+    fn ddd_weekday_token_parses_validates_and_formats() {
+        // 2026-06-10 is a Wednesday (anchored from the weekday test: 2024-06-03
+        // is a Monday, +737 days ≡ +2 mod 7).
+        let dt =
+            DateTime::parse_with_format("Wed 2026-06-10", "ddd yyyy-MM-dd", TimeUnit::Sec).unwrap();
+        assert_eq!(dt.format("ddd yyyy-MM-dd"), "Wed 2026-06-10");
+        // `ddd` is validated, not decoration: a weekday name that contradicts
+        // the civil date is a mismatch (never-silent at the call site).
+        assert!(
+            DateTime::parse_with_format("Mon 2026-06-10", "ddd yyyy-MM-dd", TimeUnit::Sec)
+                .is_none()
+        );
+        // `[ja-jp]`: single-kanji weekday + multi-byte literals, both ways.
+        let fmt = "[ja-jp]yyyy年MM月dd日(ddd)";
+        let dt = DateTime::parse_with_format("2026年06月10日(水)", fmt, TimeUnit::Sec).unwrap();
+        assert_eq!(dt.format(fmt), "2026年06月10日(水)");
+        assert!(DateTime::parse_with_format("2026年06月10日(月)", fmt, TimeUnit::Sec).is_none());
+        // A multi-byte literal must neither mangle the output nor panic the
+        // parse when the cell diverges mid-literal.
+        assert!(DateTime::parse_with_format("2026年06月10x(水)", fmt, TimeUnit::Sec).is_none());
+    }
+
+    #[test]
+    fn subsecond_run_parses_scales_and_renders() {
+        // 6-digit run at the matching Micro unit: every digit preserved.
+        let fmt = "yyyy-MM-dd HH:mm:ss.nnnnnn";
+        let dt = DateTime::parse_with_format("2026-06-10 12:00:00.123456", fmt, TimeUnit::Micro)
+            .unwrap();
+        assert_eq!(dt.ticks.rem_euclid(1_000_000), 123_456);
+        assert_eq!(dt.format(fmt), "2026-06-10 12:00:00.123456");
+        // Display appends the unit-width fraction (precision is never silently
+        // dropped on output); the Sec rendering is unchanged elsewhere.
+        assert_eq!(dt.to_string(), "2026-06-10T12:00:00.123456");
+        // 3-digit run at Milli.
+        let dt = DateTime::parse_with_format(
+            "2026-06-10 12:00:00.250",
+            "yyyy-MM-dd HH:mm:ss.nnn",
+            TimeUnit::Milli,
+        )
+        .unwrap();
+        assert_eq!(dt.ticks.rem_euclid(1_000), 250);
+        // Wrong digit count for the run is a mismatch, not a guess.
+        assert!(DateTime::parse_with_format(
+            "2026-06-10 12:00:00.25",
+            "yyyy-MM-dd HH:mm:ss.nnn",
+            TimeUnit::Milli
+        )
+        .is_none());
+        // Pre-epoch fraction composes with floored seconds (rem_euclid).
+        let dt = DateTime::parse_with_format(
+            "1969-12-31 23:59:59.500",
+            "yyyy-MM-dd HH:mm:ss.nnn",
+            TimeUnit::Milli,
+        )
+        .unwrap();
+        assert_eq!(dt.ticks, -500);
+        assert_eq!(dt.to_string(), "1969-12-31T23:59:59.500");
+    }
+
+    #[test]
+    fn format_validation_and_unit_derivation() {
+        // Program-level mistakes are declaration errors (never-silent).
+        assert!(DateTime::validate_format("[xx-yy]yyyy").is_err());
+        assert!(DateTime::validate_format("[ja-jp").is_err());
+        assert!(DateTime::validate_format("mm.nnn ss.nnn").is_err());
+        assert!(DateTime::validate_format("ss.nnnnnnnnnn").is_err()); // 10 digits
+        assert!(DateTime::validate_format("[ja-jp]yyyy年(ddd) HH:mm:ss.nnnnnn").is_ok());
+        assert!(DateTime::validate_format("[EN-US]yyyy").is_ok()); // case-insensitive
+                                                                   // The sub-second run decides the column's tick unit.
+        assert_eq!(DateTime::unit_for_format("HH:mm:ss"), TimeUnit::Sec);
+        assert_eq!(DateTime::unit_for_format("ss.n"), TimeUnit::Milli);
+        assert_eq!(DateTime::unit_for_format("ss.nnn"), TimeUnit::Milli);
+        assert_eq!(DateTime::unit_for_format("ss.nnnnnn"), TimeUnit::Micro);
+        assert_eq!(DateTime::unit_for_format("ss.nnnnnnnnn"), TimeUnit::Nano);
+        // The `n` inside the `[en-us]` tag itself must not count as a run.
+        assert_eq!(DateTime::unit_for_format("[en-us]HH:mm:ss"), TimeUnit::Sec);
+        assert!(!DateTime::format_has_subsec("[en-us]HH:mm:ss"));
+        assert!(DateTime::format_has_subsec("[en-us]HH:mm:ss.nnn"));
+    }
+
+    #[test]
+    fn tz_abbreviations_normalize_unambiguous_only() {
+        // §29 s3 / #140 (a): a trailing unambiguous abbreviation is a fixed
+        // offset — 21:00 JST is 12:00 UTC. Never a DST-rule conversion.
+        let utc = DateTime::parse_auto("2026-06-10T12:00:00Z", TimeUnit::Sec).unwrap();
+        let jst = DateTime::parse_auto("2026-06-10 21:00:00 JST", TimeUnit::Sec).unwrap();
+        assert_eq!(jst, utc);
+        // Every table entry applies exactly its fixed offset (UTC = local − off).
+        for (abbr, off) in [
+            ("UTC", 0i64),
+            ("GMT", 0),
+            ("JST", 9 * 3600),
+            ("MST", -7 * 3600),
+            ("HST", -10 * 3600),
+        ] {
+            let got = DateTime::parse_auto(&format!("2026-06-10 12:00:00 {abbr}"), TimeUnit::Sec)
+                .unwrap();
+            assert_eq!(got.ticks, utc.ticks - off, "{abbr} offset wrong");
+        }
+        // Ambiguous (CST/IST/…, and EST: US −5 vs Australian +10), lowercase,
+        // and unknown abbreviations never strip — the cell fails its formats
+        // (counted at the caller, design 23), never silently guessed.
+        for bad in [
+            "2026-06-10 12:00:00 CST",
+            "2026-06-10 12:00:00 IST",
+            "2026-06-10 12:00:00 EST",
+            "2026-06-10 12:00:00 jst",
+            "2026-06-10 12:00:00 XYZ",
+        ] {
+            assert!(
+                DateTime::parse_auto(bad, TimeUnit::Sec).is_none(),
+                "must not guess: {bad}"
+            );
+        }
+        // ISO order `…ss.frac ABBR`: both strip on the auto path…
+        assert_eq!(
+            DateTime::parse_auto("2026-06-10 21:00:00.5 JST", TimeUnit::Sec).unwrap(),
+            utc
+        );
+        // …while `strip_zone` keeps the fraction for `n…n` specs.
+        assert_eq!(
+            DateTime::strip_zone("2026-06-10 21:00:00.123 JST"),
+            ("2026-06-10 21:00:00.123", 9 * 3600)
+        );
+    }
+
+    #[test]
     fn datetime_parse_format_roundtrips() {
         // Epoch itself.
         let dt = DateTime::parse_with_format(
@@ -1695,9 +2078,16 @@ mod decimal_tests {
         assert_eq!(a, b);
         assert!(DateTime::new(999, TimeUnit::Milli) < b);
         assert!(DateTime::new(1_001, TimeUnit::Milli) > b);
-        // Sub-second resolution preserved in ticks but truncated in Display.
+        // Sub-second resolution is preserved in ticks AND rendered by Display
+        // at the unit's full width (§29 s3 — precision is never silently
+        // dropped on output; before s3 no user program could construct a
+        // unit > Sec lane, so this changes no existing flow's bytes).
         let m = DateTime::new(1_500, TimeUnit::Milli);
-        assert_eq!(m.to_string(), "1970-01-01T00:00:01");
+        assert_eq!(m.to_string(), "1970-01-01T00:00:01.500");
+        assert_eq!(
+            DateTime::new(1_000_000, TimeUnit::Micro).to_string(),
+            "1970-01-01T00:00:01.000000"
+        );
     }
 
     #[test]

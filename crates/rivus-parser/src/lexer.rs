@@ -375,27 +375,34 @@ impl<'a> Lexer<'a> {
 
     fn lex_string(&mut self, line: u32) -> Result<Tok, String> {
         self.bump(); // opening quote
-        let mut s = String::new();
+                     // Accumulate bytes, not byte-as-`char`: a multi-byte UTF-8 literal in a
+                     // string (e.g. the `[ja-jp]` format `"yyyy年MM月dd日"`, §29 s3) must be
+                     // copied verbatim — pushing each byte as a char re-encodes it into
+                     // mojibake. The source is valid UTF-8 and escapes are ASCII, so the
+                     // collected bytes are valid too; the check is belt-and-braces.
+        let mut s: Vec<u8> = Vec::new();
         loop {
             let c = self.peek();
             match c {
                 0 => return Err(format!("unterminated string at line {line}")),
                 b'"' => {
                     self.bump();
-                    return Ok(Tok::Str(s));
+                    return String::from_utf8(s)
+                        .map(Tok::Str)
+                        .map_err(|_| format!("invalid UTF-8 in string at line {line}"));
                 }
                 b'\\' => {
                     self.bump();
                     let e = self.bump();
                     s.push(match e {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        other => other as char,
+                        b'n' => b'\n',
+                        b't' => b'\t',
+                        b'"' => b'"',
+                        b'\\' => b'\\',
+                        other => other,
                     });
                 }
-                _ => s.push(self.bump() as char),
+                _ => s.push(self.bump()),
             }
         }
     }
