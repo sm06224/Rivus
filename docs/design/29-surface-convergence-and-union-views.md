@@ -345,6 +345,28 @@ text/char（CSV 固定長・#138）に続く byte 単位の構造体複合を、
    - **`~` / `'…'` regex リテラルの parse / to_source は常時 std**（IR に保持・可逆＝§04）。**評価のみ**
      off-by-default の `regex` feature を必須とし、**feature off 時は never-silent エラー**（実行不可を
      明示）。＝**既存 `Func::Regexp` と同一構成**。既定ビルドは regex crate を引かない＝依存ゼロ。
+   - **s4 具象設計（lowering・実装レビュー裁定 2026-06-10）**：
+     - **`~`（regex 中置）**：`EXPR ~ 'pat'`。比較と同位の中置。`Expr::Func(Func::Regexp,
+       [lhs, rhs])` へ lower（**IR 変更ゼロ**。`regexp`/`regex`/`matches` は従来どおり同一 Func の
+       alias）。`to_source` 正規形＝パターンが文字列リテラルなら **`lhs ~ 'pat'`**（s1 同様、
+       旧綴り `regexp(col, "p")` は fmt で `~` に収束）。パターンが式の場合・パターンに `'` を
+       含む場合は従来形 `regexp(lhs, …)` を保つ。
+     - **`'…'`（regex リテラル）**：**raw**（エスケープ処理なし＝バックスラッシュは正規表現の
+       もの）。`'` 自体は書けない（その時は `"…"` でパターンを書く）。出現位置は **`~` の右辺と
+       `regexp()`/`regex()`/`matches()` の第2引数のみ**（他は宣言時エラー＝program error）。
+     - **`$_[i]`（位置参照）**：0始まり・スキーマ列順。新 Expr variant **`Expr::FieldAt(u32)`**。
+       範囲外は**セル単位 null＋counted**（continue-first）。列名ベースの optimizer
+       pushdown/projection prune は FieldAt を含む式で**保守的に不発火**（名前で安全判定不能）。
+       to_source は `$_[i]`。
+     - **`|!` 複数検証＋`{}` サブフロー**：`|! { PRED DISP; PRED DISP … }`（`;` 区切り・末尾 `;`
+       任意）。**連鎖した `Op::Validate` へ lower（IR 変更ゼロ・順序保存）**。to_source 正規形＝
+       直列に連続する Validate が **2つ以上なら `{}` 束**・単独は従来形 `|! pred disp`。`halt` は
+       束内でも最初の違反で停止（順序が意味を持つ）。
+     - **feature off の never-silent 化（既存ギャップ修正）**：従来 `Func::Regexp` は feature off で
+       **黙って false** を返していた（expr.rs doc の「recoverable error」は未実装）。s4 で
+       **実行前検査**へ修正：plan が regex 評価（`~`/`regexp()`）を含み feature off なら
+       `RivusError::Build`（program error・サイクル検査と同じ建付け）で**実行前に明示拒否**＋
+       guidance（`--features regex` で再ビルド・既定ビルドは依存ゼロ維持）。
 
 7. **「どこまで厳密にするか」の段階**
    - (1) その場 ad-hoc な `:type{…}`（無名・即席）→ (2) **名前付き再利用 / 外部 DSL 流用**。

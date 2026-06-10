@@ -267,6 +267,15 @@ always reported** on the error stream (never silent). Same predicate syntax as
   either way), while `reject`'s dropped rows stay **byte-identical** to serial. A
   single coordinator-merged count is a validation-layer follow-up (§24). `halt`
   raises a `Fatal` (the run stops, continue-first §13).
+- **Several contracts at once** — a `{ … }` bundle holds one contract per entry
+  (`;`-separated), each with its own disposition, checked in order. It is plain
+  sugar for writing the contracts as consecutive `|!` steps (and the canonical
+  spelling `rivus fmt` produces for such a run):
+
+  ```
+  |! { age >= 0 warn; age <= 120 reject; id >= 1 halt }
+  ```
+
 - _Coming next (§24):_ declarative rules (`in 0..120`, `matches "…"`, `required`,
   `in {…}`), `quarantine(sink)` (dead-letter), and inter-row / windowed checks.
 
@@ -582,6 +591,8 @@ Used in `|?` predicates and `(…)` computed columns.
 | string | `"JP"` (escapes: `\n \t \" \\`) |
 | boolean | `true`, `false` |
 | field of the current row | `age` (bare), `$_.age` (explicit) |
+| positional field | `$_[0]` — the i-th column, 0-based, schema order (headerless data); out-of-range → null, counted |
+| regex literal | `'^JP-\d{4}$'` — **raw** (backslashes belong to the regex); only valid as a pattern: `code ~ '…'` or `regexp(code, '…')` |
 | deep / dynamic field | `$_..age` (recursive), `item("age")` (dynamic) |
 | parent scope field | `$_:1.country` (`$_:0` = current, `$_:1` = parent …) |
 | value hole | `$min` — a placeholder filled by a binding (`\| flow min=20`), §4 |
@@ -614,7 +625,12 @@ Used in `|?` predicates and `(…)` computed columns.
   `concat(a, b, …)`.
 - *predicates* (→ bool) — `contains(s, sub)`, `starts_with(s, p)`,
   `ends_with(s, p)`, `like(s, pat)`, `glob(s, pat)`, and (with `--features
-  regex`) `regexp(s, re)`.
+  regex`) the regex test: `s ~ 're'` — the **`~` infix** with a raw `'…'`
+  regex literal is the canonical spelling; `regexp(s, re)` / `regex` /
+  `matches` are call-form aliases (needed when the pattern is computed or
+  contains a `'`). Parsing and `explain` always work; a build **without** the
+  feature refuses to *run* such a flow with explicit guidance (never a silent
+  all-false).
 - *numeric* — `abs(x)`, `round(x)` (ties away from zero), `floor(x)`, `ceil(x)`;
   each returns an integer when the result is whole, else a float.
 - *null-coalesce* — `coalesce(a, b, …)`: the first **non-null** argument
@@ -1013,13 +1029,13 @@ Events:
 rivus run sessions.riv --telemetry-addr 127.0.0.1:9000   # stream metrics live
 ```
 
-**Find IDs that match a pattern and normalize them.** `regexp` (feature-gated),
-`replace`, `split_part`, `coalesce`:
+**Find IDs that match a pattern and normalize them.** the `~` regex test
+(feature-gated), `replace`, `split_part`, `coalesce`:
 
 ```
 Ids:
     open access.csv
-    |? regexp(path, "^/api/v[0-9]+/")       # only versioned API routes
+    |? path ~ '^/api/v[0-9]+/'              # only versioned API routes
     |> (split_part(path, "/", 3)) as version
        (replace(path, "//", "/")) as norm_path
        (coalesce(user, "anon")) as who
@@ -1145,6 +1161,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
+           | '|!' (contract | '{' (contract ';'?)+ '}')        (validate: row contract(s))
            | '|' IDENT (IDENT '=' VALUE)*                      (apply a named flow; bind value holes)
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
@@ -1160,10 +1177,13 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)
 
 proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;
+contract   = expr (',' expr)* ('warn'|'reject'|'halt') ;       (disposition is mandatory)
 expr       = or ; or = and ('or' and)* ; and = cmp ('and' cmp)* ;
-cmp        = add (CMP add)? ; add = mul (('+'|'-') mul)* ; mul = primary (('*'|'/'|'%') primary)* ;
+cmp        = add (CMP add | '~' (REGEX | add))? ;               (REGEX = raw '…' literal)
+add        = mul (('+'|'-') mul)* ; mul = primary (('*'|'/'|'%') primary)* ;
 primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
-           | IDENT | '$_' field-tail | '$_:'N field-tail | '$' IDENT | 'item' '(' STRING ')'
+           | IDENT | '$_' field-tail | '$_[' INT ']' | '$_:'N field-tail | '$' IDENT
+           | 'item' '(' STRING ')'
            | FUNC '(' expr (',' expr)* ')'
            | 'case' ('when' expr 'then' expr)+ ('else' expr)? 'end' ;   ('$' IDENT = value hole)
 FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;

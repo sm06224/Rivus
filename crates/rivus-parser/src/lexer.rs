@@ -41,6 +41,7 @@ pub enum Tok {
     PipeGroup,        // |#
     PipeValidate,     // |!
     Pipe,             // |
+    Tilde,            // ~   (regex infix, §29.5-6 s4)
     Cmp(CmpOp),       // == != < <= > >=
     DollarCur,        // $_
     DollarStack(u32), // $_:N
@@ -52,6 +53,10 @@ pub enum Tok {
     /// round the literal (accounting contract; design 21 §21.4).
     Float(f64, rivus_core::Decimal),
     Str(String),
+    /// A `'…'` **regex literal** (§29.5-6 s4). Raw: backslashes belong to the
+    /// regex, no escape processing; a `'` cannot appear inside (use a `"…"`
+    /// string pattern for that).
+    Regex(String),
     Word(String),
     Eof,
 }
@@ -329,8 +334,13 @@ impl<'a> Lexer<'a> {
                         _ => Tok::Pipe,
                     }
                 }
+                b'~' => {
+                    self.bump();
+                    Tok::Tilde
+                }
                 b'$' => self.lex_dollar(line)?,
                 b'"' => self.lex_string(line)?,
+                b'\'' => self.lex_regex(line)?,
                 c if c.is_ascii_digit() => self.lex_number(),
                 c if is_word_start(c) => self.lex_word(),
                 other => {
@@ -403,6 +413,30 @@ impl<'a> Lexer<'a> {
                     });
                 }
                 _ => s.push(self.bump()),
+            }
+        }
+    }
+
+    /// `'…'` regex literal (§29.5-6 s4). **Raw**: bytes are copied verbatim so
+    /// backslashes stay the regex's own (`'\d+'` is the pattern `\d+`, no
+    /// double-escaping). Consequently a `'` cannot appear inside the literal —
+    /// write such a pattern as a `"…"` string instead.
+    fn lex_regex(&mut self, line: u32) -> Result<Tok, String> {
+        self.bump(); // opening quote
+        let start = self.pos;
+        loop {
+            match self.peek() {
+                0 => return Err(format!("unterminated regex literal '…' at line {line}")),
+                b'\'' => {
+                    let s = std::str::from_utf8(&self.src[start..self.pos])
+                        .map_err(|_| format!("invalid UTF-8 in regex literal at line {line}"))?
+                        .to_string();
+                    self.bump();
+                    return Ok(Tok::Regex(s));
+                }
+                _ => {
+                    self.bump();
+                }
             }
         }
     }

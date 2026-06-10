@@ -72,9 +72,13 @@ pub enum Func {
     /// Shell glob: `*` = any run, `?` = any single char, `[abc]`/`[a-z]`/`[!..]`
     /// character classes.
     Glob,
-    /// Full regular expression (unanchored partial match). The IR always knows
-    /// it (parse/`to_source` are std-only); evaluating it needs the runtime's
-    /// off-by-default `regex` feature, else it raises a recoverable error.
+    /// Full regular expression (unanchored partial match) — the lowering of the
+    /// `~` infix and `'…'` regex literal (§29.5-6 s4) as well as the
+    /// `regexp()`/`regex()`/`matches()` calls. The IR always knows it
+    /// (parse/`to_source` are std-only); evaluating it needs the runtime's
+    /// off-by-default `regex` feature — a feature-less build **refuses the plan
+    /// before running** (`PlanGraph::uses_regexp`, never-silent) instead of
+    /// evaluating every test to false.
     Regexp,
     /// `replace(s, from, to)` — replace every occurrence of a literal substring.
     Replace,
@@ -228,6 +232,13 @@ pub enum Expr {
         name: String,
         access: Access,
     },
+    /// `$_[i]` — a **positional** column reference (§29.5-6 s4): the `i`-th
+    /// column of the current row, 0-based, in schema order. For headerless /
+    /// positionally-defined data. Out-of-range → null + counted (continue-first,
+    /// never silent). Name-keyed optimizer rules (projection pushdown) must
+    /// treat an expression containing one conservatively: positions shift when
+    /// columns are pruned, so pruning is skipped.
+    FieldAt(u32),
     /// `base.name` — a **union sub-view** (§29.3, s2): a zero-copy char slice
     /// `[start, end)` of fixed-width string column `base`, named `name`. Defined
     /// by a `col :string(W) :{ name@start..end … }` block (carried on
@@ -303,7 +314,9 @@ impl Expr {
                 Some(v) => Expr::Literal(v.clone()),
                 None => Expr::Hole(name.clone()),
             },
-            Expr::Field { .. } | Expr::SubView { .. } | Expr::Literal(_) => self.clone(),
+            Expr::Field { .. } | Expr::FieldAt(_) | Expr::SubView { .. } | Expr::Literal(_) => {
+                self.clone()
+            }
             Expr::Compare { left, op, right } => Expr::Compare {
                 left: Box::new(left.bind_holes(bindings)),
                 op: *op,
@@ -345,7 +358,7 @@ impl Expr {
     pub fn collect_holes(&self, out: &mut Vec<String>) {
         match self {
             Expr::Hole(name) => out.push(name.clone()),
-            Expr::Field { .. } | Expr::SubView { .. } | Expr::Literal(_) => {}
+            Expr::Field { .. } | Expr::FieldAt(_) | Expr::SubView { .. } | Expr::Literal(_) => {}
             Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
                 left.collect_holes(out);
                 right.collect_holes(out);
@@ -366,6 +379,48 @@ impl Expr {
                 }
             }
         }
+    }
+
+    /// Does `f` hold for this expression or any sub-expression? The one generic
+    /// walker for whole-tree predicates (`uses_regexp`, the optimizer's
+    /// positional-reference guard), so structural walks don't multiply and
+    /// drift when a variant is added.
+    pub fn any(&self, f: &impl Fn(&Expr) -> bool) -> bool {
+        if f(self) {
+            return true;
+        }
+        match self {
+            Expr::Field { .. }
+            | Expr::FieldAt(_)
+            | Expr::SubView { .. }
+            | Expr::Literal(_)
+            | Expr::Hole(_) => false,
+            Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
+                left.any(f) || right.any(f)
+            }
+            Expr::And(a, b) | Expr::Or(a, b) => a.any(f) || b.any(f),
+            Expr::Cast { expr, .. } => expr.any(f),
+            Expr::Func { args, .. } => args.iter().any(|a| a.any(f)),
+            Expr::Case { branches, default } => {
+                branches.iter().any(|(c, v)| c.any(f) || v.any(f))
+                    || default.as_ref().is_some_and(|d| d.any(f))
+            }
+        }
+    }
+
+    /// Does this expression contain a regex test (`~` / `regexp()`), i.e. need
+    /// the runtime's off-by-default `regex` feature to evaluate? (§29.5-6 s4:
+    /// a feature-less build refuses such a plan before running — never-silent.)
+    pub fn uses_regexp(&self) -> bool {
+        self.any(&|e| {
+            matches!(
+                e,
+                Expr::Func {
+                    func: Func::Regexp,
+                    ..
+                }
+            )
+        })
     }
 
     /// Escape a string for a `"…"` source literal so `to_source` round-trips a
@@ -402,6 +457,8 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Field { name, access } => write!(f, "{}", Expr::field_src(name, *access)),
+            // `$_[i]` — positional column reference (§29.5-6 s4).
+            Expr::FieldAt(i) => write!(f, "$_[{i}]"),
             // `base.name` — union sub-view accessor (§29.3, s2), same `.` form as
             // the `source.uri` provenance accessor.
             Expr::SubView { base, name, .. } => write!(f, "{base}.{name}"),
@@ -423,6 +480,23 @@ impl fmt::Display for Expr {
             Expr::Arith { left, op, right } => write!(f, "({left} {} {right})", op.as_str()),
             Expr::Cast { expr, ty } => write!(f, "{expr}:{ty}"),
             Expr::Func { func, args } => {
+                // §29.5-6 s4: the canonical spelling of a literal-pattern regex
+                // test is the `~` infix with a raw `'…'` regex literal (the old
+                // `regexp(col, "p")` call converges here, like s1's `:` chain).
+                // A pattern containing `'` has no raw spelling, and a computed
+                // pattern has no infix form — both keep the call form. The lhs
+                // must re-parse at additive level, so bare-printed predicates
+                // (Compare/And/Or) also keep the call form (unreachable from
+                // the parser, but the IR is open).
+                if let (Func::Regexp, [lhs, Expr::Literal(Value::Str(p))]) =
+                    (*func, args.as_slice())
+                {
+                    if !p.contains('\'')
+                        && !matches!(lhs, Expr::Compare { .. } | Expr::And(..) | Expr::Or(..))
+                    {
+                        return write!(f, "{lhs} ~ '{p}'");
+                    }
+                }
                 let a: Vec<String> = args.iter().map(|e| e.to_string()).collect();
                 write!(f, "{}({})", func.as_str(), a.join(", "))
             }

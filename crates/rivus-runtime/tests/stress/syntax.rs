@@ -234,6 +234,116 @@ fn validate_dispositions_surface_and_dispose_chunk_size_independent() {
     );
 }
 
+#[test]
+fn regex_flow_is_refused_without_the_feature_and_filters_with_it() {
+    // §29.5-6 s4 never-silent gate: a flow using `~` / regexp() must never
+    // quietly evaluate every test to false in a build without the `regex`
+    // feature — the engine refuses the plan before running, with guidance.
+    // With the feature, the infix filters like regexp() and is chunk-size
+    // independent.
+    let text = "id,code\n1,JP-1234\n2,US-9999\n3,JP-77\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_regex", text.as_bytes()));
+    let p = f.0.display();
+    let src = format!("R:\n open {p} (id:int code:str)\n |? code ~ '^JP-\\d{{4}}$'\n |> id\n;");
+    #[cfg(not(feature = "regex"))]
+    {
+        let g = rivus_parser::parse(&src).expect("parse");
+        let err = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                ..Default::default()
+            },
+        )
+        .expect_err("a feature-less build must refuse a regex plan, not run it");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("regex"),
+            "the refusal must name the missing feature: {msg}"
+        );
+    }
+    #[cfg(feature = "regex")]
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&src, cz);
+        assert_eq!(
+            collect_i64(&res, "R", "id"),
+            vec![1],
+            "`~` must match exactly JP-1234 @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn positional_reference_reads_schema_order_and_out_of_range_is_counted() {
+    // `$_[i]` (§29.5-6 s4): 0-based schema order, chunk-size independent;
+    // an out-of-range index → null + counted (continue-first, never silent).
+    let text = "id,age\n1,25\n2,8\n3,40\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_positional",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(
+            &format!("P:\n open {p} (id:int age:int)\n |? $_[1] >= 20\n |> id\n;"),
+            cz,
+        );
+        assert_eq!(
+            collect_i64(&res, "P", "id"),
+            vec![1, 3],
+            "$_[1] must read the age column @cz={cz}"
+        );
+    }
+    let res = run_src(
+        &format!("P:\n open {p} (id:int age:int)\n |> id ($_[9]) as ghost\n;"),
+        4096,
+    );
+    assert_eq!(res.total_rows_out(), 3, "rows continue with a null ghost");
+    assert!(
+        res.errors.iter().any(|e| e.message.contains("ghost")),
+        "out-of-range $_[9] must be surfaced, never silent: {:?}",
+        res.errors
+    );
+}
+
+#[test]
+fn validate_bundle_runs_each_contract_in_order() {
+    // `|! { … }` (§29.5-6 s4) lowers to chained contracts: each entry disposes
+    // and surfaces independently (warn keeps, reject drops), chunk-size
+    // independent — same behaviour as writing the contracts separately.
+    let text = "id,age\n1,25\n2,-5\n3,40\n4,200\n5,18\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_validate_bundle",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let src = format!(
+        "V:\n open {p} (id:int age:int)\n |! {{ age >= 0 warn; age <= 120 reject }}\n |> id\n;"
+    );
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&src, cz);
+        // warn keeps id 2 (age -5); reject drops id 4 (age 200).
+        assert_eq!(
+            collect_i64(&res, "V", "id"),
+            vec![1, 2, 3, 5],
+            "bundle dispositions @cz={cz}"
+        );
+        let warned = res
+            .errors
+            .iter()
+            .any(|e| e.message.contains("1 row(s) failed") && e.message.contains("(warn)"));
+        let rejected = res
+            .errors
+            .iter()
+            .any(|e| e.message.contains("1 row(s) failed") && e.message.contains("(reject)"));
+        assert!(
+            warned && rejected,
+            "each contract surfaces its own count @cz={cz}: {:?}",
+            res.errors
+        );
+    }
+}
+
 // ----- Executable bug specs (BUG-A/B/C, docs/TEST-AUDIT.md). These assert the
 // INTENDED behaviour and currently fail, so they are #[ignore]d to keep the gate
 // green; the fix un-ignores its spec. Fixes are PLANNED only (per the request).

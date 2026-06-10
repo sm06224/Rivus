@@ -1237,6 +1237,20 @@ impl PlanGraph {
         names
     }
 
+    /// Does any node's expression contain a regex test (`~` / `regexp()`)?
+    /// The runtime consults this before running: a build without the `regex`
+    /// feature refuses the plan explicitly (never-silent, §29.5-6 s4) instead
+    /// of evaluating every test to false. Mirrors `Op::bind_holes`'s list of
+    /// expression-carrying ops.
+    pub fn uses_regexp(&self) -> bool {
+        self.nodes.iter().any(|n| match &n.op {
+            Op::Filter { pred } | Op::Validate { pred, .. } => pred.uses_regexp(),
+            Op::ProjectExpr { items, .. } => items.iter().any(|(e, _)| e.uses_regexp()),
+            Op::FilterProject { preds, .. } => preds.iter().any(Expr::uses_regexp),
+            _ => false,
+        })
+    }
+
     pub fn add_node(&mut self, op: Op) -> NodeId {
         let id = self.nodes.len();
         self.nodes.push(Node {
@@ -1401,6 +1415,44 @@ impl PlanGraph {
                     i += 1;
                 }
                 continue;
+            }
+            // §29.5-6 s4: a contiguous run of ≥2 row contracts renders as one
+            // `|! { pred disp; … }` bundle — the canonical multi-validate
+            // spelling (order preserved; re-parses to the same Validate chain).
+            // The run only absorbs *plain* nodes: any hook, apply-site, branch
+            // fan-out or leading comment past the first node breaks it so
+            // nothing is repositioned or lost.
+            if matches!(self.nodes[nid].op, Op::Validate { .. })
+                && self.nodes[nid].hooks.is_empty()
+                && self.branch_children_of(nid).is_empty()
+            {
+                let mut j = i + 1;
+                while j < chain.len() {
+                    let m = chain[j];
+                    let plain = matches!(self.nodes[m].op, Op::Validate { .. })
+                        && self.nodes[m].applied_from.is_none()
+                        && self.nodes[m].leading_comments.is_empty()
+                        && self.nodes[m].hooks.is_empty()
+                        && self.branch_children_of(m).is_empty();
+                    if !plain {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j > i + 1 {
+                    let entries: Vec<String> = chain[i..j]
+                        .iter()
+                        .map(|&v| match &self.nodes[v].op {
+                            Op::Validate { pred, disposition } => {
+                                format!("{pred} {}", disposition.as_str())
+                            }
+                            _ => unreachable!("run contains only Validate nodes"),
+                        })
+                        .collect();
+                    let _ = writeln!(out, "{pad}|! {{ {} }}", entries.join("; "));
+                    i = j;
+                    continue;
+                }
             }
             let _ = writeln!(out, "{pad}{}", self.nodes[nid].op.to_src_line());
             for h in &self.nodes[nid].hooks {

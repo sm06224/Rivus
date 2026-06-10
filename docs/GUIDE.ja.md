@@ -254,6 +254,15 @@ where age >= 20, country == "JP"      # カンマ = AND（`and` と同じ）
   never-silent）、`reject` の落とした行は直列と **byte-identical** に保たれます。
   単一のコーディネータ統合カウントは validation-layer のフォローアップ（§24）。
   `halt` は `Fatal` を上げます（実行停止、continue-first §13）。
+- **複数契約の一括宣言** — `{ … }` 束は 1 エントリ 1 契約（`;` 区切り）で、
+  それぞれが自分の disposition を持ち、順に検査されます。連続した `|!` ステップ
+  として書くのと同じ意味の糖衣で、そのような連続列に対して `rivus fmt` が出す
+  正規形でもあります：
+
+  ```
+  |! { age >= 0 warn; age <= 120 reject; id >= 1 halt }
+  ```
+
 - _次に来る予定（§24）：_ 宣言的ルール（`in 0..120`, `matches "…"`, `required`,
   `in {…}`）、`quarantine(sink)`（dead-letter）、行間 / ウィンドウ検査。
 
@@ -550,6 +559,8 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 | 文字列 | `"JP"`（エスケープ: `\n \t \" \\`） |
 | 真偽値 | `true`, `false` |
 | 現在行のフィールド | `age`（裸）, `$_.age`（明示） |
+| 位置フィールド | `$_[0]` — i 番目の列（0 始まり・スキーマ順・ヘッダ無しデータ向け）。範囲外 → null＋カウント |
+| regex リテラル | `'^JP-\d{4}$'` — **raw**（バックスラッシュは正規表現のもの）。パターン位置のみ有効：`code ~ '…'` / `regexp(code, '…')` |
 | 深い / 動的フィールド | `$_..age`（再帰）, `item("age")`（動的） |
 | 親スコープのフィールド | `$_:1.country`（`$_:0` = 現在、`$_:1` = 親 …） |
 | 値ホール | `$min` — 束縛（`\| flow min=20`）で埋める値の穴、§4 |
@@ -578,7 +589,11 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
   `substr(s, start, len)`（1 始まり、SQL 流儀）, `replace(s, from, to)`,
   `split_part(s, sep, n)`（1 始まりのフィールド）, `concat(a, b, …)`。
 - *述語*（→ bool）— `contains(s, sub)`, `starts_with(s, p)`, `ends_with(s, p)`,
-  `like(s, pat)`, `glob(s, pat)`、および（`--features regex` 時）`regexp(s, re)`。
+  `like(s, pat)`, `glob(s, pat)`、および（`--features regex` 時）正規表現テスト：
+  `s ~ 're'` — **`~` 中置**＋raw な `'…'` regex リテラルが正規形。
+  `regexp(s, re)` / `regex` / `matches` は呼び出し形の alias（パターンが計算値
+  または `'` を含むときに使う）。パースと `explain` は常に可能で、feature 無し
+  ビルドは**実行を guidance 付きで明示拒否**します（黙って全 false にはしない）。
 - *数値* — `abs(x)`, `round(x)`（0 から離れる丸め）, `floor(x)`, `ceil(x)`。
   結果が整数なら整数、そうでなければ浮動小数を返します。
 - *null 合体* — `coalesce(a, b, …)`：最初の **非 null** 引数（SQL/pandas の
@@ -961,13 +976,13 @@ Events:
 rivus run sessions.riv --telemetry-addr 127.0.0.1:9000   # メトリクスをライブ配信
 ```
 
-**パターンに一致する ID を見つけて正規化。** `regexp`（feature-gated）・
+**パターンに一致する ID を見つけて正規化。** `~` 正規表現テスト（feature-gated）・
 `replace`・`split_part`・`coalesce`：
 
 ```
 Ids:
     open access.csv
-    |? regexp(path, "^/api/v[0-9]+/")       # バージョン付き API ルートのみ
+    |? path ~ '^/api/v[0-9]+/'              # バージョン付き API ルートのみ
     |> (split_part(path, "/", 3)) as version
        (replace(path, "//", "/")) as norm_path
        (coalesce(user, "anon")) as who
@@ -1083,7 +1098,7 @@ source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
 
 transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
            | '|' IDENT (IDENT '=' VALUE)*                      (apply a named flow; bind value holes)
-           | '|!' expr (',' expr)* ('warn'|'reject'|'halt')   (validate / contract)
+           | '|!' (contract | '{' (contract ';'?)+ '}')        (validate: row contract(s))
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
            | ('take'|'limit'|'head') INT
@@ -1098,10 +1113,13 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)
 
 proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;
+contract   = expr (',' expr)* ('warn'|'reject'|'halt') ;       (disposition は必須)
 expr       = or ; or = and ('or' and)* ; and = cmp ('and' cmp)* ;
-cmp        = add (CMP add)? ; add = mul (('+'|'-') mul)* ; mul = primary (('*'|'/'|'%') primary)* ;
+cmp        = add (CMP add | '~' (REGEX | add))? ;               (REGEX = raw '…' リテラル)
+add        = mul (('+'|'-') mul)* ; mul = primary (('*'|'/'|'%') primary)* ;
 primary    = INT | FLOAT | STRING | 'true' | 'false' | '(' expr ')'
-           | IDENT | '$_' field-tail | '$_:'N field-tail | 'item' '(' STRING ')'
+           | IDENT | '$_' field-tail | '$_[' INT ']' | '$_:'N field-tail
+           | 'item' '(' STRING ')'
            | FUNC '(' expr (',' expr)* ')'
            | 'case' ('when' expr 'then' expr)+ ('else' expr)? 'end' ;
 FMT        = 'csv' | 'tsv' | 'json' | 'jsonl' | 'ndjson' ;
