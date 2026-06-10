@@ -77,6 +77,19 @@ All notable changes to Rivus. Format loosely follows
   byte-identical to serial.
 
 ### Added
+- **`:` definition chain in `|>` projections (design §29.2, s1, std-only).**
+  `col :alias :type` stacks definitions left→right, light→heavy: `:identifier`
+  renames, `:type` casts (`|> amount :amt :decimal(2)`), at most one of each in
+  that order. Pure parser sugar over the existing `Op::ProjectExpr` items —
+  IR, runtime, optimizer and output bytes are identical to the parenthesized
+  `(amount:decimal(2)) as amt` spelling (locked by an optimizer-equiv test).
+  The chain is the canonical `to_source` form; older spellings still parse and
+  `rivus fmt` rewrites them to it. After `:` a type word always means a cast
+  (the disjointness rule that keeps round-trips exact); renaming *to* a
+  type-word name uses the parenthesized escape hatch `(col) as int`. The
+  `rename`/`cast` **verbs are unchanged** — they fix columns in place keeping
+  the whole row, which a projection cannot express, so they are different
+  operations, not aliases (§29.2).
 - **`|!` validate — declare a row contract (Epic #82 / #83, §24, std-only).** A
   validator is not a filter: `|! <pred> warn|reject|halt` declares a contract and
   disposes of a non-conforming row **explicitly and always reports it** on the

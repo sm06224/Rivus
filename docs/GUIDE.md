@@ -268,19 +268,35 @@ always reported** on the error stream (never silent). Same predicate syntax as
 
 ### `|>` — project / compute columns
 
-Select columns, rename them, or compute new ones. Each item is one of:
+Select columns, rename them, cast them, or compute new ones. Each item is one
+of:
 
 | item | meaning |
 |---|---|
 | `name` | keep column `name` |
-| `name as alias` | keep + rename |
+| `name :alias` | keep + rename (`:` **definition chain**) |
+| `name :type` | keep + cast (`int`, `decimal(2)`, `datetime`, …) |
+| `name :alias :type` | rename, then cast — definitions stack left→right |
 | `(expr) as alias` | a **computed column** (arithmetic in parens) |
 
 ```
 |> name age                                   # select
-|> name age as years                          # rename
+|> name age :years                            # rename
+|> name amount :amt :decimal(2)               # rename + cast in one item
 |> name (age * 12) as months (score / 100) as pct
 ```
+
+The `:` chain is the canonical spelling: `rivus fmt` rewrites the older
+`name as alias` / `(name:type) as alias` forms into it (same IR, same output
+bytes). Definitions stack light→heavy — rename first, then cast; anything
+after the type is an error. After `:`, a type word always means a cast, so to
+rename a column *to* a type-word name use the parenthesized escape hatch
+`(col) as int`. As everywhere (§23.6), a datetime *parse format* belongs to
+the source schema declaration, not to a cast.
+
+The `rename` / `cast` verbs (below) are **not** the same operation: they fix
+up named columns **in place while keeping every other column**, whereas `|>`
+keeps only what you list.
 
 ### `|#` — group by
 

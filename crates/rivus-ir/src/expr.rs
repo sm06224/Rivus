@@ -425,6 +425,38 @@ impl fmt::Display for Expr {
     }
 }
 
+/// A word that names a column type in surface syntax — every alias the
+/// parser's `decl_type`/`finish_type` accept (`int`/`i64`/`integer`, …) plus
+/// the structured types (`decimal`, `datetime`, …). The `:` definition chain
+/// (design §29.2) resolves `col :word` with this predicate: a type word after
+/// `:` always means a cast, never a rename target. `to_source` consults it
+/// too, so an alias that collides with a type word is rendered in the
+/// parenthesized `(col) as alias` escape-hatch form instead of a `:alias`
+/// that would re-parse as a cast. Must stay in sync with the parser's type
+/// tables (locked by the parser's `every_type_word_casts_in_a_colon_chain`).
+pub fn is_type_word(w: &str) -> bool {
+    matches!(
+        w.to_ascii_lowercase().as_str(),
+        "int"
+            | "i64"
+            | "integer"
+            | "float"
+            | "f64"
+            | "double"
+            | "str"
+            | "string"
+            | "text"
+            | "bool"
+            | "boolean"
+            | "resource"
+            | "decimal"
+            | "datetime"
+            | "duration"
+            | "date"
+            | "time"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::Expr;

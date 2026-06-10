@@ -881,24 +881,49 @@ impl Op {
             Op::ProjectExpr { items } => {
                 let parts: Vec<String> = items
                     .iter()
-                    .map(|(e, alias)| match e {
-                        Expr::Field {
-                            name,
-                            access: Access::Fast,
-                        } if name == alias => name.clone(),
-                        // The parser's computed-column rule is `(expr) as alias`,
-                        // so a computed item must render parenthesized to
-                        // re-parse. `Arith` already self-parenthesizes; wrap
-                        // anything that doesn't start with `(` (e.g. `case`,
-                        // field renames, functions).
-                        _ => {
+                    .map(|(e, alias)| {
+                        // The `:` definition chain (§29.2) is the canonical
+                        // spelling for plain select / rename / cast items.
+                        // An alias that collides with a type word must not be
+                        // emitted as `:alias` (it would re-parse as a cast),
+                        // so it — like every computed item — keeps the
+                        // parenthesized `(expr) as alias` form. `Arith`
+                        // already self-parenthesizes; wrap anything that
+                        // doesn't start with `(` (e.g. `case`, functions).
+                        let chain = match e {
+                            Expr::Field {
+                                name,
+                                access: Access::Fast,
+                            } if name == alias => Some(name.clone()),
+                            Expr::Field {
+                                name,
+                                access: Access::Fast,
+                            } if !crate::expr::is_type_word(alias) => {
+                                Some(format!("{name} :{alias}"))
+                            }
+                            Expr::Cast { expr, ty } => match expr.as_ref() {
+                                Expr::Field {
+                                    name,
+                                    access: Access::Fast,
+                                } if name == alias => Some(format!("{name} :{ty}")),
+                                Expr::Field {
+                                    name,
+                                    access: Access::Fast,
+                                } if !crate::expr::is_type_word(alias) => {
+                                    Some(format!("{name} :{alias} :{ty}"))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        chain.unwrap_or_else(|| {
                             let s = e.to_string();
                             if s.starts_with('(') {
                                 format!("{s} as {alias}")
                             } else {
                                 format!("({s}) as {alias}")
                             }
-                        }
+                        })
                     })
                     .collect();
                 format!("|> {}", parts.join(" "))

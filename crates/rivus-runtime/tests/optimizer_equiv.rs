@@ -150,6 +150,24 @@ fn optimizer_preserves_computed_columns() {
 }
 
 #[test]
+fn colon_chain_is_byte_equivalent_to_parenthesized_forms() {
+    // §29.2: the `:` definition chain is parser sugar over the same
+    // ProjectExpr items as the parenthesized spellings, so the runtime output
+    // must be identical row-for-row — and the optimizer must preserve both.
+    let data = "id,amount,note\n1,10.5,a\n2,20.25,b\n3,0.125,c\n".as_bytes();
+    let f = TempCsv(gendata::write_temp_bytes("opt_chain", data));
+    let p = f.0.display();
+
+    let chain = format!("F:\n open {p}\n |> amount :amt :decimal(2) note :memo id\n;");
+    let paren = format!("F:\n open {p}\n |> (amount:decimal(2)) as amt (note) as memo id\n;");
+    let (chain_raw, chain_opt) = fingerprints_both(&chain);
+    let (paren_raw, paren_opt) = fingerprints_both(&paren);
+    assert_eq!(chain_raw, paren_raw, "chain must equal parenthesized form");
+    assert_eq!(chain_raw, chain_opt, "optimizer changed chain results");
+    assert_eq!(paren_raw, paren_opt, "optimizer changed paren results");
+}
+
+#[test]
 fn string_prefilter_is_a_superset_and_preserves_results() {
     // The string prefilter is a raw-line substring pre-scan: a row whose
     // substring appears in the WRONG column must still be excluded by the
