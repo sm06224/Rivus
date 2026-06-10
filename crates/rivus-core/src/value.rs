@@ -311,18 +311,22 @@ fn strip_fraction(s: &str) -> &str {
 /// each entry is an **unambiguous alias for one fixed offset** — never a
 /// DST-rule conversion (named zones like `Asia/Tokyo` are out of scope; IANA
 /// tzdata would make results depend on an external, versioned dataset).
-/// Core per the ruling: `UTC`/`GMT`/`JST`; the rest are abbreviations IANA
-/// tzdata itself defines as fixed zones (`EST`/`MST`/`HST`), so they carry no
-/// competing meaning. **Deliberately excluded as ambiguous** (never-silent: a
-/// cell carrying one fails its format and is counted, never guessed): `CST`
-/// (US Central / China / Cuba), `IST` (India / Israel / Ireland), `BST`
-/// (British Summer / Bangladesh), `PST` (US Pacific / Philippine), `AST`,
-/// `CDT` (US / Cuba), and the other DST-pair names.
+/// Core per the ruling: `UTC`/`GMT`/`JST`; plus `MST`/`HST`, which are
+/// unambiguous in wild data (MST's other use, Sonora, is the same −7; HST is
+/// Hawaii only). The criterion is **"is the abbreviation ambiguous in wild
+/// cells?"**, not "is it an IANA zone name" — so `EST` is out (Australian
+/// Eastern Standard Time is +10; tzdata 2017a renamed the Australian
+/// abbreviations to `AEST` etc. precisely over this clash — silently applying
+/// −5 would be a 15-hour skew). **Deliberately excluded as ambiguous**
+/// (never-silent: a cell carrying one fails its format and is counted, never
+/// guessed): `CST` (US Central / China / Cuba), `IST` (India / Israel /
+/// Ireland), `BST` (British Summer / Bangladesh), `PST` (US Pacific /
+/// Philippine), `EST` (US Eastern / Australian Eastern), `AST`, `CDT`
+/// (US / Cuba), and the other DST-pair names.
 const TZ_ABBREV: &[(&str, i64)] = &[
     ("UTC", 0),
     ("GMT", 0),
     ("JST", 9 * 3600),
-    ("EST", -5 * 3600),
     ("MST", -7 * 3600),
     ("HST", -10 * 3600),
 ];
@@ -1883,7 +1887,6 @@ mod decimal_tests {
             ("UTC", 0i64),
             ("GMT", 0),
             ("JST", 9 * 3600),
-            ("EST", -5 * 3600),
             ("MST", -7 * 3600),
             ("HST", -10 * 3600),
         ] {
@@ -1891,12 +1894,13 @@ mod decimal_tests {
                 .unwrap();
             assert_eq!(got.ticks, utc.ticks - off, "{abbr} offset wrong");
         }
-        // Ambiguous (CST/IST/…), lowercase, and unknown abbreviations never
-        // strip — the cell fails its formats (counted at the caller, design 23),
-        // never silently guessed.
+        // Ambiguous (CST/IST/…, and EST: US −5 vs Australian +10), lowercase,
+        // and unknown abbreviations never strip — the cell fails its formats
+        // (counted at the caller, design 23), never silently guessed.
         for bad in [
             "2026-06-10 12:00:00 CST",
             "2026-06-10 12:00:00 IST",
+            "2026-06-10 12:00:00 EST",
             "2026-06-10 12:00:00 jst",
             "2026-06-10 12:00:00 XYZ",
         ] {

@@ -734,10 +734,10 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   an `n…n` format to keep sub-seconds).
 - **Timezone abbreviations** (std-only, fixed offsets — no DST rules, no IANA
   tzdata): a trailing ` JST`-style suffix (uppercase, one space) normalises to
-  UTC when it is **unambiguous** — `UTC` `GMT` `JST` plus the IANA fixed zones
-  `EST` `MST` `HST`. **Ambiguous abbreviations are never guessed**: a cell
-  carrying `CST` (US Central / China / Cuba), `IST`, `BST`, `PST`, … fails its
-  format and is counted on the error stream. Named zones (`Asia/Tokyo`) and
+  UTC when it is **unambiguous** — `UTC` `GMT` `JST` plus `MST` `HST`.
+  **Ambiguous abbreviations are never guessed**: a cell carrying `CST`
+  (US Central / China / Cuba), `IST`, `BST`, `PST`, `EST` (US Eastern /
+  Australian Eastern), … fails its format and is counted on the error stream. Named zones (`Asia/Tokyo`) and
   DST conversion are out of scope (issue #140 — kept out so results never
   depend on an external, versioned dataset).
 - **Auto-inference**: an *undeclared* column is read on the datetime lane when

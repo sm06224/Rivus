@@ -307,8 +307,10 @@ text/char（CSV 固定長・#138）に続く byte 単位の構造体複合を、
      小テーブル**で依存ゼロを死守。
    - **タイムゾーン — issue #140 で (a) std-only に確定（統括裁定 2026-06-10「外部要因に晒さない
      ように計画を後退」）**：固定オフセット（#93）＋**曖昧性のない略称の std-only 小テーブル**
-     （`UTC`/`GMT`/`JST` コア＋ IANA が固定ゾーンとして定義する `EST`/`MST`/`HST`・`TZ_ABBREV`）。
-     **曖昧略称（CST/IST/BST/PST 等）は never-silent で弾く**（セル単位カウント・推測しない）。
+     （`UTC`/`GMT`/`JST` コア＋野生データで単義の `MST`/`HST`・`TZ_ABBREV`。基準は「IANA の
+     ゾーン名か」でなく**「野生のセルで曖昧か」**——実装レビュー裁定 2026-06-10）。
+     **曖昧略称（CST/IST/BST/PST/EST 等）は never-silent で弾く**（セル単位カウント・推測しない。
+     EST は米東部 −5 と豪州東部 +10 が衝突——tzdata 2017a が豪州略称を AEST 等へ改名した曖昧性）。
      **DST ルール換算なし**・named zone（`Asia/Tokyo`）は範囲外。**(b) IANA tzdata は将来の独立
      feature-gated スライス**：着手時に SUPPLY-CHAIN チェックリスト＋crate 選定＋**版 pin 運用**
      （「同じ版＝同じ結果」）を添えて再批准（§25.10）。
