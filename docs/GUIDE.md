@@ -732,6 +732,14 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   and a fractional second is **truncated** to the column's resolution
   (`…14:30:00.5` → `…14:30:00`; the bare-`:datetime` lane is seconds — declare
   an `n…n` format to keep sub-seconds).
+- **Timezone abbreviations** (std-only, fixed offsets — no DST rules, no IANA
+  tzdata): a trailing ` JST`-style suffix (uppercase, one space) normalises to
+  UTC when it is **unambiguous** — `UTC` `GMT` `JST` plus the IANA fixed zones
+  `EST` `MST` `HST`. **Ambiguous abbreviations are never guessed**: a cell
+  carrying `CST` (US Central / China / Cuba), `IST`, `BST`, `PST`, … fails its
+  format and is counted on the error stream. Named zones (`Asia/Tokyo`) and
+  DST conversion are out of scope (issue #140 — kept out so results never
+  depend on an external, versioned dataset).
 - **Auto-inference**: an *undeclared* column is read on the datetime lane when
   every non-empty cell is a recognised datetime (and likewise `date` for
   `yyyy-MM-dd`-only columns, `time` for `HH:mm:ss`). A purely numeric column

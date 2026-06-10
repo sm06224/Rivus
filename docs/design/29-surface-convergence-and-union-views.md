@@ -305,11 +305,13 @@ text/char（CSV 固定長・#138）に続く byte 単位の構造体複合を、
 5. **書式 / ロケール / タイムゾーン拡張 — 確定（統括批准 2026-06-10・issue #137）**（別スライス s3・依存ゼロ）
    - 曜日 `ddd`・`[ja-jp]` 等**ロケール**・**サブ秒** `nnnnnn` の追加。日本語曜日は **std-only な
      小テーブル**で依存ゼロを死守。
-   - **タイムゾーンも s3 範囲に含める**（統括明言「ロケールも TZ もありあり」）。固定オフセット
-     （`+09:00`）は **#93 で既に正規化済み**。named zone（IANA）を扱う場合、フル tzdata は依存・
-     データサイズの供給網判断（§SUPPLY-CHAIN チェックリスト）が要る——**std-only の範囲（固定
-     オフセット＋限定的な既知略称テーブル等）か tzdata 取り込みかは s3 design で選択肢＋推奨を提示して
-     再確認**する。
+   - **タイムゾーン — issue #140 で (a) std-only に確定（統括裁定 2026-06-10「外部要因に晒さない
+     ように計画を後退」）**：固定オフセット（#93）＋**曖昧性のない略称の std-only 小テーブル**
+     （`UTC`/`GMT`/`JST` コア＋ IANA が固定ゾーンとして定義する `EST`/`MST`/`HST`・`TZ_ABBREV`）。
+     **曖昧略称（CST/IST/BST/PST 等）は never-silent で弾く**（セル単位カウント・推測しない）。
+     **DST ルール換算なし**・named zone（`Asia/Tokyo`）は範囲外。**(b) IANA tzdata は将来の独立
+     feature-gated スライス**：着手時に SUPPLY-CHAIN チェックリスト＋crate 選定＋**版 pin 運用**
+     （「同じ版＝同じ結果」）を添えて再批准（§25.10）。
    - **`AUTO_FORMATS` 互いに素性の再検証**（§23.1 不変条件・`auto_formats_disjoint` テスト）を
      書式追加のたびに行う（必須）。
    - **非 UTF-8（SJIS 等）は s3 範囲外**（将来・encoding 依存の判断を別途／**既定ビルド std-only を死守**）。
@@ -332,7 +334,9 @@ text/char（CSV 固定長・#138）に続く byte 単位の構造体複合を、
    - **修正（s3 で発見・同梱）**：lexer `lex_string` の byte→char 化け（マルチバイト文字列リテラル全般を
      破壊・`[ja-jp]` 書式の前提）と、`format()` リテラル出力の同型化け、`parse_with_format` の
      `&fmt[fi..]` がマルチバイトリテラル中で char 境界 panic する問題（byte スライス化）。
-   - **TZ は #140 の批准待ち**（着手しない）。AUTO_FORMATS は不変更・`auto_formats_disjoint` 再固定。
+   - **TZ（#140 (a) 批准後に同スライスで実装）**：`strip_zone`/`normalize_iso` に `TZ_ABBREV` 照合を
+     追加（末尾 ` 略称`・大文字・スペース1つ）。auto 経路と `n…n` spec 経路（fraction 維持）の両方で
+     一貫。AUTO_FORMATS は不変更・`auto_formats_disjoint` 再固定。
 
 6. **新演算子 / リテラル — 確定（統括批准 2026-06-10・issue #137）**
    - `~`（regex 中置）・`'…'`（regex リテラル）・`$_[i]`（位置参照）・`|!` 複数検証 ＋ `{}` サブフロー。

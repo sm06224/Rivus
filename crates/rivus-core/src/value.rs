@@ -307,6 +307,41 @@ fn strip_fraction(s: &str) -> &str {
     }
 }
 
+/// Timezone-abbreviation table (§29 s3 / issue #140, ratified **(a) std-only**):
+/// each entry is an **unambiguous alias for one fixed offset** — never a
+/// DST-rule conversion (named zones like `Asia/Tokyo` are out of scope; IANA
+/// tzdata would make results depend on an external, versioned dataset).
+/// Core per the ruling: `UTC`/`GMT`/`JST`; the rest are abbreviations IANA
+/// tzdata itself defines as fixed zones (`EST`/`MST`/`HST`), so they carry no
+/// competing meaning. **Deliberately excluded as ambiguous** (never-silent: a
+/// cell carrying one fails its format and is counted, never guessed): `CST`
+/// (US Central / China / Cuba), `IST` (India / Israel / Ireland), `BST`
+/// (British Summer / Bangladesh), `PST` (US Pacific / Philippine), `AST`,
+/// `CDT` (US / Cuba), and the other DST-pair names.
+const TZ_ABBREV: &[(&str, i64)] = &[
+    ("UTC", 0),
+    ("GMT", 0),
+    ("JST", 9 * 3600),
+    ("EST", -5 * 3600),
+    ("MST", -7 * 3600),
+    ("HST", -10 * 3600),
+];
+
+/// Split a trailing timezone **abbreviation** (`… JST`: uppercase, separated by
+/// exactly one space) off a datetime string, returning the remainder and the
+/// fixed offset in seconds (UTC = local − offset). Only [`TZ_ABBREV`] entries
+/// match; anything else (ambiguous `CST`, lowercase `jst`, unknown words) is
+/// left in place, so the cell fails its format never-silently instead of being
+/// silently guessed.
+fn strip_zone_abbrev(s: &str) -> Option<(&str, i64)> {
+    let (name, off) = TZ_ABBREV
+        .iter()
+        .find(|(name, _)| s.ends_with(name))
+        .copied()?;
+    let base = s[..s.len() - name.len()].strip_suffix(' ')?;
+    Some((base, off))
+}
+
 /// Weekday-name table for the `ddd` format token (§29 s3), Monday-first like
 /// ISO ([`Date::weekday`]). English short names (the default locale).
 const DDD_EN: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -443,12 +478,13 @@ impl DateTime {
             })
     }
 
-    /// Strip a trailing ISO-8601 timezone (`Z` / `±HH:mm`) and fractional-second
-    /// suffix from a datetime string, returning the bare `…HH:mm:ss` text and the
-    /// UTC offset in seconds (UTC = local − offset). Shared by `parse_auto` and
-    /// the reader's `DtSpec` so both accept the same ISO variants. #93.
+    /// Strip a trailing timezone (`Z` / `±HH:mm` — #93 — or an unambiguous
+    /// abbreviation like ` JST` — §29 s3 / #140) and fractional-second suffix
+    /// from a datetime string, returning the bare `…HH:mm:ss` text and the UTC
+    /// offset in seconds (UTC = local − offset). Shared by `parse_auto` and the
+    /// reader's `DtSpec` so both accept the same variants.
     pub fn normalize_iso(s: &str) -> (&str, i64) {
-        let (base, off) = strip_iso_zone(s.trim());
+        let (base, off) = Self::strip_zone(s);
         (strip_fraction(base), off)
     }
 
@@ -732,10 +768,15 @@ impl DateTime {
         split_locale(fmt).1.bytes().any(|b| b == b'n')
     }
 
-    /// Strip only a trailing ISO zone (`Z`/`±HH:mm`), keeping any fractional
-    /// seconds — for specs whose format consumes the fraction itself (§29 s3).
+    /// Strip only a trailing zone — an ISO `Z`/`±HH:mm` (#93) or an unambiguous
+    /// abbreviation from [`TZ_ABBREV`] (` JST`, §29 s3 / #140) — keeping any
+    /// fractional seconds, for specs whose format consumes the fraction itself.
     pub fn strip_zone(s: &str) -> (&str, i64) {
-        strip_iso_zone(s.trim())
+        let s = s.trim();
+        if let Some(hit) = strip_zone_abbrev(s) {
+            return hit;
+        }
+        strip_iso_zone(s)
     }
 }
 
@@ -1828,6 +1869,52 @@ mod decimal_tests {
         assert_eq!(DateTime::unit_for_format("[en-us]HH:mm:ss"), TimeUnit::Sec);
         assert!(!DateTime::format_has_subsec("[en-us]HH:mm:ss"));
         assert!(DateTime::format_has_subsec("[en-us]HH:mm:ss.nnn"));
+    }
+
+    #[test]
+    fn tz_abbreviations_normalize_unambiguous_only() {
+        // §29 s3 / #140 (a): a trailing unambiguous abbreviation is a fixed
+        // offset — 21:00 JST is 12:00 UTC. Never a DST-rule conversion.
+        let utc = DateTime::parse_auto("2026-06-10T12:00:00Z", TimeUnit::Sec).unwrap();
+        let jst = DateTime::parse_auto("2026-06-10 21:00:00 JST", TimeUnit::Sec).unwrap();
+        assert_eq!(jst, utc);
+        // Every table entry applies exactly its fixed offset (UTC = local − off).
+        for (abbr, off) in [
+            ("UTC", 0i64),
+            ("GMT", 0),
+            ("JST", 9 * 3600),
+            ("EST", -5 * 3600),
+            ("MST", -7 * 3600),
+            ("HST", -10 * 3600),
+        ] {
+            let got = DateTime::parse_auto(&format!("2026-06-10 12:00:00 {abbr}"), TimeUnit::Sec)
+                .unwrap();
+            assert_eq!(got.ticks, utc.ticks - off, "{abbr} offset wrong");
+        }
+        // Ambiguous (CST/IST/…), lowercase, and unknown abbreviations never
+        // strip — the cell fails its formats (counted at the caller, design 23),
+        // never silently guessed.
+        for bad in [
+            "2026-06-10 12:00:00 CST",
+            "2026-06-10 12:00:00 IST",
+            "2026-06-10 12:00:00 jst",
+            "2026-06-10 12:00:00 XYZ",
+        ] {
+            assert!(
+                DateTime::parse_auto(bad, TimeUnit::Sec).is_none(),
+                "must not guess: {bad}"
+            );
+        }
+        // ISO order `…ss.frac ABBR`: both strip on the auto path…
+        assert_eq!(
+            DateTime::parse_auto("2026-06-10 21:00:00.5 JST", TimeUnit::Sec).unwrap(),
+            utc
+        );
+        // …while `strip_zone` keeps the fraction for `n…n` specs.
+        assert_eq!(
+            DateTime::strip_zone("2026-06-10 21:00:00.123 JST"),
+            ("2026-06-10 21:00:00.123", 9 * 3600)
+        );
     }
 
     #[test]
