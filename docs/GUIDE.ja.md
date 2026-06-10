@@ -121,7 +121,10 @@ B: readbin dump.bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
 
 `le`/`be` でバイト順を選択（既定リトルエンディアン）、`packed`（既定）vs `aligned`
 で C `repr(C)` 自然アライメントのパディングを選択。フィールド型：
-`i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`。
+`i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`、加えて **`char[N]`** — 固定 `N` バイトの
+テキスト欄（C の `char[N]`）を UTF-8 デコードします。**全 `N` バイトを値として保持**
+（末尾 NUL／パディングも含む・`char[N]` は 1 バイト境界）。例：
+`readbin people.bin (id:i32 name:char[16])` は 16 バイトの名前欄を読みます。
 
 ### 来歴（provenance）— `with source` / `with filename`
 

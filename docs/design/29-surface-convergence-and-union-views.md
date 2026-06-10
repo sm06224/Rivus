@@ -237,6 +237,25 @@ open ids.csv |> complexId :string(27) :{ cls@0..3 departmentId@3..11 equipmentId
   `char[N]`（生バイト→テキストデコード）を**追加**する（§29.5-3 で確定：全 padding は値保持・可変長は範囲外）。
   `c_align`（C `repr(C)` 自然アラインメント）と `endian` は既存フィールドをそのまま使う。
 
+#### binary `char[N]` lowering（実装確定 2026-06-10・s2 follow-up）
+
+text/char（CSV 固定長・#138）に続く byte 単位の構造体複合を、既存 `Codec::Binary` に統合する:
+
+- **綴り**：`readbin f.bin (id:i32 name:char[16])`。C 配列記法の `char[N]` を採用（C-struct dump と
+  字面が一致）。lexer に `[`=`Tok::LBracket`・`]`=`Tok::RBracket` を追加（他構文に影響なし＝従来は
+  字句エラーだった文字を新規に解禁するだけ）。N は非負整数の**バイト幅**。
+- **IR**：`BinType::Char(u32)` を追加。`size()=N`・`align()=1`（C `char[]` は 1 バイト境界）・
+  `lane()=DataType::Str`。`to_source` は `name:char[N]` を復元（`BinType::label()->String`、固定幅型は
+  従来文字列）。
+- **decode（zero-copy 読み）**：レコード内オフセット `[foff, foff+N)` の生バイトを **UTF-8 lossy**
+  でテキスト化し `StrColumn` に積む。**全 N バイトを値として保持**（trailing NUL/空白も含む＝§29.5-3
+  「padding は値」。トリムは将来オプション）。binary は固定 N バイト＝**空セルが無い**ので §26 null は
+  発生しない（null セル概念は CSV 側のみ）。
+- **境界は byte 単位**（text の char 単位と対比）。`c_align` 時は align=1 ゆえ char[N] 自身は padding を
+  足さないが、後続フィールドの自然アラインメントは従来どおり。
+- **不変条件**：byte-identity（固定幅＝レコード境界はバイト範囲のみ・serial==parallel==chunk-size）・
+  to_source round-trip・依存ゼロ（std の UTF-8 デコードのみ）。
+
 ### テキストモードは UTF-8 境界を割らない
 文字列複合は **char / byte 境界を明示**し、**UTF-8 のコードポイント境界を割らない**
 （全角/半角・マルチバイトを跨ぐオフセットは never-silent でエラー化＝continue-first）。

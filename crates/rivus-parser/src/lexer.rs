@@ -34,6 +34,8 @@ pub enum Tok {
     RParen,           // )
     LBrace,           // {
     RBrace,           // }
+    LBracket,         // [   (binary `char[N]` width — §29.4)
+    RBracket,         // ]
     PipeFilter,       // |?
     PipeMap,          // |>
     PipeGroup,        // |#
@@ -213,6 +215,14 @@ impl<'a> Lexer<'a> {
                 b'}' => {
                     self.bump();
                     Tok::RBrace
+                }
+                b'[' => {
+                    self.bump();
+                    Tok::LBracket
+                }
+                b']' => {
+                    self.bump();
+                    Tok::RBracket
                 }
                 b'!' => {
                     self.bump();
