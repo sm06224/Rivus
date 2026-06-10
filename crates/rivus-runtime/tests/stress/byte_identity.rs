@@ -70,6 +70,68 @@ fn parallel_decimal_chunk_size_independent() {
 }
 
 #[test]
+fn union_view_subviews_are_parallel_chunk_size_byte_identical() {
+    // A union sub-view (§29.3, s2) is a pure row-wise char slice, so its output
+    // must be byte-identical across chunk sizes and the serial/parallel reader
+    // split (§29.7). The byte-range parallel path engages only with a file sink,
+    // so each run `save`s and the files are compared byte-for-byte. A >1 MiB file
+    // + MemoryPref::Fast forces the parallel reader; assert it engaged.
+    let rows = 120_000usize; // ~1.56 MiB of 12-char ids → crosses the Fast 1 MiB floor
+    let mut text = String::from("id\n");
+    for i in 0..rows {
+        text.push_str(&format!("{i:012}\n")); // fixed 12-char id
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_union_view",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+
+    let run_to_file = |cs: usize, pref: rivus_runtime::MemoryPref, out: &std::path::Path| {
+        let src = format!(
+            "U:\n open {p} (id:str)\n \
+             |> id :string(12) :{{ cls@0..3 dept@3..7 seq@7..12 }}\n \
+             |> (id.cls) as cls (id.dept) as dept (id.seq) as seq\n \
+             save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: cs,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run")
+    };
+
+    // Serial oracle (single-threaded reader).
+    let ser_out = TempCsv(gendata::write_temp_bytes("union_view_serial", b""));
+    run_to_file(1024, rivus_runtime::MemoryPref::Low, &ser_out.0);
+    let oracle = std::fs::read_to_string(&ser_out.0).expect("read serial out");
+    assert!(oracle.lines().count() > 1000, "oracle unexpectedly small");
+    // Spot-check the char slice on the first data row (id `000000000000`).
+    assert_eq!(
+        oracle.lines().nth(1),
+        Some("000,0000,00000"),
+        "sub-view slice wrong on first row"
+    );
+
+    for cs in [1usize, 1000, rows] {
+        let par_out = TempCsv(gendata::write_temp_bytes("union_view_parallel", b""));
+        let res = run_to_file(cs, rivus_runtime::MemoryPref::Fast, &par_out.0);
+        assert!(
+            !res.workers.is_empty(),
+            "expected the byte-range parallel reader to engage @cs={cs}"
+        );
+        let got = std::fs::read_to_string(&par_out.0).expect("read parallel out");
+        assert_eq!(got, oracle, "union view parallel != serial @cs={cs}");
+    }
+}
+
+#[test]
 fn decimal_sum_is_order_independent() {
     // The same multiset of decimals in two different row orders must give the
     // identical exact sum (f64 would drift). This is the property #41 relies on

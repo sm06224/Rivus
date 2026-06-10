@@ -25,6 +25,30 @@ pub enum Endian {
     Big,
 }
 
+/// One named sub-view of a union view (§29.3, s2): the half-open **character**
+/// range `[start, end)` of a fixed-width string column, named `name`. Defined by
+/// a `:{ name@start..end … }` block and referenced as `base.name` via the `.`
+/// accessor (lowered to [`crate::Expr::SubView`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubView {
+    pub name: String,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// A union-view definition attached to an `Op::ProjectExpr` item (§29.3, s2):
+/// column `col` (kept physically as one string column) gains the logical
+/// sub-views `subs`. `width` is the optional declared total width from
+/// `:string(W)` — preserved here for faithful `to_source` because `DataType::Str`
+/// carries no width. The sub-views are **not** materialized as columns; they are
+/// resolved lazily by the `base.name` accessor as zero-copy slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDef {
+    pub col: String,
+    pub width: Option<u32>,
+    pub subs: Vec<SubView>,
+}
+
 /// Which rows a join keeps. `Inner` emits only matched pairs; `Left` keeps
 /// every left row, padding the right columns with defaults when unmatched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,7 +508,16 @@ pub enum Op {
     /// item is `(expr, output_name)`; a bare field is `(Field, name)`. Emitted
     /// only when at least one item is computed (pure selection stays `Project`),
     /// so existing fusion/pushdown are unaffected. Stateless (row-wise).
-    ProjectExpr { items: Vec<(Expr, String)> },
+    ///
+    /// `views` carries any union sub-view definitions introduced by a
+    /// `col :string(W) :{ name@start..end … }` block (§29.3, s2). It is empty for
+    /// ordinary projections (behaviour unchanged); when present it is metadata
+    /// only — the op materializes no extra columns — so the `base.name` accessor
+    /// downstream can resolve sub-views and `to_source` can re-emit the block.
+    ProjectExpr {
+        items: Vec<(Expr, String)>,
+        views: Vec<ViewDef>,
+    },
     /// `take N` / `limit N` / `head N` — pass through at most `N` rows of the
     /// stream flowing through this node, then drop the rest. Stateful (a global
     /// running count), so it is a pipeline-breaker for the parallel executor.
@@ -657,11 +690,12 @@ impl Op {
                 pred: pred.bind_holes(bindings),
                 disposition: *disposition,
             },
-            Op::ProjectExpr { items } => Op::ProjectExpr {
+            Op::ProjectExpr { items, views } => Op::ProjectExpr {
                 items: items
                     .iter()
                     .map(|(e, a)| (e.bind_holes(bindings), a.clone()))
                     .collect(),
+                views: views.clone(),
             },
             Op::FilterProject { preds, fields } => Op::FilterProject {
                 preds: preds.iter().map(|p| p.bind_holes(bindings)).collect(),
@@ -675,7 +709,7 @@ impl Op {
     pub fn collect_holes(&self, out: &mut Vec<String>) {
         match self {
             Op::Filter { pred } | Op::Validate { pred, .. } => pred.collect_holes(out),
-            Op::ProjectExpr { items } => items.iter().for_each(|(e, _)| e.collect_holes(out)),
+            Op::ProjectExpr { items, .. } => items.iter().for_each(|(e, _)| e.collect_holes(out)),
             Op::FilterProject { preds, .. } => preds.iter().for_each(|p| p.collect_holes(out)),
             _ => {}
         }
@@ -878,10 +912,40 @@ impl Op {
             Op::Filter { pred } => format!("|? {pred}"),
             Op::Validate { pred, disposition } => format!("|! {pred} {}", disposition.as_str()),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
-            Op::ProjectExpr { items } => {
+            Op::ProjectExpr { items, views } => {
                 let parts: Vec<String> = items
                     .iter()
                     .map(|(e, alias)| {
+                        // A union-view definition item (§29.3, s2) renders as
+                        // `col :str(W) :{ name@start..end … }`: the whole-view
+                        // cast plus the sub-view block recovered from `views`.
+                        // The declared width lives in `ViewDef` (the `Str` lane
+                        // carries none), so it is re-appended here for round-trip.
+                        if let Some(v) = views.iter().find(|v| &v.col == alias) {
+                            if let Expr::Cast { expr, ty } = e {
+                                if let Expr::Field {
+                                    name,
+                                    access: Access::Fast,
+                                } = expr.as_ref()
+                                {
+                                    if name == alias {
+                                        let width = match v.width {
+                                            Some(w) => format!("({w})"),
+                                            None => String::new(),
+                                        };
+                                        let subs: Vec<String> = v
+                                            .subs
+                                            .iter()
+                                            .map(|s| format!("{}@{}..{}", s.name, s.start, s.end))
+                                            .collect();
+                                        return format!(
+                                            "{name} :{ty}{width} :{{ {} }}",
+                                            subs.join(" ")
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         // The `:` definition chain (§29.2) is the canonical
                         // spelling for plain select / rename / cast items.
                         // An alias that collides with a type word must not be

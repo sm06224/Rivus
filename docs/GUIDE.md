@@ -298,6 +298,23 @@ The `rename` / `cast` verbs (below) are **not** the same operation: they fix
 up named columns **in place while keeping every other column**, whereas `|>`
 keeps only what you list.
 
+**Union views — one column, many sub-views.** A fixed-width string column can
+carry named **character** sub-views. `id :string(27) :{ cls@0..3 dept@3..11 }`
+keeps `id` as one physical column and defines zero-copy slices `cls` (characters
+`0..3`) and `dept` (`3..11`) over it. Reference a sub-view in expression context
+with the same `.` accessor as `source.uri` (§6):
+
+```
+|> id :string(27) :{ cls@0..3 dept@3..11 equip@11..27 }   # define the sub-views
+|> (id.cls) as cls (id.dept) as dept                       # reference them
+```
+
+The ranges are **half-open character offsets** `[start, end)`, so multi-byte
+text is never split mid-character. Sub-views may overlap and need not cover the
+whole width (gaps are just padding). An offset that runs past the end of a cell
+is a never-silent failure — that cell becomes null and the count is surfaced on
+the error stream, never silently wrong.
+
 ### `|#` — group by
 
 Partition by one or more key columns and aggregate. A `count` column is always
@@ -566,6 +583,7 @@ Used in `|?` predicates and `(…)` computed columns.
 | value hole | `$min` — a placeholder filled by a binding (`\| flow min=20`), §4 |
 | resource handle | `resource("file:///data/a.csv")` — a first-class I/O handle |
 | provenance field | `source.uri`, `source.scheme` — a field of the chunk's origin (needs `with source`, §3) |
+| union sub-view | `id.cls` — a character slice of a fixed-width column defined by `id :string(W) :{ cls@0..3 … }` (§4 `\|>`) |
 
 > **Resource handle** (`resource("uri")`) is a first-class value identified by its
 > `uri` (`file://`, `s3://`, `http://`, `-` for stdin). It is the handle type that

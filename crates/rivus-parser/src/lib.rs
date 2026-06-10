@@ -30,7 +30,7 @@ use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value
 use rivus_ir::{
     is_type_word, Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery, Disposition,
     EdgeKind, Endian, Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op,
-    PlanGraph, Provenance, ReadFmt, Transport,
+    PlanGraph, Provenance, ReadFmt, SubView, Transport, ViewDef,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -48,6 +48,7 @@ pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
         g: PlanGraph::new(),
         last_dt_fmt: None,
         apply_site: 0,
+        view_defs: std::collections::HashMap::new(),
     };
     p.parse_program()?;
     Ok(p.g)
@@ -70,6 +71,11 @@ struct Parser {
     /// Monotonic id for each `| name` apply site (§25.4), stamped on the nodes it
     /// splices so `to_source` can collapse the run back to `| name`.
     apply_site: u32,
+    /// Union sub-view definitions seen so far (§29.3, s2): column → its sub-views.
+    /// Populated by a `col :string(W) :{ name@start..end … }` block and consulted
+    /// when an expression references `base.name`, which lowers to
+    /// [`Expr::SubView`] with the range inlined from here.
+    view_defs: std::collections::HashMap<String, Vec<SubView>>,
 }
 
 impl Parser {
@@ -1045,6 +1051,7 @@ impl Parser {
     /// (so existing fusion/pushdown are untouched); otherwise to `ProjectExpr`.
     fn parse_projection(&mut self) -> Result<Op, RivusError> {
         let mut items: Vec<(Expr, String)> = Vec::new();
+        let mut views: Vec<ViewDef> = Vec::new();
         let mut all_bare = true;
         loop {
             match self.tok().clone() {
@@ -1068,7 +1075,7 @@ impl Parser {
                         items.push((Expr::field(&w), alias));
                         all_bare = false;
                     } else if self.at(&Tok::Colon) {
-                        items.push(self.parse_colon_chain(&w)?);
+                        items.push(self.parse_colon_chain(&w, &mut views)?);
                         all_bare = false;
                     } else {
                         items.push((Expr::field(&w), w));
@@ -1084,7 +1091,7 @@ impl Parser {
             let fields = items.into_iter().map(|(_, alias)| alias).collect();
             Ok(Op::Project { fields })
         } else {
-            Ok(Op::ProjectExpr { items })
+            Ok(Op::ProjectExpr { items, views })
         }
     }
 
@@ -1097,7 +1104,11 @@ impl Parser {
     /// `ProjectExpr` item — rename is just the alias, cast is `Expr::Cast` —
     /// so the IR and byte-identity are exactly those of the parenthesized
     /// forms.
-    fn parse_colon_chain(&mut self, col: &str) -> Result<(Expr, String), RivusError> {
+    fn parse_colon_chain(
+        &mut self,
+        col: &str,
+        views: &mut Vec<ViewDef>,
+    ) -> Result<(Expr, String), RivusError> {
         self.expect(&Tok::Colon)?;
         let first = self.word()?;
         let (alias, ty) = if is_type_word(&first) {
@@ -1119,12 +1130,43 @@ impl Parser {
             // A datetime parse format belongs to the source schema, not a cast
             // (§23.6) — same rule as the cast verb and expression casts.
             self.reject_expr_dt_format()?;
-            if self.at(&Tok::Colon) {
-                return Err(self.err(format!(
-                    "`{col} :…`: a `:` chain is at most `col :alias :type` \
-                     (rename first, then cast — nothing follows the type)"
-                )));
+        }
+        // Union sub-view definition (§29.3, s2): `col :string(W) :{ name@a..b … }`.
+        // The optional `(W)` width is consumed only when a `:{ … }` block follows
+        // (it is kept on the ViewDef — the `Str` lane has no width). The whole
+        // view is the cast `col :str`; the sub-views are resolved lazily by the
+        // `base.name` accessor, so the op materializes no extra columns.
+        let width = self.parse_view_width(ty)?;
+        if let Some(ty) = ty {
+            if self.at(&Tok::Colon) && self.toks[self.pos + 1].0 == Tok::LBrace {
+                self.bump(); // `:` before the `{ … }` block
+                let subs = self.parse_view_block(&alias)?;
+                self.view_defs.insert(alias.clone(), subs.clone());
+                views.push(ViewDef {
+                    col: alias.clone(),
+                    width,
+                    subs,
+                });
+                return Ok((
+                    Expr::Cast {
+                        expr: Box::new(Expr::field(col)),
+                        ty,
+                    },
+                    alias,
+                ));
             }
+        }
+        if width.is_some() {
+            return Err(self.err(
+                "string(N) width is only valid with a sub-view block, e.g. \
+                 `id :string(N) :{ a@0..3 … }`",
+            ));
+        }
+        if ty.is_some() && self.at(&Tok::Colon) {
+            return Err(self.err(format!(
+                "`{col} :…`: a `:` chain is at most `col :alias :type` \
+                 (rename first, then cast — nothing follows the type)"
+            )));
         }
         let mut expr = Expr::field(col);
         if let Some(ty) = ty {
@@ -1134,6 +1176,88 @@ impl Parser {
             };
         }
         Ok((expr, alias))
+    }
+
+    /// Parse the optional `(W)` width of a string union view — but only when it
+    /// is immediately followed by a `:{ … }` block (`:string(W) :{ … }`), so a
+    /// following `(expr) as alias` projection item is never mistaken for a width.
+    /// Consumes `(W)` and returns the width, or consumes nothing.
+    fn parse_view_width(&mut self, ty: Option<DataType>) -> Result<Option<u32>, RivusError> {
+        if !matches!(ty, Some(DataType::Str)) || !self.at(&Tok::LParen) {
+            return Ok(None);
+        }
+        // Only the exact `( Int ) : {` shape is a width.
+        let is_width = matches!(self.toks.get(self.pos + 1).map(|t| &t.0), Some(Tok::Int(_)))
+            && self.toks.get(self.pos + 2).map(|t| &t.0) == Some(&Tok::RParen)
+            && self.toks.get(self.pos + 3).map(|t| &t.0) == Some(&Tok::Colon)
+            && self.toks.get(self.pos + 4).map(|t| &t.0) == Some(&Tok::LBrace);
+        if !is_width {
+            return Ok(None);
+        }
+        self.bump(); // `(`
+        let w = match self.bump() {
+            Tok::Int(n) if n >= 0 => n as u32,
+            other => {
+                return Err(self.err(format!(
+                    "string(N): width must be a non-negative integer, found {other:?}"
+                )))
+            }
+        };
+        self.expect(&Tok::RParen)?;
+        Ok(Some(w))
+    }
+
+    /// Parse a union sub-view block `{ name@start..end … }` (§29.3, s2): one or
+    /// more half-open **character** ranges. `start <= end`, offsets are
+    /// non-negative integers, and duplicate sub-view names are an error
+    /// (never-silent). The opening `{` is the current token.
+    fn parse_view_block(&mut self, col: &str) -> Result<Vec<SubView>, RivusError> {
+        self.expect(&Tok::LBrace)?;
+        let mut subs: Vec<SubView> = Vec::new();
+        while !self.at(&Tok::RBrace) {
+            if self.at(&Tok::Eof) {
+                return Err(self.err("unterminated sub-view block `:{ … }`"));
+            }
+            let name = self.word()?;
+            if !self.eat(&Tok::At) {
+                return Err(self.err(format!(
+                    "sub-view `{name}` needs an offset range, e.g. `{name}@0..3`"
+                )));
+            }
+            let start = self.view_offset(&name)?;
+            if !self.eat(&Tok::DotDot) {
+                return Err(self.err(format!(
+                    "sub-view `{name}@{start}..end`: expected `..` (a half-open range `start..end`)"
+                )));
+            }
+            let end = self.view_offset(&name)?;
+            if start > end {
+                return Err(self.err(format!(
+                    "sub-view `{name}@{start}..{end}`: start must be <= end (half-open `[start, end)`)"
+                )));
+            }
+            if subs.iter().any(|s| s.name == name) {
+                return Err(self.err(format!("duplicate sub-view name `{name}` on `{col}`")));
+            }
+            subs.push(SubView { name, start, end });
+        }
+        self.expect(&Tok::RBrace)?;
+        if subs.is_empty() {
+            return Err(self.err(format!(
+                "sub-view block on `{col}` is empty; define at least one `name@start..end`"
+            )));
+        }
+        Ok(subs)
+    }
+
+    /// Read a non-negative integer sub-view offset (a character index).
+    fn view_offset(&mut self, name: &str) -> Result<u32, RivusError> {
+        match self.bump() {
+            Tok::Int(n) if n >= 0 => Ok(n as u32),
+            other => Err(self.err(format!(
+                "sub-view `{name}` offset must be a non-negative integer, found {other:?}"
+            ))),
+        }
     }
 
     fn skip_block(&mut self) -> Result<(), RivusError> {
@@ -1453,6 +1577,31 @@ impl Parser {
                     name,
                     access: Access::Source,
                 })
+            }
+            // `base.name` — union sub-view accessor (§29.3, s2): `base` is a column
+            // with sub-views defined earlier by a `:{ … }` block, so this lowers to
+            // `Expr::SubView` with the char range inlined from `view_defs` (same
+            // expression-context `.` mechanism as `source.uri`). An unknown sub-view
+            // name is a never-silent error rather than a silently-empty slice.
+            Tok::Word(ref w)
+                if self.toks[self.pos + 1].0 == Tok::Dot && self.view_defs.contains_key(w) =>
+            {
+                let base = w.clone();
+                self.bump(); // base
+                self.expect(&Tok::Dot)?;
+                let name = self.word()?;
+                match self.view_defs[&base].iter().find(|s| s.name == name) {
+                    Some(s) => Ok(Expr::SubView {
+                        base,
+                        name,
+                        start: s.start,
+                        end: s.end,
+                    }),
+                    None => Err(self.err(format!(
+                        "`{base}.{name}`: `{base}` has no sub-view `{name}` \
+                         (sub-views come from a `:{{ … }}` block)"
+                    ))),
+                }
             }
             // Bare field of the current object: `age`. Outside parens (flow mode)
             // the lexer folds `a.b` into a single identifier, so a dotted bare word
@@ -1783,7 +1932,7 @@ mod tests {
         ));
         // Any computed item → Op::ProjectExpr.
         match nth_op("F:\n open a.csv\n |> name (age * 12) as months\n;", 1) {
-            Op::ProjectExpr { items } => {
+            Op::ProjectExpr { items, .. } => {
                 assert_eq!(items.len(), 2);
                 assert_eq!(items[1].1, "months");
                 assert!(matches!(items[1].0, Expr::Arith { .. }));
@@ -1817,7 +1966,7 @@ mod tests {
             "F:\n open a.csv\n |> amount :amt :decimal(2) qty :int note :memo plain\n;",
             1,
         ) {
-            Op::ProjectExpr { items } => {
+            Op::ProjectExpr { items, .. } => {
                 assert_eq!(items.len(), 4);
                 assert_eq!(items[0].1, "amt");
                 assert!(matches!(
@@ -1870,6 +2019,92 @@ mod tests {
     }
 
     #[test]
+    fn union_view_defines_round_trips_and_resolves_subviews() {
+        // `:string(W) :{ name@start..end … }` defines char sub-views on a
+        // fixed-width column (§29.3, s2); `base.name` references them in
+        // expression context (same `.` mechanism as `source.uri`).
+        let src = "U:\n open ids.csv\n |> id :string(27) :{ cls@0..3 dept@3..11 }\n \
+                   |> (id.cls) as cls (id.dept) as dept\n;";
+        let g = parse(src).unwrap();
+        // Node #1 (first projection): the whole-view cast item + a ViewDef that
+        // keeps the declared width and the char ranges (the `Str` lane has none).
+        match &g.nodes[1].op {
+            Op::ProjectExpr { items, views } => {
+                assert_eq!(items.len(), 1, "whole view is one materialized column");
+                assert!(matches!(&items[0].0, Expr::Cast { .. }) && items[0].1 == "id");
+                assert_eq!(views.len(), 1);
+                assert_eq!(views[0].col, "id");
+                assert_eq!(views[0].width, Some(27));
+                assert_eq!(
+                    views[0].subs,
+                    vec![
+                        rivus_ir::SubView {
+                            name: "cls".into(),
+                            start: 0,
+                            end: 3
+                        },
+                        rivus_ir::SubView {
+                            name: "dept".into(),
+                            start: 3,
+                            end: 11
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected ProjectExpr with views, got {other:?}"),
+        }
+        // Node #2: the references lower to `Expr::SubView` with inlined ranges.
+        match &g.nodes[2].op {
+            Op::ProjectExpr { items, .. } => {
+                assert!(matches!(
+                    &items[0].0,
+                    Expr::SubView { base, name, start, end }
+                        if base == "id" && name == "cls" && *start == 0 && *end == 3
+                ));
+            }
+            other => panic!("expected ProjectExpr, got {other:?}"),
+        }
+        // Canonical rendering + reversibility (§29.7 invariant).
+        let s1 = g.to_source();
+        assert!(
+            s1.contains("|> id :str(27) :{ cls@0..3 dept@3..11 }"),
+            "definition not canonical: {s1}"
+        );
+        assert!(
+            s1.contains("(id.cls) as cls (id.dept) as dept"),
+            "references not canonical: {s1}"
+        );
+        assert_eq!(
+            s1,
+            parse(&s1).unwrap().to_source(),
+            "union view not reversible: {s1}"
+        );
+    }
+
+    #[test]
+    fn union_view_malformed_definitions_and_references_are_explicit_errors() {
+        // Never-silent: every malformed sub-view definition / reference is a
+        // clear parse error rather than a silently-wrong or dropped view.
+        let bad = [
+            // unknown sub-view reference
+            "U:\n open f.csv\n |> id :str(4) :{ a@0..2 } |> (id.zzz) as z\n;",
+            // duplicate sub-view name
+            "U:\n open f.csv\n |> id :str(4) :{ a@0..2 a@2..4 }\n;",
+            // start > end
+            "U:\n open f.csv\n |> id :str(4) :{ a@3..1 }\n;",
+            // width without a sub-view block
+            "U:\n open f.csv\n |> id :string(4)\n;",
+            // empty sub-view block
+            "U:\n open f.csv\n |> id :str(4) :{ }\n;",
+            // missing offset range
+            "U:\n open f.csv\n |> id :str(4) :{ a }\n;",
+        ];
+        for src in bad {
+            assert!(parse(src).is_err(), "should have rejected: {src}");
+        }
+    }
+
+    #[test]
     fn alias_colliding_with_a_type_word_keeps_the_parenthesized_form() {
         // `|> (amount) as int` renames to a type-word name. `to_source` must
         // not emit `amount :int` — that re-parses as a cast — so the
@@ -1883,7 +2118,7 @@ mod tests {
         );
         assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
         match nth_op(&s, 1) {
-            Op::ProjectExpr { items } => {
+            Op::ProjectExpr { items, .. } => {
                 assert_eq!(items[0].1, "int");
                 assert!(
                     matches!(&items[0].0, Expr::Field { .. }),
@@ -1955,7 +2190,7 @@ mod tests {
         ] {
             let src = format!("F:\n open a.csv\n |> amount :{w}\n;");
             match nth_op(&src, 1) {
-                Op::ProjectExpr { items } => {
+                Op::ProjectExpr { items, .. } => {
                     assert_eq!(items[0].1, "amount", "alias must stay the column for :{w}");
                     assert!(
                         matches!(items[0].0, Expr::Cast { .. }),
@@ -2020,7 +2255,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::ProjectExpr { items } => Some(items),
+                Op::ProjectExpr { items, .. } => Some(items),
                 _ => None,
             })
             .expect("computed projection");
@@ -2082,7 +2317,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::ProjectExpr { items } => Some(items),
+                Op::ProjectExpr { items, .. } => Some(items),
                 _ => None,
             })
             .expect("computed projection");
@@ -2109,7 +2344,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::ProjectExpr { items } => Some(items),
+                Op::ProjectExpr { items, .. } => Some(items),
                 _ => None,
             })
             .expect("computed projection");
@@ -3222,7 +3457,7 @@ Import:
         let src = "F:\n open a.csv\n |> (case when age >= 60 then \"senior\" else \"other\" end) as bucket\n;";
         let g = parse(src).unwrap();
         match &g.nodes[1].op {
-            Op::ProjectExpr { items } => {
+            Op::ProjectExpr { items, .. } => {
                 assert_eq!(items.len(), 1);
                 assert_eq!(items[0].1, "bucket");
                 match &items[0].0 {

@@ -192,6 +192,25 @@ open ids.csv |> complexId :string(27) :{ cls@0..3 departmentId@3..11 equipmentId
 既存 `source.uri` と同じ場所・同じ機構で、**ゼロ lexer 変更・既に round-trip 済み**。裸 flow 位置の
 `.` はパス曖昧性ゆえ従来どおり明示エラーのまま（never-silent）。
 
+### s2 lowering（実装確定 2026-06-10・issue #137 裁定を受けて）
+
+§29.5-1 の「残る細目」を次のとおり確定し、s2 の最小スライス（**text／char 限定**）を実装する:
+
+- **定義の格納**：`Op::ProjectExpr` に `views: Vec<ViewDef>` を加える（既存 project は空＝**挙動不変**）。
+  `ViewDef { col, width: Option<u32>, subs: Vec<SubView> }`・`SubView { name, start, end }`（**半開・char**）。
+  `complexId :string(27) :{ … }` の `(27)` は `ViewDef.width` に保持する（`DataType::Str` は幅を持たない
+  ので、cast 自体は `Str` のまま・幅は views メタに置く）。`to_source` は item の `:string(width)` と続く
+  `:{ name@start..end … }` を views から忠実に復元（可逆）。
+- **参照**：式文脈の `base.name` は `Expr::SubView { base, name, start, end }` に lower（parser が**直前まで
+  に見た定義を状態で解決し範囲を inline**）。`to_source` は `base.name`。`source.uri` と同じ式文脈 `.` 機構。
+- **eval（zero-copy）**：`SubView` は `column(base).get(row)` の `&str` を char 範囲 `[start, end)` で
+  **借用スライス**（部分文字列を複製しない＝§29.3 のゼロコピー）。char 境界が UTF-8 コードポイント境界を
+  割る／範囲が幅を超える場合は **never-silent エラー**（continue-first・error stream へ）。
+- **解決規則**：`base` が直前までに定義された view 列で `name` がそのサブビュー名のときだけ accessor 化。
+  未知の `base.name` は従来どおり明示エラー（never-silent・`lib.rs:1413`）。同名サブビューは定義時にエラー。
+- **byte-identity**：`SubView` は純粋な行ごとスライス＝serial == parallel == chunk-size 不変。
+- **binary（byte 単位・`char[N]` BinType）は後続コミット**（§29.4・§29.5-3）。本スライスは text（char）限定。
+
 ---
 
 ## 29.4 テキスト複合 vs 構造体複合 — 3軸差異（必須節）

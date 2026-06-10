@@ -310,7 +310,9 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             fails: Default::default(),
         }),
         Op::Reorder { cols } => Box::new(Reorder { cols: cols.clone() }),
-        Op::ProjectExpr { items } => Box::new(ProjectExpr {
+        // `views` are metadata only (§29.3, s2): sub-view references are lowered
+        // to `Expr::SubView` at parse time, so the operator needs just `items`.
+        Op::ProjectExpr { items, .. } => Box::new(ProjectExpr {
             items: items.clone(),
             fails: Default::default(),
         }),

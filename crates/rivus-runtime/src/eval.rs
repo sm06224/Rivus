@@ -841,6 +841,15 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
                 .collect();
             column_from_values(vals)
         }
+        // `base.name` — union sub-view (§29.3, s2): a per-row `Str` char slice
+        // (or null). Row-wise, like `case`; build a null-aware column so a null
+        // cell stays null rather than forcing the string lane to an empty value.
+        Expr::SubView { .. } => {
+            let vals: Vec<Value> = (0..chunk.len)
+                .map(|r| eval_acc(expr, chunk, r, fails))
+                .collect();
+            column_from_values(vals)
+        }
         // Compare / And / Or are predicates → a boolean column.
         _ => {
             let v: Vec<bool> = (0..chunk.len)
@@ -1219,6 +1228,13 @@ pub fn eval_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> Valu
         // reaches eval it yields Null (continue-first, never a panic).
         Expr::Hole(_) => Value::Null,
         Expr::Field { name, access } => eval_field(name, *access, chunk, row),
+        // `base.name` — union sub-view (§29.3, s2): a zero-copy char slice of the
+        // fixed-width string column `base`. Out-of-range slices are counted as
+        // never-silent failures (continue-first null), like a cast that won't
+        // parse (BUG-D §23.6).
+        Expr::SubView {
+            base, start, end, ..
+        } => eval_subview(base, *start, *end, chunk, row, fails),
         Expr::Compare { left, op, right } => {
             Value::Bool(compare_fast(left, *op, right, chunk, row, fails))
         }
@@ -1315,6 +1331,43 @@ fn eval_field(name: &str, access: Access, chunk: &Chunk, row: usize) -> Value {
         Some(col) => col.value_at(row),
         None => Value::Null,
     }
+}
+
+/// Resolve a union sub-view `base.name` (§29.3, s2) at `row`: the half-open
+/// **character** range `[start, end)` of the fixed-width string column `base`.
+/// Char (not byte) offsets so a multi-byte code point is never split (§29.4);
+/// the slice is a borrow of the cell — only the produced `Value` owns a copy.
+/// A null cell (§26) yields null; an out-of-range range is a never-silent
+/// failure (counted in `fails`, continue-first null) rather than a panic.
+fn eval_subview(
+    base: &str,
+    start: u32,
+    end: u32,
+    chunk: &Chunk,
+    row: usize,
+    fails: &mut u64,
+) -> Value {
+    let Some(col) = chunk.column(base) else {
+        return Value::Null; // base column absent → continue-first null
+    };
+    if col.is_null(row) {
+        return Value::Null; // null cell (§26) → null sub-view
+    }
+    // Sub-views are defined on string columns only (char unit, this slice). A
+    // non-string base never occurs for a well-formed `:string(W) :{ … }`.
+    let ColumnData::Str(sc) = col.data() else {
+        return Value::Null;
+    };
+    let cell = sc.get(row);
+    let (s, e) = (start as usize, end as usize);
+    let char_count = cell.chars().count();
+    if s > e || e > char_count {
+        *fails += 1;
+        return Value::Null;
+    }
+    // Byte offset of the k-th character boundary (k == char_count → end of cell).
+    let byte_at = |k: usize| cell.char_indices().nth(k).map_or(cell.len(), |(i, _)| i);
+    Value::Str(cell[byte_at(s)..byte_at(e)].to_string())
 }
 
 /// Generic field accessor on a [`Resource`] (design §28.6 / §00 0.14), used by
