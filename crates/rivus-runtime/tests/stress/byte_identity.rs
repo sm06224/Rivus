@@ -70,6 +70,58 @@ fn parallel_decimal_chunk_size_independent() {
 }
 
 #[test]
+fn binary_char_field_is_parallel_chunk_size_byte_identical() {
+    // `char[N]` decode (§29.4, #139) on the **parallel** binary reader: records
+    // are fixed-width, so byte ranges split on record boundaries and the Str
+    // lane must come out byte-identical to serial across chunk sizes. Record =
+    // i32 id + char[12] name → 16 B; 80_000 records = 1.22 MiB > the Fast floor.
+    let rows = 80_000usize;
+    let mut bytes = Vec::with_capacity(rows * 16);
+    for i in 0..rows {
+        bytes.extend_from_slice(&(i as i32).to_le_bytes());
+        // 12-byte name with NUL padding kept as value (ratification #137 ③).
+        let name = format!("n{:07}\0\0\0\0", i % 1_000_000);
+        assert_eq!(name.len(), 12);
+        bytes.extend_from_slice(name.as_bytes());
+    }
+    let f = TempCsv(gendata::write_temp_bytes("stress_par_binchar", &bytes));
+    let p = f.0.display();
+
+    let run_to_file = |cs: usize, pref: rivus_runtime::MemoryPref, out: &std::path::Path| {
+        let src = format!(
+            "B:\n readbin {p} (id:i32 name:char[12])\n |? id >= 1000\n |> id name\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: cs,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run")
+    };
+
+    let ser_out = TempCsv(gendata::write_temp_bytes("par_binchar_serial", b""));
+    run_to_file(1024, rivus_runtime::MemoryPref::Low, &ser_out.0);
+    let oracle = std::fs::read_to_string(&ser_out.0).expect("read serial out");
+    assert!(oracle.lines().count() > 1000, "oracle unexpectedly small");
+
+    for cs in [1usize, 1000, rows] {
+        let par_out = TempCsv(gendata::write_temp_bytes("par_binchar_parallel", b""));
+        let res = run_to_file(cs, rivus_runtime::MemoryPref::Fast, &par_out.0);
+        assert!(
+            !res.workers.is_empty(),
+            "expected the record-range parallel binary reader to engage @cs={cs}"
+        );
+        let got = std::fs::read_to_string(&par_out.0).expect("read parallel out");
+        assert_eq!(got, oracle, "binary char[N] parallel != serial @cs={cs}");
+    }
+}
+
+#[test]
 fn union_view_subviews_are_parallel_chunk_size_byte_identical() {
     // A union sub-view (§29.3, s2) is a pure row-wise char slice, so its output
     // must be byte-identical across chunk sizes and the serial/parallel reader

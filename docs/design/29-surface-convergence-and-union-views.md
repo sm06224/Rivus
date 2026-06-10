@@ -314,6 +314,26 @@ text/char（CSV 固定長・#138）に続く byte 単位の構造体複合を、
      書式追加のたびに行う（必須）。
    - **非 UTF-8（SJIS 等）は s3 範囲外**（将来・encoding 依存の判断を別途／**既定ビルド std-only を死守**）。
 
+   **s3 lowering（実装確定 2026-06-10・TZ 以外）**：
+   - **`ddd`（検証つき曜日）**：トークン表（`value.rs` `parse_with_format`/`format`）に `ddd` を追加。
+     `dd` のプレフィックスなので**トークン表より先に判定**。パース時は曜日名を civil date と**照合**し、
+     矛盾するセルはパース失敗（never-silent・カウント）。整形は `Date::weekday` と同じ
+     `(days+3).rem_euclid(7)`（0=月..6=日）。
+   - **`[ja-jp]` ロケール**：書式文字列**先頭の `[tag]`**（`[ja-jp]`/`[en-us]`・大文字小文字無視）が
+     `ddd` の曜日表（std-only const：`Mon..Sun`／`月..日`）を選ぶ。書式文字列に埋め込むので
+     **IR/シグネチャ変更ゼロ**（スキーマ宣言と `format()` の両方で同一機構）。未知タグは
+     `DateTime::validate_format` が**宣言時に**拒否（never-silent）。
+   - **`n…n` サブ秒**：k 個の `n` が小数秒をちょうど k 桁読む／書く。書式の最長 run が列の tick unit を
+     決め（`DateTime::unit_for_format`：0→Sec・1-3→Milli・4-6→Micro・7-9→Nano）、parser の
+     `finish_type` → スキーマ `DataType::DateTime{unit}` → reader `DtSpec` へ自動配線。run を持つ書式は
+     reader の #93 fraction 事前 strip を**スキップ**（zone strip のみ・`DtSpec.subsec`）。
+     `Display` は unit>Sec で**全幅小数を必ず描画**（精度の黙殺禁止。s3 以前は unit>Sec の列を作る手段が
+     無いので既存フローのバイト不変）。1 書式に run は 1 つ・最大 9 桁（宣言時検証）。
+   - **修正（s3 で発見・同梱）**：lexer `lex_string` の byte→char 化け（マルチバイト文字列リテラル全般を
+     破壊・`[ja-jp]` 書式の前提）と、`format()` リテラル出力の同型化け、`parse_with_format` の
+     `&fmt[fi..]` がマルチバイトリテラル中で char 境界 panic する問題（byte スライス化）。
+   - **TZ は #140 の批准待ち**（着手しない）。AUTO_FORMATS は不変更・`auto_formats_disjoint` 再固定。
+
 6. **新演算子 / リテラル — 確定（統括批准 2026-06-10・issue #137）**
    - `~`（regex 中置）・`'…'`（regex リテラル）・`$_[i]`（位置参照）・`|!` 複数検証 ＋ `{}` サブフロー。
    - **`~` / `'…'` regex リテラルの parse / to_source は常時 std**（IR に保持・可逆＝§04）。**評価のみ**

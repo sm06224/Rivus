@@ -712,11 +712,19 @@ impl Parser {
         self.last_dt_fmt = None;
         if word.eq_ignore_ascii_case("datetime") {
             // Optional explicit strptime format: `datetime("yyMMddhhmmss")`. A
-            // bare `datetime` auto-infers common formats at read time (design 23).
-            // The unit is `Sec` in the MVP (sub-second tokens come later).
+            // bare `datetime` auto-infers common formats at read time (design
+            // 23) at `Sec`. An explicit format is validated here (§29 s3,
+            // never-silent: unknown `[locale]` tag / bad `n…n` run = program
+            // error) and its `n…n` sub-second run decides the column's tick
+            // unit (none → Sec, 1-3 → Milli, 4-6 → Micro, 7-9 → Nano).
+            let mut unit = TimeUnit::Sec;
             if self.eat(&Tok::LParen) {
                 match self.bump() {
-                    Tok::Str(fmt) => self.last_dt_fmt = Some(fmt),
+                    Tok::Str(fmt) => {
+                        rivus_core::DateTime::validate_format(&fmt).map_err(|e| self.err(e))?;
+                        unit = rivus_core::DateTime::unit_for_format(&fmt);
+                        self.last_dt_fmt = Some(fmt);
+                    }
                     other => {
                         return Err(self.err(format!(
                             "datetime(\"fmt\"): expected a quoted format string, found {other:?}"
@@ -725,9 +733,7 @@ impl Parser {
                 }
                 self.expect(&Tok::RParen)?;
             }
-            return Ok(DataType::DateTime {
-                unit: TimeUnit::Sec,
-            });
+            return Ok(DataType::DateTime { unit });
         }
         if word.eq_ignore_ascii_case("duration") {
             // Signed tick span, read from the human `HH:MM:SS[.frac]` form
@@ -2200,6 +2206,29 @@ mod tests {
             format!("{e:?}").contains("must be a type"),
             "missing type hint: {e:?}"
         );
+    }
+
+    #[test]
+    fn datetime_format_is_validated_and_derives_the_unit() {
+        // §29 s3: a schema-declared format is validated at parse (never-silent
+        // program errors) and its `n…n` run decides the column's tick unit.
+        for bad in [
+            "F:\n open a.csv (ts:datetime(\"[xx-yy]yyyy\"))\n;", // unknown locale
+            "F:\n open a.csv (ts:datetime(\"[ja-jp\"))\n;",      // unclosed tag
+            "F:\n open a.csv (ts:datetime(\"mm.nnn ss.nnn\"))\n;", // two runs
+            "F:\n open a.csv (ts:datetime(\"ss.nnnnnnnnnn\"))\n;", // 10-digit run
+        ] {
+            assert!(parse(bad).is_err(), "should have rejected: {bad}");
+        }
+        // A `[ja-jp]` + sub-second format parses and round-trips verbatim
+        // (multi-byte literals intact — the string lexer copies bytes, §29 s3).
+        let src = "F:\n open a.csv (ts:datetime(\"[ja-jp]yyyy年MM月dd日(ddd) HH:mm:ss.nnnnnn\"))\n |> ts\n;";
+        let s = parse(src).unwrap().to_source();
+        assert!(
+            s.contains("[ja-jp]yyyy年MM月dd日(ddd) HH:mm:ss.nnnnnn"),
+            "format mangled: {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
     }
 
     #[test]

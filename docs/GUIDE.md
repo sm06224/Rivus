@@ -710,14 +710,28 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
 ```
 
 - **Format tokens** (a small `strptime` subset, std-only): `yyyy` `yy` `MM`
-  `dd` `HH`/`hh` `mm` `ss`; any other character is a literal that must match.
-  Two-digit years pivot `00–68 → 20xx`, `69–99 → 19xx` (deterministic). A bare
-  `:datetime` (no format) auto-infers `yyyy-MM-ddTHH:mm:ss`, `yyyy-MM-dd HH:mm:ss`,
+  `dd` `ddd` `HH`/`hh` `mm` `ss` `n…n`; any other character is a literal that
+  must match (multi-byte literals like `年` work). Two-digit years pivot
+  `00–68 → 20xx`, `69–99 → 19xx` (deterministic). A bare `:datetime` (no
+  format) auto-infers `yyyy-MM-ddTHH:mm:ss`, `yyyy-MM-dd HH:mm:ss`,
   `yyyy-MM-dd`, `yyyyMMddHHmmss`, `yyMMddHHmmss`, `yyyyMMdd` in that order.
+- **`ddd` weekday names** (validated): parses/renders the short weekday —
+  `Mon…Sun` by default, `月…日` with a leading **`[ja-jp]` locale tag** (e.g.
+  `ts:datetime("[ja-jp]yyyy年MM月dd日(ddd)")`; std-only tables, no locale
+  dependency). On parse the weekday is **checked against the date** — a cell
+  claiming `(月)` on a Wednesday is a counted parse failure, never silently
+  accepted. An unknown locale tag is a program error at declaration.
+- **`n…n` sub-second digits**: a run of k `n` reads/renders exactly k
+  fractional digits, and the run's length picks the column's exact tick
+  resolution (1–3 → ms, 4–6 → µs, 7–9 → ns) — every declared digit is kept as
+  integer ticks (`ss.nnnnnn` reads `…00.123456` to the microsecond), and the
+  default rendering of a sub-second column appends its full-width fraction so
+  precision is never silently dropped. At most one run per format.
 - **ISO timezone & fractional seconds** are accepted on the auto path: a trailing
   `Z` or `±HH:mm` offset is **normalised to UTC** (`…14:30:00+09:00` → `05:30:00`),
   and a fractional second is **truncated** to the column's resolution
-  (`…14:30:00.5` → `…14:30:00`; the MVP lane is seconds).
+  (`…14:30:00.5` → `…14:30:00`; the bare-`:datetime` lane is seconds — declare
+  an `n…n` format to keep sub-seconds).
 - **Auto-inference**: an *undeclared* column is read on the datetime lane when
   every non-empty cell is a recognised datetime (and likewise `date` for
   `yyyy-MM-dd`-only columns, `time` for `HH:mm:ss`). A purely numeric column
@@ -729,8 +743,10 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   non-instant (continue-first; only `!=` holds against it).
 - **Functions**: `year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)`
   `second(ts)` (→ integers); `trunc(ts, "day"|"hour"|"minute"|"month"|"year")`
-  (→ datetime bucket key); `format(ts, "fmt")` (→ text). Default rendering is
-  ISO-8601 `yyyy-MM-ddTHH:mm:ss`.
+  (→ datetime bucket key); `format(ts, "fmt")` (→ text, same tokens incl.
+  `ddd`/`[ja-jp]`/`n…n` — `format(ts, "[ja-jp]ddd")` renders `水`). Default
+  rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss` (+ full-width fraction on a
+  sub-second lane).
 
 **Duration lane (`duration`)** — a **signed time span**, the result of
 `DateTime − DateTime`. A distinct type from a datetime *instant*, because their
