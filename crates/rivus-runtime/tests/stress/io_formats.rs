@@ -459,6 +459,24 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         "route bytes must be serial == parallel"
     );
 
+    // Computed placeholder keys (s4c, #143 ①): each expression is its own
+    // anonymous key, evaluated per row (chunk-size independent like the rest).
+    for cz in [1usize, 4096] {
+        let _ = std::fs::remove_dir_all(&dir);
+        run_src(
+            &format!(
+                "R:\n open {p} (id:int country:str score:int)\n |> id country\n save \"{base}/x/{{substr(country,1,1)}}.csv\"\n;"
+            ),
+            cz,
+        );
+        assert_eq!(
+            read("x/J.csv"),
+            "id,country\n1,JP\n4,JP\n",
+            "computed key @cz={cz}"
+        );
+        assert_eq!(read("x/U.csv"), "id,country\n2,US\n", "@cz={cz}");
+    }
+
     // Traversal guard (review #145): a `.`/`..` key value escapes instead of
     // walking out of the declared output tree.
     let _ = std::fs::remove_dir_all(&dir);

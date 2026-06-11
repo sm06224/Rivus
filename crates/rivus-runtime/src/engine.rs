@@ -2043,8 +2043,15 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
             // inside `write_routed`); ALL failures are aggregated so the
             // parallel path surfaces them like the serial operator does
             // (never-silent across strategies, not just the first one).
-            rivus_ir::Route::Template { template, by, flat } => {
-                let fails = crate::route::write_routed(template, by, *flat, *codec, chunks);
+            rivus_ir::Route::Template {
+                template,
+                by,
+                flat,
+                exprs,
+            } => {
+                let fails = crate::route::write_routed(
+                    template, by, *flat, *codec, exprs, chunks, &mut 0u64,
+                );
                 let res = if fails.is_empty() {
                     Ok(())
                 } else {

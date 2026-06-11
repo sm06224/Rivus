@@ -10,7 +10,7 @@
 > s4a（Sink 統一 move-only）＝#144 landed。s4b（route 本体）＝**本PR**（#143 裁定反映：
 > 正準形 `save TEMPLATE [by KEY…] [as flat]`・プレースホルダ＝キー・null=Hive センチネル・
 > `%` 込み単射エスケープ・**基数上限 Fatal なし＝書き切る**・各ファイル byte-identical）。
-> 残: `{expr}` プレースホルダ（次スライス）・streaming per-partition writer＋LRU/spill（工学
+> s4b landed（#145）。s4c（`{expr}` 計算キー）＝本PR。残: streaming per-partition writer＋LRU/spill（工学
 > follow-up・現 MVP は finish 一括書き）。その後＝§28 slice 5（非有界骨組み）。
 > design は `docs/design/29-surface-convergence-and-union-views.md`（裁定反映済）。
 > §28 は slice 3 まで landed（次は slice 4 route 出力・§29 完了後）。レビュアー＝統括

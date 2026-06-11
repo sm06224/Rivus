@@ -892,7 +892,10 @@ A quoted `save` path may **route rows to many files** by their key values
 - **Template placeholders are the partition keys** — `save "out/{country}.csv"`
   ≡ `by country`. A `by` key that does not appear in the template is a
   declaration-time error (a key never silently adds a directory level).
-  Literal braces are written `{{` / `}}`.
+  Literal braces are written `{{` / `}}`. A placeholder may also be an
+  **expression** (`save "out/{substr(id,22,4)}.csv"`) — each one is its own
+  computed, anonymous key (an eval failure routes the row to the null
+  partition, counted).
 - **Deterministic & byte-identical**: the file set and every path are a pure,
   injective function of the key values (path-unsafe characters incl. `%` are
   percent-escaped); rows keep stream order within each partition, so each file

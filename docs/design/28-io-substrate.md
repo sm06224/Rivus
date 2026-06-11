@@ -169,7 +169,8 @@ read as csv with source                 # 各行/chunk に由来 Resource を付
   書込不能はパーティション単位 Recoverable で他継続）。IR＝`Route::Template{template, by, flat}`・
   runtime コア＝`rivus_runtime::route`（serial と並列 single-write merge が同一コア＝各ファイル
   byte-identical serial==parallel==chunk-size・パーティション内行順＝入力順・part 名固定
-  `part.<codec拡張子>`）。式プレースホルダ `{expr}` は次スライス。
+  `part.<codec拡張子>`）。式プレースホルダ `{expr}` は s4c で実装（snippet を射影 1 項にラップして本体文法でパース＝
+  文法の二重化なし・`Route::Template.exprs`・評価失敗は counted→null パーティション）。
 
 ## 28.8 IR への落とし方（typed-IR・既存ノードの再編・正しさ保存）
 

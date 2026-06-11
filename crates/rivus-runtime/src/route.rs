@@ -14,7 +14,8 @@
 //! real resource failure surfaces (per partition, continue-first — never a
 //! silent fallback to a different layout).
 
-use rivus_core::Chunk;
+use rivus_core::{Chunk, Value};
+use rivus_ir::Expr;
 use rivus_ir::{parse_route_template, RouteSeg, SinkCodec};
 use std::collections::HashMap;
 
@@ -89,12 +90,25 @@ pub fn group_by_path(
     by: &[String],
     flat: bool,
     codec: SinkCodec,
+    exprs: &[Expr],
+    fails: &mut u64,
 ) -> Vec<(String, Vec<Chunk>)> {
     // Validated at declaration time; an un-parseable template here would be a
     // parser bug — fall back to a single literal segment (never a panic).
     let segs = parse_route_template(template)
         .unwrap_or_else(|_| vec![RouteSeg::Lit(template.to_string())]);
-    let templated = segs.iter().any(|s| matches!(s, RouteSeg::Key(_)));
+    let templated = segs
+        .iter()
+        .any(|s| matches!(s, RouteSeg::Key(_) | RouteSeg::Raw(_)));
+    // Align each Raw seg with its parsed expression (template order).
+    let mut next_expr = exprs.iter();
+    let seg_exprs: Vec<Option<&Expr>> = segs
+        .iter()
+        .map(|g| match g {
+            RouteSeg::Raw(_) => next_expr.next(),
+            _ => None,
+        })
+        .collect();
     let ext = ext_for(codec);
     let base = template.trim_end_matches('/');
 
@@ -113,13 +127,27 @@ pub fn group_by_path(
         for row in 0..chunk.len {
             let path = if templated {
                 let mut p = String::new();
-                for seg in &segs {
+                for (si, seg) in segs.iter().enumerate() {
                     match seg {
                         RouteSeg::Lit(l) => p.push_str(l),
                         RouteSeg::Key(k) => {
                             let col = chunk.schema.index_of(k);
                             p.push_str(&key_component(chunk, col, row));
                         }
+                        // Computed key (s4c): evaluated per row; an eval
+                        // failure → counted + the null partition (same
+                        // continue-first shape as a cast that won't parse).
+                        RouteSeg::Raw(_) => match seg_exprs[si] {
+                            Some(e) => {
+                                let v = crate::eval::eval_acc(e, chunk, row, fails);
+                                if matches!(v, Value::Null) {
+                                    p.push_str(NULL_PARTITION);
+                                } else {
+                                    p.push_str(&escape_component(&v.to_string()));
+                                }
+                            }
+                            None => p.push_str(NULL_PARTITION),
+                        },
                     }
                 }
                 p
@@ -165,10 +193,12 @@ pub fn write_routed(
     by: &[String],
     flat: bool,
     codec: SinkCodec,
+    exprs: &[Expr],
     chunks: &[Chunk],
+    fails: &mut u64,
 ) -> Vec<(String, std::io::Error)> {
     let mut failures = Vec::new();
-    for (path, parts) in group_by_path(chunks, template, by, flat, codec) {
+    for (path, parts) in group_by_path(chunks, template, by, flat, codec, exprs, fails) {
         let res = std::path::Path::new(&path)
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)

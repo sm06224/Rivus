@@ -354,10 +354,16 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             // Partitioned route (§28.7 / #143): collect, then write every
             // partition on finish through `crate::route` (same bytes as the
             // parallel single-write merge).
-            rivus_ir::Route::Template { template, by, flat } => Box::new(SinkRoute {
+            rivus_ir::Route::Template {
+                template,
+                by,
+                flat,
+                exprs,
+            } => Box::new(SinkRoute {
                 template: template.clone(),
                 by: by.clone(),
                 flat: *flat,
+                exprs: exprs.clone(),
                 codec: *codec,
                 buf: Vec::new(),
                 warned_missing: false,

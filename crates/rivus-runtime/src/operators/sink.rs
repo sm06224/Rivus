@@ -503,6 +503,7 @@ pub(crate) struct SinkRoute {
     pub(crate) template: String,
     pub(crate) by: Vec<String>,
     pub(crate) flat: bool,
+    pub(crate) exprs: Vec<Expr>,
     pub(crate) codec: rivus_ir::SinkCodec,
     pub(crate) buf: Vec<Chunk>,
     pub(crate) warned_missing: bool,
@@ -538,9 +539,31 @@ impl Operator for SinkRoute {
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
         // Every partition is attempted (continue-first): one unwritable path
         // surfaces and the rest still land — never a silent fallback (#143 ③).
-        for (path, e) in
-            crate::route::write_routed(&self.template, &self.by, self.flat, self.codec, &self.buf)
-        {
+        let mut eval_fails = 0u64;
+        let failures = crate::route::write_routed(
+            &self.template,
+            &self.by,
+            self.flat,
+            self.codec,
+            &self.exprs,
+            &self.buf,
+            &mut eval_fails,
+        );
+        if eval_fails > 0 {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Recoverable,
+                    ErrorScope::Item,
+                    format!(
+                        "save route: {eval_fails} value(s) could not be evaluated in a \
+                         computed placeholder; routed to the {} partition",
+                        crate::route::NULL_PARTITION
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        for (path, e) in failures {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Recoverable,
