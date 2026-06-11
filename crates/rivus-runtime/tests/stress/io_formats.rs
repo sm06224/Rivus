@@ -395,7 +395,7 @@ fn route_save_partitions_deterministically_and_byte_identically() {
     // sentinel, escape injectivity (`a/b` → `a%2Fb`); per-file bytes are
     // chunk-size independent and serial == parallel (the parallel path routes
     // the merged stream through the same `route` core).
-    let text = "id,country,score\n1,JP,10\n2,US,\n3,a/b,30\n4,JP,10\n";
+    let text = "id,country,score\n1,JP,10\n2,US,\n3,a/b,30\n4,JP,10\n5,a%2Fb,30\n";
     let f = TempCsv(gendata::write_temp_bytes("stress_route", text.as_bytes()));
     let p = f.0.display();
     let dir = std::env::temp_dir().join(format!("rivus_route_{}", std::process::id()));
@@ -417,7 +417,11 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         assert_eq!(nullp, "id,country,score\n2,US,\n", "@cz={cz}");
         let esc = read("h/country=a%2Fb/score=30/part.csv");
         assert_eq!(esc, "id,country,score\n3,a/b,30\n", "@cz={cz}");
-        snaps.push(format!("{jp}|{nullp}|{esc}"));
+        // Injectivity (#143 ②): `%` itself escapes, so the literal key
+        // `a%2Fb` can never collide with the escaped form of `a/b`.
+        let pct = read("h/country=a%252Fb/score=30/part.csv");
+        assert_eq!(pct, "id,country,score\n5,a%2Fb,30\n", "@cz={cz}");
+        snaps.push(format!("{jp}|{nullp}|{esc}|{pct}"));
     }
     assert!(
         snaps.windows(2).all(|w| w[0] == w[1]),
