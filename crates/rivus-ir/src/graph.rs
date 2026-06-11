@@ -445,6 +445,39 @@ impl Codec {
     }
 }
 
+/// **Route** (design §28.7): where a sink's encoded bytes go — the destination
+/// resource(s), the output mirror of `Discovery`. Today this is always a single
+/// fixed path (`save out.csv`); slice 4b adds the template / `by key`
+/// partitioned form (issue #143) as further variants, without re-shaping `Op`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// A single fixed output path — the v1 `save` destination.
+    Fixed(String),
+}
+
+impl Route {
+    /// The route's single fixed path. Total today (the only variant); the
+    /// slice-4b template route will make callers choose explicitly.
+    pub fn path(&self) -> &str {
+        match self {
+            Route::Fixed(p) => p,
+        }
+    }
+}
+
+/// **Sink codec** (design §28.7): how chunks encode into bytes — the write-side
+/// mirror of [`Codec`]. Carries only encode configuration (no reader pushdowns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkCodec {
+    /// Delimited text; `delim` is the field byte (`b','` CSV / `b'\t'` TSV).
+    Csv { delim: u8 },
+    /// JSON Lines — one object per row, streaming.
+    Jsonl,
+    /// A single JSON array (`[{…},{…}]`); written incrementally (open bracket,
+    /// comma-separated rows, close bracket) so it stays bounded-memory.
+    Json,
+}
+
 /// Format selector for the multi-file `read` (design §28.3, slice 3c). `None`
 /// (no `as FMT`) infers per file from its extension; otherwise every file is
 /// forced to this format. `Tsv` is CSV with a tab delimiter.
@@ -607,18 +640,23 @@ pub enum Op {
         right_keys: Vec<String>,
         kind: JoinKind,
     },
-    /// `print` / default leaf sink.
+    /// `print` / default leaf sink — a display leaf, not an encoded file write,
+    /// so it stays outside the `Sink` unification.
     SinkPrint,
-    /// `save path.csv` — `delim` selects the field separator (`b','` for CSV,
-    /// `b'\t'` for a `.tsv`/`.tab` path or `save out.x as tsv`).
-    SinkCsv { path: String, delim: u8 },
-    /// `save path.jsonl` — write JSON Lines (one object per row).
-    SinkJsonl { path: String },
-    /// `save path.json` — write a single JSON array (`[{…},{…}]`). Unlike
-    /// `SinkJsonl` (one object per line, streaming), this brackets the whole
-    /// result; still written incrementally (open bracket, comma-separated rows,
-    /// close bracket) so it stays bounded-memory.
-    SinkJson { path: String },
+    /// A **sink** (design §28.7/§28.8): encode chunks with `codec` and write
+    /// them over `transport` to the destination(s) chosen by `route` — the
+    /// output mirror of [`Op::Source`]. One composable node replacing the
+    /// former format-specific `SinkCsv`/`SinkJsonl`/`SinkJson`, so routing
+    /// (slice 4b's template / `by key` split, issue #143) and remote transports
+    /// (slice 5) attach here without re-stratifying output by format. The v1
+    /// surface forms — `save PATH [as FMT]`, `writecsv`/`writejson` — desugar
+    /// to this (`Route::Fixed` + `Transport::Local` + the matching codec), and
+    /// `to_source` restores the original surface form (reversible).
+    Sink {
+        route: Route,
+        transport: Transport,
+        codec: SinkCodec,
+    },
 }
 
 /// The default CSV field delimiter.
@@ -731,10 +769,18 @@ impl Op {
     /// Is this a sink (leaf writer)? Used so `| name` reuse splices only a
     /// flow's *transforms* and never drags its sink along (§25.4).
     pub fn is_sink(&self) -> bool {
-        matches!(
-            self,
-            Op::SinkPrint | Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. }
-        )
+        matches!(self, Op::SinkPrint | Op::Sink { .. })
+    }
+
+    /// A v1 fixed-path local file sink: `Route::Fixed(path)` +
+    /// `Transport::Local` + `codec` — the `save` desugar target (the mirror of
+    /// [`Op::source`]).
+    pub fn sink(path: impl Into<String>, codec: SinkCodec) -> Op {
+        Op::Sink {
+            route: Route::Fixed(path.into()),
+            transport: Transport::Local,
+            codec,
+        }
     }
 
     /// A v1 single-file source: `Discovery::Fixed(path)` + `Transport::Local` +
@@ -780,9 +826,7 @@ impl Op {
             Op::Merge => "merge",
             Op::Join { .. } => "join",
             Op::SinkPrint => "print",
-            Op::SinkCsv { .. } => "save",
-            Op::SinkJsonl { .. } => "save",
-            Op::SinkJson { .. } => "save",
+            Op::Sink { .. } => "save",
         }
     }
 
@@ -1080,25 +1124,32 @@ impl Op {
                 kind,
             } => format!("{} {}", kind.amp(), join_on_clause(left_keys, right_keys)),
             Op::SinkPrint => "print".to_string(),
-            Op::SinkCsv { path, delim } => match delim_modifier_for(path, *delim) {
-                Some(m) => format!("save {path} {m}"),
-                None => format!("save {path}"),
-            },
-            Op::SinkJsonl { path } => {
-                // `.jsonl`/`.ndjson` paths imply jsonl; otherwise be explicit.
-                let lower = path.to_ascii_lowercase();
-                if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
-                    format!("save {path}")
-                } else {
-                    format!("save {path} as jsonl")
-                }
-            }
-            Op::SinkJson { path } => {
-                // A `.json` path implies a JSON array; otherwise be explicit.
-                if path.to_ascii_lowercase().ends_with(".json") {
-                    format!("save {path}")
-                } else {
-                    format!("save {path} as json")
+            // The v1 `save` forms restore byte-identically: codec/route carry
+            // exactly what the parser desugared from (§28.8 reversibility).
+            Op::Sink { route, codec, .. } => {
+                let path = route.path();
+                match codec {
+                    SinkCodec::Csv { delim } => match delim_modifier_for(path, *delim) {
+                        Some(m) => format!("save {path} {m}"),
+                        None => format!("save {path}"),
+                    },
+                    SinkCodec::Jsonl => {
+                        // `.jsonl`/`.ndjson` paths imply jsonl; else be explicit.
+                        let lower = path.to_ascii_lowercase();
+                        if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
+                            format!("save {path}")
+                        } else {
+                            format!("save {path} as jsonl")
+                        }
+                    }
+                    SinkCodec::Json => {
+                        // A `.json` path implies a JSON array; else be explicit.
+                        if path.to_ascii_lowercase().ends_with(".json") {
+                            format!("save {path}")
+                        } else {
+                            format!("save {path} as json")
+                        }
+                    }
                 }
             }
         }
