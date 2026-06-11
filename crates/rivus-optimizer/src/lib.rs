@@ -410,6 +410,16 @@ fn project_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
                     preds,
                     fields: Some(proj),
                 } => {
+                    // A positional reference `$_[i]` (§29.5-6 s4) is resolved by
+                    // schema order, which pruning would shift — and the column it
+                    // names has no name to keep live. Conservatively skip.
+                    if preds
+                        .iter()
+                        .any(|p| p.any(&|e| matches!(e, Expr::FieldAt(_))))
+                    {
+                        safe = false;
+                        break;
+                    }
                     for p in preds {
                         collect_fields(p, &mut needed);
                     }
@@ -456,8 +466,10 @@ fn collect_fields(e: &Expr, out: &mut Vec<String>) {
         // A union sub-view `base.name` (§29.3, s2) reads the physical column
         // `base`, so keep `base` live for projection pushdown.
         Expr::SubView { base, .. } => push_unique(out, base),
-        // A value hole references no column.
-        Expr::Literal(_) | Expr::Hole(_) => {}
+        // A value hole references no column. A positional `$_[i]` names no
+        // column either — its consumer disables pruning instead (see
+        // `project_pushdown`), so collecting nothing here is safe.
+        Expr::Literal(_) | Expr::Hole(_) | Expr::FieldAt(_) => {}
         Expr::Compare { left, right, .. } => {
             collect_fields(left, out);
             collect_fields(right, out);

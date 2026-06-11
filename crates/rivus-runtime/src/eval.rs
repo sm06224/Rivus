@@ -67,7 +67,9 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut u
         }
         Func::Regexp => {
             // Row-wise fallback (the columnar path in `eval_column` compiles the
-            // pattern once). With the feature off this is always false.
+            // pattern once). A feature-less build never reaches here through the
+            // engine (`PlanGraph::uses_regexp` refuses the plan pre-run,
+            // §29.5-6 s4); the always-false stub only keeps this API total.
             let hay = arg(0).to_string();
             let pat = arg(1).to_string();
             Value::Bool(regexp_match(&hay, &pat))
@@ -290,8 +292,10 @@ fn with_regex<R>(pat: &str, f: impl FnOnce(Option<&regex::Regex>) -> R) -> R {
 }
 
 /// Does `text` contain a match for `pat` (unanchored)? Behind the off-by-default
-/// `regex` feature; without it, always `false`. Uses the per-thread compiled-
-/// regex cache so repeated calls with the same pattern don't recompile.
+/// `regex` feature. Without it the stub answers `false`, but engine-run plans
+/// never get that far — `PlanGraph::uses_regexp` refuses them pre-run
+/// (never-silent, §29.5-6 s4). Uses the per-thread compiled-regex cache so
+/// repeated calls with the same pattern don't recompile.
 #[cfg(feature = "regex")]
 fn regexp_match(text: &str, pat: &str) -> bool {
     with_regex(pat, |re| re.map(|r| r.is_match(text)).unwrap_or(false))
@@ -763,6 +767,16 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
             // Missing field → a NaN numeric lane (continue-first).
             None => Column::f64(vec![f64::NAN; chunk.len]),
         },
+        // `$_[i]` — positional reference (§29.5-6 s4): the i-th column in
+        // schema order. Out of range → all-null + counted (continue-first,
+        // never silent).
+        Expr::FieldAt(i) => match chunk.columns.get(*i as usize) {
+            Some(c) => c.clone(),
+            None => {
+                *fails += chunk.len as u64;
+                const_column(&Value::Null, chunk.len)
+            }
+        },
         Expr::Literal(v) => const_column(v, chunk.len),
         Expr::Cast { expr, ty } => cast_column(eval_column(expr, chunk, fails), *ty, fails),
         Expr::Arith { left, op, right } => eval_arith(left, *op, right, chunk, fails),
@@ -1228,6 +1242,15 @@ pub fn eval_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> Valu
         // reaches eval it yields Null (continue-first, never a panic).
         Expr::Hole(_) => Value::Null,
         Expr::Field { name, access } => eval_field(name, *access, chunk, row),
+        // `$_[i]` — positional reference (§29.5-6 s4). Out of range → null +
+        // counted (continue-first, never silent).
+        Expr::FieldAt(i) => match chunk.columns.get(*i as usize) {
+            Some(c) => c.value_at(row),
+            None => {
+                *fails += 1;
+                Value::Null
+            }
+        },
         // `base.name` — union sub-view (§29.3, s2): a zero-copy char slice of the
         // fixed-width string column `base`. Out-of-range slices are counted as
         // never-silent failures (continue-first null), like a cast that won't

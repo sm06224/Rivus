@@ -114,6 +114,17 @@ pub fn run_with_progress(
     opts: RunOptions,
     hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
 ) -> Result<RunResult, RivusError> {
+    // §29.5-6 s4 (never-silent): a build without the `regex` feature cannot
+    // evaluate `~` / regexp(). Refuse the plan explicitly before running —
+    // evaluating every test to false would be a silent wrong answer.
+    if cfg!(not(feature = "regex")) && graph.uses_regexp() {
+        return Err(RivusError::Build(
+            "this flow uses a regular expression (`~` / regexp()), but this build has the \
+             `regex` feature disabled — rebuild with `--features regex` (the default build \
+             stays zero-dependency)"
+                .into(),
+        ));
+    }
     let mut res = run_dispatch(graph, opts, hook)?;
     // Never-silent: a `$x` value hole that reaches execution with no binding
     // would evaluate to null in silence (e.g. running a template scope on its

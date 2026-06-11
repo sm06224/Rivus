@@ -278,23 +278,38 @@ impl Parser {
                 }
                 // `|! pred warn|reject|halt` — a row contract; the disposition is
                 // required (no implicit default, so a silent policy is impossible).
+                // `|! { pred disp; pred disp … }` — a validation bundle
+                // (§29.5-6 s4): each entry is its own contract, lowered to a
+                // chain of `Op::Validate` nodes (order preserved, zero new IR —
+                // a `halt` entry still stops at the first violation in order).
                 Tok::PipeValidate => {
                     self.bump();
-                    let pred = self.parse_filter_preds()?;
-                    let disposition = match self.tok().clone() {
-                        Tok::Word(w) if Disposition::parse(&w).is_some() => {
-                            self.bump();
-                            Disposition::parse(&w).unwrap()
+                    if self.eat(&Tok::LBrace) {
+                        let mut any = false;
+                        loop {
+                            while self.eat(&Tok::Semicolon) {}
+                            if self.eat(&Tok::RBrace) {
+                                break;
+                            }
+                            let pred = self.parse_filter_preds()?;
+                            let disposition = self.parse_disposition()?;
+                            let n = self.g.add_node(Op::Validate { pred, disposition });
+                            self.g.add_edge(current, n, EdgeKind::Stream);
+                            current = n;
+                            any = true;
                         }
-                        other => {
-                            return Err(self.err(format!(
-                                "`|!` needs a disposition (warn|reject|halt), found {other:?}"
-                            )))
+                        if !any {
+                            return Err(self.err(
+                                "`|! { … }` needs at least one `pred warn|reject|halt` entry",
+                            ));
                         }
-                    };
-                    let n = self.g.add_node(Op::Validate { pred, disposition });
-                    self.g.add_edge(current, n, EdgeKind::Stream);
-                    current = n;
+                    } else {
+                        let pred = self.parse_filter_preds()?;
+                        let disposition = self.parse_disposition()?;
+                        let n = self.g.add_node(Op::Validate { pred, disposition });
+                        self.g.add_edge(current, n, EdgeKind::Stream);
+                        current = n;
+                    }
                 }
                 Tok::PipeMap => {
                     self.bump();
@@ -1381,6 +1396,20 @@ impl Parser {
         Ok(pred)
     }
 
+    /// The required `warn|reject|halt` word after a `|!` contract's predicate
+    /// (no implicit default, so a silent policy is impossible).
+    fn parse_disposition(&mut self) -> Result<Disposition, RivusError> {
+        match self.tok().clone() {
+            Tok::Word(w) if Disposition::parse(&w).is_some() => {
+                self.bump();
+                Ok(Disposition::parse(&w).unwrap())
+            }
+            other => Err(self.err(format!(
+                "`|!` needs a disposition (warn|reject|halt), found {other:?}"
+            ))),
+        }
+    }
+
     fn parse_or(&mut self) -> Result<Expr, RivusError> {
         let mut e = self.parse_and()?;
         while self.peek_is_word("or") {
@@ -1410,6 +1439,22 @@ impl Parser {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
+            })
+        } else if self.at(&Tok::Tilde) {
+            // `EXPR ~ 'pat'` — regex infix (§29.5-6 s4), comparison-level.
+            // Lowers to the existing `Func::Regexp` (zero new IR); the pattern
+            // is usually a raw `'…'` regex literal but any expression works
+            // (per-row pattern, like `regexp(col, expr)`).
+            self.bump();
+            let right = if let Tok::Regex(p) = self.tok().clone() {
+                self.bump();
+                Expr::Literal(Value::Str(p))
+            } else {
+                self.parse_add()?
+            };
+            Ok(Expr::Func {
+                func: Func::Regexp,
+                args: vec![left, right],
             })
         } else if self.at(&Tok::Assign) {
             // A lone `=` in a predicate is almost always a `==` typo (the bare
@@ -1513,6 +1558,14 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Literal(Value::Str(s)))
             }
+            // A `'…'` regex literal is *only* a pattern: the right side of `~`
+            // or the pattern argument of regexp(…) (both consume it before
+            // reaching here). Anywhere else it is a declaration-time error —
+            // never a silent plain string (§29.5-6 s4).
+            Tok::Regex(_) => Err(self.err(
+                "a '…' regex literal is only valid as the right side of `~` or as the \
+                 pattern of regexp(…); for a plain string use \"…\"",
+            )),
             Tok::DollarCur | Tok::DollarStack(_) => {
                 self.bump();
                 self.parse_field_tail()
@@ -1575,11 +1628,22 @@ impl Parser {
                 let func = Func::parse(w).unwrap();
                 self.bump(); // func name
                 self.expect(&Tok::LParen)?;
+                // A `'…'` regex literal is accepted exactly in the pattern slot
+                // of the regexp family — `regexp(col, '\d+')` (§29.5-6 s4).
+                let arg = |p: &mut Self, idx: usize| -> Result<Expr, RivusError> {
+                    if func == Func::Regexp && idx == 1 {
+                        if let Tok::Regex(pat) = p.tok().clone() {
+                            p.bump();
+                            return Ok(Expr::Literal(Value::Str(pat)));
+                        }
+                    }
+                    p.parse_expr()
+                };
                 let mut args = Vec::new();
                 if !self.at(&Tok::RParen) {
-                    args.push(self.parse_expr()?);
+                    args.push(arg(self, 0)?);
                     while self.eat(&Tok::Comma) {
-                        args.push(self.parse_expr()?);
+                        args.push(arg(self, args.len())?);
                     }
                 }
                 self.expect(&Tok::RParen)?;
@@ -1700,8 +1764,24 @@ impl Parser {
                 name,
                 access: Access::Fast,
             })
+        } else if self.eat(&Tok::LBracket) {
+            // `$_[i]` — positional column reference (§29.5-6 s4): the i-th
+            // column, 0-based, in schema order (headerless/positional data).
+            // The index must fit `u32` — a larger literal is a declaration-time
+            // error, never silently truncated (the source digits must round-trip).
+            let idx = match self.bump() {
+                Tok::Int(n) if (0..=u32::MAX as i64).contains(&n) => n as u32,
+                other => {
+                    return Err(self.err(format!(
+                        "`$_[i]` expects a column index in 0..={}, found {other:?}",
+                        u32::MAX
+                    )))
+                }
+            };
+            self.expect(&Tok::RBracket)?;
+            Ok(Expr::FieldAt(idx))
         } else {
-            Err(self.err("expected '.field' or '..field' after $_"))
+            Err(self.err("expected '.field', '..field' or '[i]' after $_"))
         }
     }
 }
@@ -2652,6 +2732,140 @@ mod tests {
             parse("F:\n open d.csv\n |! age >= 0\n;").is_err(),
             "validate must require an explicit disposition"
         );
+    }
+
+    #[test]
+    fn regex_infix_and_literal_parse_and_are_reversible() {
+        // `EXPR ~ '…'` (§29.5-6 s4) round-trips; the regexp()/regex()/matches()
+        // call spellings converge to the `~` canonical form when the pattern is
+        // a literal (like s1's `:` chain convergence).
+        let src = "F:\n open d.csv\n |? code ~ '^JP-\\d{4}$'\n;";
+        let s = parse(src).unwrap().to_source();
+        assert!(s.contains("code ~ '^JP-\\d{4}$'"), "infix lost in {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        for old in [
+            "F:\n open d.csv\n |? regexp(code, \"^JP\")\n;",
+            "F:\n open d.csv\n |? regex(code, \"^JP\")\n;",
+            "F:\n open d.csv\n |? matches(code, \"^JP\")\n;",
+            // The '…' literal is also accepted in the call's pattern slot.
+            "F:\n open d.csv\n |? regexp(code, '^JP')\n;",
+        ] {
+            let s = parse(old).unwrap().to_source();
+            assert!(s.contains("code ~ '^JP"), "no canonical ~ in {s}");
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        }
+        // A pattern containing `'` has no raw '…' spelling → the call form is
+        // kept (and stays reversible).
+        let quoted = parse("F:\n open d.csv\n |? regexp(code, \"a'b\")\n;")
+            .unwrap()
+            .to_source();
+        assert!(
+            quoted.contains("regexp($_.code, \"a'b\")"),
+            "quoted pattern must keep the call form: {quoted}"
+        );
+        assert_eq!(quoted, parse(&quoted).unwrap().to_source());
+        // A computed (non-literal) pattern has no infix spelling either.
+        let dynpat = parse("F:\n open d.csv\n |? regexp(code, pat)\n;")
+            .unwrap()
+            .to_source();
+        assert!(
+            dynpat.contains("regexp($_.code, $_.pat)"),
+            "computed pattern must keep the call form: {dynpat}"
+        );
+        // A '…' literal anywhere but a pattern slot is a declaration-time error
+        // (never a silent plain string), as is an unterminated literal.
+        assert!(parse("F:\n open d.csv\n |? code == 'x'\n;").is_err());
+        assert!(parse("F:\n open d.csv\n |? upper('x') == code\n;").is_err());
+        assert!(parse("F:\n open d.csv\n |? code ~ 'abc\n;").is_err());
+    }
+
+    #[test]
+    fn positional_reference_parses_and_is_reversible() {
+        // `$_[i]` — positional column reference (§29.5-6 s4): 0-based, schema
+        // order; the index must be a non-negative integer.
+        let src = "F:\n open d.csv\n |? $_[0] == \"x\"\n |> ($_[1]) as second\n;";
+        let s = parse(src).unwrap().to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        assert!(
+            s.contains("$_[0]") && s.contains("$_[1]"),
+            "positional refs lost in {s}"
+        );
+        assert!(parse("F:\n open d.csv\n |? $_[x] == 1\n;").is_err());
+        assert!(parse("F:\n open d.csv\n |? $_[] == 1\n;").is_err());
+        // An index past u32::MAX is a declaration-time error, never silently
+        // truncated into a different (re-parsing) column (never-silent).
+        assert!(parse("F:\n open d.csv\n |? $_[4294967296] == 1\n;").is_err());
+        // The largest valid index round-trips its exact digits.
+        let big = parse("F:\n open d.csv\n |? $_[4294967295] == 1\n;")
+            .unwrap()
+            .to_source();
+        assert!(big.contains("$_[4294967295]"), "max index lost in {big}");
+    }
+
+    #[test]
+    fn regex_infix_is_parenthesized_in_operator_context() {
+        // The bare `~` infix is not an atom: a `~`/compare/cast/regex parent
+        // must parenthesize it so `to_source` re-parses (IR reversibility).
+        for src in [
+            "F:\n open d.csv\n |? (code ~ '^JP') == true\n;",
+            "F:\n open d.csv\n |? (code ~ '^JP') ~ 'true'\n;",
+            "F:\n open d.csv\n |> ((code ~ '^JP'):int) as m\n;",
+            // A cast over an arithmetic group also self-parenthesizes its
+            // operand — the same projection-wrap fix makes it reversible
+            // (was a pre-existing leading-paren regression, not s4-specific).
+            "F:\n open d.csv\n |> ((a + b):int) as m\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        }
+    }
+
+    #[test]
+    fn validate_bundle_round_trips_and_is_canonical_for_runs() {
+        // `|! { pred disp; … }` (§29.5-6 s4) lowers to one `Op::Validate` per
+        // entry (zero new IR, order preserved) and is the canonical spelling
+        // for ≥2 consecutive contracts; a single contract stays flat.
+        let src = "F:\n open d.csv\n |! { age >= 0 warn; age <= 120 reject }\n;";
+        let g = parse(src).unwrap();
+        let validates = g
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, Op::Validate { .. }))
+            .count();
+        assert_eq!(validates, 2, "bundle must lower to one Validate per entry");
+        let s = g.to_source();
+        assert!(
+            s.contains("|! { $_.age >= 0 warn; $_.age <= 120 reject }"),
+            "bundle spelling lost in {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        // Two flat consecutive contracts converge to the bundle…
+        let flat = parse("F:\n open d.csv\n |! age >= 0 warn\n |! age <= 120 reject\n;")
+            .unwrap()
+            .to_source();
+        assert_eq!(flat, s, "consecutive |! must converge to the bundle");
+        // …a single one stays flat…
+        let single = parse("F:\n open d.csv\n |! age >= 0 warn\n;")
+            .unwrap()
+            .to_source();
+        assert!(
+            single.contains("|! $_.age >= 0 warn") && !single.contains("|! {"),
+            "single |! must stay flat: {single}"
+        );
+        // …and a comment pinned to the second contract breaks the run (trivia
+        // is never repositioned or lost).
+        let commented =
+            parse("F:\n open d.csv\n |! age >= 0 warn\n # upper bound\n |! age <= 120 reject\n;")
+                .unwrap()
+                .to_source();
+        assert!(
+            commented.contains("# upper bound") && !commented.contains("|! {"),
+            "a comment must break the bundle: {commented}"
+        );
+        assert_eq!(commented, parse(&commented).unwrap().to_source());
+        // Empty bundles / missing dispositions are declaration-time errors.
+        assert!(parse("F:\n open d.csv\n |! { }\n;").is_err());
+        assert!(parse("F:\n open d.csv\n |! { age >= 0 }\n;").is_err());
     }
 
     #[test]
