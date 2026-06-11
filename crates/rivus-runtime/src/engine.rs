@@ -2040,16 +2040,21 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
                 Some((path.as_str(), res))
             }
             // Partitioned route: every partition is attempted (continue-first
-            // inside `write_routed`); the first failure is the reported result.
+            // inside `write_routed`); ALL failures are aggregated so the
+            // parallel path surfaces them like the serial operator does
+            // (never-silent across strategies, not just the first one).
             rivus_ir::Route::Template { template, by, flat } => {
-                let res = match crate::route::write_routed(template, by, *flat, *codec, chunks)
-                    .into_iter()
-                    .next()
-                {
-                    Some((p, e)) => {
-                        Err(std::io::Error::new(e.kind(), format!("partition {p}: {e}")))
-                    }
-                    None => Ok(()),
+                let fails = crate::route::write_routed(template, by, *flat, *codec, chunks);
+                let res = if fails.is_empty() {
+                    Ok(())
+                } else {
+                    let list: Vec<String> =
+                        fails.iter().map(|(p, e)| format!("{p}: {e}")).collect();
+                    Err(std::io::Error::other(format!(
+                        "{} partition(s) failed: {}",
+                        fails.len(),
+                        list.join("; ")
+                    )))
                 };
                 Some((template.as_str(), res))
             }
