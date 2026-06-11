@@ -3119,6 +3119,9 @@ mod tests {
             "F:\n open a.csv\n save \"out/\" by country as flat\n;",
             "F:\n open a.csv\n save \"out/\" as jsonl by country\n;",
             "F:\n open a.csv\n save \"out/{{lit}}_{k}.csv\"\n;",
+            // A literal-only {{x}} template keeps its `by` (review #145: fmt
+            // must never turn a partitioned save into a fixed one).
+            "F:\n open a.csv\n save \"out/o_{{x}}/\" by k\n;",
         ] {
             let s = parse(src).unwrap().to_source();
             assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");

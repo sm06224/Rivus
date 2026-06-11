@@ -459,6 +459,29 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         "route bytes must be serial == parallel"
     );
 
+    // Traversal guard (review #145): a `.`/`..` key value escapes instead of
+    // walking out of the declared output tree.
+    let _ = std::fs::remove_dir_all(&dir);
+    let evil = "id,country\n1,..\n2,.\n";
+    let g = TempCsv(gendata::write_temp_bytes(
+        "stress_route_dots",
+        evil.as_bytes(),
+    ));
+    let gp = g.0.display();
+    run_src(
+        &format!(
+            "R:\n open {gp} (id:int country:str)\n save \"{base}/t2/{{country}}/data.csv\"\n;"
+        ),
+        4096,
+    );
+    assert_eq!(
+        read("t2/%2E%2E/data.csv"),
+        "id,country\n1,..\n",
+        "`..` must escape, not traverse"
+    );
+    assert_eq!(read("t2/%2E/data.csv"), "id,country\n2,.\n");
+    assert!(!dir.join("data.csv").exists(), "no write outside the tree");
+
     // Flat layout: `v.ext` names under the base.
     let _ = std::fs::remove_dir_all(&dir);
     let flat = format!(

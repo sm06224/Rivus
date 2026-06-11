@@ -1225,7 +1225,14 @@ impl Op {
                 if let Some(m) = modifier {
                     s.push_str(&format!(" {m}"));
                 }
-                if !template.contains('{') {
+                // `by` is derived (and omitted) only when the template really
+                // has key placeholders — judged on the parsed segments, never
+                // on a raw '{' (a literal `{{x}}` template must keep its `by`
+                // or re-parsing would silently become a fixed save).
+                let templated = parse_route_template(template)
+                    .map(|segs| segs.iter().any(|g| matches!(g, RouteSeg::Key(_))))
+                    .unwrap_or(false);
+                if !templated {
                     s.push_str(&format!(" by {}", by.join(" ")));
                 }
                 if *flat {

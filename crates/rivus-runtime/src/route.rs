@@ -26,6 +26,12 @@ pub const NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 /// Windows-unsafe set are `%XX`-escaped (uppercase hex); everything else —
 /// including non-ASCII UTF-8 (Japanese keys, §27.6) — passes through.
 pub fn escape_component(s: &str) -> String {
+    // A component that is exactly `.` or `..` would walk the directory tree —
+    // a data-driven escape from the declared output root (review #145). Fully
+    // escape it (never-silent: the bytes still say what the key was).
+    if s == "." || s == ".." {
+        return s.chars().map(|_| "%2E").collect();
+    }
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         if ch.is_ascii() {
