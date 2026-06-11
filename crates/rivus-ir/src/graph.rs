@@ -453,16 +453,92 @@ impl Codec {
 pub enum Route {
     /// A single fixed output path — the v1 `save` destination.
     Fixed(String),
+    /// Partitioned / dynamic output (§28.7 route, ratified #143): rows split by
+    /// the partition-key values, each group to its own file. `template` is the
+    /// raw source template; `{col}` placeholders derive the keys
+    /// (`save "out/{country}.csv"` ≡ `by country` — §27.3 is the degenerate
+    /// form of §27.4). A plain path with explicit `by` uses the Hive `k=v/`
+    /// layout (DuckDB-compatible), or `v1_v2.ext` with `flat`. `by` always
+    /// carries the full key list (derived or explicit). The file set and every
+    /// path are a **pure, injective function** of the key values
+    /// (percent-escaped incl. `%`; null → `__HIVE_DEFAULT_PARTITION__`).
+    Template {
+        template: String,
+        by: Vec<String>,
+        flat: bool,
+    },
 }
 
 impl Route {
-    /// The route's single fixed path. Total today (the only variant); the
-    /// slice-4b template route will make callers choose explicitly.
-    pub fn path(&self) -> &str {
+    /// The route's single fixed path — `None` for the partitioned template
+    /// route, so every caller must decide explicitly what a multi-file
+    /// destination means for it (the slice-4a forcing function).
+    pub fn path(&self) -> Option<&str> {
         match self {
-            Route::Fixed(p) => p,
+            Route::Fixed(p) => Some(p),
+            Route::Template { .. } => None,
         }
     }
+}
+
+/// One piece of a parsed `save` template: literal text or a `{col}` key
+/// placeholder. `{{` / `}}` escape literal braces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteSeg {
+    Lit(String),
+    Key(String),
+}
+
+/// Parse a `save` template into segments (shared by the parser's
+/// declaration-time validation and the runtime's path rendering, so the two
+/// can never drift). Errors are program errors (never-silent, §27.3):
+/// unbalanced braces, an empty `{}`, or a non-identifier placeholder.
+pub fn parse_route_template(s: &str) -> Result<Vec<RouteSeg>, String> {
+    let mut segs = Vec::new();
+    let mut lit = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                lit.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                lit.push('}');
+            }
+            '}' => return Err("unbalanced '}' in save template (use '}}' for a literal)".into()),
+            '{' => {
+                let mut name = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' => name.push(ch),
+                        Some(ch) => {
+                            return Err(format!(
+                                "save template placeholder may only name a column \
+                                 ([A-Za-z0-9_]); found {ch:?} — expression placeholders \
+                                 are a follow-up slice"
+                            ))
+                        }
+                        None => return Err("unclosed '{' in save template".into()),
+                    }
+                }
+                if name.is_empty() {
+                    return Err("empty '{}' placeholder in save template".into());
+                }
+                if !lit.is_empty() {
+                    segs.push(RouteSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(RouteSeg::Key(name));
+            }
+            other => lit.push(other),
+        }
+    }
+    if !lit.is_empty() {
+        segs.push(RouteSeg::Lit(lit));
+    }
+    Ok(segs)
 }
 
 /// **Sink codec** (design §28.7): how chunks encode into bytes — the write-side
@@ -1126,8 +1202,49 @@ impl Op {
             Op::SinkPrint => "print".to_string(),
             // The v1 `save` forms restore byte-identically: codec/route carry
             // exactly what the parser desugared from (§28.8 reversibility).
-            Op::Sink { route, codec, .. } => {
-                let path = route.path();
+            // The partitioned route renders its canonical form: quoted
+            // template + the same format-modifier rules; `by` is emitted only
+            // for a plain path (a template's placeholders derive the keys, so
+            // re-parsing restores the identical IR without the clause).
+            Op::Sink {
+                route: Route::Template { template, by, flat },
+                codec,
+                ..
+            } => {
+                let mut s = format!("save \"{template}\"");
+                let modifier = match codec {
+                    SinkCodec::Csv { delim } => delim_modifier_for(template, *delim),
+                    SinkCodec::Jsonl => {
+                        let lower = template.to_ascii_lowercase();
+                        (!lower.ends_with(".jsonl") && !lower.ends_with(".ndjson"))
+                            .then(|| "as jsonl".to_string())
+                    }
+                    SinkCodec::Json => (!template.to_ascii_lowercase().ends_with(".json"))
+                        .then(|| "as json".to_string()),
+                };
+                if let Some(m) = modifier {
+                    s.push_str(&format!(" {m}"));
+                }
+                // `by` is derived (and omitted) only when the template really
+                // has key placeholders — judged on the parsed segments, never
+                // on a raw '{' (a literal `{{x}}` template must keep its `by`
+                // or re-parsing would silently become a fixed save).
+                let templated = parse_route_template(template)
+                    .map(|segs| segs.iter().any(|g| matches!(g, RouteSeg::Key(_))))
+                    .unwrap_or(false);
+                if !templated {
+                    s.push_str(&format!(" by {}", by.join(" ")));
+                }
+                if *flat {
+                    s.push_str(" as flat");
+                }
+                s
+            }
+            Op::Sink {
+                route: Route::Fixed(path),
+                codec,
+                ..
+            } => {
                 match codec {
                     SinkCodec::Csv { delim } => match delim_modifier_for(path, *delim) {
                         Some(m) => format!("save {path} {m}"),

@@ -342,14 +342,27 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         // The unified sink (§28.7): Route::Fixed + Transport::Local today, so
         // the codec alone picks the writer (same operators as before the
         // unification — behaviour-identical).
-        Op::Sink { route, codec, .. } => {
-            let path = route.path().to_string();
-            match codec {
-                SinkCodec::Csv { delim } => Box::new(SinkCsv::new(path, *delim)),
-                SinkCodec::Jsonl => Box::new(SinkJsonl::new(path)),
-                SinkCodec::Json => Box::new(SinkJson::new(path)),
+        Op::Sink { route, codec, .. } => match route {
+            rivus_ir::Route::Fixed(path) => {
+                let path = path.clone();
+                match codec {
+                    SinkCodec::Csv { delim } => Box::new(SinkCsv::new(path, *delim)),
+                    SinkCodec::Jsonl => Box::new(SinkJsonl::new(path)),
+                    SinkCodec::Json => Box::new(SinkJson::new(path)),
+                }
             }
-        }
+            // Partitioned route (§28.7 / #143): collect, then write every
+            // partition on finish through `crate::route` (same bytes as the
+            // parallel single-write merge).
+            rivus_ir::Route::Template { template, by, flat } => Box::new(SinkRoute {
+                template: template.clone(),
+                by: by.clone(),
+                flat: *flat,
+                codec: *codec,
+                buf: Vec::new(),
+                warned_missing: false,
+            }),
+        },
     }
 }
 

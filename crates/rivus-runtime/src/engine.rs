@@ -638,15 +638,15 @@ fn try_streaming_parallel(
         // per-worker parts), exactly as before the Sink unification.
         match &nd.op {
             Op::Sink {
-                route,
+                route: rivus_ir::Route::Fixed(path),
                 codec: SinkCodec::Csv { delim },
                 ..
-            } => sinks.push((nd.id, route.path().to_string(), false, *delim)),
+            } => sinks.push((nd.id, path.clone(), false, *delim)),
             Op::Sink {
-                route,
+                route: rivus_ir::Route::Fixed(path),
                 codec: SinkCodec::Jsonl,
                 ..
-            } => sinks.push((nd.id, route.path().to_string(), true, b',')),
+            } => sinks.push((nd.id, path.clone(), true, b',')),
             _ => {}
         }
     }
@@ -2030,15 +2030,35 @@ fn flush_parallel_sinks(graph: &PlanGraph, res: &mut RunResult) {
 /// If `op` is a file sink, write `chunks` to it once and return (path, result).
 fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Result<()>)> {
     match op {
-        Op::Sink { route, codec, .. } => {
-            let path = route.path();
-            let res = match codec {
-                SinkCodec::Csv { delim } => operators::write_csv_file(path, chunks, *delim),
-                SinkCodec::Jsonl => operators::write_jsonl_file(path, chunks),
-                SinkCodec::Json => operators::write_json_file(path, chunks),
-            };
-            Some((path, res))
-        }
+        Op::Sink { route, codec, .. } => match route {
+            rivus_ir::Route::Fixed(path) => {
+                let res = match codec {
+                    SinkCodec::Csv { delim } => operators::write_csv_file(path, chunks, *delim),
+                    SinkCodec::Jsonl => operators::write_jsonl_file(path, chunks),
+                    SinkCodec::Json => operators::write_json_file(path, chunks),
+                };
+                Some((path.as_str(), res))
+            }
+            // Partitioned route: every partition is attempted (continue-first
+            // inside `write_routed`); ALL failures are aggregated so the
+            // parallel path surfaces them like the serial operator does
+            // (never-silent across strategies, not just the first one).
+            rivus_ir::Route::Template { template, by, flat } => {
+                let fails = crate::route::write_routed(template, by, *flat, *codec, chunks);
+                let res = if fails.is_empty() {
+                    Ok(())
+                } else {
+                    let list: Vec<String> =
+                        fails.iter().map(|(p, e)| format!("{p}: {e}")).collect();
+                    Err(std::io::Error::other(format!(
+                        "{} partition(s) failed: {}",
+                        fails.len(),
+                        list.join("; ")
+                    )))
+                };
+                Some((template.as_str(), res))
+            }
+        },
         _ => None,
     }
 }

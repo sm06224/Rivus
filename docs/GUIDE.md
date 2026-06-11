@@ -877,6 +877,32 @@ array**; **`as jsonl`/`.jsonl`** is one object per line (and what `writejson`
 emits). Both stream in bounded memory; an empty result is `[]` (json) or no
 lines (jsonl).
 
+### Partitioned / dynamic output (route)
+
+A quoted `save` path may **route rows to many files** by their key values
+(design §28.7, ratified #143):
+
+```
+… save "out/{country}.csv"            # template: {col} derives the keys
+… save "out/" by country region       # Hive layout: out/country=JP/region=13/part.csv
+… save "out/" by country as flat      # flat names: out/JP.csv
+… save "out/" as jsonl by country     # any sink format partitions
+```
+
+- **Template placeholders are the partition keys** — `save "out/{country}.csv"`
+  ≡ `by country`. A `by` key that does not appear in the template is a
+  declaration-time error (a key never silently adds a directory level).
+  Literal braces are written `{{` / `}}`.
+- **Deterministic & byte-identical**: the file set and every path are a pure,
+  injective function of the key values (path-unsafe characters incl. `%` are
+  percent-escaped); rows keep stream order within each partition, so each file
+  is byte-identical across serial / parallel / chunk-size. A null key goes to
+  the DuckDB-compatible `__HIVE_DEFAULT_PARTITION__` partition.
+- **Written out in full** (#143): a partitioned save is an explicit opt-in —
+  there is no preventive cardinality cap and never a silent fallback to a
+  single file; an unwritable partition surfaces on the error stream while the
+  other partitions continue.
+
 ---
 
 ## 8. Lifecycle hooks (continue-first)
@@ -1173,7 +1199,8 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'rename' (IDENT IDENT)+ | 'drop' IDENT+ | 'reorder' IDENT+
            | 'cast' (IDENT ':' TYPE)+
            | '->' IDENT ':' body ';'                          (branch)
-           | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')
+           | ('save' (PATH | TEMPLATE) ('as' FMT)? ('by' IDENT+)? ('as' 'flat')?
+              | 'writecsv' PATH | 'writejson' PATH | 'print')   (TEMPLATE = "…{col}…", {{ }} escape)
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)
 
 proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;

@@ -14,6 +14,7 @@ mod eval;
 mod jsonl;
 mod kernel;
 mod operators;
+mod route;
 mod telemetry;
 mod transport;
 

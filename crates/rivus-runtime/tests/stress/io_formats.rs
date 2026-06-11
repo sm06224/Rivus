@@ -388,3 +388,106 @@ fn zstd_csv_matches_uncompressed_oracle() {
         assert!(res.errors.is_empty(), "zstd errors @cs={cs}");
     }
 }
+
+#[test]
+fn route_save_partitions_deterministically_and_byte_identically() {
+    // §28.7 route (#143): Hive layout + template + flat, the null-key
+    // sentinel, escape injectivity (`a/b` → `a%2Fb`); per-file bytes are
+    // chunk-size independent and serial == parallel (the parallel path routes
+    // the merged stream through the same `route` core).
+    let text = "id,country,score\n1,JP,10\n2,US,\n3,a/b,30\n4,JP,10\n5,a%2Fb,30\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_route", text.as_bytes()));
+    let p = f.0.display();
+    let dir = std::env::temp_dir().join(format!("rivus_route_{}", std::process::id()));
+    let base = dir.display();
+    let read = |rel: &str| std::fs::read_to_string(dir.join(rel)).unwrap_or_default();
+
+    // Hive layout by a string key (escape) and by an int key (blank → null).
+    let hive = format!(
+        "R:\n open {p} (id:int country:str score:int)\n save \"{base}/h\" by country score\n;"
+    );
+    let mut snaps: Vec<String> = Vec::new();
+    for cz in [1usize, 2, 4096] {
+        let _ = std::fs::remove_dir_all(&dir);
+        let res = run_src(&hive, cz);
+        assert_eq!(res.final_mode, rivus_core::Mode::Normal, "@cz={cz}");
+        let jp = read("h/country=JP/score=10/part.csv");
+        assert_eq!(jp, "id,country,score\n1,JP,10\n4,JP,10\n", "@cz={cz}");
+        let nullp = read("h/country=US/score=__HIVE_DEFAULT_PARTITION__/part.csv");
+        assert_eq!(nullp, "id,country,score\n2,US,\n", "@cz={cz}");
+        let esc = read("h/country=a%2Fb/score=30/part.csv");
+        assert_eq!(esc, "id,country,score\n3,a/b,30\n", "@cz={cz}");
+        // Injectivity (#143 ②): `%` itself escapes, so the literal key
+        // `a%2Fb` can never collide with the escaped form of `a/b`.
+        let pct = read("h/country=a%252Fb/score=30/part.csv");
+        assert_eq!(pct, "id,country,score\n5,a%2Fb,30\n", "@cz={cz}");
+        snaps.push(format!("{jp}|{nullp}|{esc}|{pct}"));
+    }
+    assert!(
+        snaps.windows(2).all(|w| w[0] == w[1]),
+        "per-file bytes must be chunk-size independent"
+    );
+
+    // Serial vs parallel: identical per-file bytes (template form).
+    let tmpl = format!(
+        "R:\n open {p} (id:int country:str score:int)\n |> id country\n save \"{base}/t/{{country}}.csv\"\n;"
+    );
+    let bytes_for = |pref: rivus_runtime::MemoryPref| {
+        let _ = std::fs::remove_dir_all(&dir);
+        let g = rivus_parser::parse(&tmpl).expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: 2,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        format!("{}|{}", read("t/JP.csv"), read("t/a%2Fb.csv"))
+    };
+    let serial = bytes_for(rivus_runtime::MemoryPref::Low);
+    assert_eq!(
+        serial, "id,country\n1,JP\n4,JP\n|id,country\n3,a/b\n",
+        "template naming + content"
+    );
+    assert_eq!(
+        serial,
+        bytes_for(rivus_runtime::MemoryPref::Fast),
+        "route bytes must be serial == parallel"
+    );
+
+    // Traversal guard (review #145): a `.`/`..` key value escapes instead of
+    // walking out of the declared output tree.
+    let _ = std::fs::remove_dir_all(&dir);
+    let evil = "id,country\n1,..\n2,.\n";
+    let g = TempCsv(gendata::write_temp_bytes(
+        "stress_route_dots",
+        evil.as_bytes(),
+    ));
+    let gp = g.0.display();
+    run_src(
+        &format!(
+            "R:\n open {gp} (id:int country:str)\n save \"{base}/t2/{{country}}/data.csv\"\n;"
+        ),
+        4096,
+    );
+    assert_eq!(
+        read("t2/%2E%2E/data.csv"),
+        "id,country\n1,..\n",
+        "`..` must escape, not traverse"
+    );
+    assert_eq!(read("t2/%2E/data.csv"), "id,country\n2,.\n");
+    assert!(!dir.join("data.csv").exists(), "no write outside the tree");
+
+    // Flat layout: `v.ext` names under the base.
+    let _ = std::fs::remove_dir_all(&dir);
+    let flat = format!(
+        "R:\n open {p} (id:int country:str score:int)\n |> id country\n save \"{base}/f\" by country as flat\n;"
+    );
+    run_src(&flat, 4096);
+    assert_eq!(read("f/US.csv"), "id,country\n2,US\n", "flat naming");
+    let _ = std::fs::remove_dir_all(&dir);
+}
