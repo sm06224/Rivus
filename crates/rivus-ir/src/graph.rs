@@ -994,8 +994,15 @@ impl Op {
                             _ => None,
                         };
                         chain.unwrap_or_else(|| {
+                            // A computed item is `(expr) as alias`. Only `Arith`
+                            // already renders as a self-contained `(…)`; anything
+                            // else — including a `Cast` whose inner operand
+                            // self-parenthesized (`($_.x ~ 'p'):int`, `(a + b):int`)
+                            // — needs wrapping so the `(expr) as alias` form
+                            // re-parses (the old `starts_with('(')` proxy mistook
+                            // those leading-paren casts for fully wrapped exprs).
                             let s = e.to_string();
-                            if s.starts_with('(') {
+                            if matches!(e, Expr::Arith { .. }) {
                                 format!("{s} as {alias}")
                             } else {
                                 format!("({s}) as {alias}")

@@ -1767,11 +1767,14 @@ impl Parser {
         } else if self.eat(&Tok::LBracket) {
             // `$_[i]` — positional column reference (§29.5-6 s4): the i-th
             // column, 0-based, in schema order (headerless/positional data).
+            // The index must fit `u32` — a larger literal is a declaration-time
+            // error, never silently truncated (the source digits must round-trip).
             let idx = match self.bump() {
-                Tok::Int(n) if n >= 0 => n as u32,
+                Tok::Int(n) if (0..=u32::MAX as i64).contains(&n) => n as u32,
                 other => {
                     return Err(self.err(format!(
-                        "`$_[i]` expects a non-negative column index, found {other:?}"
+                        "`$_[i]` expects a column index in 0..={}, found {other:?}",
+                        u32::MAX
                     )))
                 }
             };
@@ -2789,6 +2792,32 @@ mod tests {
         );
         assert!(parse("F:\n open d.csv\n |? $_[x] == 1\n;").is_err());
         assert!(parse("F:\n open d.csv\n |? $_[] == 1\n;").is_err());
+        // An index past u32::MAX is a declaration-time error, never silently
+        // truncated into a different (re-parsing) column (never-silent).
+        assert!(parse("F:\n open d.csv\n |? $_[4294967296] == 1\n;").is_err());
+        // The largest valid index round-trips its exact digits.
+        let big = parse("F:\n open d.csv\n |? $_[4294967295] == 1\n;")
+            .unwrap()
+            .to_source();
+        assert!(big.contains("$_[4294967295]"), "max index lost in {big}");
+    }
+
+    #[test]
+    fn regex_infix_is_parenthesized_in_operator_context() {
+        // The bare `~` infix is not an atom: a `~`/compare/cast/regex parent
+        // must parenthesize it so `to_source` re-parses (IR reversibility).
+        for src in [
+            "F:\n open d.csv\n |? (code ~ '^JP') == true\n;",
+            "F:\n open d.csv\n |? (code ~ '^JP') ~ 'true'\n;",
+            "F:\n open d.csv\n |> ((code ~ '^JP'):int) as m\n;",
+            // A cast over an arithmetic group also self-parenthesizes its
+            // operand — the same projection-wrap fix makes it reversible
+            // (was a pre-existing leading-paren regression, not s4-specific).
+            "F:\n open d.csv\n |> ((a + b):int) as m\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        }
     }
 
     #[test]

@@ -451,6 +451,35 @@ impl Expr {
             Access::Source => format!("source.{name}"),
         }
     }
+
+    /// Will this expression render as the bare `~` infix (`lhs ~ 'pat'`, §29.5-6
+    /// s4)? Such a rendering is **not an atom** — a `~` literal binds at the
+    /// comparison level and is not parenthesized, so an operator/cast/`~` parent
+    /// must wrap it in parens or `to_source` re-parses differently (IR
+    /// reversibility). A `Regexp` lhs is excluded so a nested test keeps the
+    /// call form (`regexp(a ~ 'x', "y")`), whose arg re-parses cleanly.
+    fn renders_as_infix(e: &Expr) -> bool {
+        matches!(e, Expr::Func { func: Func::Regexp, args }
+        if matches!(args.as_slice(), [lhs, Expr::Literal(Value::Str(p))]
+            if !p.contains('\'')
+                && !matches!(
+                    lhs,
+                    Expr::Compare { .. }
+                        | Expr::And(..)
+                        | Expr::Or(..)
+                        | Expr::Func { func: Func::Regexp, .. }
+                )))
+    }
+
+    /// `to_source` of `e`, parenthesized when it would otherwise render as the
+    /// bare `~` infix (so the result is an atom for the calling context).
+    fn paren_if_infix(e: &Expr) -> String {
+        if Expr::renders_as_infix(e) {
+            format!("({e})")
+        } else {
+            e.to_string()
+        }
+    }
 }
 
 impl fmt::Display for Expr {
@@ -470,30 +499,39 @@ impl fmt::Display for Expr {
             }
             Expr::Literal(v) => write!(f, "{v}"),
             Expr::Hole(name) => write!(f, "${name}"),
+            // Operands are parenthesized when they would render as the bare `~`
+            // infix, which is not an atom (else `(a ~ 'x') == b` re-parses wrong).
             Expr::Compare { left, op, right } => {
-                write!(f, "{left} {} {right}", op.as_str())
+                write!(
+                    f,
+                    "{} {} {}",
+                    Expr::paren_if_infix(left),
+                    op.as_str(),
+                    Expr::paren_if_infix(right)
+                )
             }
             Expr::And(a, b) => write!(f, "{a} and {b}"),
             Expr::Or(a, b) => write!(f, "{a} or {b}"),
             // Always parenthesized so the source round-trips and re-parses with
             // the same structure regardless of precedence.
-            Expr::Arith { left, op, right } => write!(f, "({left} {} {right})", op.as_str()),
-            Expr::Cast { expr, ty } => write!(f, "{expr}:{ty}"),
+            Expr::Arith { left, op, right } => write!(
+                f,
+                "({} {} {})",
+                Expr::paren_if_infix(left),
+                op.as_str(),
+                Expr::paren_if_infix(right)
+            ),
+            Expr::Cast { expr, ty } => write!(f, "{}:{ty}", Expr::paren_if_infix(expr)),
             Expr::Func { func, args } => {
                 // §29.5-6 s4: the canonical spelling of a literal-pattern regex
                 // test is the `~` infix with a raw `'…'` regex literal (the old
                 // `regexp(col, "p")` call converges here, like s1's `:` chain).
-                // A pattern containing `'` has no raw spelling, and a computed
-                // pattern has no infix form — both keep the call form. The lhs
-                // must re-parse at additive level, so bare-printed predicates
-                // (Compare/And/Or) also keep the call form (unreachable from
-                // the parser, but the IR is open).
-                if let (Func::Regexp, [lhs, Expr::Literal(Value::Str(p))]) =
-                    (*func, args.as_slice())
-                {
-                    if !p.contains('\'')
-                        && !matches!(lhs, Expr::Compare { .. } | Expr::And(..) | Expr::Or(..))
-                    {
+                // A pattern containing `'` has no raw spelling, a computed pattern
+                // has no infix form, and a nested regex / bare-printed predicate
+                // (Compare/And/Or) lhs would not re-parse as the `~` lhs — all
+                // keep the call form (see `renders_as_infix`).
+                if Expr::renders_as_infix(self) {
+                    if let [lhs, Expr::Literal(Value::Str(p))] = args.as_slice() {
                         return write!(f, "{lhs} ~ '{p}'");
                     }
                 }
