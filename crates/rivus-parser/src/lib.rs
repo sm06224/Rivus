@@ -28,9 +28,10 @@ mod lexer;
 use lexer::{Comment, Lexer, Tok};
 use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
-    is_type_word, Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery, Disposition,
-    EdgeKind, Endian, Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op,
-    PlanGraph, Provenance, ReadFmt, SinkCodec, SubView, Transport, ViewDef,
+    is_type_word, parse_route_template, Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery,
+    Disposition, EdgeKind, Endian, Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind,
+    NodeId, Op, PlanGraph, Provenance, ReadFmt, Route, RouteSeg, SinkCodec, SubView, Transport,
+    ViewDef,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -420,18 +421,97 @@ impl Parser {
                 // sink mirrors the source format set (write what you can read).
                 Tok::Word(w) if w == "save" => {
                     self.bump();
-                    let path = norm_path(self.path_word()?);
-                    let explicit = if self.peek_is_word("as") {
-                        self.bump();
-                        Some(self.word()?)
-                    } else {
-                        None
+                    // A quoted path may be a route template (`{col}` derives the
+                    // partition keys, §28.7 / #143); a bare word stays the v1
+                    // fixed path (braces never lex into a word).
+                    let path = match self.tok().clone() {
+                        Tok::Str(p) => {
+                            self.bump();
+                            norm_path(p)
+                        }
+                        _ => norm_path(self.path_word()?),
                     };
+                    let mut explicit: Option<String> = None;
+                    let mut by: Vec<String> = Vec::new();
+                    let mut flat = false;
+                    loop {
+                        if self.peek_is_word("as") {
+                            self.bump();
+                            let m = self.word()?;
+                            if m == "flat" {
+                                flat = true;
+                            } else {
+                                explicit = Some(m);
+                            }
+                        } else if self.peek_is_word("by") {
+                            self.bump();
+                            while matches!(self.tok(), Tok::Word(k) if k != "as" && k != "by") {
+                                by.push(self.word()?);
+                            }
+                            if by.is_empty() {
+                                return Err(self.err("`save … by` needs at least one key column"));
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    // Template validation is declaration-time (never-silent).
+                    let segs = parse_route_template(&path).map_err(|e| self.err(e))?;
+                    let mut keys: Vec<String> = Vec::new();
+                    for seg in &segs {
+                        if let RouteSeg::Key(k) = seg {
+                            if !keys.contains(k) {
+                                keys.push(k.clone());
+                            }
+                        }
+                    }
+                    let templated = !keys.is_empty();
+                    if templated {
+                        // A key that never reaches the path would silently add
+                        // a directory level — refuse instead (#143 ①).
+                        for k in &by {
+                            if !keys.contains(k) {
+                                return Err(self.err(format!(
+                                    "`by {k}` does not appear in the save template —                                      add a {{{k}}} placeholder"
+                                )));
+                            }
+                        }
+                        if flat {
+                            return Err(self.err(
+                                "`as flat` applies to a plain path with `by`;                                  a template owns its naming",
+                            ));
+                        }
+                    } else if flat && by.is_empty() {
+                        return Err(self.err("`as flat` needs `by KEY…`"));
+                    }
                     let delim = resolve_delim(&path, explicit.as_deref());
-                    let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
-                        self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
-                    })?;
-                    let n = self.g.add_node(fmt.into_sink_op(path, delim));
+                    let fmt = resolve_format(&path, explicit.as_deref());
+                    let n = if templated || !by.is_empty() {
+                        // Partitioned default format: CSV (a Hive base like
+                        // `out/` has no extension to infer from).
+                        let codec = match fmt.unwrap_or(Format::Csv) {
+                            Format::Csv => SinkCodec::Csv { delim },
+                            Format::Jsonl => SinkCodec::Jsonl,
+                            Format::Json => SinkCodec::Json,
+                        };
+                        self.g.add_node(Op::Sink {
+                            route: Route::Template {
+                                template: path,
+                                by: if templated { keys } else { by },
+                                flat,
+                            },
+                            transport: Transport::Local,
+                            codec,
+                        })
+                    } else {
+                        let fmt = fmt.ok_or_else(|| {
+                            self.err(format!(
+                                "unknown format '{}'",
+                                explicit.clone().unwrap_or_default()
+                            ))
+                        })?;
+                        self.g.add_node(fmt.into_sink_op(path, delim))
+                    };
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -2929,7 +3009,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::Sink { route, .. } => Some(route.path().to_string()),
+                Op::Sink { route, .. } => route.path().map(str::to_string),
                 _ => None,
             })
             .unwrap();
@@ -2954,7 +3034,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::Sink { route, .. } => Some(route.path().to_string()),
+                Op::Sink { route, .. } => route.path().map(str::to_string),
                 _ => None,
             })
             .unwrap();
@@ -3023,6 +3103,59 @@ mod tests {
             nth_op("F:\n open a.csv\n writecsv o.x\n;", 1),
             Op::Sink {
                 codec: SinkCodec::Csv { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn route_save_parses_validates_and_round_trips() {
+        // §28.7 route (#143 ①): template placeholders derive the partition
+        // keys (§27.3 is the degenerate form of §27.4); a plain path with
+        // `by` is the Hive layout; `as flat` flattens names; `{{`/`}}` escape.
+        for src in [
+            "F:\n open a.csv\n save \"out/{country}.csv\"\n;",
+            "F:\n open a.csv\n save \"out/\" by country region\n;",
+            "F:\n open a.csv\n save \"out/\" by country as flat\n;",
+            "F:\n open a.csv\n save \"out/\" as jsonl by country\n;",
+            "F:\n open a.csv\n save \"out/{{lit}}_{k}.csv\"\n;",
+        ] {
+            let s = parse(src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(s.contains("save \""), "route must stay quoted: {s}");
+        }
+        // Declaration-time errors (never-silent): a `by` key outside the
+        // template, `as flat` on a template, empty/unclosed placeholders,
+        // flat or by without keys.
+        assert!(parse("F:\n open a.csv\n save \"out/{a}.csv\" by b\n;").is_err());
+        assert!(parse("F:\n open a.csv\n save \"out/{a}.csv\" as flat\n;").is_err());
+        assert!(parse("F:\n open a.csv\n save \"out/{}.csv\" by a\n;").is_err());
+        assert!(parse("F:\n open a.csv\n save \"out/{a.csv\"\n;").is_err());
+        assert!(parse("F:\n open a.csv\n save \"out/\" as flat\n;").is_err());
+        assert!(parse("F:\n open a.csv\n save \"out/\" by\n;").is_err());
+        // A redundant `by` matching the template canonicalizes away (the
+        // placeholders are the keys), and the derived keys land on the IR.
+        let g = parse("F:\n open a.csv\n save \"out/{country}.csv\" by country\n;").unwrap();
+        match &g.nodes[1].op {
+            Op::Sink {
+                route: Route::Template { by, flat, .. },
+                ..
+            } => {
+                assert_eq!(by, &vec!["country".to_string()]);
+                assert!(!flat);
+            }
+            o => panic!("expected a template sink, got {o:?}"),
+        }
+        let s = g.to_source();
+        assert!(
+            s.contains("save \"out/{country}.csv\"") && !s.contains(" by "),
+            "derived keys must not re-emit `by`: {s}"
+        );
+        // A quoted plain path (no placeholders, no `by`) stays a fixed sink.
+        assert!(matches!(
+            nth_op("F:\n open a.csv\n save \"o.csv\"\n;", 1),
+            Op::Sink {
+                route: Route::Fixed(_),
                 ..
             }
         ));
@@ -3824,7 +3957,7 @@ Import:
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::Sink { route, .. } => Some(route.path().to_string()),
+                Op::Sink { route, .. } => route.path().map(str::to_string),
                 _ => None,
             })
             .unwrap();

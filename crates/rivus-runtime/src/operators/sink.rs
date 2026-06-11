@@ -488,3 +488,68 @@ fn json_string(out: &mut String, s: &str) {
     }
     out.push('"');
 }
+
+// ---------------------------------------------------------------- sink: route
+
+/// Partitioned / dynamic-output sink (design §28.7, ratified #143):
+/// `save "out/{country}.csv"` / `save "out/" by k [as flat]`. Collects the
+/// stream and writes every partition on finish through `crate::route` — the
+/// same core the parallel single-write merge uses, so the bytes per file are
+/// identical across serial / parallel / chunk-size. Buffering the stream is
+/// the MVP (the parallel collector already does); streaming per-partition
+/// writers with an LRU handle pool are the follow-up engineering the #143
+/// ruling leaves to implementation judgement.
+pub(crate) struct SinkRoute {
+    pub(crate) template: String,
+    pub(crate) by: Vec<String>,
+    pub(crate) flat: bool,
+    pub(crate) codec: rivus_ir::SinkCodec,
+    pub(crate) buf: Vec<Chunk>,
+    pub(crate) warned_missing: bool,
+}
+
+impl Operator for SinkRoute {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        // A key column missing from the live schema folds its rows into the
+        // null partition — surfaced once, never silent.
+        if !self.warned_missing {
+            for k in &self.by {
+                if chunk.schema.index_of(k).is_none() {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Recoverable,
+                            ErrorScope::Chunk,
+                            format!(
+                                "save route: unknown partition key column '{k}' — its rows \
+                                 go to the {} partition",
+                                crate::route::NULL_PARTITION
+                            ),
+                        )
+                        .at_node(ctx.label.clone()),
+                    );
+                    self.warned_missing = true;
+                }
+            }
+        }
+        self.buf.push(chunk);
+        Vec::new()
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        // Every partition is attempted (continue-first): one unwritable path
+        // surfaces and the rest still land — never a silent fallback (#143 ③).
+        for (path, e) in
+            crate::route::write_routed(&self.template, &self.by, self.flat, self.codec, &self.buf)
+        {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Recoverable,
+                    ErrorScope::Graph,
+                    format!("save route: could not write partition {path}: {e}; other partitions continue"),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        Vec::new()
+    }
+}

@@ -9,9 +9,10 @@ pub mod graph;
 
 pub use expr::{is_type_word, Access, ArithOp, CmpOp, Expr, Func};
 pub use graph::{
-    delim_for_path, delim_modifier_for, AggFunc, BinType, Codec, Discovery, Disposition, Edge,
-    EdgeKind, Endian, FillMethod, Hook, HookAction, HookEvent, JoinKind, Node, NodeId, Op,
-    PlanGraph, Provenance, ReadFmt, Route, SinkCodec, SubView, Transport, ViewDef, COMMA,
+    delim_for_path, delim_modifier_for, parse_route_template, AggFunc, BinType, Codec, Discovery,
+    Disposition, Edge, EdgeKind, Endian, FillMethod, Hook, HookAction, HookEvent, JoinKind, Node,
+    NodeId, Op, PlanGraph, Provenance, ReadFmt, Route, RouteSeg, SinkCodec, SubView, Transport,
+    ViewDef, COMMA,
 };
 
 #[cfg(test)]

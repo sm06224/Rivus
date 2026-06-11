@@ -3,10 +3,15 @@
 最終更新: 2026-06-10 ／ ブランチ運用：**テーマ毎に main 基底の `claude/design-…` を
 1本切り、常に唯一の開いた PR**（統括承認 2026-06-10。旧指定 `claude/eager-bohr-HsrXO`
 の remote は §28 squash 済みの非祖先 tip で放置・使わない）。版数 **`1.3.0-dev`**
-（提案タグ v1.3.0-dev.15・v1.3.0-dev.16（#141 分）はカット待ち）。squash 後は
+（提案タグ v1.3.0-dev.15〜18 はカット待ち：…15=s2 系・…16=#141・…17=#142・…18=#144）。squash 後は
 `git fetch origin main && git reset --hard origin/main` して継続。
 
-> **現フォーカス＝§29 surface 収束（s1-s3 landed → s4＝本PR）。**
+> **現フォーカス＝§28 slice 4（route 出力）。§29 は s1-s4 全 landed（#136-#142）。**
+> s4a（Sink 統一 move-only）＝#144 landed。s4b（route 本体）＝**本PR**（#143 裁定反映：
+> 正準形 `save TEMPLATE [by KEY…] [as flat]`・プレースホルダ＝キー・null=Hive センチネル・
+> `%` 込み単射エスケープ・**基数上限 Fatal なし＝書き切る**・各ファイル byte-identical）。
+> 残: `{expr}` プレースホルダ（次スライス）・streaming per-partition writer＋LRU/spill（工学
+> follow-up・現 MVP は finish 一括書き）。その後＝§28 slice 5（非有界骨組み）。
 > design は `docs/design/29-surface-convergence-and-union-views.md`（裁定反映済）。
 > §28 は slice 3 まで landed（次は slice 4 route 出力・§29 完了後）。レビュアー＝統括
 > （人間）。各スライスは「**byte-identity 不変・to_source 可逆・依存ゼロ**」を実測で

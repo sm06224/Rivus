@@ -824,6 +824,29 @@ open events.csv (ts:datetime)
 （`writejson` が出すもの）。どちらも有界メモリでストリーム。空結果は `[]`（json）
 または行なし（jsonl）です。
 
+### 分割・動的出力（route）
+
+クォートした `save` パスは、**キー値ごとに複数ファイルへ振り分け**できます
+（design §28.7・#143 批准）：
+
+```
+… save "out/{country}.csv"            # テンプレート：{col} がキーを導出
+… save "out/" by country region       # Hive 形：out/country=JP/region=13/part.csv
+… save "out/" by country as flat      # フラット名：out/JP.csv
+… save "out/" as jsonl by country     # どの形式でも分割可
+```
+
+- **テンプレートのプレースホルダ＝分割キー** — `save "out/{country}.csv"` ≡
+  `by country`。テンプレートに現れない `by` キーは宣言時エラー（キーが黙って
+  ディレクトリ階層を増やすことはない）。リテラルの波括弧は `{{` / `}}`。
+- **決定的・byte-identical**：ファイル集合と各パスはキー値の純関数（単射。
+  `%` 含むパス危険文字はパーセントエスケープ）。パーティション内の行順は
+  入力ストリーム順で、各ファイルは serial / parallel / chunk-size で
+  byte-identical。null キーは DuckDB 互換の `__HIVE_DEFAULT_PARTITION__` へ。
+- **書き切る**（#143）：分割出力は明示のオプトインなので、予防的な基数上限
+  Fatal はなく、黙って単一ファイルへ fallback することもありません。書けない
+  パーティションはエラーストリームに surface し、他のパーティションは継続します。
+
 ---
 
 ## 8. ライフサイクルフック（continue-first）
@@ -1109,7 +1132,8 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'rename' (IDENT IDENT)+ | 'drop' IDENT+ | 'reorder' IDENT+
            | 'cast' (IDENT ':' TYPE)+
            | '->' IDENT ':' body ';'                          (branch)
-           | ('save' PATH ('as' FMT)? | 'writecsv' PATH | 'writejson' PATH | 'print')
+           | ('save' (PATH | TEMPLATE) ('as' FMT)? ('by' IDENT+)? ('as' 'flat')?
+              | 'writecsv' PATH | 'writejson' PATH | 'print')   (TEMPLATE = "…{col}…"・{{ }} エスケープ)
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)
 
 proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;

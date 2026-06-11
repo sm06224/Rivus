@@ -161,6 +161,15 @@ read as csv with source                 # 各行/chunk に由来 Resource を付
   データから生成。
 - **transport(write)**: file/POST/publish。サービス/分散の出力側。
 - 決定的・byte-identity（分割キーは順序非依存・決定的）。
+- **s4b 具象（#143 批准・統括裁定 2026-06-11）**：正準形 `save TEMPLATE [by KEY…] [as flat]`。
+  テンプレートのプレースホルダ＝キー（§27.3 は §27.4 の退化形・テンプレート外 `by` キーはエラー・
+  `{{}}` エスケープ）。プレーンパス＋`by`＝Hive `k=v/part.ext`（DuckDB 互換）・`as flat`＝`v1_v2.ext`。
+  null キー＝`__HIVE_DEFAULT_PARTITION__`・キー値は `%` 込みパーセントエスケープ（**単射**）。
+  **基数上限 Fatal なし＝書き切る**（silent fallback 禁止・資源圧は LRU/spill 等の工学で吸収・
+  書込不能はパーティション単位 Recoverable で他継続）。IR＝`Route::Template{template, by, flat}`・
+  runtime コア＝`rivus_runtime::route`（serial と並列 single-write merge が同一コア＝各ファイル
+  byte-identical serial==parallel==chunk-size・パーティション内行順＝入力順・part 名固定
+  `part.<codec拡張子>`）。式プレースホルダ `{expr}` は次スライス。
 
 ## 28.8 IR への落とし方（typed-IR・既存ノードの再編・正しさ保存）
 
