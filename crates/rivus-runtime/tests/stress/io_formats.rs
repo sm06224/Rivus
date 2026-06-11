@@ -477,6 +477,42 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         assert_eq!(read("x/U.csv"), "id,country\n2,US\n", "@cz={cz}");
     }
 
+    // Eval-failure surfacing is strategy-independent (review #146): the
+    // parallel collector path reports the same Recoverable as serial.
+    for pref in [
+        rivus_runtime::MemoryPref::Low,
+        rivus_runtime::MemoryPref::Fast,
+    ] {
+        let _ = std::fs::remove_dir_all(&dir);
+        let g2 = rivus_parser::parse(&format!(
+            "R:\n open {p} (id:int country:str score:int)\n |> id\n save \"{base}/pe/{{$_[9]}}.csv\"\n;"
+        ))
+        .expect("parse");
+        std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+        let res = run(
+            &g2,
+            RunOptions {
+                chunk_size: 2,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        assert!(
+            res.errors
+                .iter()
+                .any(|e| e.message.contains("could not be evaluated")),
+            "computed-key eval fails must surface @{pref:?}: {:?}",
+            res.errors
+        );
+        assert_eq!(
+            read("pe/__HIVE_DEFAULT_PARTITION__.csv"),
+            "id\n1\n2\n3\n4\n5\n",
+            "all rows to the sentinel @{pref:?}"
+        );
+    }
+
     // Traversal guard (review #145): a `.`/`..` key value escapes instead of
     // walking out of the declared output tree.
     let _ = std::fs::remove_dir_all(&dir);

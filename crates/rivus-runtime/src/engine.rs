@@ -1829,15 +1829,21 @@ fn finalize_group_partials(
     };
 
     if let Some(sink) = sink_id {
-        if let Some((path, Err(e))) = write_sink(&graph.nodes[sink].op, &out_chunks) {
-            res.errors.push(
-                ErrorEvent::new(
-                    Severity::Critical,
-                    ErrorScope::Graph,
-                    format!("cannot write '{path}': {e}"),
-                )
-                .at_node(label_of(graph, sink)),
-            );
+        if let Some((path, result, eval_fails)) = write_sink(&graph.nodes[sink].op, &out_chunks) {
+            if eval_fails > 0 {
+                res.errors
+                    .push(route_eval_event(eval_fails, label_of(graph, sink)));
+            }
+            if let Err(e) = result {
+                res.errors.push(
+                    ErrorEvent::new(
+                        Severity::Critical,
+                        ErrorScope::Graph,
+                        format!("cannot write '{path}': {e}"),
+                    )
+                    .at_node(label_of(graph, sink)),
+                );
+            }
         }
     } else {
         res.outputs.push(Output {
@@ -2009,7 +2015,13 @@ fn try_unbounded_group(
 fn flush_parallel_sinks(graph: &PlanGraph, res: &mut RunResult) {
     let mut kept = Vec::new();
     for out in std::mem::take(&mut res.outputs) {
-        if let Some((path, result)) = write_sink(&graph.nodes[out.node_id].op, &out.chunks) {
+        if let Some((path, result, eval_fails)) =
+            write_sink(&graph.nodes[out.node_id].op, &out.chunks)
+        {
+            if eval_fails > 0 {
+                res.errors
+                    .push(route_eval_event(eval_fails, label_of(graph, out.node_id)));
+            }
             if let Err(e) = result {
                 res.errors.push(
                     ErrorEvent::new(
@@ -2027,8 +2039,12 @@ fn flush_parallel_sinks(graph: &PlanGraph, res: &mut RunResult) {
     res.outputs = kept;
 }
 
-/// If `op` is a file sink, write `chunks` to it once and return (path, result).
-fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Result<()>)> {
+/// If `op` is a file sink, write `chunks` to it once and return
+/// (path, result, computed-placeholder eval failures). Every caller surfaces
+/// the eval-fail count via [`route_eval_event`], so the parallel paths report
+/// it exactly like the serial operator (never-silent across strategies —
+/// review #146; same shape as #145 fix 3).
+fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Result<()>, u64)> {
     match op {
         Op::Sink { route, codec, .. } => match route {
             rivus_ir::Route::Fixed(path) => {
@@ -2037,7 +2053,7 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
                     SinkCodec::Jsonl => operators::write_jsonl_file(path, chunks),
                     SinkCodec::Json => operators::write_json_file(path, chunks),
                 };
-                Some((path.as_str(), res))
+                Some((path.as_str(), res, 0))
             }
             // Partitioned route: every partition is attempted (continue-first
             // inside `write_routed`); ALL failures are aggregated so the
@@ -2049,8 +2065,15 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
                 flat,
                 exprs,
             } => {
+                let mut eval_fails = 0u64;
                 let fails = crate::route::write_routed(
-                    template, by, *flat, *codec, exprs, chunks, &mut 0u64,
+                    template,
+                    by,
+                    *flat,
+                    *codec,
+                    exprs,
+                    chunks,
+                    &mut eval_fails,
                 );
                 let res = if fails.is_empty() {
                     Ok(())
@@ -2063,11 +2086,27 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
                         list.join("; ")
                     )))
                 };
-                Some((template.as_str(), res))
+                Some((template.as_str(), res, eval_fails))
             }
         },
         _ => None,
     }
+}
+
+/// The Recoverable event for computed-placeholder eval failures — one shared
+/// constructor so the parallel callers surface the same wording as the serial
+/// `SinkRoute` operator.
+fn route_eval_event(n: u64, label: String) -> ErrorEvent {
+    ErrorEvent::new(
+        Severity::Recoverable,
+        ErrorScope::Item,
+        format!(
+            "save route: {n} value(s) could not be evaluated in a computed placeholder; \
+             routed to the {} partition",
+            crate::route::NULL_PARTITION
+        ),
+    )
+    .at_node(label)
 }
 
 /// Merge per-partition results in source order: concatenate outputs, sum
@@ -2148,7 +2187,10 @@ fn merge_results(
 
     let mut outputs = Vec::new();
     for (node_id, chunks) in by_node {
-        if let Some((path, result)) = write_sink(&graph.nodes[node_id].op, &chunks) {
+        if let Some((path, result, eval_fails)) = write_sink(&graph.nodes[node_id].op, &chunks) {
+            if eval_fails > 0 {
+                errors.push(route_eval_event(eval_fails, label_of(graph, node_id)));
+            }
             if let Err(e) = result {
                 errors.push(
                     ErrorEvent::new(

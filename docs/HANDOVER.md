@@ -131,6 +131,8 @@ cargo test --workspace --all-features   # gzip/zstd オラクル・stress 含む
 - 新 enum variant（`Value`/`DataType`/`ColumnData`/`Op` フィールド/`Access`）は
   **`cargo build --workspace --all-targets` の E0004/E0027/E0063 を潰し切る**（公開
   re-export の variant は dead-code 警告は出ない＝構築経路なしでも先行可）。
+- **sink に新しい失敗系を足すときは serial（operator）と parallel（`write_sink` 呼出 3 箇所）の
+  surface を対で確認**（#145 fix3・#146 で同型 divergence が 2 連発した教訓）。
 - force-push 不可。`reset --hard origin/main` 後の push は merge commit 経由で FF。
   上流 merge commit（committer `noreply@github.com`）は**amend しない**（公開済・乖離する）。
 
