@@ -30,7 +30,7 @@ use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value
 use rivus_ir::{
     is_type_word, Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery, Disposition,
     EdgeKind, Endian, Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind, NodeId, Op,
-    PlanGraph, Provenance, ReadFmt, SubView, Transport, ViewDef,
+    PlanGraph, Provenance, ReadFmt, SinkCodec, SubView, Transport, ViewDef,
 };
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
@@ -438,17 +438,19 @@ impl Parser {
                 Tok::Word(w) if w == "writecsv" => {
                     self.bump();
                     let path = self.word()?;
-                    let n = self.g.add_node(Op::SinkCsv {
-                        delim: rivus_ir::delim_for_path(&path),
-                        path,
-                    });
+                    let n = self.g.add_node(Op::sink(
+                        path.clone(),
+                        SinkCodec::Csv {
+                            delim: rivus_ir::delim_for_path(&path),
+                        },
+                    ));
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
                 Tok::Word(w) if w == "writejson" => {
                     self.bump();
                     let path = self.word()?;
-                    let n = self.g.add_node(Op::SinkJsonl { path });
+                    let n = self.g.add_node(Op::sink(path, SinkCodec::Jsonl));
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -1843,11 +1845,12 @@ impl Format {
     }
 
     fn into_sink_op(self, path: String, delim: u8) -> Op {
-        match self {
-            Format::Csv => Op::SinkCsv { path, delim },
-            Format::Jsonl => Op::SinkJsonl { path },
-            Format::Json => Op::SinkJson { path },
-        }
+        let codec = match self {
+            Format::Csv => SinkCodec::Csv { delim },
+            Format::Jsonl => SinkCodec::Jsonl,
+            Format::Json => SinkCodec::Json,
+        };
+        Op::sink(path, codec)
     }
 }
 
@@ -2926,7 +2929,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::SinkCsv { path, .. } => Some(path.clone()),
+                Op::Sink { route, .. } => Some(route.path().to_string()),
                 _ => None,
             })
             .unwrap();
@@ -2951,7 +2954,7 @@ mod tests {
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::SinkCsv { path, .. } => Some(path.clone()),
+                Op::Sink { route, .. } => Some(route.path().to_string()),
                 _ => None,
             })
             .unwrap();
@@ -2965,30 +2968,48 @@ mod tests {
         // The sink mirrors the source format set: extension default + `as` + aliases.
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.csv\n;", 1),
-            Op::SinkCsv { .. }
+            Op::Sink {
+                codec: SinkCodec::Csv { .. },
+                ..
+            }
         ));
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.jsonl\n;", 1),
-            Op::SinkJsonl { .. }
+            Op::Sink {
+                codec: SinkCodec::Jsonl,
+                ..
+            }
         ));
         // `as json` (and a `.json` extension) is a JSON *array*; `.jsonl` /
         // `.ndjson` / `as jsonl` stay one-object-per-line.
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.dat as json\n;", 1),
-            Op::SinkJson { .. }
+            Op::Sink {
+                codec: SinkCodec::Json,
+                ..
+            }
         ));
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.json\n;", 1),
-            Op::SinkJson { .. }
+            Op::Sink {
+                codec: SinkCodec::Json,
+                ..
+            }
         ));
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.dat as jsonl\n;", 1),
-            Op::SinkJsonl { .. }
+            Op::Sink {
+                codec: SinkCodec::Jsonl,
+                ..
+            }
         ));
         // `writejson` keeps emitting NDJSON (backward-compatible).
         assert!(matches!(
             nth_op("F:\n open a.csv\n writejson o.x\n;", 1),
-            Op::SinkJsonl { .. }
+            Op::Sink {
+                codec: SinkCodec::Jsonl,
+                ..
+            }
         ));
         // Round-trip: `save o.json` (array) and `save o.jsonl` survive to_source.
         for prog in [
@@ -3000,7 +3021,10 @@ mod tests {
         }
         assert!(matches!(
             nth_op("F:\n open a.csv\n writecsv o.x\n;", 1),
-            Op::SinkCsv { .. }
+            Op::Sink {
+                codec: SinkCodec::Csv { .. },
+                ..
+            }
         ));
     }
 
@@ -3466,15 +3490,24 @@ Import:
         // Sinks pick up the delimiter the same way sources do.
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.tsv\n;", 1),
-            Op::SinkCsv { delim: b'\t', .. }
+            Op::Sink {
+                codec: SinkCodec::Csv { delim: b'\t' },
+                ..
+            }
         ));
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.csv as tsv\n;", 1),
-            Op::SinkCsv { delim: b'\t', .. }
+            Op::Sink {
+                codec: SinkCodec::Csv { delim: b'\t' },
+                ..
+            }
         ));
         assert!(matches!(
             nth_op("F:\n open a.csv\n save o.csv\n;", 1),
-            Op::SinkCsv { delim: b',', .. }
+            Op::Sink {
+                codec: SinkCodec::Csv { delim: b',' },
+                ..
+            }
         ));
     }
 
@@ -3791,7 +3824,7 @@ Import:
             .nodes
             .iter()
             .find_map(|n| match &n.op {
-                Op::SinkCsv { path, .. } => Some(path.clone()),
+                Op::Sink { route, .. } => Some(route.path().to_string()),
                 _ => None,
             })
             .unwrap();

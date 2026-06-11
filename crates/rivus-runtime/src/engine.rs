@@ -14,7 +14,7 @@
 use crate::operators::{self, OpCtx, Operator};
 use crate::telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
 use rivus_core::{Chunk, DataType, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
-use rivus_ir::{Codec, HookAction, HookEvent, NodeId, Op, PlanGraph};
+use rivus_ir::{Codec, HookAction, HookEvent, NodeId, Op, PlanGraph, SinkCodec};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -258,9 +258,7 @@ fn must_drain(graph: &PlanGraph) -> bool {
     graph.nodes.iter().any(|nd| {
         matches!(
             nd.op,
-            Op::SinkCsv { .. }
-                | Op::SinkJsonl { .. }
-                | Op::SinkJson { .. }
+            Op::Sink { .. }
                 | Op::GroupBy { .. }
                 | Op::Sort { .. }
                 | Op::Distinct { .. }
@@ -301,12 +299,7 @@ fn build_ops(
         .map(|node| {
             if Some(node.id) == ov_id {
                 ov_op.take().expect("source override used once")
-            } else if ov_id.is_some()
-                && matches!(
-                    node.op,
-                    Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. }
-                )
-            {
+            } else if ov_id.is_some() && matches!(node.op, Op::Sink { .. }) {
                 operators::collector()
             } else {
                 operators::build(
@@ -641,9 +634,19 @@ fn try_streaming_parallel(
     // buffering — that stays on the serial path).
     let mut sinks: Vec<(NodeId, String, bool, u8)> = Vec::new();
     for nd in &graph.nodes {
+        // JSON-array sinks stay serial (the bracketed form can't concatenate
+        // per-worker parts), exactly as before the Sink unification.
         match &nd.op {
-            Op::SinkCsv { path, delim } => sinks.push((nd.id, path.clone(), false, *delim)),
-            Op::SinkJsonl { path } => sinks.push((nd.id, path.clone(), true, b',')),
+            Op::Sink {
+                route,
+                codec: SinkCodec::Csv { delim },
+                ..
+            } => sinks.push((nd.id, route.path().to_string(), false, *delim)),
+            Op::Sink {
+                route,
+                codec: SinkCodec::Jsonl,
+                ..
+            } => sinks.push((nd.id, route.path().to_string(), true, b',')),
             _ => {}
         }
     }
@@ -1237,11 +1240,7 @@ fn eligible_group_flow_inner(
         [] => None,
         [s] => {
             let s = *s;
-            if !matches!(
-                graph.nodes[s].op,
-                Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. }
-            ) || !graph.outputs_of(s).is_empty()
-            {
+            if !matches!(graph.nodes[s].op, Op::Sink { .. }) || !graph.outputs_of(s).is_empty() {
                 return None;
             }
             Some(s)
@@ -2031,11 +2030,15 @@ fn flush_parallel_sinks(graph: &PlanGraph, res: &mut RunResult) {
 /// If `op` is a file sink, write `chunks` to it once and return (path, result).
 fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Result<()>)> {
     match op {
-        Op::SinkCsv { path, delim } => {
-            Some((path, operators::write_csv_file(path, chunks, *delim)))
+        Op::Sink { route, codec, .. } => {
+            let path = route.path();
+            let res = match codec {
+                SinkCodec::Csv { delim } => operators::write_csv_file(path, chunks, *delim),
+                SinkCodec::Jsonl => operators::write_jsonl_file(path, chunks),
+                SinkCodec::Json => operators::write_json_file(path, chunks),
+            };
+            Some((path, res))
         }
-        Op::SinkJsonl { path } => Some((path, operators::write_jsonl_file(path, chunks))),
-        Op::SinkJson { path } => Some((path, operators::write_json_file(path, chunks))),
         _ => None,
     }
 }
@@ -2082,10 +2085,7 @@ fn merge_results(
         // `rows_in` is the right "rows this worker produced".
         let mut w_rows: u64 = 0;
         for (i, t) in res.telemetry.iter().enumerate() {
-            if matches!(
-                graph.nodes[i].op,
-                Op::SinkCsv { .. } | Op::SinkJsonl { .. } | Op::SinkJson { .. } | Op::SinkPrint
-            ) {
+            if matches!(graph.nodes[i].op, Op::Sink { .. } | Op::SinkPrint) {
                 w_rows += t.rows_in;
             }
         }

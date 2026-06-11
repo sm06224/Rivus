@@ -15,6 +15,7 @@ use rivus_core::{
 };
 use rivus_ir::{
     AggFunc, BinType, CmpOp, Codec, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
+    SinkCodec,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -338,9 +339,17 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             inputs.first().copied().unwrap_or(usize::MAX),
         )),
         Op::SinkPrint => Box::new(SinkPrint),
-        Op::SinkCsv { path, delim } => Box::new(SinkCsv::new(path.clone(), *delim)),
-        Op::SinkJsonl { path } => Box::new(SinkJsonl::new(path.clone())),
-        Op::SinkJson { path } => Box::new(SinkJson::new(path.clone())),
+        // The unified sink (§28.7): Route::Fixed + Transport::Local today, so
+        // the codec alone picks the writer (same operators as before the
+        // unification — behaviour-identical).
+        Op::Sink { route, codec, .. } => {
+            let path = route.path().to_string();
+            match codec {
+                SinkCodec::Csv { delim } => Box::new(SinkCsv::new(path, *delim)),
+                SinkCodec::Jsonl => Box::new(SinkJsonl::new(path)),
+                SinkCodec::Json => Box::new(SinkJson::new(path)),
+            }
+        }
     }
 }
 
