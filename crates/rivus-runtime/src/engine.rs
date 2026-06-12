@@ -347,6 +347,40 @@ fn build_ops(
 /// Drive the DAG to completion with a pre-built operator set (the chunk-granular
 /// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
 #[allow(clippy::too_many_arguments)]
+/// Could a chunk pulled from `src` still have an observable effect — is there a
+/// path from `src` to a sink / leaf capture that does not pass a **saturated**
+/// operator (a `take N` that has emitted its N)? When no such path remains, an
+/// **unbounded** source stops (§28.12) — its only self-termination. Memoized
+/// per node (saturation is a node property, path-independent). Only consulted
+/// for unbounded sources; a bounded source never early-stops (pinned by test).
+fn unbounded_effect_remains(graph: &PlanGraph, src: NodeId, ops: &[Box<dyn Operator>]) -> bool {
+    fn effect(
+        graph: &PlanGraph,
+        n: NodeId,
+        ops: &[Box<dyn Operator>],
+        memo: &mut [Option<bool>],
+    ) -> bool {
+        if let Some(v) = memo[n] {
+            return v;
+        }
+        memo[n] = Some(false); // DAG, but guard anyway
+        let v = if ops[n].saturated() {
+            false
+        } else {
+            let outs = graph.outputs_of(n);
+            // A leaf (sink, print, or engine capture) is the observable effect.
+            outs.is_empty() || outs.into_iter().any(|m| effect(graph, m, ops, memo))
+        };
+        memo[n] = Some(v);
+        v
+    }
+    let mut memo: Vec<Option<bool>> = vec![None; graph.nodes.len()];
+    graph
+        .outputs_of(src)
+        .into_iter()
+        .any(|m| effect(graph, m, ops, &mut memo))
+}
+
 fn drive(
     graph: &PlanGraph,
     mut ops: Vec<Box<dyn Operator>>,
@@ -366,6 +400,15 @@ fn drive(
 
     // Only a sink-less, non-blocking flow may stop the source early on a cap.
     let must_drain = must_drain(graph);
+
+    // §28.12: per-node flag for unbounded sources (`watch`). Only these consult
+    // the downstream-saturation check below — a bounded source keeps the exact
+    // drain-to-exhaustion loop (pinned by test).
+    let unbounded_src: Vec<bool> = graph
+        .nodes
+        .iter()
+        .map(|nd| matches!(&nd.op, Op::Source { discovery, .. } if discovery.is_unbounded()))
+        .collect();
 
     let mut in_q: Vec<VecDeque<(NodeId, Chunk)>> = (0..n).map(|_| VecDeque::new()).collect();
     let mut done = vec![false; n];
@@ -417,6 +460,14 @@ fn drive(
 
             if ops[nid].is_source() {
                 if preview_satisfied {
+                    finished_now = true;
+                } else if unbounded_src[nid] && !unbounded_effect_remains(graph, nid, &ops) {
+                    // §28.12: every downstream path from this unbounded source
+                    // passes a saturated operator (a filled `take N`) — nothing
+                    // it could ever emit is observable anymore. Stop it: the
+                    // only self-termination an endless stream has. Checked
+                    // *before* pull, so a satisfied flow never re-enters the
+                    // blocking wait.
                     finished_now = true;
                 } else {
                     let mut ctx = OpCtx {

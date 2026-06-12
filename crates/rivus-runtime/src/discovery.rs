@@ -101,6 +101,52 @@ fn walk(fs: &Path, uri: &str, segs: &[&str], name_prefilter: &[String], out: &mu
     }
 }
 
+/// Split a watch glob into its **literal directory root** (the segments before
+/// the first wildcard — what the OS watcher subscribes to) and the remaining
+/// pattern segments (matched against event paths relative to that root). The
+/// last segment is never consumed into the root (an all-literal pattern still
+/// matches its file name): `in/*.csv` → `("in", ["*.csv"])`, `logs/**/x?.csv` →
+/// `("logs", ["**", "x?.csv"])`, `*.csv` → `(".", ["*.csv"])`, `/a/b.csv` →
+/// `("/a", ["b.csv"])`. Used by the `unbounded` watch source (§28.12).
+#[cfg(feature = "unbounded")]
+pub(crate) fn split_watch_root(pattern: &str) -> (String, Vec<String>) {
+    let segs: Vec<&str> = pattern.split('/').collect();
+    let last = segs.len().saturating_sub(1);
+    let split_at = segs
+        .iter()
+        .position(|s| s.contains(['*', '?', '[']))
+        .unwrap_or(last)
+        .min(last);
+    let root = segs[..split_at].join("/");
+    let rest: Vec<String> = segs[split_at..].iter().map(|s| s.to_string()).collect();
+    let root = if root.is_empty() {
+        if pattern.starts_with('/') { "/" } else { "." }.to_string()
+    } else {
+        root
+    };
+    (root, rest)
+}
+
+/// Match a `/`-separated **relative path** against pattern segments: `**` spans
+/// zero or more whole segments, every other segment uses the [`glob_match`]
+/// segment matcher. Used by the watch source to filter change events.
+#[cfg(feature = "unbounded")]
+pub(crate) fn glob_segs_match(pat: &[String], rel: &str) -> bool {
+    let parts: Vec<&str> = rel.split('/').collect();
+    fn rec(pat: &[String], parts: &[&str]) -> bool {
+        match pat.split_first() {
+            None => parts.is_empty(),
+            Some((seg, rest)) if seg == "**" => {
+                rec(rest, parts) || (!parts.is_empty() && rec(pat, &parts[1..]))
+            }
+            Some((seg, rest)) => {
+                !parts.is_empty() && glob_match(seg, parts[0]) && rec(rest, &parts[1..])
+            }
+        }
+    }
+    rec(pat, &parts)
+}
+
 /// Match a single path segment against one glob segment (`*` / `?` / `[…]`).
 fn glob_match(pat: &str, name: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
@@ -203,5 +249,32 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("a*b*c", "axxbyyc"));
         assert!(!glob_match("a*b*c", "axxbyy"));
+    }
+
+    #[cfg(feature = "unbounded")]
+    #[test]
+    fn watch_root_split_and_path_match() {
+        use super::{glob_segs_match, split_watch_root};
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(split_watch_root("in/*.csv"), ("in".into(), s(&["*.csv"])));
+        assert_eq!(
+            split_watch_root("logs/**/x?.csv"),
+            ("logs".into(), s(&["**", "x?.csv"]))
+        );
+        assert_eq!(split_watch_root("*.csv"), (".".into(), s(&["*.csv"])));
+        assert_eq!(split_watch_root("in/a.csv"), ("in".into(), s(&["a.csv"])));
+        assert_eq!(split_watch_root("/a/b.csv"), ("/a".into(), s(&["b.csv"])));
+        assert_eq!(
+            split_watch_root("/tmp/x/in/*.csv"),
+            ("/tmp/x/in".into(), s(&["*.csv"]))
+        );
+
+        assert!(glob_segs_match(&s(&["*.csv"]), "a.csv"));
+        assert!(!glob_segs_match(&s(&["*.csv"]), "sub/a.csv"));
+        assert!(glob_segs_match(&s(&["**", "x?.csv"]), "x1.csv"));
+        assert!(glob_segs_match(&s(&["**", "x?.csv"]), "a/b/x1.csv"));
+        assert!(!glob_segs_match(&s(&["**", "x?.csv"]), "a/b/y1.csv"));
+        assert!(glob_segs_match(&s(&["a.csv"]), "a.csv"));
+        assert!(!glob_segs_match(&s(&["a.csv"]), "b.csv"));
     }
 }

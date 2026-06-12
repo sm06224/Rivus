@@ -1066,9 +1066,12 @@ impl Operator for StreamRef {
 /// engine (§28.12): `run_with_progress` refuses a feature-less plan **pre-run**
 /// (`RivusError::Build`, the `regex`/`gzip` shape), so this only fires if a
 /// caller builds operators directly — then it fails loudly (Fatal) instead of
-/// silently behaving like a one-shot `ls`.
+/// silently behaving like a one-shot `ls`. Feature-on builds dispatch the real
+/// `SourceWatch` instead and never construct this.
+#[cfg(not(feature = "unbounded"))]
 pub(crate) struct SourceUnboundedStub;
 
+#[cfg(not(feature = "unbounded"))]
 impl Operator for SourceUnboundedStub {
     fn is_source(&self) -> bool {
         true
