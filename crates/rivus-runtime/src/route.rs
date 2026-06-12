@@ -6,8 +6,8 @@
 //! `__HIVE_DEFAULT_PARTITION__` sentinel, and key values are percent-escaped
 //! (including `%` itself, so `a/b` can never collide with a literal `a%2Fb`).
 //! Rows are written in stream order within each partition, so each file is
-//! byte-identical across serial / parallel / chunk-size (the parallel path
-//! collects and routes the merged stream through this same module).
+//! byte-identical across serial / parallel / chunk-size (the serial operator
+//! and the parallel merge both stream chunk-wise through [`RouteWriter`]).
 //!
 //! Per the #143 ruling there is **no preventive cardinality cap**: a
 //! partitioned save is an explicit opt-in and is written out in full; only a
@@ -214,11 +214,13 @@ struct OpenFile {
 /// **Streaming** partitioned writer (design §28.7 / #143 ③ engineering
 /// follow-up): routes rows to per-partition files **as chunks arrive**, holding
 /// at most [`ROUTE_FD_BUDGET`] files open at once (LRU eviction) instead of
-/// buffering the whole stream. The bytes per file are identical to the buffered
-/// [`write_routed`] — the same row formatters (`write_cell` / `json_object_row`)
-/// and the same within-partition stream order — so byte-identity (serial ==
-/// parallel == chunk-size) is preserved by construction; an eviction only
-/// flushes and reopens (append), never re-headers or reorders.
+/// buffering the whole stream. Used by the serial `SinkRoute` operator **and**
+/// the parallel merge (`write_sink`). The bytes per file are identical to the
+/// buffered one-shot reference (`write_routed`, kept as the test oracle) — the
+/// same row formatters (`write_cell` / `json_object_row`) and the same
+/// within-partition stream order — so byte-identity (serial == parallel ==
+/// chunk-size) is preserved by construction; an eviction only flushes and
+/// reopens (append), never re-headers or reorders.
 pub struct RouteWriter {
     codec: SinkCodec,
     cap: usize,
@@ -412,9 +414,14 @@ impl RouteWriter {
     }
 }
 
-/// Write every partition (creating parent directories), attempting **all** of
-/// them even when one fails (continue-first; never a silent fallback). Returns
-/// the per-partition failures for the caller to surface.
+/// **Buffered reference implementation** (test oracle): write every partition
+/// in one shot from the fully gathered stream, attempting **all** of them even
+/// when one fails (continue-first; never a silent fallback). Returns the
+/// per-partition failures for the caller to surface. Production paths — the
+/// serial `SinkRoute` operator and the parallel merge's `write_sink` — both
+/// stream through [`RouteWriter`] instead; the unit tests below pin the
+/// streamed bytes against this one-shot form.
+#[cfg(test)]
 pub fn write_routed(
     template: &str,
     by: &[String],
@@ -439,4 +446,189 @@ pub fn write_routed(
         }
     }
     failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rivus_core::{Column, ColumnData, DataType, Field, StrColumn, Validity};
+    use std::sync::Arc;
+
+    fn str_col(vals: &[Option<&str>]) -> Column {
+        let mut s = StrColumn::default();
+        let mut bits = Vec::with_capacity(vals.len());
+        for v in vals {
+            s.push(v.unwrap_or(""));
+            bits.push(v.is_some());
+        }
+        Column::new(ColumnData::Str(s), Validity::from_bits(&bits))
+    }
+
+    fn int_col(vals: &[i64]) -> Column {
+        Column::new(ColumnData::I64(vals.to_vec()), Validity::all_valid())
+    }
+
+    /// Three chunks whose partitions interleave across chunk boundaries (so the
+    /// JSON comma / CSV header logic is exercised across calls), with a null
+    /// key (sentinel partition) and a `/` key (escape).
+    fn sample_chunks() -> Vec<Chunk> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Str),
+            Field::new("v", DataType::I64),
+        ]));
+        vec![
+            Chunk::new(
+                0,
+                schema.clone(),
+                vec![
+                    str_col(&[Some("JP"), Some("US"), Some("JP")]),
+                    int_col(&[1, 2, 3]),
+                ],
+            ),
+            Chunk::new(
+                1,
+                schema.clone(),
+                vec![
+                    str_col(&[None, Some("JP"), Some("a/b")]),
+                    int_col(&[4, 5, 6]),
+                ],
+            ),
+            Chunk::new(
+                2,
+                schema,
+                vec![
+                    str_col(&[Some("US"), Some("JP"), None]),
+                    int_col(&[7, 8, 9]),
+                ],
+            ),
+        ]
+    }
+
+    /// Stream `chunks` one at a time through a [`RouteWriter`] with the given
+    /// open-file budget — exactly what the serial operator and the parallel
+    /// merge do.
+    fn stream_with(cap: usize, codec: SinkCodec, template: &str, chunks: &[Chunk]) {
+        let mut eval_fails = 0u64;
+        let mut w = RouteWriter::with_cap(codec, cap);
+        for c in chunks {
+            let groups = group_by_path(
+                std::slice::from_ref(c),
+                template,
+                &[],
+                false,
+                codec,
+                &[],
+                &mut eval_fails,
+            );
+            w.write_groups(groups);
+        }
+        assert_eq!(eval_fails, 0, "no computed keys in this fixture");
+        let failures = w.finish();
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+    }
+
+    /// (file name → contents) of a flat output directory, sorted by name.
+    fn read_tree(dir: &std::path::Path) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| {
+                        (
+                            e.file_name().to_string_lossy().into_owned(),
+                            std::fs::read_to_string(e.path()).unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// The chunk-wise streamed bytes (default budget AND a budget of 1 that
+    /// forces evict+reopen on nearly every write) must equal the buffered
+    /// one-shot oracle [`write_routed`], per partition, for every codec —
+    /// including the cross-chunk JSON array commas, the single header, the
+    /// null-key sentinel and the escaped `/` key.
+    #[test]
+    fn streamed_route_equals_buffered_oracle_per_codec() {
+        let chunks = sample_chunks();
+        let base = std::env::temp_dir().join(format!("rivus_route_unit_{}", std::process::id()));
+        for (name, codec) in [
+            ("csv", SinkCodec::Csv { delim: b',' }),
+            ("tsv", SinkCodec::Csv { delim: b'\t' }),
+            ("jsonl", SinkCodec::Jsonl),
+            ("json", SinkCodec::Json),
+        ] {
+            let dirs = [
+                base.join(format!("{name}_oracle")),
+                base.join(format!("{name}_stream")),
+                base.join(format!("{name}_evict")),
+            ];
+            for d in &dirs {
+                let _ = std::fs::remove_dir_all(d);
+            }
+            let tmpl = |d: &std::path::Path| format!("{}/{{k}}.out", d.display());
+
+            let mut eval_fails = 0u64;
+            let failures = write_routed(
+                &tmpl(&dirs[0]),
+                &[],
+                false,
+                codec,
+                &[],
+                &chunks,
+                &mut eval_fails,
+            );
+            assert!(failures.is_empty(), "oracle failures: {failures:?}");
+            assert_eq!(eval_fails, 0);
+            stream_with(512, codec, &tmpl(&dirs[1]), &chunks);
+            stream_with(1, codec, &tmpl(&dirs[2]), &chunks);
+
+            let oracle = read_tree(&dirs[0]);
+            let names: Vec<&str> = oracle.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    "JP.out",
+                    "US.out",
+                    "__HIVE_DEFAULT_PARTITION__.out",
+                    "a%2Fb.out"
+                ],
+                "partition set for {name}"
+            );
+            assert_eq!(oracle, read_tree(&dirs[1]), "streamed != oracle for {name}");
+            assert_eq!(oracle, read_tree(&dirs[2]), "evicted != oracle for {name}");
+            for d in &dirs {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    /// Anchor the oracle itself (not just the three-way equality): exact CSV
+    /// bytes for an interleaved partition, the null-key partition (null → empty
+    /// unquoted field) and the escaped key, in stream order.
+    #[test]
+    fn buffered_oracle_csv_bytes_are_anchored() {
+        let chunks = sample_chunks();
+        let base = std::env::temp_dir().join(format!("rivus_route_anchor_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut eval_fails = 0u64;
+        let failures = write_routed(
+            &format!("{}/{{k}}.csv", base.display()),
+            &[],
+            false,
+            SinkCodec::Csv { delim: b',' },
+            &[],
+            &chunks,
+            &mut eval_fails,
+        );
+        assert!(failures.is_empty());
+        let read = |n: &str| std::fs::read_to_string(base.join(n)).unwrap();
+        assert_eq!(read("JP.csv"), "k,v\nJP,1\nJP,3\nJP,5\nJP,8\n");
+        assert_eq!(read("US.csv"), "k,v\nUS,2\nUS,7\n");
+        assert_eq!(read("__HIVE_DEFAULT_PARTITION__.csv"), "k,v\n,4\n,9\n");
+        assert_eq!(read("a%2Fb.csv"), "k,v\na/b,6\n");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

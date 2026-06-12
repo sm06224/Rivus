@@ -1322,3 +1322,44 @@ json) pins each file equal to the default large-budget run. Peak memory is now
 bounded by `min(distinct partitions, budget)` open writers + one input chunk,
 not the stream length. (The parallel-merge path still buffers its already-merged
 chunks; streaming it + spill is the remaining engineering, HANDOVER.)
+
+## partitioned `save` route — parallel merge streams through the same writer (#143 ③, part 2)
+
+The **parallel-merge** route write (`write_sink`, all three callers: the
+chunk-partition merge, the single-partition flush, the group-by finalize) still
+used the buffered one-shot form: `group_by_path` over the *whole* merged stream
+gathered a second full copy of the output — for sequential keys that copy is
+~one single-row sub-chunk *per row* (meta + schema arc + column headers each),
+so peak RSS exploded exactly like the pre-streaming serial sink. It now streams
+the merged chunks **chunk-wise through the same `RouteWriter`** the serial
+operator uses (shared formatters, same within-partition stream order — bytes
+unchanged by construction; the buffered form is kept as the `#[cfg(test)]`
+oracle and the unit pins streamed ≡ buffered per codec, eviction included).
+
+Peak RSS (`VmHWM`), 1 M rows via `ls | read` (the in-memory collector path =
+the parallel merge), `save "{k}.…"` template, debug build:
+
+| scenario | buffered merge (before) | streamed merge (after) | files |
+|---|---:|---:|---:|
+| CSV, 20 k partitions  | 4,561,952 KB / 46.1 s | **148,884 KB (≈ 1/31)** / 47.7 s (≈ flat) | md5 ≡ |
+| JSON, 20 k partitions | 4,561,320 KB / 18.4 s | **148,048 KB (≈ 1/31)** / 53.9 s (× 2.9)  | md5 ≡ |
+| JSON, 3 k partitions (budget 512)    | 3,321,520 KB / 11.8 s | **117,412 KB (≈ 1/28)** / 35.3 s (× 3.0) | md5 ≡ |
+| JSON, 3 k partitions (budget 3,500)  | — | **99,536 KB (≈ 1/33)** / 13.2 s (+ 12 %) | md5 ≡ |
+
+Every scenario's output files md5-match before vs after. The **wall trade is
+the bounded-fd streaming trade** (#143 ③, same as the serial sink): with
+distinct partitions ≫ `RIVUS_ROUTE_FD_BUDGET` and cyclic keys (LRU's worst
+case) every write pays an evict + reopen, which the buffered one-open-per-
+partition JSON write never did — ×3 wall on that synthetic worst case. Raising
+the budget to ≥ the cardinality (within the fd ulimit; 3 k partitions, budget
+3,500 above) removes the churn: wall lands within ~12 % of buffered while
+keeping the ~1/30 RSS. CSV is ≈ flat even under worst-case churn (its buffered
+write paid comparable per-partition costs). Robustness pin: a budget *over*
+the ulimit (20 k partitions, budget 25 k, ulimit 4,096) fails per partition
+with EMFILE, **aggregated into one surfaced critical event (one entry per
+partition, never silent)** while the in-budget partitions still write —
+continue-first holds.
+
+Remaining engineering (HANDOVER): the merge path still *holds* the collected
+worker outputs themselves; spilling those to disk (or per-worker part files for
+routes) is the next, separate step.

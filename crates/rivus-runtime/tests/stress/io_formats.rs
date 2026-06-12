@@ -585,3 +585,98 @@ fn route_save_partitions_deterministically_and_byte_identically() {
     assert_eq!(read("f/US.csv"), "id,country\n2,US\n", "flat naming");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn route_save_parallel_merge_streams_byte_identically() {
+    // #143 ③ follow-up: the parallel-merge path streams the merged chunks
+    // through the same `RouteWriter` as the serial operator (chunk-wise, no
+    // whole-stream gather). An `ls | read` flow has no single-file size, so the
+    // autotuner defers to the engine, which takes the in-memory collector path
+    // — the real parallel-merge route write. With chunk_size=1 the 16 handle
+    // rows split across workers (multi-worker merge); with a large chunk_size
+    // the single-partition path (`flush_parallel_sinks`) runs. Both must be
+    // byte-identical, per partition file, to the forced-serial run — across
+    // different chunk sizes (the chunk-size independence contract).
+    let base = std::env::temp_dir().join(format!("rivus_route_par_{}", std::process::id()));
+    let files = base.join("in");
+    let out = base.join("out");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&files).unwrap();
+    let countries = ["JP", "US", "DE", "FR"];
+    for i in 0..16usize {
+        let mut s = String::from("id,country\n");
+        for r in 0..3usize {
+            s.push_str(&format!("{},{}\n", i * 3 + r, countries[(i + r) % 4]));
+        }
+        std::fs::write(files.join(format!("f{i:02}.csv")), s).unwrap();
+    }
+    let flow = format!(
+        "R:\n ls \"{}/*.csv\"\n read as csv\n save \"{}/{{country}}.csv\"\n;",
+        files.display(),
+        out.display()
+    );
+    let snap = |out: &std::path::Path| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = std::fs::read_dir(out)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| {
+                        (
+                            e.file_name().to_string_lossy().into_owned(),
+                            std::fs::read_to_string(e.path()).unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    let run_pref = |pref: rivus_runtime::MemoryPref, cz: usize| -> (Vec<(String, String)>, usize) {
+        let _ = std::fs::remove_dir_all(&out);
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        assert_eq!(res.final_mode, rivus_core::Mode::Normal, "@cz={cz}");
+        (snap(&out), res.workers.len())
+    };
+    let (serial, _) = run_pref(rivus_runtime::MemoryPref::Low, 4096);
+    assert_eq!(
+        serial.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        ["DE.csv", "FR.csv", "JP.csv", "US.csv"],
+        "partition set"
+    );
+    assert_eq!(
+        serial.iter().map(|(_, c)| c.lines().count()).sum::<usize>(),
+        4 + 48,
+        "4 headers + all 48 rows"
+    );
+    let (par_multi, nworkers) = run_pref(rivus_runtime::MemoryPref::Fast, 1);
+    assert_eq!(
+        serial, par_multi,
+        "multi-worker parallel merge must be byte-identical to serial"
+    );
+    // Guard against the parallel leg silently going serial (vacuous test): with
+    // 2..=8 cpus, 16 handle chunks split across ≥ 2 workers. Outside that range
+    // (1 cpu, or > 8 where 16 < 2×threads) the engine legitimately runs the
+    // single-partition path and the byte assertion above still holds.
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    if (2..=8).contains(&threads) {
+        assert!(
+            nworkers >= 2,
+            "expected the multi-worker merge path with {threads} cpus, got {nworkers} workers"
+        );
+    }
+    let (par_single, _) = run_pref(rivus_runtime::MemoryPref::Fast, 4096);
+    assert_eq!(
+        serial, par_single,
+        "single-partition parallel merge must be byte-identical to serial"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

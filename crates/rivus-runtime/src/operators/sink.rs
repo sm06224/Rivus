@@ -495,9 +495,9 @@ fn json_string(out: &mut String, s: &str) {
 /// `save "out/{country}.csv"` / `save "out/" by k [as flat]`. **Streams** rows
 /// to per-partition files as chunks arrive through a bounded LRU handle pool
 /// ([`crate::route::RouteWriter`]) — no longer buffering the whole stream, so a
-/// high-cardinality save stays bounded-memory. The bytes per file are identical
-/// to the buffered [`crate::route::write_routed`] the parallel merge still uses
-/// (shared row formatters + within-partition stream order), so byte-identity
+/// high-cardinality save stays bounded-memory. The parallel merge
+/// (`write_sink`) streams the merged chunks through the same writer (shared
+/// row formatters + within-partition stream order), so byte-identity
 /// (serial == parallel == chunk-size) holds.
 pub(crate) struct SinkRoute {
     pub(crate) template: String,
