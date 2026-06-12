@@ -266,12 +266,23 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                         .with_provenance(*provenance, path),
                 ),
                 // `ls` discovery: enumerate the glob (`path` is the pattern) into a
-                // Resource stream; no codec decode, no provenance.
-                Codec::Discover { name_prefilter } => Box::new(SourceDiscover::new(
-                    path.to_string(),
-                    chunk_size,
-                    name_prefilter.clone(),
-                )),
+                // Resource stream; no codec decode, no provenance. The unbounded
+                // `watch` discovery (§28.12) is dispatched apart: its evaluator is
+                // feature-gated and `run_with_progress` refuses a feature-less
+                // plan pre-run, so the stub here is defense-in-depth (a caller
+                // that skips the engine still gets a loud Fatal, never a silent
+                // `ls`-like one-shot scan).
+                Codec::Discover { name_prefilter } => {
+                    if discovery.is_unbounded() {
+                        Box::new(SourceUnboundedStub)
+                    } else {
+                        Box::new(SourceDiscover::new(
+                            path.to_string(),
+                            chunk_size,
+                            name_prefilter.clone(),
+                        ))
+                    }
+                }
             }
         }
         Op::Read { fmt, provenance } => Box::new(Read::new(*fmt, *provenance, chunk_size)),

@@ -359,16 +359,35 @@ pub enum Discovery {
     /// std-only (no deps); resources are emitted in deterministic uri-ascending
     /// order. Paired with `Codec::Discover` it lists files as a `Resource` table.
     Glob(String),
+    /// **Unbounded** discovery (`watch "glob"`, design §28.12 / ratified #149):
+    /// subscribe to the OS change-notification mechanism and emit a handle row
+    /// per changed file matching the glob — a stream that never ends. Outside
+    /// the deterministic-op set (§0.14): arrival order is environmental, so the
+    /// byte-identity contract is asserted only on **bounded** sub-DAGs (see
+    /// [`PlanGraph::unbounded_nodes`]). Parse / `to_source` are always-std;
+    /// evaluation requires the off-by-default `unbounded` feature (a
+    /// feature-less run refuses pre-run, never-silent).
+    Watch(String),
 }
 
 impl Discovery {
     /// The discovery's path/pattern string: the fixed path (`Fixed`) or the glob
-    /// pattern (`Glob`). Used for `to_source` and the parallel-read size gate
-    /// (`Glob` never plans a byte-range read — its codec is `Discover`).
+    /// pattern (`Glob`/`Watch`). Used for `to_source` and the parallel-read size
+    /// gate (`Glob`/`Watch` never plan a byte-range read — their codec is
+    /// `Discover`).
     pub fn path(&self) -> &str {
         match self {
-            Discovery::Fixed(p) | Discovery::Glob(p) => p,
+            Discovery::Fixed(p) | Discovery::Glob(p) | Discovery::Watch(p) => p,
         }
+    }
+
+    /// Is this discovery **unbounded** (a stream that never ends)? The source of
+    /// the boundedness-derived determinism tag (§0.14 / §28.12): everything
+    /// downstream of an unbounded discovery is outside the byte-identity
+    /// contract and must not be re-ordered or re-combined by the optimizer or
+    /// the parallel executor.
+    pub fn is_unbounded(&self) -> bool {
+        matches!(self, Discovery::Watch(_))
     }
 }
 
@@ -909,9 +928,13 @@ impl Op {
     pub fn kind_str(&self) -> &'static str {
         match self {
             // `readbin` for the binary codec, `open` for csv/jsonl (matching the
-            // surface verb each desugars from).
-            Op::Source { codec, .. } => match codec {
+            // surface verb each desugars from). A discovery source is `ls`, or
+            // `watch` when the discovery is the unbounded subscription (§28.12).
+            Op::Source {
+                codec, discovery, ..
+            } => match codec {
                 Codec::Binary { .. } => "readbin",
+                Codec::Discover { .. } if discovery.is_unbounded() => "watch",
                 Codec::Discover { .. } => "ls",
                 Codec::Csv { .. } | Codec::Jsonl => "open",
             },
@@ -1055,12 +1078,18 @@ impl Op {
                         )
                     }
                     Codec::Jsonl => format!("open {path}{}", provenance.modifier()),
-                    // `ls "glob"` — the path is the glob pattern; quote it so it
-                    // re-lexes as one string token (reversible). Provenance is not
-                    // applicable to a discovery source (it emits handles already).
-                    // A pushed name pre-filter is an inert `#` comment (like CSV).
+                    // `ls "glob"` / `watch "glob"` — the path is the glob
+                    // pattern; quote it so it re-lexes as one string token
+                    // (reversible). Provenance is not applicable to a discovery
+                    // source (it emits handles already). A pushed name
+                    // pre-filter is an inert `#` comment (like CSV).
                     Codec::Discover { name_prefilter } => {
-                        let mut s = format!("ls {path:?}");
+                        let verb = if discovery.is_unbounded() {
+                            "watch"
+                        } else {
+                            "ls"
+                        };
+                        let mut s = format!("{verb} {path:?}");
                         if !name_prefilter.is_empty() {
                             s.push_str(&format!("  # name-prefilter: {name_prefilter:?}"));
                         }
@@ -1469,6 +1498,45 @@ impl PlanGraph {
             } => exprs.iter().any(Expr::uses_regexp),
             _ => false,
         })
+    }
+
+    /// Does the plan contain an **unbounded** source (`watch`, §28.12)? The
+    /// runtime consults this before running: a build without the `unbounded`
+    /// feature refuses the plan explicitly (never-silent, the `regex`/`gzip`
+    /// shape), and the bounded-only execution strategies (parallel partition /
+    /// byte-range / group merge) step aside — an unbounded flow runs on the
+    /// serial streaming loop.
+    pub fn uses_unbounded(&self) -> bool {
+        self.nodes.iter().any(|n| match &n.op {
+            Op::Source { discovery, .. } => discovery.is_unbounded(),
+            _ => false,
+        })
+    }
+
+    /// The **boundedness-derived determinism tag** (§0.14 / §28.12 ratified
+    /// #149 ③): `tag[id]` is true iff `id` is an unbounded source or is
+    /// (transitively) downstream of one. Derived from the discovery's
+    /// boundedness on demand — never stored, so it cannot go stale and adds
+    /// nothing to serialization (`to_source` stays reversible for free). The
+    /// optimizer and the parallel executor must not re-order, re-combine or
+    /// rewrite nodes inside this set; byte-identity is asserted only on the
+    /// bounded complement.
+    pub fn unbounded_nodes(&self) -> Vec<bool> {
+        let mut tag = vec![false; self.nodes.len()];
+        let mut stack: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, Op::Source { discovery, .. } if discovery.is_unbounded()))
+            .map(|n| n.id)
+            .collect();
+        while let Some(id) = stack.pop() {
+            if tag[id] {
+                continue;
+            }
+            tag[id] = true;
+            stack.extend(self.outputs_of(id));
+        }
+        tag
     }
 
     pub fn add_node(&mut self, op: Op) -> NodeId {

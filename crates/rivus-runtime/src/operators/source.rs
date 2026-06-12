@@ -1059,3 +1059,31 @@ impl Operator for StreamRef {
         Vec::new()
     }
 }
+
+// ------------------------------------------------- source (unbounded, refused)
+
+/// Defense-in-depth stub for an unbounded `watch` source reaching the bounded
+/// engine (§28.12): `run_with_progress` refuses a feature-less plan **pre-run**
+/// (`RivusError::Build`, the `regex`/`gzip` shape), so this only fires if a
+/// caller builds operators directly — then it fails loudly (Fatal) instead of
+/// silently behaving like a one-shot `ls`.
+pub(crate) struct SourceUnboundedStub;
+
+impl Operator for SourceUnboundedStub {
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
+        ctx.raise(ErrorEvent::new(
+            Severity::Fatal,
+            ErrorScope::Graph,
+            "unbounded `watch` source cannot run in this build — rebuild with \
+             `--features unbounded` (the default build stays zero-dependency)"
+                .to_string(),
+        ));
+        None
+    }
+    fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        Vec::new()
+    }
+}
