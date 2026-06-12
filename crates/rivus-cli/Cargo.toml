@@ -23,3 +23,6 @@ default = []
 regex = ["rivus-runtime/regex"]
 gzip = ["rivus-runtime/gzip"]
 zstd = ["rivus-runtime/zstd"]
+# §28.12 (#149): the unbounded transport skeleton (`watch`). Off by default —
+# parse/explain always work; running an unbounded flow needs this feature.
+unbounded = ["rivus-runtime/unbounded"]

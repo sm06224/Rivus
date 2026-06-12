@@ -212,6 +212,13 @@ impl Operator for Take {
         self.remaining = 0;
         vec![chunk.gather(&idx)]
     }
+
+    /// A filled `take` passes nothing further — the saturation signal that
+    /// stops an **unbounded** source upstream (§28.12; bounded sources never
+    /// consult it, so the bounded serial loop is unchanged).
+    fn saturated(&self) -> bool {
+        self.remaining == 0
+    }
 }
 
 // ---------------------------------------------------------------------- sort
