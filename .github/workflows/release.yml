@@ -80,7 +80,10 @@ jobs:
       - name: Build release binary
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --locked -p rivus-cli --target ${{ matrix.target }}
+        # Distribution is fat (#149 ⑤): `full` = the curated feature set
+        # (regex/gzip/zstd — see rivus-cli's Cargo.toml). The *source tree's*
+        # cargo default stays lean/zero-dep; only what we ship is full-featured.
+        run: cargo build --release --locked -p rivus-cli --features full --target ${{ matrix.target }}
 
       - name: Resolve tag
         id: tag

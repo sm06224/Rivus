@@ -23,3 +23,8 @@ default = []
 regex = ["rivus-runtime/regex"]
 gzip = ["rivus-runtime/gzip"]
 zstd = ["rivus-runtime/zstd"]
+# The curated full-feature set for distributed binaries (#149 ⑤): the source
+# tree's cargo default stays lean (zero-dep), but releases ship fat — Rivus as
+# a future compiler can only emit what it embeds. release.yml builds with
+# `--features full`; add new ratified features here so distribution follows.
+full = ["regex", "gzip", "zstd"]
