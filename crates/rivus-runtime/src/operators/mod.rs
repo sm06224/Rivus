@@ -365,7 +365,8 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                 flat: *flat,
                 exprs: exprs.clone(),
                 codec: *codec,
-                buf: Vec::new(),
+                writer: None,
+                eval_fails: 0,
                 warned_missing: false,
             }),
         },
@@ -402,7 +403,9 @@ use transform::*;
 
 // Re-exports for `engine.rs` (which refers to these as `operators::X`).
 pub(crate) use aggregate::{group_parallel_safe, new_group, GroupBy};
-pub(crate) use sink::{write_csv_file, write_json_file, write_jsonl_file};
+pub(crate) use sink::{
+    json_object_row, write_cell, write_csv_file, write_json_file, write_jsonl_file,
+};
 pub(crate) use source::{bin_layout, bin_range_source, bin_schema};
 
 #[cfg(test)]
