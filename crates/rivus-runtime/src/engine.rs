@@ -2055,10 +2055,15 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
                 };
                 Some((path.as_str(), res, 0))
             }
-            // Partitioned route: every partition is attempted (continue-first
-            // inside `write_routed`); ALL failures are aggregated so the
-            // parallel path surfaces them like the serial operator does
-            // (never-silent across strategies, not just the first one).
+            // Partitioned route: stream the merged chunks through the same
+            // bounded LRU writer the serial operator uses (chunk-wise grouping,
+            // no whole-stream gather), so the merge path's peak memory no longer
+            // holds a second full copy of the output. Bytes and within-partition
+            // order are unchanged (shared formatters + stream order). Every
+            // partition is attempted (continue-first) and ALL failures are
+            // aggregated so the parallel path surfaces them like the serial
+            // operator does (never-silent across strategies, not just the first
+            // one).
             rivus_ir::Route::Template {
                 template,
                 by,
@@ -2066,15 +2071,28 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
                 exprs,
             } => {
                 let mut eval_fails = 0u64;
-                let fails = crate::route::write_routed(
-                    template,
-                    by,
-                    *flat,
-                    *codec,
-                    exprs,
-                    chunks,
-                    &mut eval_fails,
-                );
+                let mut writer = crate::route::RouteWriter::new(*codec);
+                for chunk in chunks {
+                    let groups = crate::route::group_by_path(
+                        std::slice::from_ref(chunk),
+                        template,
+                        by,
+                        *flat,
+                        *codec,
+                        exprs,
+                        &mut eval_fails,
+                    );
+                    writer.write_groups(groups);
+                }
+                // A partition that keeps failing fails once per chunk in the
+                // streaming writer; the aggregate surface stays one entry per
+                // partition (first error wins), as the buffered write reported.
+                let mut seen = std::collections::HashSet::new();
+                let fails: Vec<(String, std::io::Error)> = writer
+                    .finish()
+                    .into_iter()
+                    .filter(|(p, _)| seen.insert(p.clone()))
+                    .collect();
                 let res = if fails.is_empty() {
                     Ok(())
                 } else {
