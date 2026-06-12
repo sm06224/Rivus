@@ -21,12 +21,24 @@ flate2 = { version = "1", optional = true, default-features = false, features = 
 # (no C), MIT. Decode-only is all a reader needs; default features (std + the
 # pure-Rust `twox-hash` checksum) are all pure-Rust. See SUPPLY-CHAIN.md.
 ruzstd = { version = "0.8", optional = true }
+# Off-by-default (#149 ② amended ruling): OS file-change notification for the
+# unbounded `watch` discovery — subscribe to inotify / kqueue / FSEvents /
+# ReadDirectoryChangesW instead of polling (std polling rejected: needless OS
+# load). `notify` is the de-facto standard (notify-rs), latest stable line,
+# CC0-1.0. `macos_fsevent` (its only default feature) kept explicitly so macOS
+# uses FSEvents, not one-fd-per-file kqueue. See SUPPLY-CHAIN.md.
+notify = { version = "8.2", optional = true, default-features = false, features = [
+    "macos_fsevent",
+] }
 
 [features]
 default = []
 regex = ["dep:regex"]
 gzip = ["dep:flate2"]
 zstd = ["dep:ruzstd"]
+# #149 ⑤: unbounded transport skeleton (watch). parse/to_source stay always-std;
+# only evaluation needs this feature; feature-off runs refuse pre-run (§28.12).
+unbounded = ["dep:notify"]
 
 [dev-dependencies]
 rivus-parser.workspace = true
