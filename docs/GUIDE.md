@@ -219,6 +219,46 @@ open manifest.csv |> (resource(filepath)) as path  read with source
   `(source.uri)` is the file that row came from); `with filename` also adds a
   `filename` column.
 
+### `watch` — subscribe to file changes (unbounded)
+
+`watch "glob"` is the **unbounded** sibling of `ls`: instead of listing files
+once, it subscribes to the OS change notification (inotify / FSEvents / kqueue /
+ReadDirectoryChangesW) and emits a row **every time a matching file is created
+or modified** — a stream that never ends, with the same columns as `ls`
+(`path` / `name` / `size` / `mtime`), so `read` consumes it unchanged.
+
+```
+watch "in/*.csv"        # a row per created/modified file, forever
+  take 10               # bound it: the flow stops once take is full
+  read as csv           # read each changed file as it arrives
+  save out.csv
+```
+
+- **Feature-gated**: runs only in a build with `--features unbounded` (the
+  source tree's default build stays zero-dependency; the subscription uses the
+  vetted `notify` crate — see SUPPLY-CHAIN.md). Parsing and `rivus explain`
+  always work; *running* it in a default build is refused up front with this
+  exact rebuild guidance — never a silent wrong answer.
+- **It never ends on its own.** Bound it with `take N`, or stop the process.
+  Whole-stream operators (`|#` group, `sort`, `describe`, `join`, whole-stream
+  fills) are refused up front — they would wait for an end that never comes;
+  windows arrive in a later slice.
+- **Outside the determinism contract** (§0.14): arrival order is environmental.
+  Byte-identity still holds for everything *bounded*; an unbounded flow always
+  runs on the serial streaming loop, and the optimizer leaves the whole plan
+  alone (and says so — visible in `rivus explain`).
+- **Lossless backpressure**: events queue in a bounded buffer
+  (`RIVUS_WATCH_QUEUE`, default 1024) that blocks the producer when full —
+  nothing is dropped or sampled. Several notifications for one file within one
+  batch coalesce into a single row; the same file changing again later is a new
+  row (each change is a new handle).
+- **Capability boundary**: set `RIVUS_CAP_WATCH_PATHS` (comma-separated path
+  prefixes) to confine what may be watched; a root outside it is rejected as a
+  surfaced event and the run continues (continue-first). The allowlist is a
+  boundary, not a secret — credentials never ride the plan, the telemetry or
+  the error stream. Both env knobs are environment configuration, not data.
+- Deletions/renames emit nothing (there is nothing to read).
+
 ---
 
 ## 4. Transforms
