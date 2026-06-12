@@ -218,10 +218,11 @@ read as csv with source                 # 各行/chunk に由来 Resource を付
 | 27.5 長パス | Transport(File) の実装詳細（slice 1/2 で吸収） |
 | 27.6 Unicode/日本語パス&列名 | `Resource.uri`（UTF-8）＋識別子 Unicode（横断・別途） |
 
-## 28.12 slice 5 — 非有界 transport の骨組み（**批准依頼中**・§00 0.13/0.14/0.15）
+## 28.12 slice 5 — 非有界 transport の骨組み（**批准済 #149**・§00 0.13/0.14/0.15）
 
-> **状態：批准前。** 本節は slice 5 の設計案で、決定分岐は批准 issue（#143 形式）に上げる。
-> **裁可前にコードを書かない**（§25.10・自己マージ禁止）。slice 4（route）までは landed。
+> **状態：批准済（2026-06-12）。** 決定分岐①〜⑥は issue #149 で全裁定
+> （正式記録は #149 の裁定記録コメント。①③④＝推奨どおり裁可、**②＝修正裁定**、
+> **⑤⑥＝明確化付き裁可**）。本節は裁定反映済みの確定版＝実装 PR の契約。
 
 ### 28.12.0 狙いと不変条件
 非有界源（`watch`/`subscribe`/socket）を**一級**に扱う土台を、**既存の有界・決定的経路の
@@ -230,35 +231,78 @@ read as csv with source                 # 各行/chunk に由来 Resource を付
 - **既定ビルドは依存ゼロ・挙動不変**：非有界経路は **off-by-default feature** の裏。feature off
   のビルドは非有界 transport を一切コンパイルせず、有界フローのバイト・テスト・依存グラフは
   完全不変（slice 1〜4 の stress / optimizer_equiv はそのまま緑）。
+  **明確化（裁定⑤）**：「off-by-default」は**ソースツリーの cargo 既定値**の話であって
+  **配布物の話ではない**。配布バイナリは**厳選フル機能（fat）**でビルドする——Rivus は将来
+  コンパイラとして自蔵機能しか出力できない（自分に無い機能はリンクできない）ため、配布は
+  fat が正。gate の価値は「コア std-only の機械的保証・依存面の監査可能性・最小ビルドの
+  選択肢・CI が両構成を証明」。付帯是正（裁定済・slice 5 と独立の小 PR として先行可）：
+  現行 `release.yml` は default features のみでビルドしており gzip/zstd/regex も配布物に
+  入っていない → リリースビルドへ feature 指定追加＋`docs/RELEASE.md` に
+  「ソース既定 lean／配布 fat」を明文化。
 - **決定性境界（§0.14）**：非有界＋到着順は**決定的 op 集合の外側**。byte-identity 契約は
   **有界部分木に限定**し、非有界部分木は IR の**決定性タグ**で並べ替え・並列再結合の対象から外す。
+  なお `watch` の通知バッファ等の運用ノブと⑥の env 由来 allowlist は**環境設定であって
+  データではない**（決定性契約の外側の運用ノブ＝`read` の fd budget と同類）。
 - **never-silent / continue-first**：feature off で非有界フローを実行＝実行前 `RivusError::Build`
   で明示拒否（`regex`/`gzip` と同型）。capability 違反は fatal でなく**拒否イベント**で surface。
 - **メモリ有界**：非有界でもパススルー（filter/project/save・route streaming）は handle/chunk を
   逐次処理して破棄＝有界。集約（`|#`）は**窓が要る**ため slice 5 では**窓無し集約を拒否**（誘導
-  付き）。窓そのものは後続スライス。
+  付き）。窓そのものは後続スライス。④の境界キューは非有界経路にのみ導入し、**有界経路の
+  直列ループは不変**——実装 PR はこの不変を**テストで pin** する（裁定記録のレビュー付記）。
 
-### 28.12.1 スコープ（骨組みのみ）
-**含む**：①ローカル `watch`（std-only・依存ゼロ）= 変化したファイルの **handle を産む非有界
-Discovery**（既存 `read` が消費）／②非有界の IR 表現（boundedness ＋ 決定性タグ）／③背圧の
-配線／④feature-gate ＋ never-silent 拒否／⑤capability 拒否イベント機構。
-**含まない（後続スライス）**：socket/http transport（ネットワーク＝別 capability・依存検討）／
-窓（tumbling/sliding/session）／watermark／状態付き集約の非有界化。
+### 28.12.1 スコープ（骨組みのみ・裁定①）
+**含む**：①ローカル `watch` ＝ **OS の変更通知機構へのサブスクライブ**（裁定②・下記 28.12.1a）で
+変化したファイルの **handle を産む非有界 Discovery**（既存 `read` が消費）／②非有界の IR 表現
+（boundedness ＋ 決定性タグ）／③背圧の配線／④feature-gate ＋ never-silent 拒否／⑤capability
+拒否イベント機構。
+**含まない（後続スライス）**：socket/http transport（ネットワーク＝別 capability・依存検討・
+方向性は 28.12.5）／窓（tumbling/sliding/session）／watermark／状態付き集約の非有界化。
 
-### 28.12.2 IR / 構文（可逆・既存ノード非再形）
+### 28.12.1a `watch` の実装方式（裁定②・修正裁定）
+- **std polling は却下**：一定間隔で対象 glob を列挙し続ける方式は OS 負荷を無駄に増やす。
+- **OS の変更通知機構（inotify / kqueue / ReadDirectoryChangesW）へのサブスクライブ方式**とする。
+  統括明言：**「依存ゼロは原則であって、依存なしで実装可能になるまでは依存ありで可」**。
+  よって成熟クレートの採用可（第一候補 **`notify`**）。
+- 採用条件：`docs/SUPPLY-CHAIN.md` チェックリスト全項目（成熟度・維持者・推移依存 pin・
+  ライセンス・`cargo deny check --all-features`）を通し、結果を SUPPLY-CHAIN の選定表へ追記
+  （実装 PR）。**⑤の `unbounded` feature の裏に隔離**＝既定ビルドの依存ゼロは不変。
+
+### 28.12.2 IR / 構文（裁定③④・可逆・既存ノード非再形）
 - `Discovery` に **`Watch(glob)`**（非有界）を追加（`Fixed`/`Glob` の隣・**Op 非再形**＝Transport/
-  Route と同じ slot 追加方式）。`watch "glob"` で desugar、`to_source` 復元（可逆）。
+  Route と同じ slot 追加方式・新 `Op` なし）。`watch "glob"` で desugar、`to_source` 復元（可逆）。
 - `Op`／`PlanGraph` に **boundedness 由来の決定性タグ**（非有界部分木を最適化・並列が触らない）。
   parse/to_source は**常時 std**（IR 可逆）。評価のみ feature ゲート。
-- 背圧：エンジンは既に chunk 単位 pull。非有界では**境界付きキュー（満杯でブロック＝ロスレス）**を
-  オペレータ間に挟む（有界経路の直列ループは不変）。
+- 背圧（裁定④）：エンジンは既に chunk 単位 pull。非有界では**境界付きキュー（満杯でブロック＝
+  ロスレス）**をオペレータ間に挟む（有界経路の直列ループは不変・28.12.0 の pin 対象）。
+  drop-oldest / sampling は**既定では不可**（never-silent 違反。将来の明示オプトインのみ）。
 
-### 28.12.3 決定分岐（→ 批准 issue）
-①スコープ（骨組みのみ vs socket/http も今 vs 窓も今）／②`watch` の zero-dep 実装（std polling vs
-feature-gated `notify`）／③非有界の IR 表現（Discovery 性＋決定性タグ vs 新 Op）／④背圧
-（bounded-block vs drop/sample）／⑤feature-gate＋既定不変（off-by-default＋parse 常時 std＋
-never-silent vs 常時コンパイル）／⑥capability（拒否イベント機構を据える・local watch は read 権で
-自明）。**②③④⑤⑥ の推奨案＋根拠＋代替案は批准 issue 参照。**
+### 28.12.3 決定分岐の裁定（issue #149・2026-06-12）
+①スコープ＝**裁可（骨組みのみ）**。socket/http・窓は後続スライス。／②`watch`＝**修正裁定**：
+std polling 却下 → OS 通知サブスクライブ（`notify` 等・条件は 28.12.1a）。／③IR＝**裁可**：
+`Discovery::Watch` slot 追加＋決定性タグ・新 Op なし。／④背圧＝**裁可**：bounded pull・満杯
+ブロック・ロスレス。／⑤feature-gate＝**裁可（明確化付き）**：ソース既定 lean／配布 fat
+（28.12.0）。／⑥capability＝**裁可（明確化付き）**：拒否イベント機構＋秘匿に依らない境界設計
+（28.12.4）。
+
+### 28.12.4 capability の平面分離（裁定⑥・明確化）
+- capability は**秘匿（obscurity）で守る機構ではない**。allowlist は「機密」でなく「**境界**」——
+  読まれても破れないことが要件で、守るのは**実行時の強制**。
+- 秘匿すべき資格情報は**別レーン**：env 等から実行時供給し、**IR・`to_source`・テレメトリ・
+  エラーイベントに決して写さない**（「IR 可逆＝計画は全部見える」と矛盾させない）。
+- **拒否イベントには拒否対象のみ**を載せ、allowlist 全体は漏らさない（情報最小化）。
+
+### 28.12.5 附記：socket/http 後続スライスの方向性（統括裁可済・設計の種）
+1. **素のリスナーは存在しない**（「保護されたチャネルか、無しか」。例外は loopback のみ・
+   capability 明示許可制）。
+2. **既定態＝カーネル WireGuard に乗る（埋め込まない）**：capability で「信頼インターフェース
+   （wg 等）にしかバインドしない」を強制。Rivus 本体に暗号コード・依存は入らない
+   （Kilo / Cilium wg / KubeSpan と同型のオーケストレーション実績ある構図）。
+3. **feature-gated 代替＝QUIC（候補 quinn）**：1 接続にコントロール＋データのストリーム多重・
+   ストリーム毎流量制御が④の bounded pull と整合。
+4. **身元＝静的公開鍵**。allowlist＝許可ピア公開鍵リスト。コントロールプレーン署名の allowlist
+   更新で再起動なしにピア/権限を操作。配備成果物は IR そのもの。
+5. userspace WireGuard 埋め込み（boringtun 等）・TLS+CA は**非推奨**（前者は維持状況と IP 層の
+   重さ、後者は証明書ライフサイクルの運用負荷）。
 
 ## MVP / 次 / 将来
 
