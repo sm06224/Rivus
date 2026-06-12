@@ -10,7 +10,7 @@
 > s4a（Sink 統一 move-only）＝#144 landed。s4b（route 本体）＝**本PR**（#143 裁定反映：
 > 正準形 `save TEMPLATE [by KEY…] [as flat]`・プレースホルダ＝キー・null=Hive センチネル・
 > `%` 込み単射エスケープ・**基数上限 Fatal なし＝書き切る**・各ファイル byte-identical）。
-> 残: `{expr}` プレースホルダ（次スライス）・streaming per-partition writer＋LRU/spill（工学
+> s4b landed（#145）。s4c（`{expr}` 計算キー）＝本PR。残: streaming per-partition writer＋LRU/spill（工学
 > follow-up・現 MVP は finish 一括書き）。その後＝§28 slice 5（非有界骨組み）。
 > design は `docs/design/29-surface-convergence-and-union-views.md`（裁定反映済）。
 > §28 は slice 3 まで landed（次は slice 4 route 出力・§29 完了後）。レビュアー＝統括
@@ -131,6 +131,8 @@ cargo test --workspace --all-features   # gzip/zstd オラクル・stress 含む
 - 新 enum variant（`Value`/`DataType`/`ColumnData`/`Op` フィールド/`Access`）は
   **`cargo build --workspace --all-targets` の E0004/E0027/E0063 を潰し切る**（公開
   re-export の variant は dead-code 警告は出ない＝構築経路なしでも先行可）。
+- **sink に新しい失敗系を足すときは serial（operator）と parallel（`write_sink` 呼出 3 箇所）の
+  surface を対で確認**（#145 fix3・#146 で同型 divergence が 2 連発した教訓）。
 - force-push 不可。`reset --hard origin/main` 後の push は merge commit 経由で FF。
   上流 merge commit（committer `noreply@github.com`）は**amend しない**（公開済・乖離する）。
 

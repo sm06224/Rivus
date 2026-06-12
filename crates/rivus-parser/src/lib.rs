@@ -458,14 +458,47 @@ impl Parser {
                     // Template validation is declaration-time (never-silent).
                     let segs = parse_route_template(&path).map_err(|e| self.err(e))?;
                     let mut keys: Vec<String> = Vec::new();
+                    let mut exprs: Vec<Expr> = Vec::new();
                     for seg in &segs {
-                        if let RouteSeg::Key(k) = seg {
-                            if !keys.contains(k) {
-                                keys.push(k.clone());
+                        match seg {
+                            RouteSeg::Key(k) => {
+                                if !keys.contains(k) {
+                                    keys.push(k.clone());
+                                }
                             }
+                            // A computed placeholder (s4c, #143 ①): parse the
+                            // snippet through the normal expression grammar by
+                            // wrapping it in a one-item projection (the parens
+                            // delimit it exactly), so the two grammars can
+                            // never drift. Each is its own anonymous key.
+                            RouteSeg::Raw(raw) => {
+                                let wrapped = format!("__T:\n open __x\n |> ({raw}) as __k\n;");
+                                let sub = parse(&wrapped).map_err(|e| {
+                                    self.err(format!(
+                                        "invalid expression placeholder {{{raw}}} in save \
+                                         template: {e}"
+                                    ))
+                                })?;
+                                let expr = sub
+                                    .nodes
+                                    .iter()
+                                    .find_map(|n| match &n.op {
+                                        Op::ProjectExpr { items, .. } => {
+                                            items.first().map(|(e, _)| e.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                    .ok_or_else(|| {
+                                        self.err(format!(
+                                            "invalid expression placeholder {{{raw}}}"
+                                        ))
+                                    })?;
+                                exprs.push(expr);
+                            }
+                            RouteSeg::Lit(_) => {}
                         }
                     }
-                    let templated = !keys.is_empty();
+                    let templated = !keys.is_empty() || !exprs.is_empty();
                     if templated {
                         // A key that never reaches the path would silently add
                         // a directory level — refuse instead (#143 ①).
@@ -499,6 +532,7 @@ impl Parser {
                                 template: path,
                                 by: if templated { keys } else { by },
                                 flat,
+                                exprs,
                             },
                             transport: Transport::Local,
                             codec,
@@ -3122,6 +3156,9 @@ mod tests {
             // A literal-only {{x}} template keeps its `by` (review #145: fmt
             // must never turn a partitioned save into a fixed one).
             "F:\n open a.csv\n save \"out/o_{{x}}/\" by k\n;",
+            // Computed placeholders (s4c, #143 ①): the raw expression text
+            // round-trips verbatim.
+            "F:\n open a.csv\n save \"out/{substr(country,1,2)}_{id}.csv\"\n;",
         ] {
             let s = parse(src).unwrap().to_source();
             assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
@@ -3136,6 +3173,10 @@ mod tests {
         assert!(parse("F:\n open a.csv\n save \"out/{a.csv\"\n;").is_err());
         assert!(parse("F:\n open a.csv\n save \"out/\" as flat\n;").is_err());
         assert!(parse("F:\n open a.csv\n save \"out/\" by\n;").is_err());
+        // A computed placeholder is an anonymous key: `by` can only name {col}
+        // placeholders, and a broken snippet is a declaration-time error.
+        assert!(parse("F:\n open a.csv\n save \"out/{substr(a,1)}.csv\" by a\n;").is_err());
+        assert!(parse("F:\n open a.csv\n save \"out/{substr(}.csv\"\n;").is_err());
         // A redundant `by` matching the template canonicalizes away (the
         // placeholders are the keys), and the derived keys land on the IR.
         let g = parse("F:\n open a.csv\n save \"out/{country}.csv\" by country\n;").unwrap();

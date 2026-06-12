@@ -449,7 +449,7 @@ impl Codec {
 /// resource(s), the output mirror of `Discovery`. Today this is always a single
 /// fixed path (`save out.csv`); slice 4b adds the template / `by key`
 /// partitioned form (issue #143) as further variants, without re-shaping `Op`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Route {
     /// A single fixed output path — the v1 `save` destination.
     Fixed(String),
@@ -466,6 +466,11 @@ pub enum Route {
         template: String,
         by: Vec<String>,
         flat: bool,
+        /// Parsed expressions for the template's **computed** placeholders
+        /// (`{substr(id,22,4)}`, #143 ① / s4c), in `RouteSeg::Raw` order. Each
+        /// is its own anonymous partition key, evaluated per row. The raw
+        /// `template` stays authoritative for `to_source` (verbatim).
+        exprs: Vec<Expr>,
     },
 }
 
@@ -487,6 +492,9 @@ impl Route {
 pub enum RouteSeg {
     Lit(String),
     Key(String),
+    /// A computed placeholder's raw source text (`substr(id,22,4)`), parsed
+    /// into an [`Expr`] by the parser (carried on `Route::Template::exprs`).
+    Raw(String),
 }
 
 /// Parse a `save` template into segments (shared by the parser's
@@ -509,28 +517,31 @@ pub fn parse_route_template(s: &str) -> Result<Vec<RouteSeg>, String> {
             }
             '}' => return Err("unbalanced '}' in save template (use '}}' for a literal)".into()),
             '{' => {
-                let mut name = String::new();
+                // Collect to the matching '}' then classify: identifier text is
+                // a named column key; anything else is a computed-expression
+                // placeholder (s4c, #143 ①), parsed by the parser. A '}' inside
+                // the expression (e.g. in a string literal) is unsupported —
+                // it closes the placeholder and the snippet fails to parse
+                // (declaration-time, never silent).
+                let mut text = String::new();
                 loop {
                     match chars.next() {
                         Some('}') => break,
-                        Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' => name.push(ch),
-                        Some(ch) => {
-                            return Err(format!(
-                                "save template placeholder may only name a column \
-                                 ([A-Za-z0-9_]); found {ch:?} — expression placeholders \
-                                 are a follow-up slice"
-                            ))
-                        }
+                        Some(ch) => text.push(ch),
                         None => return Err("unclosed '{' in save template".into()),
                     }
                 }
-                if name.is_empty() {
+                if text.is_empty() {
                     return Err("empty '{}' placeholder in save template".into());
                 }
                 if !lit.is_empty() {
                     segs.push(RouteSeg::Lit(std::mem::take(&mut lit)));
                 }
-                segs.push(RouteSeg::Key(name));
+                if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    segs.push(RouteSeg::Key(text));
+                } else {
+                    segs.push(RouteSeg::Raw(text));
+                }
             }
             other => lit.push(other),
         }
@@ -828,6 +839,26 @@ impl Op {
                 preds: preds.iter().map(|p| p.bind_holes(bindings)).collect(),
                 fields: fields.clone(),
             },
+            Op::Sink {
+                route:
+                    Route::Template {
+                        template,
+                        by,
+                        flat,
+                        exprs,
+                    },
+                transport,
+                codec,
+            } => Op::Sink {
+                route: Route::Template {
+                    template: template.clone(),
+                    by: by.clone(),
+                    flat: *flat,
+                    exprs: exprs.iter().map(|e| e.bind_holes(bindings)).collect(),
+                },
+                transport: *transport,
+                codec: *codec,
+            },
             other => other.clone(),
         }
     }
@@ -835,6 +866,10 @@ impl Op {
     /// Collect the names of every `$x` value hole in this op's expressions.
     pub fn collect_holes(&self, out: &mut Vec<String>) {
         match self {
+            Op::Sink {
+                route: Route::Template { exprs, .. },
+                ..
+            } => exprs.iter().for_each(|e| e.collect_holes(out)),
             Op::Filter { pred } | Op::Validate { pred, .. } => pred.collect_holes(out),
             Op::ProjectExpr { items, .. } => items.iter().for_each(|(e, _)| e.collect_holes(out)),
             Op::FilterProject { preds, .. } => preds.iter().for_each(|p| p.collect_holes(out)),
@@ -1207,7 +1242,10 @@ impl Op {
             // for a plain path (a template's placeholders derive the keys, so
             // re-parsing restores the identical IR without the clause).
             Op::Sink {
-                route: Route::Template { template, by, flat },
+                route:
+                    Route::Template {
+                        template, by, flat, ..
+                    },
                 codec,
                 ..
             } => {
@@ -1230,7 +1268,10 @@ impl Op {
                 // on a raw '{' (a literal `{{x}}` template must keep its `by`
                 // or re-parsing would silently become a fixed save).
                 let templated = parse_route_template(template)
-                    .map(|segs| segs.iter().any(|g| matches!(g, RouteSeg::Key(_))))
+                    .map(|segs| {
+                        segs.iter()
+                            .any(|g| matches!(g, RouteSeg::Key(_) | RouteSeg::Raw(_)))
+                    })
                     .unwrap_or(false);
                 if !templated {
                     s.push_str(&format!(" by {}", by.join(" ")));
@@ -1422,6 +1463,10 @@ impl PlanGraph {
             Op::Filter { pred } | Op::Validate { pred, .. } => pred.uses_regexp(),
             Op::ProjectExpr { items, .. } => items.iter().any(|(e, _)| e.uses_regexp()),
             Op::FilterProject { preds, .. } => preds.iter().any(Expr::uses_regexp),
+            Op::Sink {
+                route: Route::Template { exprs, .. },
+                ..
+            } => exprs.iter().any(Expr::uses_regexp),
             _ => false,
         })
     }
