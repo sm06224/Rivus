@@ -1046,6 +1046,29 @@ impl Parser {
                     provenance: Provenance::Off,
                 }))
             }
+            // `watch "glob"` — the **unbounded** discovery (§28.12, ratified
+            // #149): subscribe to OS file-change notification and emit a handle
+            // row per changed file matching the glob (same bare-column shape as
+            // `ls`; `read` consumes it). Parsing is always-std (IR reversible);
+            // *evaluation* requires the off-by-default `unbounded` feature — a
+            // feature-less run refuses pre-run (never-silent).
+            Tok::Word(w) if w == "watch" => {
+                self.bump();
+                let pattern = match self.bump() {
+                    Tok::Str(s) => s,
+                    other => {
+                        return Err(self.err(format!(
+                            "watch expects a quoted glob pattern, found {other:?}"
+                        )))
+                    }
+                };
+                Ok(self.g.add_node(Op::Source {
+                    discovery: Discovery::Watch(pattern),
+                    transport: Transport::Local,
+                    codec: Codec::discover(),
+                    provenance: Provenance::Off,
+                }))
+            }
             // `readbin path [le|be] [packed|aligned] (name:type ...)`.
             Tok::Word(w) if w == "readbin" => {
                 self.bump();
@@ -2658,6 +2681,70 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn watch_unbounded_discovery_parses_and_round_trips() {
+        // `watch "glob"` (§28.12, ratified #149) → the unbounded discovery
+        // source (Watch + Codec::Discover). Parse / to_source are always-std
+        // (IR reversible); only evaluation is feature-gated.
+        let src = "W:\n watch \"in/*.csv\"\n read as csv\n take 5\n;";
+        let g = parse(src).unwrap();
+        assert!(matches!(
+            &g.nodes[0].op,
+            Op::Source {
+                discovery: Discovery::Watch(p),
+                codec: Codec::Discover { .. },
+                ..
+            } if p == "in/*.csv"
+        ));
+        let s = g.to_source();
+        assert!(s.contains("watch \"in/*.csv\""), "watch lost in {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+
+        // The boundedness-derived determinism tag (§0.14): the watch source and
+        // everything downstream carry it; a bounded sibling scope does not.
+        assert!(g.uses_unbounded());
+        let tag = g.unbounded_nodes();
+        assert!(
+            (0..g.nodes.len()).all(|i| tag[i]),
+            "all nodes of a watch flow are downstream of the unbounded source"
+        );
+        let two = parse("B:\n open data.csv\n;\nW:\n watch \"in/*.csv\"\n;").unwrap();
+        let tag2 = two.unbounded_nodes();
+        let bounded = two
+            .nodes
+            .iter()
+            .find(|n| {
+                matches!(
+                    &n.op,
+                    Op::Source {
+                        discovery: Discovery::Fixed(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap()
+            .id;
+        let unbounded = two
+            .nodes
+            .iter()
+            .find(|n| {
+                matches!(
+                    &n.op,
+                    Op::Source {
+                        discovery: Discovery::Watch(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap()
+            .id;
+        assert!(!tag2[bounded], "bounded sibling scope must stay untagged");
+        assert!(tag2[unbounded]);
+
+        // A non-string pattern is an explicit parse error (never-silent).
+        assert!(parse("W:\n watch in.csv\n;").is_err());
     }
 
     #[test]

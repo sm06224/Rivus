@@ -125,3 +125,57 @@ fn ls_zero_matches_warns_and_is_empty() {
         res.errors
     );
 }
+
+#[test]
+fn watch_blocking_op_is_refused_pre_run_with_guidance() {
+    // §28.12.0 (ratified #149 ①): a blocking operator downstream of the
+    // unbounded `watch` would emit only on a finish that never comes — refused
+    // pre-run with guidance, identically in every build (the plan-shape check
+    // runs before the feature gate; never-silent, no hang).
+    for flow in [
+        "W:\n watch \"in/*.csv\"\n read as csv\n sort id\n;",
+        "W:\n watch \"in/*.csv\"\n read as csv\n |# country sum:age\n;",
+    ] {
+        let g = rivus_parser::parse(flow).expect("parse is always-std");
+        let err = run(&g, RunOptions::default()).expect_err("must refuse pre-run");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unbounded") && msg.contains("take N"),
+            "guidance must name the cause and a way out: {msg}"
+        );
+    }
+}
+
+#[cfg(not(feature = "unbounded"))]
+#[test]
+fn watch_without_the_feature_is_refused_pre_run() {
+    // §28.12 (ratified #149 ⑤): the default (zero-dep) build cannot evaluate
+    // `watch` — explicit pre-run refusal with rebuild guidance (the
+    // `regex`/`gzip` shape), never a silent wrong answer. Parse/to_source
+    // stay always-std (exercised by the parser round-trip tests).
+    let g = rivus_parser::parse("W:\n watch \"in/*.csv\"\n read as csv\n take 1\n;")
+        .expect("parse is always-std");
+    let err = run(&g, RunOptions::default()).expect_err("must refuse pre-run");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--features unbounded"),
+        "refusal must guide the rebuild: {msg}"
+    );
+}
+
+#[test]
+fn watch_plan_is_not_touched_by_the_optimizer() {
+    // §28.12 (ratified #149 ③): the boundedness-derived determinism tag — the
+    // optimizer skips an unbounded plan entirely (skeleton posture) and says
+    // so in the report (observable-first).
+    let g = rivus_parser::parse("W:\n watch \"in/*.csv\"\n |? name == \"a.csv\"\n |> path\n;")
+        .expect("parse");
+    let before = g.to_source();
+    let (opt, report) = rivus_optimizer::optimize(g);
+    assert_eq!(opt.to_source(), before, "unbounded plan must be untouched");
+    assert!(
+        report.applied.iter().any(|l| l.contains("skipped")),
+        "the skip must be reported, got {:?}",
+        report.applied
+    );
+}

@@ -125,6 +125,37 @@ pub fn run_with_progress(
                 .into(),
         ));
     }
+    // §28.12.0 (ratified #149 ①): a blocking operator (group/sort/describe/
+    // join, or a whole-stream fill) downstream of an unbounded source emits
+    // only on finish — which never comes — so it would hang silently. Windows
+    // are a later slice; refuse with guidance (never-silent). Checked before
+    // the feature gate: the plan's *shape* is invalid in every build, so the
+    // message is the same with or without the feature.
+    if graph.uses_unbounded() {
+        let tag = graph.unbounded_nodes();
+        for node in &graph.nodes {
+            if tag[node.id] && node.op.is_blocking() {
+                return Err(RivusError::Build(format!(
+                    "`{}` needs the whole stream, but it is downstream of an unbounded \
+                     source (`watch`) that never ends — windowed aggregation is a later \
+                     slice; bound the stream first (e.g. `take N`) or remove `watch`",
+                    node.op.kind_str()
+                )));
+            }
+        }
+    }
+    // §28.12 (ratified #149 ⑤, never-silent): a build without the `unbounded`
+    // feature cannot evaluate an unbounded source (`watch`). Refuse the plan
+    // explicitly before running — the same shape as `regex`/`gzip`. Parsing and
+    // `rivus explain` stay always-std.
+    if cfg!(not(feature = "unbounded")) && graph.uses_unbounded() {
+        return Err(RivusError::Build(
+            "this flow uses an unbounded source (`watch`), but this build has the \
+             `unbounded` feature disabled — rebuild with `--features unbounded` (the \
+             default build stays zero-dependency)"
+                .into(),
+        ));
+    }
     let mut res = run_dispatch(graph, opts, hook)?;
     // Never-silent: a `$x` value hole that reaches execution with no binding
     // would evaluate to null in silence (e.g. running a template scope on its
@@ -1027,7 +1058,14 @@ fn try_parallel(
     let mut source: Option<NodeId> = None;
     for node in &graph.nodes {
         match &node.op {
-            Op::Source { .. } => {
+            Op::Source { discovery, .. } => {
+                // An unbounded source (`watch`, §28.12) never partitions or
+                // materializes — byte-identity is asserted only on bounded
+                // sub-DAGs, so the unbounded flow stays on the serial
+                // streaming loop (ratified #149 ③/④).
+                if discovery.is_unbounded() {
+                    return None;
+                }
                 if source.is_some() {
                     return None; // multiple sources → serial
                 }
