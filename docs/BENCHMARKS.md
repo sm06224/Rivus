@@ -1297,3 +1297,28 @@ strictly alternates two datetime formats every row: move-to-front mispredicts on
 every cell and pays one extra trial — that is the inherent move-to-front
 trade-off, and it is not a shape real datetime columns take (a column comes from
 one producer with one format). byte-identity holds in every case.
+
+## partitioned `save` route — buffered → bounded-memory streaming (#143 ③)
+
+The serial partitioned `save` first buffered the **whole** stream and wrote
+every partition on `finish`, so peak memory grew with the *data*, not with the
+open-file budget — a high-cardinality route blew up RSS. `SinkRoute` now
+streams each chunk's rows to their partition files as they arrive through an
+LRU pool of open handles (`RIVUS_ROUTE_FD_BUDGET`, default 512), evicting +
+reopening (append) under the budget. The bytes per file are unchanged (shared
+row formatters + within-partition stream order).
+
+Peak RSS (`VmHWM`), **1 M rows × 20,000 partitions**, CSV template
+`save "{k}.csv"`, `--memory low`, debug build:
+
+| | peak RSS | vs buffered |
+|---|---:|---:|
+| `main` 1acb14c (buffered, finish-write) | 4,638,844 KB | — |
+| this PR 298dce5 (streaming, LRU 512)    | **85,572 KB** | **≈ 1/54** |
+
+**Byte-identical**: all 20,000 output files md5-match between the two builds,
+and the eviction stress (`RIVUS_ROUTE_FD_BUDGET=1`, `chunk_size=1`, csv/jsonl/
+json) pins each file equal to the default large-budget run. Peak memory is now
+bounded by `min(distinct partitions, budget)` open writers + one input chunk,
+not the stream length. (The parallel-merge path still buffers its already-merged
+chunks; streaming it + spill is the remaining engineering, HANDOVER.)

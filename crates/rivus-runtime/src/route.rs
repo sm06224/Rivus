@@ -14,10 +14,12 @@
 //! real resource failure surfaces (per partition, continue-first — never a
 //! silent fallback to a different layout).
 
-use rivus_core::{Chunk, Value};
+use rivus_core::{Chunk, Schema, Value};
 use rivus_ir::Expr;
 use rivus_ir::{parse_route_template, RouteSeg, SinkCodec};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 
 /// The DuckDB/Hive-compatible partition directory name for a null key.
 pub const NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
@@ -183,6 +185,231 @@ pub fn group_by_path(
         }
     }
     order.into_iter().zip(groups).collect()
+}
+
+/// Default open-file budget for the streaming [`RouteWriter`]. Bounded so a
+/// high-cardinality partitioned save never exhausts file descriptors; the
+/// least-recently-used writer is flushed and closed when the budget is hit, and
+/// reopened (append) when its partition next receives a row. Comfortably under
+/// a typical 1024 fd ulimit.
+const ROUTE_FD_BUDGET: usize = 512;
+
+/// Persistent per-partition state, kept for **every** path ever opened (small:
+/// the path string plus two integers), so an evicted-then-reopened file appends
+/// without re-emitting its header and a JSON array closes exactly once.
+#[derive(Default)]
+struct PartMeta {
+    /// CSV header / JSON `[` already written (so a reopen appends).
+    header_done: bool,
+    /// Objects written so far (JSON array comma placement, across evictions).
+    json_items: u64,
+}
+
+/// An open partition writer plus its recency stamp (for LRU eviction).
+struct OpenFile {
+    w: BufWriter<File>,
+    last_used: u64,
+}
+
+/// **Streaming** partitioned writer (design §28.7 / #143 ③ engineering
+/// follow-up): routes rows to per-partition files **as chunks arrive**, holding
+/// at most [`ROUTE_FD_BUDGET`] files open at once (LRU eviction) instead of
+/// buffering the whole stream. The bytes per file are identical to the buffered
+/// [`write_routed`] — the same row formatters (`write_cell` / `json_object_row`)
+/// and the same within-partition stream order — so byte-identity (serial ==
+/// parallel == chunk-size) is preserved by construction; an eviction only
+/// flushes and reopens (append), never re-headers or reorders.
+pub struct RouteWriter {
+    codec: SinkCodec,
+    cap: usize,
+    clock: u64,
+    pool: HashMap<String, OpenFile>,
+    meta: HashMap<String, PartMeta>,
+    /// Per-partition write failures (continue-first: one bad path never stops
+    /// the others), surfaced by the caller.
+    failures: Vec<(String, std::io::Error)>,
+}
+
+impl RouteWriter {
+    pub fn new(codec: SinkCodec) -> Self {
+        // `RIVUS_ROUTE_FD_BUDGET` overrides the open-file budget (tests force a
+        // tiny budget to exercise evict/reopen; ops can raise it under a higher
+        // ulimit). Invalid / unset → the default.
+        let cap = std::env::var("RIVUS_ROUTE_FD_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(ROUTE_FD_BUDGET);
+        Self::with_cap(codec, cap)
+    }
+
+    /// Construct with an explicit open-file budget (≥ 1) — lets tests force
+    /// eviction with a tiny budget to pin evict/reopen byte-identity.
+    pub fn with_cap(codec: SinkCodec, cap: usize) -> Self {
+        RouteWriter {
+            codec,
+            cap: cap.max(1),
+            clock: 0,
+            pool: HashMap::new(),
+            meta: HashMap::new(),
+            failures: Vec::new(),
+        }
+    }
+
+    /// Route one input chunk's rows (already grouped by path) to disk. `groups`
+    /// comes straight from [`group_by_path`] on a single chunk, so each entry's
+    /// sub-chunks are exactly the rows destined for `path`.
+    pub fn write_groups(&mut self, groups: Vec<(String, Vec<Chunk>)>) {
+        for (path, subs) in groups {
+            if let Err(e) = self.append(&path, &subs) {
+                self.failures.push((path, e));
+            }
+        }
+    }
+
+    /// Append the rows of `subs` (all destined for `path`) to that partition's
+    /// file, opening / re-opening it as needed.
+    fn append(&mut self, path: &str, subs: &[Chunk]) -> std::io::Result<()> {
+        let nrows: usize = subs.iter().map(|c| c.len).sum();
+        if nrows == 0 {
+            return Ok(());
+        }
+        // Format the fragment first (no `self.pool` borrow), tracking the
+        // JSON-array item counter so commas stay correct across calls/evictions.
+        let mut items = self.meta.get(path).map_or(0, |m| m.json_items);
+        let mut frag = String::new();
+        match self.codec {
+            SinkCodec::Csv { delim } => {
+                let sep = delim as char;
+                for chunk in subs {
+                    for row in 0..chunk.len {
+                        for c in 0..chunk.columns.len() {
+                            if c > 0 {
+                                frag.push(sep);
+                            }
+                            crate::operators::write_cell(&mut frag, &chunk.columns[c], row, delim);
+                        }
+                        frag.push('\n');
+                    }
+                }
+            }
+            SinkCodec::Jsonl => {
+                for chunk in subs {
+                    let names = chunk.schema.field_names();
+                    for row in 0..chunk.len {
+                        crate::operators::json_object_row(&mut frag, chunk, &names, row);
+                        frag.push('\n');
+                    }
+                }
+            }
+            SinkCodec::Json => {
+                for chunk in subs {
+                    let names = chunk.schema.field_names();
+                    for row in 0..chunk.len {
+                        if items > 0 {
+                            frag.push(',');
+                        }
+                        crate::operators::json_object_row(&mut frag, chunk, &names, row);
+                        items += 1;
+                    }
+                }
+            }
+        }
+        let schema = subs[0].schema.clone();
+        let w = self.ensure_open(path, &schema)?;
+        w.write_all(frag.as_bytes())?;
+        if matches!(self.codec, SinkCodec::Json) {
+            self.meta.entry(path.to_string()).or_default().json_items = items;
+        }
+        Ok(())
+    }
+
+    /// Get (or open) the writer for `path`, writing the header / array-open on
+    /// the first open and evicting the LRU file if the budget is exceeded.
+    fn ensure_open(
+        &mut self,
+        path: &str,
+        schema: &Schema,
+    ) -> std::io::Result<&mut BufWriter<File>> {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(of) = self.pool.get_mut(path) {
+            of.last_used = now;
+            return Ok(&mut self.pool.get_mut(path).unwrap().w);
+        }
+        let first_open = !self.meta.get(path).is_some_and(|m| m.header_done);
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = if first_open {
+            File::create(path)?
+        } else {
+            OpenOptions::new().append(true).open(path)?
+        };
+        let mut w = BufWriter::with_capacity(64 * 1024, file);
+        if first_open {
+            match self.codec {
+                SinkCodec::Csv { delim } => {
+                    let sep = (delim as char).to_string();
+                    writeln!(w, "{}", schema.field_names().join(&sep))?;
+                }
+                SinkCodec::Jsonl => {}
+                SinkCodec::Json => write!(w, "[")?,
+            }
+            self.meta.entry(path.to_string()).or_default().header_done = true;
+        }
+        // Evict the LRU open file (flush first) before inserting the new one.
+        if self.pool.len() >= self.cap {
+            if let Some(victim) = self
+                .pool
+                .iter()
+                .min_by_key(|(_, of)| of.last_used)
+                .map(|(p, _)| p.clone())
+            {
+                if let Some(mut of) = self.pool.remove(&victim) {
+                    of.w.flush()?;
+                }
+            }
+        }
+        self.pool
+            .insert(path.to_string(), OpenFile { w, last_used: now });
+        Ok(&mut self.pool.get_mut(path).unwrap().w)
+    }
+
+    /// Close every partition: write the JSON array's `]` (each path opened, even
+    /// if since evicted), flush all open writers, and return the accumulated
+    /// per-partition failures. Paths are visited in sorted order for
+    /// deterministic error reporting.
+    pub fn finish(mut self) -> Vec<(String, std::io::Error)> {
+        if matches!(self.codec, SinkCodec::Json) {
+            let mut paths: Vec<String> = self.meta.keys().cloned().collect();
+            paths.sort();
+            for path in paths {
+                // Reopen (append) and close the array; a never-opened path can't
+                // occur (we only record meta on a real write).
+                let r = self
+                    .ensure_open(&path, &Schema::new(Vec::new()))
+                    .and_then(|w| {
+                        writeln!(w, "]")?;
+                        w.flush()
+                    });
+                if let Err(e) = r {
+                    self.failures.push((path, e));
+                }
+            }
+        }
+        // Flush whatever is still open (CSV/JSONL, or JSON just closed above).
+        let mut open: Vec<(String, OpenFile)> = self.pool.drain().collect();
+        open.sort_by(|a, b| a.0.cmp(&b.0));
+        for (path, mut of) in open {
+            if let Err(e) = of.w.flush() {
+                self.failures.push((path, e));
+            }
+        }
+        self.failures
+    }
 }
 
 /// Write every partition (creating parent directories), attempting **all** of

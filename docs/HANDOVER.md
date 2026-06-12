@@ -6,14 +6,18 @@
 （提案タグ v1.3.0-dev.15〜18 はカット待ち：…15=s2 系・…16=#141・…17=#142・…18=#144）。squash 後は
 `git fetch origin main && git reset --hard origin/main` して継続。
 
-> **現フォーカス＝§28 slice 4（route 出力）。§29 は s1-s4 全 landed（#136-#142）。**
-> s4a（Sink 統一 move-only）＝#144 landed。s4b（route 本体）＝**本PR**（#143 裁定反映：
-> 正準形 `save TEMPLATE [by KEY…] [as flat]`・プレースホルダ＝キー・null=Hive センチネル・
-> `%` 込み単射エスケープ・**基数上限 Fatal なし＝書き切る**・各ファイル byte-identical）。
-> s4b landed（#145）。s4c（`{expr}` 計算キー）＝本PR。残: streaming per-partition writer＋LRU/spill（工学
-> follow-up・現 MVP は finish 一括書き）。その後＝§28 slice 5（非有界骨組み）。
-> design は `docs/design/29-surface-convergence-and-union-views.md`（裁定反映済）。
-> §28 は slice 3 まで landed（次は slice 4 route 出力・§29 完了後）。レビュアー＝統括
+> **§28 slice 4（route 出力）完了。§29 は s1-s4 全 landed（#136-#142）。**
+> s4a（Sink 統一 move-only・#144）／s4b（route 本体・#145：正準形
+> `save TEMPLATE [by KEY…] [as flat]`・プレースホルダ＝キー・null=Hive センチネル・
+> `%`＋`.`/`..` 込み単射エスケープ・**基数上限 Fatal なし＝書き切る**・各ファイル
+> byte-identical）／s4c（`{expr}` 計算キー・#146）landed。**route streaming writer（serial
+> bounded-memory・`RouteWriter` LRU・`RIVUS_ROUTE_FD_BUDGET` 既定 512・evict/reopen は
+> append でヘッダ一度・JSON `[`/`]` メタ追跡・byte-identical）＝本PR**（#143 ③ の工学
+> follow-up・批准不要）。残工学：parallel マージ経路も streaming 化（現状は手元の merged
+> chunks を `write_routed` で在荷書き）・spill。
+> **次＝§28 slice 5（非有界 transport・watch/socket・feature-gate）＝design doc 先行＋
+> 批准 issue（#143 形式・§25.10 自己マージ禁止）が前段。**
+> design は `docs/design/28-io-substrate.md`（§28.7 に裁定反映済）。レビュアー＝統括
 > （人間）。各スライスは「**byte-identity 不変・to_source 可逆・依存ゼロ**」を実測で
 > 裏取りして承認 → squash-merge（統括の明示指示があれば自分で merge 可・自己判断は不可）。
 

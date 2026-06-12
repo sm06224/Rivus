@@ -459,6 +459,46 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         "route bytes must be serial == parallel"
     );
 
+    // Streaming bounded-memory writer (route follow-up): a tiny fd budget
+    // forces evict+reopen on (nearly) every row, yet the per-file bytes stay
+    // identical to the default (large-budget) run — header written once,
+    // append on reopen, JSON `[`/`]` closed exactly once.
+    for codec_save in ["{country}.csv", "{country}.jsonl", "{country}.json"] {
+        let flow = format!(
+            "R:\n open {p} (id:int country:str score:int)\n |> id country\n save \"{base}/sw/{codec_save}\"\n;"
+        );
+        let read_all = |sub: &str| -> Vec<(String, String)> {
+            let d = dir.join(sub);
+            let mut v: Vec<(String, String)> = std::fs::read_dir(&d)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| {
+                            (
+                                e.file_name().to_string_lossy().into_owned(),
+                                std::fs::read_to_string(e.path()).unwrap(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("RIVUS_ROUTE_FD_BUDGET", "1"); // force eviction
+        run_src(&flow, 1);
+        std::env::remove_var("RIVUS_ROUTE_FD_BUDGET");
+        let evicted = read_all("sw");
+        let _ = std::fs::remove_dir_all(&dir);
+        run_src(&flow, 4096); // default large budget, single chunk
+        let plain = read_all("sw");
+        assert_eq!(
+            evicted, plain,
+            "evict/reopen must be byte-identical for {codec_save}"
+        );
+        assert!(!evicted.is_empty(), "wrote files for {codec_save}");
+    }
+
     // Computed placeholder keys (s4c, #143 ①): each expression is its own
     // anonymous key, evaluated per row (chunk-size independent like the rest).
     for cz in [1usize, 4096] {

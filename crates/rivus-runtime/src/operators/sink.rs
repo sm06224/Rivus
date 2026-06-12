@@ -136,7 +136,7 @@ pub fn write_csv_file(path: &str, chunks: &[Chunk], delim: u8) -> std::io::Resul
 /// to that: numeric/bool/decimal lanes never contain the delimiter, `"`, or a
 /// newline so they are written verbatim; only a string cell that does is quoted
 /// with `"` doubled.
-fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
+pub(crate) fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8) {
     use std::fmt::Write as _;
     // Null → an unquoted empty field (design 26 §26.5). A real empty string is a
     // valid `Str` cell and falls through to the lane below, so the two stay
@@ -300,7 +300,7 @@ pub fn write_jsonl_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
 }
 
 /// Append one row as a JSON object to `out`.
-fn json_object_row(out: &mut String, chunk: &Chunk, names: &[&str], row: usize) {
+pub(crate) fn json_object_row(out: &mut String, chunk: &Chunk, names: &[&str], row: usize) {
     out.push('{');
     for (c, name) in names.iter().enumerate() {
         if c > 0 {
@@ -492,21 +492,30 @@ fn json_string(out: &mut String, s: &str) {
 // ---------------------------------------------------------------- sink: route
 
 /// Partitioned / dynamic-output sink (design §28.7, ratified #143):
-/// `save "out/{country}.csv"` / `save "out/" by k [as flat]`. Collects the
-/// stream and writes every partition on finish through `crate::route` — the
-/// same core the parallel single-write merge uses, so the bytes per file are
-/// identical across serial / parallel / chunk-size. Buffering the stream is
-/// the MVP (the parallel collector already does); streaming per-partition
-/// writers with an LRU handle pool are the follow-up engineering the #143
-/// ruling leaves to implementation judgement.
+/// `save "out/{country}.csv"` / `save "out/" by k [as flat]`. **Streams** rows
+/// to per-partition files as chunks arrive through a bounded LRU handle pool
+/// ([`crate::route::RouteWriter`]) — no longer buffering the whole stream, so a
+/// high-cardinality save stays bounded-memory. The bytes per file are identical
+/// to the buffered [`crate::route::write_routed`] the parallel merge still uses
+/// (shared row formatters + within-partition stream order), so byte-identity
+/// (serial == parallel == chunk-size) holds.
 pub(crate) struct SinkRoute {
     pub(crate) template: String,
     pub(crate) by: Vec<String>,
     pub(crate) flat: bool,
     pub(crate) exprs: Vec<Expr>,
     pub(crate) codec: rivus_ir::SinkCodec,
-    pub(crate) buf: Vec<Chunk>,
+    pub(crate) writer: Option<crate::route::RouteWriter>,
+    pub(crate) eval_fails: u64,
     pub(crate) warned_missing: bool,
+}
+
+impl SinkRoute {
+    fn writer(&mut self) -> &mut crate::route::RouteWriter {
+        let codec = self.codec;
+        self.writer
+            .get_or_insert_with(|| crate::route::RouteWriter::new(codec))
+    }
 }
 
 impl Operator for SinkRoute {
@@ -532,31 +541,37 @@ impl Operator for SinkRoute {
                 }
             }
         }
-        self.buf.push(chunk);
-        Vec::new()
-    }
-
-    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        // Every partition is attempted (continue-first): one unwritable path
-        // surfaces and the rest still land — never a silent fallback (#143 ③).
-        let mut eval_fails = 0u64;
-        let failures = crate::route::write_routed(
+        // Route this chunk's rows immediately (bounded memory): group by path,
+        // then stream each group to its partition file.
+        let groups = crate::route::group_by_path(
+            std::slice::from_ref(&chunk),
             &self.template,
             &self.by,
             self.flat,
             self.codec,
             &self.exprs,
-            &self.buf,
-            &mut eval_fails,
+            &mut self.eval_fails,
         );
-        if eval_fails > 0 {
+        self.writer().write_groups(groups);
+        Vec::new()
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        // Close all partitions (continue-first): one unwritable path surfaces
+        // and the rest still land — never a silent fallback (#143 ③).
+        let failures = match self.writer.take() {
+            Some(w) => w.finish(),
+            None => Vec::new(),
+        };
+        if self.eval_fails > 0 {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Recoverable,
                     ErrorScope::Item,
                     format!(
-                        "save route: {eval_fails} value(s) could not be evaluated in a \
+                        "save route: {} value(s) could not be evaluated in a \
                          computed placeholder; routed to the {} partition",
+                        self.eval_fails,
                         crate::route::NULL_PARTITION
                     ),
                 )

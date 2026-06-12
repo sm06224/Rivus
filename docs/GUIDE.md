@@ -904,7 +904,9 @@ A quoted `save` path may **route rows to many files** by their key values
 - **Written out in full** (#143): a partitioned save is an explicit opt-in —
   there is no preventive cardinality cap and never a silent fallback to a
   single file; an unwritable partition surfaces on the error stream while the
-  other partitions continue.
+  other partitions continue. The partitioned writer is **bounded-memory** — it
+  streams rows to files as they arrive through an LRU pool of open handles
+  (`RIVUS_ROUTE_FD_BUDGET`, default 512), not by buffering the whole result.
 
 ---
 
