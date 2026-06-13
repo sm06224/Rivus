@@ -73,6 +73,7 @@ hidden serialization / opaque optimizer / runtime magic without observability。
 | 27 | [filesystem-io](27-filesystem-io.md) | 一部（§28 に吸収） | ファイルシステム統合のユースケース集（`filename`・再帰グロブ・動的/分割出力・長パス・Unicode）。**§28 I/O サブストレートに吸収・一般化**（§28.11 に対応表）。slice 1=PR #114 は park |
 | 28 | [io-substrate](28-io-substrate.md) | 設計中（§00 Phase 1） | **I/O サブストレート（ピラー1）**：`Resource` handle 第一級値型 ＋ Discovery/Transport/Codec/Provenance 直交4層 ＋ discovery-as-flow ＋ 形式非依存 codec。ファイル中心 I/O 結合を壊して再建、既存の byte-identity/null/zero-dep を保存して載せ替え。§27 を吸収。**批准必須・自己マージ禁止**。批准後 §28.10 のスライス |
 | 29 | [surface-convergence-and-union-views](29-surface-convergence-and-union-views.md) | 設計中（phase-0） | **Surface 収束 ＋ 共用体的ユーザー型**：cast/rename/projection の複数入口を `\|>`（`Op::ProjectExpr`）の **`:` 定義チェーン**一本に収束（byte-identity 不変）。記号原則（`()`=式・`{}`=ブロック・`:`=定義・軽→重）。**共用体的ユーザー型**＝「物理1列＋多重論理ビュー」（struct lane 物理新設なし・zero-copy オフセットビュー・§28 binary 統合）。テキスト複合 vs 構造体複合の3軸差異。**批准必須・自己マージ禁止**。批准後 s1〜s4 |
+| 30 | [windowing](30-windowing.md) | 設計中（phase-0） | **窓スライス**：event-time 窓（`tumbling`/`sliding`/`session`・締める基準＝ts 列＝データの値＝決定的・byte-identity 保持）と arrival/processing 窓（締める基準＝到着順・実時刻＝非決定）の**二分原則**（裁定 A）。`Op::GroupBy` へ `window: Option<Window>` 直交スロット（新 `Op` なし・`None`＝挙動不変・to_source 可逆）。段階 6a（有界 tumbling・watch 非依存・即実用）→6b（sliding/session）→6c（非有界＋watermark＋late＝counted+surface）→6d（arrival・opt-in＋never-silent warn）。#41 f64 集約制約を継承・決定性タグ（`unbounded_nodes`）は**窓で打ち切らない**（有界 event-time のみ元々タグ無し）。**批准必須・自己マージ禁止**。issue #154 裁定反映・批准後 6a〜6d |
 
 ## 段階設計（MVP → 最適化 → JIT/分散）
 
