@@ -30,5 +30,4 @@ unbounded = ["rivus-runtime/unbounded"]
 # tree's cargo default stays lean (zero-dep), but releases ship fat — Rivus as
 # a future compiler can only emit what it embeds. release.yml builds with
 # `--features full`; add new ratified features here so distribution follows.
-# (`unbounded` joining `full` is a pending maintainer decision — skeleton stage.)
-full = ["regex", "gzip", "zstd"]
+full = ["regex", "gzip", "zstd", "unbounded"]

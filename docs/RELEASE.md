@@ -30,9 +30,9 @@ about what users receive. The default `cargo build` stays **lean / zero-dep**
 (the machine-checked guarantee that the core is std-only, the auditable
 dependency surface, and the minimal-build option; CI proves both
 configurations). **Released binaries are built fat** with the curated `full`
-feature of `rivus-cli` (`full = regex + gzip + zstd` today): Rivus as a future
-compiler can only emit functionality it embeds — a feature missing from the
-shipped binary can never be linked in afterwards. When a new feature is
+feature of `rivus-cli` (`full = regex + gzip + zstd + unbounded` today): Rivus
+as a future compiler can only emit functionality it embeds — a feature missing
+from the shipped binary can never be linked in afterwards. When a new feature is
 ratified, add it to `full` so distribution follows automatically
 (`release.yml` builds with `--features full`).
 
