@@ -128,17 +128,22 @@ pub fn run_with_progress(
     // §28.12.0 (ratified #149 ①): a blocking operator (group/sort/describe/
     // join, or a whole-stream fill) downstream of an unbounded source emits
     // only on finish — which never comes — so it would hang silently. Windows
-    // are a later slice; refuse with guidance (never-silent). Checked before
-    // the feature gate: the plan's *shape* is invalid in every build, so the
-    // message is the same with or without the feature.
+    // are a later slice; refuse with guidance (never-silent). `take N` is NOT
+    // offered as the fix (#154 ruling (b)): it bounds the row *count* but not
+    // *which* rows arrive (arrival order is environmental, §0.14), so a
+    // take-then-aggregate result would be non-deterministic — the refusal
+    // stays; only the wording dropped `take N`. Checked before the feature
+    // gate: the plan's *shape* is invalid in every build, so the message is the
+    // same with or without the feature.
     if graph.uses_unbounded() {
         let tag = graph.unbounded_nodes();
         for node in &graph.nodes {
             if tag[node.id] && node.op.is_blocking() {
                 return Err(RivusError::Build(format!(
                     "`{}` needs the whole stream, but it is downstream of an unbounded \
-                     source (`watch`) that never ends — windowed aggregation is a later \
-                     slice; bound the stream first (e.g. `take N`) or remove `watch`",
+                     source (`watch`) that never ends — aggregating an unbounded source \
+                     needs a window (a later slice); remove `watch`, or wait for the \
+                     windowing slice",
                     node.op.kind_str()
                 )));
             }

@@ -135,13 +135,24 @@ fn watch_blocking_op_is_refused_pre_run_with_guidance() {
     for flow in [
         "W:\n watch \"in/*.csv\"\n read as csv\n sort id\n;",
         "W:\n watch \"in/*.csv\"\n read as csv\n |# country sum:age\n;",
+        // #154: `take N` before the aggregate is STILL refused — it recovers
+        // termination but not determinism, so the mechanism is unchanged.
+        "W:\n watch \"in/*.csv\"\n read as csv\n take 5\n |# country sum:age\n;",
     ] {
         let g = rivus_parser::parse(flow).expect("parse is always-std");
         let err = run(&g, RunOptions::default()).expect_err("must refuse pre-run");
         let msg = err.to_string();
         assert!(
-            msg.contains("unbounded") && msg.contains("take N"),
-            "guidance must name the cause and a way out: {msg}"
+            msg.contains("unbounded") && msg.contains("window"),
+            "guidance must name the cause and the windowing way out: {msg}"
+        );
+        // #154 ruling (b): `take N` is NOT offered as the fix — it bounds the
+        // row count but not which rows arrive (arrival order is environmental),
+        // so a take-then-aggregate result would be non-deterministic. The
+        // refusal mechanism is unchanged; only the wording dropped `take N`.
+        assert!(
+            !msg.contains("take"),
+            "must not suggest `take` to bound an unbounded aggregation: {msg}"
         );
     }
 }
