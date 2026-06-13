@@ -1,6 +1,6 @@
 # セッション・ハンドオーバー（次セッションの実装担当へ）
 
-最終更新: 2026-06-10 ／ ブランチ運用：**テーマ毎に main 基底の `claude/design-…` を
+最終更新: 2026-06-12 ／ ブランチ運用：**テーマ毎に main 基底の `claude/design-…` を
 1本切り、常に唯一の開いた PR**（統括承認 2026-06-10。旧指定 `claude/eager-bohr-HsrXO`
 の remote は §28 squash 済みの非祖先 tip で放置・使わない）。版数 **`1.3.0-dev`**
 （提案タグ v1.3.0-dev.15〜18 はカット待ち：…15=s2 系・…16=#141・…17=#142・…18=#144）。squash 後は
@@ -10,11 +10,14 @@
 > s4a（Sink 統一 move-only・#144）／s4b（route 本体・#145：正準形
 > `save TEMPLATE [by KEY…] [as flat]`・プレースホルダ＝キー・null=Hive センチネル・
 > `%`＋`.`/`..` 込み単射エスケープ・**基数上限 Fatal なし＝書き切る**・各ファイル
-> byte-identical）／s4c（`{expr}` 計算キー・#146）landed。**route streaming writer（serial
-> bounded-memory・`RouteWriter` LRU・`RIVUS_ROUTE_FD_BUDGET` 既定 512・evict/reopen は
-> append でヘッダ一度・JSON `[`/`]` メタ追跡・byte-identical）＝本PR**（#143 ③ の工学
-> follow-up・批准不要）。残工学：parallel マージ経路も streaming 化（現状は手元の merged
-> chunks を `write_routed` で在荷書き）・spill。
+> byte-identical）／s4c（`{expr}` 計算キー・#146）／route streaming writer（serial
+> bounded-memory・`RouteWriter` LRU・`RIVUS_ROUTE_FD_BUDGET` 既定 512・#147）landed。
+> **parallel マージ経路の streaming 化＝本コミット**（#143 ③ part 2・批准不要：
+> `write_sink` の Template 腕が merged chunks を chunk 単位で同じ `RouteWriter` に流す。
+> 在荷 `write_routed` は `#[cfg(test)]` オラクル化・streamed≡buffered を unit で pin・
+> 1M×20k で RSS ≈1/31 実測・JSON は budget≪基数の worst case で wall ×3（budget≥基数で
+> +12% まで回復・BENCHMARKS 参照）・budget>ulimit は EMFILE を partition 毎に集約 surface）。
+> 残工学：collected worker outputs 自体の spill（または route の per-worker part file 化）。
 > **次＝§28 slice 5（非有界 transport・watch/socket・feature-gate）＝design doc 先行＋
 > 批准 issue（#143 形式・§25.10 自己マージ禁止）が前段。**
 > design は `docs/design/28-io-substrate.md`（§28.7 に裁定反映済）。レビュアー＝統括
