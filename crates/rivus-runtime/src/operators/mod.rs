@@ -105,6 +105,14 @@ pub trait Operator {
     fn inference(&self) -> Vec<(String, DataType, bool)> {
         Vec::new()
     }
+    /// Will this operator pass **no further rows** no matter what arrives
+    /// (e.g. a `take N` that has emitted its N)? The engine uses this to stop
+    /// an **unbounded** source whose every downstream path is saturated — the
+    /// only self-termination an endless stream has (§28.12). Bounded sources
+    /// never consult it (the bounded serial loop is unchanged — pinned).
+    fn saturated(&self) -> bool {
+        false
+    }
 }
 
 /// Write a text sink: the `-` sentinel writes stdout, otherwise a file.
@@ -266,12 +274,28 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                         .with_provenance(*provenance, path),
                 ),
                 // `ls` discovery: enumerate the glob (`path` is the pattern) into a
-                // Resource stream; no codec decode, no provenance.
-                Codec::Discover { name_prefilter } => Box::new(SourceDiscover::new(
-                    path.to_string(),
-                    chunk_size,
-                    name_prefilter.clone(),
-                )),
+                // Resource stream; no codec decode, no provenance. The unbounded
+                // `watch` discovery (§28.12) is dispatched apart: its evaluator is
+                // feature-gated; `run_with_progress` refuses a feature-less plan
+                // pre-run, so the feature-less stub is defense-in-depth (a caller
+                // that skips the engine still gets a loud Fatal, never a silent
+                // `ls`-like one-shot scan).
+                Codec::Discover { name_prefilter } => {
+                    if discovery.is_unbounded() {
+                        #[cfg(feature = "unbounded")]
+                        let src: Box<dyn Operator> =
+                            Box::new(SourceWatch::new(path.to_string(), chunk_size));
+                        #[cfg(not(feature = "unbounded"))]
+                        let src: Box<dyn Operator> = Box::new(SourceUnboundedStub);
+                        src
+                    } else {
+                        Box::new(SourceDiscover::new(
+                            path.to_string(),
+                            chunk_size,
+                            name_prefilter.clone(),
+                        ))
+                    }
+                }
             }
         }
         Op::Read { fmt, provenance } => Box::new(Read::new(*fmt, *provenance, chunk_size)),
@@ -391,6 +415,10 @@ mod read;
 mod sink;
 mod source;
 mod transform;
+// The unbounded `watch` evaluator (§28.12) — the only feature-gated operator
+// module; the default build does not compile it (zero-dep invariant).
+#[cfg(feature = "unbounded")]
+mod watch;
 
 // Flat shared namespace: each submodule pulls these via `use super::*`, and the
 // dispatch/tests below see the submodules' items via these globs.
@@ -400,6 +428,8 @@ use read::*;
 use sink::*;
 use source::*;
 use transform::*;
+#[cfg(feature = "unbounded")]
+use watch::SourceWatch;
 
 // Re-exports for `engine.rs` (which refers to these as `operators::X`).
 pub(crate) use aggregate::{group_parallel_safe, new_group, GroupBy};

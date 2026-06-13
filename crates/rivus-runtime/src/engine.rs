@@ -125,6 +125,37 @@ pub fn run_with_progress(
                 .into(),
         ));
     }
+    // §28.12.0 (ratified #149 ①): a blocking operator (group/sort/describe/
+    // join, or a whole-stream fill) downstream of an unbounded source emits
+    // only on finish — which never comes — so it would hang silently. Windows
+    // are a later slice; refuse with guidance (never-silent). Checked before
+    // the feature gate: the plan's *shape* is invalid in every build, so the
+    // message is the same with or without the feature.
+    if graph.uses_unbounded() {
+        let tag = graph.unbounded_nodes();
+        for node in &graph.nodes {
+            if tag[node.id] && node.op.is_blocking() {
+                return Err(RivusError::Build(format!(
+                    "`{}` needs the whole stream, but it is downstream of an unbounded \
+                     source (`watch`) that never ends — windowed aggregation is a later \
+                     slice; bound the stream first (e.g. `take N`) or remove `watch`",
+                    node.op.kind_str()
+                )));
+            }
+        }
+    }
+    // §28.12 (ratified #149 ⑤, never-silent): a build without the `unbounded`
+    // feature cannot evaluate an unbounded source (`watch`). Refuse the plan
+    // explicitly before running — the same shape as `regex`/`gzip`. Parsing and
+    // `rivus explain` stay always-std.
+    if cfg!(not(feature = "unbounded")) && graph.uses_unbounded() {
+        return Err(RivusError::Build(
+            "this flow uses an unbounded source (`watch`), but this build has the \
+             `unbounded` feature disabled — rebuild with `--features unbounded` (the \
+             default build stays zero-dependency)"
+                .into(),
+        ));
+    }
     let mut res = run_dispatch(graph, opts, hook)?;
     // Never-silent: a `$x` value hole that reaches execution with no binding
     // would evaluate to null in silence (e.g. running a template scope on its
@@ -316,6 +347,40 @@ fn build_ops(
 /// Drive the DAG to completion with a pre-built operator set (the chunk-granular
 /// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
 #[allow(clippy::too_many_arguments)]
+/// Could a chunk pulled from `src` still have an observable effect — is there a
+/// path from `src` to a sink / leaf capture that does not pass a **saturated**
+/// operator (a `take N` that has emitted its N)? When no such path remains, an
+/// **unbounded** source stops (§28.12) — its only self-termination. Memoized
+/// per node (saturation is a node property, path-independent). Only consulted
+/// for unbounded sources; a bounded source never early-stops (pinned by test).
+fn unbounded_effect_remains(graph: &PlanGraph, src: NodeId, ops: &[Box<dyn Operator>]) -> bool {
+    fn effect(
+        graph: &PlanGraph,
+        n: NodeId,
+        ops: &[Box<dyn Operator>],
+        memo: &mut [Option<bool>],
+    ) -> bool {
+        if let Some(v) = memo[n] {
+            return v;
+        }
+        memo[n] = Some(false); // DAG, but guard anyway
+        let v = if ops[n].saturated() {
+            false
+        } else {
+            let outs = graph.outputs_of(n);
+            // A leaf (sink, print, or engine capture) is the observable effect.
+            outs.is_empty() || outs.into_iter().any(|m| effect(graph, m, ops, memo))
+        };
+        memo[n] = Some(v);
+        v
+    }
+    let mut memo: Vec<Option<bool>> = vec![None; graph.nodes.len()];
+    graph
+        .outputs_of(src)
+        .into_iter()
+        .any(|m| effect(graph, m, ops, &mut memo))
+}
+
 fn drive(
     graph: &PlanGraph,
     mut ops: Vec<Box<dyn Operator>>,
@@ -335,6 +400,15 @@ fn drive(
 
     // Only a sink-less, non-blocking flow may stop the source early on a cap.
     let must_drain = must_drain(graph);
+
+    // §28.12: per-node flag for unbounded sources (`watch`). Only these consult
+    // the downstream-saturation check below — a bounded source keeps the exact
+    // drain-to-exhaustion loop (pinned by test).
+    let unbounded_src: Vec<bool> = graph
+        .nodes
+        .iter()
+        .map(|nd| matches!(&nd.op, Op::Source { discovery, .. } if discovery.is_unbounded()))
+        .collect();
 
     let mut in_q: Vec<VecDeque<(NodeId, Chunk)>> = (0..n).map(|_| VecDeque::new()).collect();
     let mut done = vec![false; n];
@@ -386,6 +460,14 @@ fn drive(
 
             if ops[nid].is_source() {
                 if preview_satisfied {
+                    finished_now = true;
+                } else if unbounded_src[nid] && !unbounded_effect_remains(graph, nid, &ops) {
+                    // §28.12: every downstream path from this unbounded source
+                    // passes a saturated operator (a filled `take N`) — nothing
+                    // it could ever emit is observable anymore. Stop it: the
+                    // only self-termination an endless stream has. Checked
+                    // *before* pull, so a satisfied flow never re-enters the
+                    // blocking wait.
                     finished_now = true;
                 } else {
                     let mut ctx = OpCtx {
@@ -1027,7 +1109,14 @@ fn try_parallel(
     let mut source: Option<NodeId> = None;
     for node in &graph.nodes {
         match &node.op {
-            Op::Source { .. } => {
+            Op::Source { discovery, .. } => {
+                // An unbounded source (`watch`, §28.12) never partitions or
+                // materializes — byte-identity is asserted only on bounded
+                // sub-DAGs, so the unbounded flow stays on the serial
+                // streaming loop (ratified #149 ③/④).
+                if discovery.is_unbounded() {
+                    return None;
+                }
                 if source.is_some() {
                     return None; // multiple sources → serial
                 }

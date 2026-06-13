@@ -208,6 +208,41 @@ open manifest.csv |> (resource(filepath)) as path  read with source
 - **provenance**：`with source` は各ファイルのハンドルを行に載せ（`(source.uri)` がその行の
   由来ファイル）、`with filename` はさらに `filename` 列を付与します。
 
+### `watch` — ファイル変更の購読（非有界）
+
+`watch "glob"` は `ls` の**非有界**版です：一度だけ一覧するのではなく、OS の変更通知
+（inotify / FSEvents / kqueue / ReadDirectoryChangesW）を購読し、glob に合致するファイルが
+**作成・変更されるたびに** 1 行を産みます — 終わらないストリームで、列は `ls` と同じ
+（`path` / `name` / `size` / `mtime`）なので `read` がそのまま消費できます。
+
+```
+watch "in/*.csv"        # 作成/変更されたファイルごとに 1 行、ずっと
+  take 10               # 有界化：take が満ちたらフローは停止
+  read as csv           # 届いた変更ファイルを順に読む
+  save out.csv
+```
+
+- **feature ゲート**：`--features unbounded` でビルドした時だけ実行できます（ソースツリーの
+  既定ビルドは依存ゼロのまま。購読は審査済みの `notify` クレート — SUPPLY-CHAIN.md 参照）。
+  パースと `rivus explain` は常に動作し、既定ビルドでの*実行*は再ビルド誘導つきで実行前に
+  明示拒否されます — 黙った誤答はありません。
+- **自分からは終わりません。** `take N` で有界化するか、プロセスを停止してください。
+  全ストリームが必要な演算（`|#` 集約・`sort`・`describe`・`join`・全列 fill）は実行前に
+  拒否されます — 来ない終端を待ち続けるため。窓は後続スライスで入ります。
+- **決定性契約の外**（§0.14）：到着順は環境依存です。*有界*な部分の byte-identity は
+  従来どおり成立します。非有界フローは常に serial streaming ループで動き、optimizer は
+  プラン全体に手を付けません（その旨を `rivus explain` に表示）。
+- **ロスレス背圧**：イベントは有界バッファ（`RIVUS_WATCH_QUEUE`・既定 1024）に積まれ、
+  満杯時は供給側がブロックします — 取りこぼしも間引きもありません。同一ファイルへの複数
+  通知は 1 バッチ内でのみ合流して 1 行に、後から再度変更されれば新しい行になります
+  （変更ごとに新しいハンドル）。
+- **capability 境界**：`RIVUS_CAP_WATCH_PATHS`（カンマ区切りのパス接頭辞）で監視可能な
+  範囲を限定できます。範囲外の root は**イベントとして拒否**され、run は継続します
+  （continue-first）。allowlist は「境界」であって「秘密」ではありません — 資格情報は
+  プラン・テレメトリ・エラーストリームに決して載りません。これらの環境変数は
+  環境設定であってデータではありません。
+- 削除・rename は行を産みません（読むものが無いため）。
+
 ---
 
 ## 4. 変換

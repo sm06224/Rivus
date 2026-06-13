@@ -23,8 +23,12 @@ default = []
 regex = ["rivus-runtime/regex"]
 gzip = ["rivus-runtime/gzip"]
 zstd = ["rivus-runtime/zstd"]
+# §28.12 (#149): the unbounded transport skeleton (`watch`). Off by default —
+# parse/explain always work; running an unbounded flow needs this feature.
+unbounded = ["rivus-runtime/unbounded"]
 # The curated full-feature set for distributed binaries (#149 ⑤): the source
 # tree's cargo default stays lean (zero-dep), but releases ship fat — Rivus as
 # a future compiler can only emit what it embeds. release.yml builds with
 # `--features full`; add new ratified features here so distribution follows.
+# (`unbounded` joining `full` is a pending maintainer decision — skeleton stage.)
 full = ["regex", "gzip", "zstd"]
