@@ -105,7 +105,7 @@ needs: [read:sales/*.csv]  # (C) capability の宣言（付与は運用者・§0
 
 ```flow
 sales:
-  sales.csv |> open |> (trunc(ts, "day")) as day |# day sum:amount
+  open sales.csv |> (trunc(ts, "day")) as day |# day sum:amount
 ```
 ````
 
@@ -120,10 +120,13 @@ sales:
 
 **拡張子**：`.riv.md`（Markdown ツール群が一級認識・Quarto/jupytext 互換）。素フローは `.riv`。
 
-**IR への lowering**：1つの `.riv.md` は **既存 `PlanGraph` 1つ**に落ちる。frontmatter の (S)
-意味設定はスコープ属性へ、Markdown 散文は **新しい trivia スロット**（`Node::leading_comments`
-の文書版 — フェンス前後の散文ブロックを順序保存）へ riding。**IR の実行意味論はゼロ改造**＝
-段階1 は parser/fmt/explain の拡張だけで完結（最低リスク）。
+**IR への lowering**：1つの `.riv.md` は **既存 `PlanGraph` 1つ**に落ちる。**段階1 の frontmatter は
+(R) 資源ヒント＋(C) capability 宣言＋メタ（title 等）のみ＝非意味**（結果バイトを変えない）で、
+(R) は実行ヒント／スコープ属性へ riding する。**(S) 意味設定は frontmatter に出さず in-script
+（`:decimal`/`:datetime`/`|!`）に残す**（§31.3・これが「意味論ゼロ改造」と整合する要）。
+Markdown 散文は **新しい trivia スロット**（`Node::leading_comments` の文書版 — フェンス前後の
+散文ブロックを順序保存）へ riding。**IR の実行意味論はゼロ改造**＝段階1 は parser/fmt/explain の
+拡張だけで完結（最低リスク）。schema-in-frontmatter のような (S) 級宣言は段階2/3 へ送る。
 
 ---
 
@@ -141,7 +144,7 @@ per-cell オプションは **フェンス内先頭の `#|`**（Quarto のハッ
 ```flow
 #| name: daily
 #| cache: true
-sales.csv |> open |> (trunc(ts, "day")) as day |# day sum:amount
+open sales.csv |> (trunc(ts, "day")) as day |# day sum:amount
 ```
 ````
 
