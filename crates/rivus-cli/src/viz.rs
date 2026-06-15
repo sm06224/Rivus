@@ -585,23 +585,39 @@ pub fn render_explain(graph: &PlanGraph) -> String {
 
 /// Render the IR as an embeddable Mermaid `flowchart` (§31.4): a generated,
 /// **output-only** view — it is never parsed back, so it carries no round-trip
-/// burden and is regenerated from the IR each time. Stream edges are solid; the
-/// continue-first error side-channel is dotted. Pure and deterministic (node
-/// order = IR node order), hence unit-testable and idempotent.
+/// burden and is regenerated from the IR each time. Nodes are shaped by role
+/// (source = cylinder, sink = parallelogram, join = hexagon, else rectangle)
+/// and tinted via `classDef`; labels are surface form (the flow operator and
+/// `$_.` sigils dropped, inert `# …` annotations stripped, detail truncated at a
+/// token boundary). Stream edges are solid; the continue-first error
+/// side-channel is dotted. Pure and deterministic (node order = IR node order),
+/// hence unit-testable and idempotent.
 pub fn render_mermaid(graph: &PlanGraph) -> String {
     let mut s = String::from("flowchart TD\n");
+    let mut used_src = false;
+    let mut used_sink = false;
     for n in &graph.nodes {
-        let title = n
-            .label
-            .clone()
-            .unwrap_or_else(|| n.op.kind_str().to_string());
-        let src = truncate(&n.op.to_src_line(), 48);
-        let label = if src.is_empty() || src == title {
-            format!("{title}\n{}", n.op.kind_str())
+        let kind = n.op.kind_str();
+        let shape = NodeShape::of(kind);
+        let detail = mermaid_detail(kind, &n.op.to_src_line(), shape);
+        let text = if detail.is_empty() {
+            mermaid_escape(kind)
         } else {
-            format!("{title} · {}\n{src}", n.op.kind_str())
+            // Head (kind) and detail are escaped independently, then joined with
+            // a literal `<br/>` so the line break survives escaping.
+            format!("{}<br/>{}", mermaid_escape(kind), mermaid_escape(&detail))
         };
-        s.push_str(&format!("  n{}[\"{}\"]\n", n.id, mermaid_escape(&label)));
+        let (open, close) = shape.delims();
+        match shape {
+            NodeShape::Source => used_src = true,
+            NodeShape::Sink => used_sink = true,
+            _ => {}
+        }
+        s.push_str(&format!(
+            "  n{}{open}\"{text}\"{close}{}\n",
+            n.id,
+            shape.class()
+        ));
     }
     for e in &graph.edges {
         match e.kind {
@@ -609,18 +625,137 @@ pub fn render_mermaid(graph: &PlanGraph) -> String {
             EdgeKind::Error => s.push_str(&format!("  n{} -. error .-> n{}\n", e.from, e.to)),
         }
     }
+    if used_src {
+        s.push_str("  classDef src fill:#e3f2fd,stroke:#1976d2\n");
+    }
+    if used_sink {
+        s.push_str("  classDef sink fill:#e8f5e9,stroke:#388e3c\n");
+    }
     s
 }
 
+/// The Mermaid node shape for an op, by `kind_str` (§31.4 review): sources,
+/// sinks and joins are visually distinct; everything else is a plain rectangle.
+#[derive(Clone, Copy, PartialEq)]
+enum NodeShape {
+    Source,
+    Sink,
+    Join,
+    Plain,
+}
+
+impl NodeShape {
+    fn of(kind: &str) -> Self {
+        match kind {
+            "open" | "ls" | "watch" | "readbin" | "read" | "stream" => NodeShape::Source,
+            "save" | "print" => NodeShape::Sink,
+            "join" => NodeShape::Join,
+            _ => NodeShape::Plain,
+        }
+    }
+    /// The opening / closing delimiters for this shape.
+    fn delims(self) -> (&'static str, &'static str) {
+        match self {
+            NodeShape::Source => ("[(", ")]"), // cylinder
+            NodeShape::Sink => ("[/", "/]"),   // parallelogram
+            NodeShape::Join => ("{{", "}}"),   // hexagon
+            NodeShape::Plain => ("[", "]"),    // rectangle
+        }
+    }
+    /// The `classDef` tint suffix (`:::src` / `:::sink`), or empty.
+    fn class(self) -> &'static str {
+        match self {
+            NodeShape::Source => ":::src",
+            NodeShape::Sink => ":::sink",
+            _ => "",
+        }
+    }
+}
+
+/// The surface-form detail line for a node (§31.4 review): the IR source line
+/// with inert `# …` annotations dropped, `$_.` sigils removed, the leading flow
+/// operator / verb stripped (so it doesn't repeat the kind head), and the result
+/// truncated at a token boundary.
+fn mermaid_detail(kind: &str, src_line: &str, shape: NodeShape) -> String {
+    // Drop inert "  # …" annotations (read-only / pre-filter hints — noise here).
+    let line = match src_line.split_once("  #") {
+        Some((before, _)) => before.trim_end(),
+        None => src_line,
+    };
+    let line = line.replace("$_.", "");
+    let detail = match shape {
+        // "open PATH" / "ls \"glob\"" / "read as csv" / "stream NAME" → the target.
+        NodeShape::Source | NodeShape::Sink => after_first_word(&line),
+        _ => {
+            // Drop a leading flow operator (`|?`/`|>`/`|#`/`|!`/`->`/`|`); for
+            // verb-led ops (sort/take/distinct/…) the verb equals the kind head,
+            // so drop it too to avoid repeating it.
+            let d = strip_flow_op(&line);
+            d.strip_prefix(kind).unwrap_or(&d).trim().to_string()
+        }
+    };
+    truncate_tokens(detail.trim(), 40)
+}
+
+/// Everything after the first whitespace-delimited word (the verb), trimmed;
+/// empty when there is no second token (e.g. `print`).
+fn after_first_word(s: &str) -> String {
+    match s.trim().split_once(char::is_whitespace) {
+        Some((_, rest)) => rest.trim().to_string(),
+        None => String::new(),
+    }
+}
+
+/// Strip a leading flow-operator token (`|?`/`|>`/`|#`/`|!`/`->`/`|`).
+fn strip_flow_op(s: &str) -> String {
+    let t = s.trim_start();
+    for p in ["|?", "|>", "|#", "|!", "->"] {
+        if let Some(rest) = t.strip_prefix(p) {
+            return rest.trim_start().to_string();
+        }
+    }
+    t.strip_prefix('|').unwrap_or(t).trim_start().to_string()
+}
+
+/// Truncate at a token (word) boundary to at most `max` chars, appending `…`
+/// when cut. A single over-long first word is hard-cut.
+fn truncate_tokens(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for word in s.split(' ') {
+        if out.is_empty() {
+            if word.chars().count() > max {
+                let mut w: String = word.chars().take(max.saturating_sub(1)).collect();
+                w.push('…');
+                return w;
+            }
+            out.push_str(word);
+        } else if out.chars().count() + 1 + word.chars().count() < max {
+            out.push(' ');
+            out.push_str(word);
+        } else {
+            out.push('…');
+            return out;
+        }
+    }
+    out
+}
+
 /// Sanitize text for a Mermaid quoted node label `["…"]`: replace characters
-/// that would break the syntax. Quotes/backticks → `'`, newline → `<br/>`,
-/// brackets/braces/pipes → space.
+/// that would break the syntax. Quotes/backticks → `'`, `<`/`>` → HTML entities
+/// (so a predicate like `age < 18` doesn't start a tag), brackets/braces/pipes →
+/// space. The `<br/>` line break is added by the caller *after* escaping, so it
+/// survives.
 fn mermaid_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             '"' | '`' => out.push('\''),
-            '\n' => out.push_str("<br/>"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\n' => out.push(' '),
             '[' | ']' | '{' | '}' | '|' => out.push(' '),
             _ => out.push(c),
         }
@@ -711,9 +846,12 @@ mod ux_j_tests {
             .expect("parse");
         let m = render_mermaid(&g);
         assert!(m.starts_with("flowchart TD\n"), "header missing:\n{m}");
-        // One node line per IR node, and a solid stream edge between them.
+        // One node-definition line per IR node (each holds a quoted label), and a
+        // solid stream edge between them.
         assert_eq!(
-            m.lines().filter(|l| l.contains("[\"")).count(),
+            m.lines()
+                .filter(|l| l.trim_start().starts_with('n') && l.contains('"'))
+                .count(),
             g.nodes.len(),
             "one node per IR node:\n{m}"
         );
@@ -722,16 +860,51 @@ mod ux_j_tests {
         assert_eq!(m, render_mermaid(&g), "mermaid must be deterministic");
     }
 
-    // Each node label is wrapped in exactly one `["…"]` with no inner double
-    // quote (which would break Mermaid). The flow operator pipes (`|?`/`|>`) are
-    // sanitized out of the label rather than leaking and corrupting the syntax.
+    // §31.4 review: nodes are shaped by role and tinted; labels are surface form
+    // (no leading flow operator, no `$_.` sigil), with `<`/`>` HTML-escaped.
+    #[test]
+    fn mermaid_shapes_and_surface_labels() {
+        let g = rivus_parser::parse(
+            "U:\n open users.csv\n |? age < 20\n |> name age\n save out.csv as csv\n;",
+        )
+        .expect("parse");
+        let m = render_mermaid(&g);
+        // Source = cylinder + src class; sink = parallelogram + sink class.
+        assert!(
+            m.contains("[(\"open<br/>users.csv\")]:::src"),
+            "source shape:\n{m}"
+        );
+        assert!(m.contains("[/\"save<br/>out.csv"), "sink shape:\n{m}");
+        assert!(m.contains("classDef src "), "missing src classDef:\n{m}");
+        assert!(m.contains("classDef sink "), "missing sink classDef:\n{m}");
+        // Surface form: the `$_.` sigil and leading `|?` are gone, `<` escaped.
+        assert!(
+            m.contains("filter<br/>age &lt; 20"),
+            "filter not surfaced:\n{m}"
+        );
+        assert!(!m.contains("$_."), "raw $_. sigil leaked:\n{m}");
+    }
+
+    // A join renders as a hexagon.
+    #[test]
+    fn mermaid_join_is_hexagon() {
+        let g =
+            rivus_parser::parse("A: open a.csv ; B: open b.csv ; J: A & B on id ;").expect("parse");
+        let m = render_mermaid(&g);
+        assert!(m.contains("{{\"join"), "join not a hexagon:\n{m}");
+    }
+
+    // Each node label is wrapped in exactly two double quotes (the openers/closers)
+    // with no inner quote, and no flow-operator pipe leaks into a label.
     #[test]
     fn mermaid_labels_are_well_formed() {
         let g =
             rivus_parser::parse("U:\n open u.csv\n |? age >= 20\n |> name age\n;").expect("parse");
         let m = render_mermaid(&g);
-        for line in m.lines().filter(|l| l.contains("[\"")) {
-            // Exactly the opening `["` and closing `"]` quotes — two total.
+        for line in m
+            .lines()
+            .filter(|l| l.trim_start().starts_with('n') && l.contains('"'))
+        {
             assert_eq!(
                 line.matches('"').count(),
                 2,
