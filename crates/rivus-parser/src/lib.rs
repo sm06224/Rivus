@@ -25,6 +25,8 @@
 
 mod lexer;
 
+pub mod literate;
+
 use lexer::{Comment, Lexer, Tok};
 use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value};
 use rivus_ir::{
@@ -53,6 +55,24 @@ pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
     };
     p.parse_program()?;
     Ok(p.g)
+}
+
+/// Parse a `.riv.md` Literate document (§31) into a [`PlanGraph`]. The document
+/// is split into frontmatter / prose / ```flow fences ([`literate::parse_literate`]);
+/// the concatenated flow bodies are the executable program (§31.2), parsed by
+/// [`parse`]. Prose and frontmatter carry no execution meaning (stage 1 is a
+/// zero semantic change), so the resulting graph is identical to parsing the
+/// equivalent `.riv`. A document with no `flow` fence is an error (never-silent).
+pub fn parse_md(src: &str) -> Result<PlanGraph, RivusError> {
+    let doc = literate::parse_literate(src)?;
+    if !doc.has_flow() {
+        return Err(RivusError::Parse(
+            "no ```flow fence found: a .riv.md document needs at least one executable \
+             ```flow block (untagged or other-language fences are inert display)"
+                .to_string(),
+        ));
+    }
+    parse(&doc.flow_source())
 }
 
 struct Parser {

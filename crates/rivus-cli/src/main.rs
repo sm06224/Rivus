@@ -49,7 +49,11 @@ fn main() -> ExitCode {
         inline = Some(args[1].clone());
         cmd = "run";
     }
-    let mut chunk_size = RunOptions::default().chunk_size;
+    // Track an *explicit* `--chunk-size` so the §31 config cascade can apply
+    // `frontmatter ← CLI`: the CLI wins when given, otherwise a `.riv.md`
+    // frontmatter hint (an (R) resource hint, result-invariant) supplies the
+    // default (§31.3). `None` here means "not set on the command line".
+    let mut chunk_size_cli: Option<usize> = None;
     let mut optimize = true;
     // `rivus fmt … --write`/`-w`: rewrite the source file in place instead of
     // printing the canonical form to stdout.
@@ -127,7 +131,7 @@ fn main() -> ExitCode {
             "--chunk-size" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
-                    Some(n) if n >= 1 => chunk_size = n,
+                    Some(n) if n >= 1 => chunk_size_cli = Some(n),
                     _ => {
                         eprintln!("error: --chunk-size requires a positive integer");
                         return ExitCode::from(2);
@@ -188,11 +192,38 @@ fn main() -> ExitCode {
         }
     };
 
-    // Unix-filter shorthand: a transform-only program (one that starts with a
-    // pipe `|…` or a transform verb, i.e. has no source/scope) is wrapped to
-    // read CSV from stdin and write CSV to stdout. So this just works:
-    //   cat data.csv | rivus run -c '|? age >= 20 |> name age'
-    if !prog_stdin && is_transform_only(&source) {
+    // §31: a `.riv.md` path is a Rivus Literate document (frontmatter + prose +
+    // ```flow fences). Parse it into a document so the executable flow can be
+    // extracted, the (R) config cascade applied, and `fmt` can reformat only the
+    // flow bodies while preserving prose. A `.riv` / -c / stdin program is plain
+    // flow (the REPL form) exactly as before.
+    let literate_doc = if is_literate_path(&label) {
+        match rivus_parser::literate::parse_literate(&source) {
+            Ok(doc) => Some(doc),
+            Err(e) => {
+                eprintln!("parse error in {label}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Config cascade `frontmatter ← CLI` (§31.3): a `--chunk-size` on the command
+    // line wins; otherwise a `.riv.md` frontmatter `chunk_size:` (an (R) hint,
+    // result-invariant) supplies the default; otherwise the engine default.
+    let fm_chunk_size = literate_doc
+        .as_ref()
+        .and_then(|d| frontmatter_usize(d, "chunk_size"));
+    let chunk_size = chunk_size_cli
+        .or(fm_chunk_size)
+        .unwrap_or_else(|| RunOptions::default().chunk_size);
+
+    // Unix-filter shorthand (plain flow only): a transform-only program (one
+    // that starts with a pipe `|…` or a transform verb, i.e. has no source/scope)
+    // is wrapped to read CSV from stdin and write CSV to stdout. So this just
+    // works:   cat data.csv | rivus run -c '|? age >= 20 |> name age'
+    if literate_doc.is_none() && !prog_stdin && is_transform_only(&source) {
         let has_sink = source.contains("save ")
             || source.contains("writecsv")
             || source.contains("writejson")
@@ -201,7 +232,18 @@ fn main() -> ExitCode {
         source = format!("Pipe: open stdin {}{} ;", source.trim(), sink);
     }
 
-    let parsed = match rivus_parser::parse(&source) {
+    // Lower to the IR. A `.riv.md` lowers via its concatenated flow bodies (one
+    // document → one `PlanGraph`, §31.2); a `.riv` parses directly.
+    let parse_result = match &literate_doc {
+        Some(doc) if !doc.has_flow() => Err(rivus_core::RivusError::Parse(
+            "no ```flow fence found: a .riv.md document needs at least one executable \
+             ```flow block (untagged or other-language fences are inert display)"
+                .to_string(),
+        )),
+        Some(doc) => rivus_parser::parse(&doc.flow_source()),
+        None => rivus_parser::parse(&source),
+    };
+    let parsed = match parse_result {
         Ok(g) => g,
         Err(e) => {
             eprintln!("parse error in {label}: {e}");
@@ -213,33 +255,36 @@ fn main() -> ExitCode {
         "fmt" => {
             // Format = parse → IR → canonical source (§25.8: fmt is IR-based).
             // Comment trivia is preserved through the IR (§25.7), so the
-            // author's notes survive.
-            let formatted = parsed.to_source();
-            // Honesty gate: the canonical renderer is faithful for linear flows,
-            // merge/join scopes and `->` branch fan-out, but a few constructs
-            // (e.g. an anonymous, unlabeled scope) are not yet reproduced
-            // losslessly. Re-parse the result and refuse to emit anything we
-            // can't round-trip, rather than silently rewrite it into something
-            // different.
-            let faithful = match rivus_parser::parse(&formatted) {
-                Ok(re) => {
-                    re.nodes.len() == parsed.nodes.len()
-                        && re
-                            .nodes
-                            .iter()
-                            .zip(parsed.nodes.iter())
-                            .all(|(a, b)| a.op.kind_str() == b.op.kind_str())
+            // author's notes survive. For a `.riv.md` document, fmt reformats
+            // only the ```flow cell bodies and round-trips prose / frontmatter
+            // verbatim (§31.5).
+            let formatted = match &literate_doc {
+                Some(doc) => match fmt_literate(doc) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => {
+                    let formatted = parsed.to_source();
+                    // Honesty gate: the canonical renderer is faithful for linear
+                    // flows, merge/join scopes and `->` branch fan-out, but a few
+                    // constructs (e.g. an anonymous, unlabeled scope) are not yet
+                    // reproduced losslessly. Re-parse the result and refuse to
+                    // emit anything we can't round-trip, rather than silently
+                    // rewrite it into something different.
+                    if !fmt_faithful(&parsed, &formatted) {
+                        eprintln!(
+                            "error: `rivus fmt` cannot yet faithfully round-trip this \
+                             program (it uses a construct the canonical renderer does \
+                             not yet reproduce losslessly); left the source unchanged"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    formatted
                 }
-                Err(_) => false,
             };
-            if !faithful {
-                eprintln!(
-                    "error: `rivus fmt` cannot yet faithfully round-trip this \
-                     program (it uses a construct the canonical renderer does \
-                     not yet reproduce losslessly); left the source unchanged"
-                );
-                return ExitCode::FAILURE;
-            }
             if fmt_write {
                 if label == "<command>" || label == "<stdin>" {
                     eprintln!("error: `rivus fmt --write` needs a file path (not -c / stdin)");
@@ -264,11 +309,44 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "explain" => {
+            // The graph to visualize: optimized when the optimizer is on
+            // (explain's value is the *post-optimization* DAG), else as parsed.
+            let viz_graph = if optimize {
+                rivus_optimizer::optimize(parsed.clone()).0
+            } else {
+                parsed.clone()
+            };
+            if fmt_write {
+                // §31.4: `explain --write` embeds a generated, output-only
+                // Mermaid DAG into the `.riv.md` document's sentinel-fenced
+                // region — idempotent, preserving prose / frontmatter / flow.
+                if literate_doc.is_none() {
+                    eprintln!(
+                        "error: `rivus explain --write` needs a .riv.md document (the Mermaid \
+                         DAG is embedded into the document)"
+                    );
+                    return ExitCode::from(2);
+                }
+                if label == "<command>" || label == "<stdin>" {
+                    eprintln!("error: `rivus explain --write` needs a file path (not -c / stdin)");
+                    return ExitCode::from(2);
+                }
+                let updated = upsert_generated_region(&source, &generated_region(&viz_graph));
+                if let Err(e) = std::fs::write(&label, &updated) {
+                    eprintln!("error: cannot write '{label}': {e}");
+                    return ExitCode::FAILURE;
+                }
+                eprintln!("wrote generated DAG region to {label}");
+                return ExitCode::SUCCESS;
+            }
             print!("{}", viz::render_explain(&parsed));
             if optimize {
                 let (opt, report) = rivus_optimizer::optimize(parsed.clone());
                 print!("{}", viz::render_optimization(&report, &opt));
             }
+            // Also emit the embeddable Mermaid DAG, so `explain` is a generator
+            // even without --write (copy into a `.riv.md`, or pipe it on).
+            print!("\n{}", generated_region(&viz_graph));
             ExitCode::SUCCESS
         }
         "run" => {
@@ -568,17 +646,127 @@ fn is_transform_only(src: &str) -> bool {
     )
 }
 
+/// Sentinel that opens the `explain`-generated region in a `.riv.md` (§31.4).
+/// Matched by prefix so the trailing note can change without breaking upsert.
+const GEN_BEGIN_PREFIX: &str = "<!-- rivus:begin";
+/// Sentinel that closes the generated region.
+const GEN_END: &str = "<!-- rivus:end -->";
+
+/// Build the `explain`-generated region (§31.4): a sentinel-fenced, output-only
+/// Mermaid DAG. The block is regenerated from the IR each time and never parsed
+/// back (it lives in inert prose / a ```mermaid fence), so editing inside it is
+/// overwritten. Ends with exactly one newline for idempotent upsert.
+fn generated_region(graph: &rivus_ir::PlanGraph) -> String {
+    let mut s = String::new();
+    s.push_str(GEN_BEGIN_PREFIX);
+    s.push_str(" generated by `rivus explain --write`; edits inside are overwritten -->\n");
+    s.push_str("```mermaid\n");
+    s.push_str(&viz::render_mermaid(graph));
+    s.push_str("```\n");
+    s.push_str(GEN_END);
+    s.push('\n');
+    s
+}
+
+/// Insert or replace the generated region in a `.riv.md` document, idempotently
+/// (§31.4). When a `<!-- rivus:begin … -->…<!-- rivus:end -->` span exists, its
+/// content is replaced in place (hand-written prose around it is preserved);
+/// otherwise the region is appended after a blank line. Running it twice on the
+/// same IR is a fixed point.
+fn upsert_generated_region(src: &str, region: &str) -> String {
+    if let (Some(b), Some(e)) = (src.find(GEN_BEGIN_PREFIX), src.rfind(GEN_END)) {
+        let e_end = e + GEN_END.len();
+        if e_end >= b {
+            let mut out = String::with_capacity(src.len() + region.len());
+            out.push_str(&src[..b]);
+            out.push_str(region.trim_end_matches('\n'));
+            out.push_str(&src[e_end..]);
+            return out;
+        }
+    }
+    let mut out = src.trim_end_matches('\n').to_string();
+    out.push_str("\n\n");
+    out.push_str(region);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Is this input path a Rivus Literate document (§31)? `.riv.md` is the canonical
+/// extension; a plain `.md` is also treated as Literate so documents authored in
+/// a Markdown editor work. Anything else (`.riv`, `-c`, stdin) is plain flow.
+fn is_literate_path(label: &str) -> bool {
+    label.ends_with(".riv.md") || label.ends_with(".md")
+}
+
+/// Read a `usize` frontmatter value for the config cascade (§31.3), e.g.
+/// `chunk_size`. Returns `None` when absent or not a positive integer.
+fn frontmatter_usize(doc: &rivus_parser::literate::LiterateDoc, key: &str) -> Option<usize> {
+    doc.frontmatter_pairs()
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Does the canonical source round-trip back to a structurally identical IR?
+/// The honesty gate for `fmt`: refuse to rewrite anything the renderer cannot
+/// reproduce losslessly (§25.8) rather than silently change the program.
+fn fmt_faithful(parsed: &rivus_ir::PlanGraph, formatted: &str) -> bool {
+    match rivus_parser::parse(formatted) {
+        Ok(re) => {
+            re.nodes.len() == parsed.nodes.len()
+                && re
+                    .nodes
+                    .iter()
+                    .zip(parsed.nodes.iter())
+                    .all(|(a, b)| a.op.kind_str() == b.op.kind_str())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Format a `.riv.md` document (§31.5): reformat each ```flow cell body via the
+/// IR (parse → `to_source`) with the same honesty gate as plain `fmt`, and
+/// re-render the document so prose, frontmatter and `#|` options round-trip
+/// verbatim. Cells are reformatted independently; a cell that does not parse on
+/// its own (e.g. it relies on a name defined in another cell) or does not
+/// round-trip faithfully leaves fmt refusing — never a silent rewrite.
+fn fmt_literate(doc: &rivus_parser::literate::LiterateDoc) -> Result<String, String> {
+    use rivus_parser::literate::Segment;
+    let mut out = doc.clone();
+    for seg in &mut out.segments {
+        if let Segment::Flow(cell) = seg {
+            let parsed = rivus_parser::parse(&cell.body)
+                .map_err(|e| format!("`rivus fmt` cannot parse a ```flow cell on its own: {e}"))?;
+            let formatted = parsed.to_source();
+            if !fmt_faithful(&parsed, &formatted) {
+                return Err(
+                    "`rivus fmt` cannot yet faithfully round-trip a ```flow cell (it uses a \
+                     construct the canonical renderer does not reproduce losslessly); left the \
+                     document unchanged"
+                        .to_string(),
+                );
+            }
+            cell.body = formatted.trim_end_matches('\n').to_string();
+        }
+    }
+    Ok(out.render())
+}
+
 fn usage() {
     eprintln!(
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
          \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--memory low|auto|fast|unbounded] [--json|--telemetry-addr HOST:PORT|--tui|--serve [ADDR]]  run a flow\n\
-         \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
+         \x20 rivus explain <program> [--no-opt] [--write|-w]         show DAG IR; --write embeds a Mermaid DAG into a .riv.md\n\
          \x20 rivus check   <program>                                parse only\n\
-         \x20 rivus fmt     <program> [--write|-w]                   reformat to canonical source (preserves #{{ }}# comments)\n\
+         \x20 rivus fmt     <program> [--write|-w]                   reformat to canonical source (preserves comments / .riv.md prose)\n\
          \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\
          PROGRAM (any of):\n\
-         \x20 <file.riv>                 read the program from a file\n\
+         \x20 <file.riv>                 read a bare flow (the REPL form) from a file\n\
+         \x20 <file.riv.md>              read a Literate document (frontmatter + prose + ```flow fences)\n\
          \x20 -c, --command <STRING>     pass the program inline as a string\n\
          \x20 - | stdin                  read the program from stdin (heredoc)\n\n\
          EXAMPLES:\n\

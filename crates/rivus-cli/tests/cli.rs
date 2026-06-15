@@ -499,3 +499,228 @@ fn json_summary_exposes_worker_breakdown_on_parallel_runs() {
     let _ = std::fs::remove_file(&csv);
     let _ = std::fs::remove_file(&out);
 }
+
+// ─── §31 stage 1: `.riv.md` Literate ──────────────────────────────────────
+
+/// A unique temp `.riv.md` path for this process + tag (avoids cross-test races).
+fn tmp_md(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("rivus_md_{}_{}.riv.md", tag, std::process::id()))
+}
+
+/// `run <doc.riv.md>` extracts the executable program from the ```flow fence(s),
+/// ignores frontmatter/prose, and runs it — data reaches stdout via the sink.
+#[test]
+fn riv_md_run_extracts_flow_and_ignores_prose() {
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_md_data_{}.csv", std::process::id()));
+    std::fs::write(&csv, "name,age\nalice,30\nbob,15\ncarol,42\n").unwrap();
+    let md = tmp_md("run");
+    let doc = format!(
+        "---\ntitle: adults\nchunk_size: 2\nneeds: [read:data.csv]\n---\n\n\
+         # Heading\n\nThis prose is inert.\n\n\
+         ```flow\n#| name: adults\nU: open {} as csv |? age >= 20 |> name age save stdout as csv ;\n```\n",
+        csv.display()
+    );
+    std::fs::write(&md, &doc).unwrap();
+
+    let out = Command::new(BIN)
+        .args(["run"])
+        .arg(&md)
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&csv);
+    let _ = std::fs::remove_file(&md);
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("alice") && stdout.contains("carol"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("bob"), "filtered row leaked: {stdout}");
+    // Prose / frontmatter must never reach the executed program or output.
+    assert!(
+        !stdout.contains("Heading") && !stdout.contains("title"),
+        "prose leaked: {stdout}"
+    );
+}
+
+/// `fmt <doc.riv.md>` reformats only the ```flow body and round-trips prose,
+/// frontmatter and `#|` options verbatim; it is idempotent.
+#[test]
+fn riv_md_fmt_preserves_prose_and_is_idempotent() {
+    let md = tmp_md("fmt");
+    let doc = "---\ntitle: demo\nchunk_size: 4096\n---\n\n\
+               # 見出し\n\ninert prose\n\n\
+               ```flow\n#| name: a\nU: open d.csv |? age >= 20 |> name age ;\n```\n";
+    std::fs::write(&md, doc).unwrap();
+
+    let out = Command::new(BIN)
+        .args(["fmt"])
+        .arg(&md)
+        .output()
+        .expect("spawn rivus");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let once = String::from_utf8_lossy(&out.stdout).to_string();
+    // Frontmatter, prose and the `#|` option survive; the flow body is canonicalized.
+    assert!(once.contains("title: demo"), "frontmatter lost:\n{once}");
+    assert!(
+        once.contains("# 見出し") && once.contains("inert prose"),
+        "prose lost:\n{once}"
+    );
+    assert!(once.contains("#| name: a"), "cell option lost:\n{once}");
+    assert!(
+        once.contains("|? $_.age >= 20"),
+        "flow not canonicalized:\n{once}"
+    );
+
+    // Idempotent: writing the formatted doc back and reformatting is a fixed point.
+    std::fs::write(&md, &once).unwrap();
+    let out2 = Command::new(BIN)
+        .args(["fmt"])
+        .arg(&md)
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&md);
+    assert!(out2.status.success());
+    assert_eq!(
+        once,
+        String::from_utf8_lossy(&out2.stdout),
+        "fmt not idempotent"
+    );
+}
+
+/// A `.riv.md` with no ```flow fence is a never-silent error (untagged / other
+/// fences are inert and cannot be executed).
+#[test]
+fn riv_md_without_flow_fence_errors() {
+    let md = tmp_md("noflow");
+    std::fs::write(&md, "# just prose\n\n```\nopen NOT_RUN.csv ;\n```\n").unwrap();
+    let out = Command::new(BIN)
+        .args(["check"])
+        .arg(&md)
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&md);
+    assert!(!out.status.success(), "should fail with no flow fence");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("flow"),
+        "stderr should mention the missing flow fence"
+    );
+}
+
+/// The (R) chunk-size cascade is result-invariant (§31.3): the frontmatter hint
+/// and a CLI override produce byte-identical output (serial byte-identity across
+/// chunk sizes), and `--chunk-size` takes precedence without changing bytes.
+#[test]
+fn riv_md_chunk_size_cascade_is_result_invariant() {
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_md_cascade_{}.csv", std::process::id()));
+    let mut body = String::from("name,age\n");
+    for i in 0..50 {
+        body.push_str(&format!("u{i},{}\n", 20 + (i % 5)));
+    }
+    std::fs::write(&csv, &body).unwrap();
+    let md = tmp_md("cascade");
+    let doc = format!(
+        "---\nchunk_size: 3\n---\n\n```flow\nU: open {} as csv |? age >= 22 |> name age save stdout as csv ;\n```\n",
+        csv.display()
+    );
+    std::fs::write(&md, &doc).unwrap();
+
+    let from_fm = Command::new(BIN)
+        .args(["run"])
+        .arg(&md)
+        .output()
+        .expect("spawn rivus");
+    let from_cli = Command::new(BIN)
+        .args(["run"])
+        .arg(&md)
+        .args(["--chunk-size", "64"])
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&csv);
+    let _ = std::fs::remove_file(&md);
+
+    assert!(from_fm.status.success() && from_cli.status.success());
+    assert_eq!(
+        from_fm.stdout, from_cli.stdout,
+        "chunk-size is an (R) hint — output bytes must not depend on it"
+    );
+}
+
+/// `explain --write <doc.riv.md>` embeds a generated, output-only Mermaid DAG in
+/// a sentinel-fenced region (§31.4); it is idempotent and preserves prose, and
+/// the generated ```mermaid is inert (not executed when the doc is run).
+#[test]
+fn riv_md_explain_write_is_idempotent_and_inert() {
+    let md = tmp_md("explain");
+    let doc = "---\ntitle: t\n---\n\n# doc\n\nhand-written prose\n\n\
+               ```flow\nU: open examples/users.csv |? age >= 20 |> name age ;\n```\n";
+    std::fs::write(&md, doc).unwrap();
+
+    let w1 = Command::new(BIN)
+        .args(["explain"])
+        .arg(&md)
+        .arg("--write")
+        .output()
+        .expect("spawn rivus");
+    assert!(
+        w1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&w1.stderr)
+    );
+    let after1 = std::fs::read_to_string(&md).unwrap();
+    assert!(
+        after1.contains("```mermaid"),
+        "no mermaid embedded:\n{after1}"
+    );
+    assert!(after1.contains("flowchart TD"), "no flowchart:\n{after1}");
+    assert!(
+        after1.contains("hand-written prose"),
+        "prose lost:\n{after1}"
+    );
+    assert!(
+        after1.contains("<!-- rivus:begin"),
+        "no sentinel:\n{after1}"
+    );
+
+    // Second write is a fixed point (idempotent).
+    let _ = Command::new(BIN)
+        .args(["explain"])
+        .arg(&md)
+        .arg("--write")
+        .output()
+        .expect("spawn rivus");
+    let after2 = std::fs::read_to_string(&md).unwrap();
+    assert_eq!(after1, after2, "explain --write not idempotent");
+
+    // The generated mermaid block is inert: `check` still sees exactly the one
+    // executable flow (the mermaid fence is not an executable ```flow).
+    let chk = Command::new(BIN)
+        .args(["check"])
+        .arg(&md)
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&md);
+    assert!(
+        chk.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
+    let nodes = String::from_utf8_lossy(&chk.stdout);
+    // Same node count as the lone flow (check parses pre-optimization: open +
+    // filter + project = 3). A leaked ```mermaid block would change the count.
+    assert!(
+        nodes.contains("3 node(s)"),
+        "mermaid leaked into execution: {nodes}"
+    );
+}
