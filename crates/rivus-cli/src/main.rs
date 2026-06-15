@@ -760,12 +760,13 @@ fn usage() {
         "rivus — flow-oriented, DAG-native stream runtime\n\n\
          USAGE:\n\
          \x20 rivus run     <program> [--chunk-size N] [--no-opt] [--memory low|auto|fast|unbounded] [--json|--telemetry-addr HOST:PORT|--tui|--serve [ADDR]]  run a flow\n\
-         \x20 rivus explain <program> [--no-opt]                     show DAG IR + optimizer report\n\
+         \x20 rivus explain <program> [--no-opt] [--write|-w]         show DAG IR; --write embeds a Mermaid DAG into a .riv.md\n\
          \x20 rivus check   <program>                                parse only\n\
-         \x20 rivus fmt     <program> [--write|-w]                   reformat to canonical source (preserves #{{ }}# comments)\n\
+         \x20 rivus fmt     <program> [--write|-w]                   reformat to canonical source (preserves comments / .riv.md prose)\n\
          \x20 rivus gen      <shape> [--rows N --seed S --ratio R]    write seeded data to stdout\n\n\
          PROGRAM (any of):\n\
-         \x20 <file.riv>                 read the program from a file\n\
+         \x20 <file.riv>                 read a bare flow (the REPL form) from a file\n\
+         \x20 <file.riv.md>              read a Literate document (frontmatter + prose + ```flow fences)\n\
          \x20 -c, --command <STRING>     pass the program inline as a string\n\
          \x20 - | stdin                  read the program from stdin (heredoc)\n\n\
          EXAMPLES:\n\
