@@ -583,6 +583,51 @@ pub fn render_explain(graph: &PlanGraph) -> String {
     s
 }
 
+/// Render the IR as an embeddable Mermaid `flowchart` (§31.4): a generated,
+/// **output-only** view — it is never parsed back, so it carries no round-trip
+/// burden and is regenerated from the IR each time. Stream edges are solid; the
+/// continue-first error side-channel is dotted. Pure and deterministic (node
+/// order = IR node order), hence unit-testable and idempotent.
+pub fn render_mermaid(graph: &PlanGraph) -> String {
+    let mut s = String::from("flowchart TD\n");
+    for n in &graph.nodes {
+        let title = n
+            .label
+            .clone()
+            .unwrap_or_else(|| n.op.kind_str().to_string());
+        let src = truncate(&n.op.to_src_line(), 48);
+        let label = if src.is_empty() || src == title {
+            format!("{title}\n{}", n.op.kind_str())
+        } else {
+            format!("{title} · {}\n{src}", n.op.kind_str())
+        };
+        s.push_str(&format!("  n{}[\"{}\"]\n", n.id, mermaid_escape(&label)));
+    }
+    for e in &graph.edges {
+        match e.kind {
+            EdgeKind::Stream => s.push_str(&format!("  n{} --> n{}\n", e.from, e.to)),
+            EdgeKind::Error => s.push_str(&format!("  n{} -. error .-> n{}\n", e.from, e.to)),
+        }
+    }
+    s
+}
+
+/// Sanitize text for a Mermaid quoted node label `["…"]`: replace characters
+/// that would break the syntax. Quotes/backticks → `'`, newline → `<br/>`,
+/// brackets/braces/pipes → space.
+fn mermaid_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' | '`' => out.push('\''),
+            '\n' => out.push_str("<br/>"),
+            '[' | ']' | '{' | '}' | '|' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod ux_j_tests {
     use super::*;
@@ -655,5 +700,47 @@ mod ux_j_tests {
             blocks("S:\n open d.csv\n fill age mean\n;"),
             "mean fill blocks"
         );
+    }
+
+    // §31.4: the Mermaid emitter is a pure, output-only view of the IR — a
+    // `flowchart` with one node per IR node and solid stream / dotted error
+    // edges. Deterministic (node order = IR order), so it's idempotent.
+    #[test]
+    fn mermaid_renders_nodes_and_edges() {
+        let g = rivus_parser::parse("F:\n open data.csv\n |? age >= 20\n sort age desc\n;")
+            .expect("parse");
+        let m = render_mermaid(&g);
+        assert!(m.starts_with("flowchart TD\n"), "header missing:\n{m}");
+        // One node line per IR node, and a solid stream edge between them.
+        assert_eq!(
+            m.lines().filter(|l| l.contains("[\"")).count(),
+            g.nodes.len(),
+            "one node per IR node:\n{m}"
+        );
+        assert!(m.contains(" --> n"), "missing a stream edge:\n{m}");
+        // Pure / deterministic → byte-identical on a second call.
+        assert_eq!(m, render_mermaid(&g), "mermaid must be deterministic");
+    }
+
+    // Each node label is wrapped in exactly one `["…"]` with no inner double
+    // quote (which would break Mermaid). The flow operator pipes (`|?`/`|>`) are
+    // sanitized out of the label rather than leaking and corrupting the syntax.
+    #[test]
+    fn mermaid_labels_are_well_formed() {
+        let g =
+            rivus_parser::parse("U:\n open u.csv\n |? age >= 20\n |> name age\n;").expect("parse");
+        let m = render_mermaid(&g);
+        for line in m.lines().filter(|l| l.contains("[\"")) {
+            // Exactly the opening `["` and closing `"]` quotes — two total.
+            assert_eq!(
+                line.matches('"').count(),
+                2,
+                "label must have exactly the wrapping quotes: {line}"
+            );
+            assert!(
+                !line.contains('|'),
+                "pipe leaked into a Mermaid label: {line}"
+            );
+        }
     }
 }

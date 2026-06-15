@@ -656,3 +656,71 @@ fn riv_md_chunk_size_cascade_is_result_invariant() {
         "chunk-size is an (R) hint — output bytes must not depend on it"
     );
 }
+
+/// `explain --write <doc.riv.md>` embeds a generated, output-only Mermaid DAG in
+/// a sentinel-fenced region (§31.4); it is idempotent and preserves prose, and
+/// the generated ```mermaid is inert (not executed when the doc is run).
+#[test]
+fn riv_md_explain_write_is_idempotent_and_inert() {
+    let md = tmp_md("explain");
+    let doc = "---\ntitle: t\n---\n\n# doc\n\nhand-written prose\n\n\
+               ```flow\nU: open examples/users.csv |? age >= 20 |> name age ;\n```\n";
+    std::fs::write(&md, doc).unwrap();
+
+    let w1 = Command::new(BIN)
+        .args(["explain"])
+        .arg(&md)
+        .arg("--write")
+        .output()
+        .expect("spawn rivus");
+    assert!(
+        w1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&w1.stderr)
+    );
+    let after1 = std::fs::read_to_string(&md).unwrap();
+    assert!(
+        after1.contains("```mermaid"),
+        "no mermaid embedded:\n{after1}"
+    );
+    assert!(after1.contains("flowchart TD"), "no flowchart:\n{after1}");
+    assert!(
+        after1.contains("hand-written prose"),
+        "prose lost:\n{after1}"
+    );
+    assert!(
+        after1.contains("<!-- rivus:begin"),
+        "no sentinel:\n{after1}"
+    );
+
+    // Second write is a fixed point (idempotent).
+    let _ = Command::new(BIN)
+        .args(["explain"])
+        .arg(&md)
+        .arg("--write")
+        .output()
+        .expect("spawn rivus");
+    let after2 = std::fs::read_to_string(&md).unwrap();
+    assert_eq!(after1, after2, "explain --write not idempotent");
+
+    // The generated mermaid block is inert: `check` still sees exactly the one
+    // executable flow (the mermaid fence is not an executable ```flow).
+    let chk = Command::new(BIN)
+        .args(["check"])
+        .arg(&md)
+        .output()
+        .expect("spawn rivus");
+    let _ = std::fs::remove_file(&md);
+    assert!(
+        chk.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
+    let nodes = String::from_utf8_lossy(&chk.stdout);
+    // Same node count as the lone flow (check parses pre-optimization: open +
+    // filter + project = 3). A leaked ```mermaid block would change the count.
+    assert!(
+        nodes.contains("3 node(s)"),
+        "mermaid leaked into execution: {nodes}"
+    );
+}
