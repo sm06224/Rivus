@@ -49,7 +49,11 @@ fn main() -> ExitCode {
         inline = Some(args[1].clone());
         cmd = "run";
     }
-    let mut chunk_size = RunOptions::default().chunk_size;
+    // Track an *explicit* `--chunk-size` so the §31 config cascade can apply
+    // `frontmatter ← CLI`: the CLI wins when given, otherwise a `.riv.md`
+    // frontmatter hint (an (R) resource hint, result-invariant) supplies the
+    // default (§31.3). `None` here means "not set on the command line".
+    let mut chunk_size_cli: Option<usize> = None;
     let mut optimize = true;
     // `rivus fmt … --write`/`-w`: rewrite the source file in place instead of
     // printing the canonical form to stdout.
@@ -127,7 +131,7 @@ fn main() -> ExitCode {
             "--chunk-size" => {
                 i += 1;
                 match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
-                    Some(n) if n >= 1 => chunk_size = n,
+                    Some(n) if n >= 1 => chunk_size_cli = Some(n),
                     _ => {
                         eprintln!("error: --chunk-size requires a positive integer");
                         return ExitCode::from(2);
@@ -188,11 +192,38 @@ fn main() -> ExitCode {
         }
     };
 
-    // Unix-filter shorthand: a transform-only program (one that starts with a
-    // pipe `|…` or a transform verb, i.e. has no source/scope) is wrapped to
-    // read CSV from stdin and write CSV to stdout. So this just works:
-    //   cat data.csv | rivus run -c '|? age >= 20 |> name age'
-    if !prog_stdin && is_transform_only(&source) {
+    // §31: a `.riv.md` path is a Rivus Literate document (frontmatter + prose +
+    // ```flow fences). Parse it into a document so the executable flow can be
+    // extracted, the (R) config cascade applied, and `fmt` can reformat only the
+    // flow bodies while preserving prose. A `.riv` / -c / stdin program is plain
+    // flow (the REPL form) exactly as before.
+    let literate_doc = if is_literate_path(&label) {
+        match rivus_parser::literate::parse_literate(&source) {
+            Ok(doc) => Some(doc),
+            Err(e) => {
+                eprintln!("parse error in {label}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Config cascade `frontmatter ← CLI` (§31.3): a `--chunk-size` on the command
+    // line wins; otherwise a `.riv.md` frontmatter `chunk_size:` (an (R) hint,
+    // result-invariant) supplies the default; otherwise the engine default.
+    let fm_chunk_size = literate_doc
+        .as_ref()
+        .and_then(|d| frontmatter_usize(d, "chunk_size"));
+    let chunk_size = chunk_size_cli
+        .or(fm_chunk_size)
+        .unwrap_or_else(|| RunOptions::default().chunk_size);
+
+    // Unix-filter shorthand (plain flow only): a transform-only program (one
+    // that starts with a pipe `|…` or a transform verb, i.e. has no source/scope)
+    // is wrapped to read CSV from stdin and write CSV to stdout. So this just
+    // works:   cat data.csv | rivus run -c '|? age >= 20 |> name age'
+    if literate_doc.is_none() && !prog_stdin && is_transform_only(&source) {
         let has_sink = source.contains("save ")
             || source.contains("writecsv")
             || source.contains("writejson")
@@ -201,7 +232,18 @@ fn main() -> ExitCode {
         source = format!("Pipe: open stdin {}{} ;", source.trim(), sink);
     }
 
-    let parsed = match rivus_parser::parse(&source) {
+    // Lower to the IR. A `.riv.md` lowers via its concatenated flow bodies (one
+    // document → one `PlanGraph`, §31.2); a `.riv` parses directly.
+    let parse_result = match &literate_doc {
+        Some(doc) if !doc.has_flow() => Err(rivus_core::RivusError::Parse(
+            "no ```flow fence found: a .riv.md document needs at least one executable \
+             ```flow block (untagged or other-language fences are inert display)"
+                .to_string(),
+        )),
+        Some(doc) => rivus_parser::parse(&doc.flow_source()),
+        None => rivus_parser::parse(&source),
+    };
+    let parsed = match parse_result {
         Ok(g) => g,
         Err(e) => {
             eprintln!("parse error in {label}: {e}");
@@ -213,33 +255,36 @@ fn main() -> ExitCode {
         "fmt" => {
             // Format = parse → IR → canonical source (§25.8: fmt is IR-based).
             // Comment trivia is preserved through the IR (§25.7), so the
-            // author's notes survive.
-            let formatted = parsed.to_source();
-            // Honesty gate: the canonical renderer is faithful for linear flows,
-            // merge/join scopes and `->` branch fan-out, but a few constructs
-            // (e.g. an anonymous, unlabeled scope) are not yet reproduced
-            // losslessly. Re-parse the result and refuse to emit anything we
-            // can't round-trip, rather than silently rewrite it into something
-            // different.
-            let faithful = match rivus_parser::parse(&formatted) {
-                Ok(re) => {
-                    re.nodes.len() == parsed.nodes.len()
-                        && re
-                            .nodes
-                            .iter()
-                            .zip(parsed.nodes.iter())
-                            .all(|(a, b)| a.op.kind_str() == b.op.kind_str())
+            // author's notes survive. For a `.riv.md` document, fmt reformats
+            // only the ```flow cell bodies and round-trips prose / frontmatter
+            // verbatim (§31.5).
+            let formatted = match &literate_doc {
+                Some(doc) => match fmt_literate(doc) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => {
+                    let formatted = parsed.to_source();
+                    // Honesty gate: the canonical renderer is faithful for linear
+                    // flows, merge/join scopes and `->` branch fan-out, but a few
+                    // constructs (e.g. an anonymous, unlabeled scope) are not yet
+                    // reproduced losslessly. Re-parse the result and refuse to
+                    // emit anything we can't round-trip, rather than silently
+                    // rewrite it into something different.
+                    if !fmt_faithful(&parsed, &formatted) {
+                        eprintln!(
+                            "error: `rivus fmt` cannot yet faithfully round-trip this \
+                             program (it uses a construct the canonical renderer does \
+                             not yet reproduce losslessly); left the source unchanged"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    formatted
                 }
-                Err(_) => false,
             };
-            if !faithful {
-                eprintln!(
-                    "error: `rivus fmt` cannot yet faithfully round-trip this \
-                     program (it uses a construct the canonical renderer does \
-                     not yet reproduce losslessly); left the source unchanged"
-                );
-                return ExitCode::FAILURE;
-            }
             if fmt_write {
                 if label == "<command>" || label == "<stdin>" {
                     eprintln!("error: `rivus fmt --write` needs a file path (not -c / stdin)");
@@ -566,6 +611,68 @@ fn is_transform_only(src: &str) -> bool {
         first,
         "where" | "take" | "limit" | "head" | "sort" | "distinct" | "describe" | "dropna" | "fill"
     )
+}
+
+/// Is this input path a Rivus Literate document (§31)? `.riv.md` is the canonical
+/// extension; a plain `.md` is also treated as Literate so documents authored in
+/// a Markdown editor work. Anything else (`.riv`, `-c`, stdin) is plain flow.
+fn is_literate_path(label: &str) -> bool {
+    label.ends_with(".riv.md") || label.ends_with(".md")
+}
+
+/// Read a `usize` frontmatter value for the config cascade (§31.3), e.g.
+/// `chunk_size`. Returns `None` when absent or not a positive integer.
+fn frontmatter_usize(doc: &rivus_parser::literate::LiterateDoc, key: &str) -> Option<usize> {
+    doc.frontmatter_pairs()
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Does the canonical source round-trip back to a structurally identical IR?
+/// The honesty gate for `fmt`: refuse to rewrite anything the renderer cannot
+/// reproduce losslessly (§25.8) rather than silently change the program.
+fn fmt_faithful(parsed: &rivus_ir::PlanGraph, formatted: &str) -> bool {
+    match rivus_parser::parse(formatted) {
+        Ok(re) => {
+            re.nodes.len() == parsed.nodes.len()
+                && re
+                    .nodes
+                    .iter()
+                    .zip(parsed.nodes.iter())
+                    .all(|(a, b)| a.op.kind_str() == b.op.kind_str())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Format a `.riv.md` document (§31.5): reformat each ```flow cell body via the
+/// IR (parse → `to_source`) with the same honesty gate as plain `fmt`, and
+/// re-render the document so prose, frontmatter and `#|` options round-trip
+/// verbatim. Cells are reformatted independently; a cell that does not parse on
+/// its own (e.g. it relies on a name defined in another cell) or does not
+/// round-trip faithfully leaves fmt refusing — never a silent rewrite.
+fn fmt_literate(doc: &rivus_parser::literate::LiterateDoc) -> Result<String, String> {
+    use rivus_parser::literate::Segment;
+    let mut out = doc.clone();
+    for seg in &mut out.segments {
+        if let Segment::Flow(cell) = seg {
+            let parsed = rivus_parser::parse(&cell.body)
+                .map_err(|e| format!("`rivus fmt` cannot parse a ```flow cell on its own: {e}"))?;
+            let formatted = parsed.to_source();
+            if !fmt_faithful(&parsed, &formatted) {
+                return Err(
+                    "`rivus fmt` cannot yet faithfully round-trip a ```flow cell (it uses a \
+                     construct the canonical renderer does not reproduce losslessly); left the \
+                     document unchanged"
+                        .to_string(),
+                );
+            }
+            cell.body = formatted.trim_end_matches('\n').to_string();
+        }
+    }
+    Ok(out.render())
 }
 
 fn usage() {
