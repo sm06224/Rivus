@@ -684,6 +684,11 @@ fn riv_md_explain_write_is_idempotent_and_inert() {
         "no mermaid embedded:\n{after1}"
     );
     assert!(after1.contains("flowchart TD"), "no flowchart:\n{after1}");
+    // The canonical (optimized) flow is embedded as an inert ```text block.
+    assert!(
+        after1.contains("```text"),
+        "no canonical-flow text block:\n{after1}"
+    );
     assert!(
         after1.contains("hand-written prose"),
         "prose lost:\n{after1}"

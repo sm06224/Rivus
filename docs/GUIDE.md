@@ -1340,17 +1340,30 @@ sentinel-fenced region of the document:
 ```mermaid
 flowchart TD
   n0["open · open<br/>open examples/users.csv"]
-  n1["filter · filter<br/> ? $_.age >= 20"]
+  n1["filter · filter<br/> ? $_.age &gt;= 20"]
   n2["ByCountry · group<br/> # country"]
   n0 --> n1
   n1 --> n2
 ```
+```text
+ByCountry:
+    open examples/users.csv
+    |? $_.age >= 20
+    |# country
+;
+```
 <!-- rivus:end -->
 ```
 
-The block is regenerated from the IR each time (it is never parsed back), so
-editing inside it is overwritten and re-running is idempotent — hand-written
-prose around it is preserved. The Mermaid fence is inert, so it never affects
-what `run` executes.
+The region holds the Mermaid DAG and the canonical, optimized flow as an inert
+` ```text ` block. It is regenerated from the IR each time (never parsed back),
+so editing inside it is overwritten and re-running is idempotent — hand-written
+prose around it is preserved. Both fences are inert (the flow is `text`, not an
+executable `flow`), so the region never affects what `run` executes.
+
+> The Mermaid here is a **provisional op-graph** (one node per IR op). The
+> approved target is a dataset-centric lineage (nodes = typed datasets with
+> their columns; edges = operations), which needs static schema propagation and
+> arrives in §32.
 
 See `examples/literate.riv.md` for a complete document.

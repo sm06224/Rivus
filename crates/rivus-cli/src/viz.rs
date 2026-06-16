@@ -584,10 +584,16 @@ pub fn render_explain(graph: &PlanGraph) -> String {
 }
 
 /// Render the IR as an embeddable Mermaid `flowchart` (§31.4): a generated,
-/// **output-only** view — it is never parsed back, so it carries no round-trip
-/// burden and is regenerated from the IR each time. Stream edges are solid; the
-/// continue-first error side-channel is dotted. Pure and deterministic (node
-/// order = IR node order), hence unit-testable and idempotent.
+/// **output-only** view — never parsed back, regenerated from the IR each time.
+/// Stream edges are solid; the continue-first error side-channel is dotted.
+/// Pure and deterministic (node order = IR node order), hence unit-testable and
+/// idempotent.
+///
+/// This is the *provisional* op-graph view (one node per IR op). The approved
+/// target is a **dataset-centric lineage** (nodes = named typed datasets with
+/// their columns + emoji; edges = operations) which needs static schema
+/// propagation and is built in **§32** (#161 issuecomment-4709512127); this
+/// op-graph stands in until then.
 pub fn render_mermaid(graph: &PlanGraph) -> String {
     let mut s = String::from("flowchart TD\n");
     for n in &graph.nodes {
@@ -612,14 +618,18 @@ pub fn render_mermaid(graph: &PlanGraph) -> String {
     s
 }
 
-/// Sanitize text for a Mermaid quoted node label `["…"]`: replace characters
-/// that would break the syntax. Quotes/backticks → `'`, newline → `<br/>`,
-/// brackets/braces/pipes → space.
+/// Sanitize text for a Mermaid quoted node label `["…"]`: quotes/backticks →
+/// `'`, **`<`/`>` → HTML entities** (so a predicate like `age < 18` can't start
+/// a tag — they also collide with the `-->` edge arrow and break the render),
+/// newline → `<br/>`, brackets/braces/pipes → space. The `<br/>` we emit here is
+/// pushed whole, so its own `<`/`>` are not re-escaped.
 fn mermaid_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             '"' | '`' => out.push('\''),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
             '\n' => out.push_str("<br/>"),
             '[' | ']' | '{' | '}' | '|' => out.push(' '),
             _ => out.push(c),
@@ -711,9 +721,12 @@ mod ux_j_tests {
             .expect("parse");
         let m = render_mermaid(&g);
         assert!(m.starts_with("flowchart TD\n"), "header missing:\n{m}");
-        // One node line per IR node, and a solid stream edge between them.
+        // One node-definition line per IR node (each holds a quoted label), and a
+        // solid stream edge between them.
         assert_eq!(
-            m.lines().filter(|l| l.contains("[\"")).count(),
+            m.lines()
+                .filter(|l| l.trim_start().starts_with('n') && l.contains('"'))
+                .count(),
             g.nodes.len(),
             "one node per IR node:\n{m}"
         );
@@ -722,16 +735,40 @@ mod ux_j_tests {
         assert_eq!(m, render_mermaid(&g), "mermaid must be deterministic");
     }
 
-    // Each node label is wrapped in exactly one `["…"]` with no inner double
-    // quote (which would break Mermaid). The flow operator pipes (`|?`/`|>`) are
-    // sanitized out of the label rather than leaking and corrupting the syntax.
+    // The render-error fix that is kept from the polish work: `<`/`>` in a label
+    // (a predicate like `age < 18`) are HTML-escaped so they can't start a tag or
+    // collide with the `-->` edge arrow and break the Mermaid render. The
+    // op-graph styling (shapes / colors / surface labels) was dropped — the
+    // approved dataset-centric view is built in §32 (#161).
+    #[test]
+    fn mermaid_escapes_angle_brackets() {
+        let g = rivus_parser::parse("U:\n open u.csv\n |? age < 20\n;").expect("parse");
+        let m = render_mermaid(&g);
+        assert!(m.contains("&lt;"), "`<` not HTML-escaped:\n{m}");
+        // No bare `<` survives inside a node label (would break the render); the
+        // only `<`/`>` left are in the `<br/>` line breaks we emit ourselves.
+        for line in m
+            .lines()
+            .filter(|l| l.trim_start().starts_with('n') && l.contains('"'))
+        {
+            assert!(
+                !line.replace("<br/>", "").contains('<'),
+                "bare `<` leaked into a label: {line}"
+            );
+        }
+    }
+
+    // Each node label is wrapped in exactly two double quotes (the openers/closers)
+    // with no inner quote, and no flow-operator pipe leaks into a label.
     #[test]
     fn mermaid_labels_are_well_formed() {
         let g =
             rivus_parser::parse("U:\n open u.csv\n |? age >= 20\n |> name age\n;").expect("parse");
         let m = render_mermaid(&g);
-        for line in m.lines().filter(|l| l.contains("[\"")) {
-            // Exactly the opening `["` and closing `"]` quotes — two total.
+        for line in m
+            .lines()
+            .filter(|l| l.trim_start().starts_with('n') && l.contains('"'))
+        {
             assert_eq!(
                 line.matches('"').count(),
                 2,

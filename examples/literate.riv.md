@@ -41,9 +41,16 @@ ByCountry:
 ```mermaid
 flowchart TD
   n0["open · open<br/>open examples/users.csv"]
-  n1["filter · filter<br/> ? $_.age >= 20"]
+  n1["filter · filter<br/> ? $_.age &gt;= 20"]
   n2["ByCountry · group<br/> # country"]
   n0 --> n1
   n1 --> n2
+```
+```text
+ByCountry:
+    open examples/users.csv
+    |? $_.age >= 20
+    |# country
+;
 ```
 <!-- rivus:end -->
