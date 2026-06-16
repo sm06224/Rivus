@@ -5,7 +5,7 @@
 //! `rivus live` Markdown renderer will read (Observability spec §13).
 
 use rivus_core::Chunk;
-use rivus_ir::{EdgeKind, PlanGraph};
+use rivus_ir::{EdgeKind, Op, PlanGraph};
 use rivus_optimizer::OptReport;
 use rivus_runtime::{Output, RunResult, RuntimeSnapshot};
 
@@ -583,39 +583,211 @@ pub fn render_explain(graph: &PlanGraph) -> String {
     s
 }
 
-/// Render the IR as an embeddable Mermaid `flowchart` (§31.4): a generated,
-/// **output-only** view — never parsed back, regenerated from the IR each time.
-/// Stream edges are solid; the continue-first error side-channel is dotted.
-/// Pure and deterministic (node order = IR node order), hence unit-testable and
-/// idempotent.
-///
-/// This is the *provisional* op-graph view (one node per IR op). The approved
-/// target is a **dataset-centric lineage** (nodes = named typed datasets with
-/// their columns + emoji; edges = operations) which needs static schema
-/// propagation and is built in **§32** (#161 issuecomment-4709512127); this
-/// op-graph stands in until then.
+/// Render the IR as an embeddable Mermaid **dataset-centric lineage** (§32.5):
+/// a generated, **output-only** view (never parsed back, regenerated from the
+/// IR each time). Nodes are the *named typed datasets* — sources, named scopes,
+/// joins/merges and the final result — each shown with its columns and a role
+/// emoji (🗄️ source, 📦 intermediate, 📄 sink), with the columns supplied by the
+/// static schema-propagation pass (§32.1). Edges are the *operations* that
+/// transform one dataset into the next (🔍 filter, 🔗 join, 📋 project,
+/// 📊 group, 🔀 sort, 🏆 take), folding a chain of intermediate ops onto one
+/// edge. Pure and deterministic (node order = IR node order), hence
+/// unit-testable and idempotent.
 pub fn render_mermaid(graph: &PlanGraph) -> String {
+    let n = graph.nodes.len();
+    let schemas = graph.node_schemas();
+    // A node is a *dataset* node (a box) vs. an intermediate op (an edge): the
+    // boxes are sources, sinks, joins/merges, any named scope, and the leaf.
+    let ds: Vec<bool> = (0..n)
+        .map(|i| {
+            let node = &graph.nodes[i];
+            is_source(&node.op)
+                || is_sink(&node.op)
+                || node.label.is_some()
+                || matches!(node.op, Op::Join { .. } | Op::Merge)
+                || graph.outputs_of(i).is_empty()
+        })
+        .collect();
+
     let mut s = String::from("flowchart TD\n");
-    for n in &graph.nodes {
-        let title = n
-            .label
-            .clone()
-            .unwrap_or_else(|| n.op.kind_str().to_string());
-        let src = truncate(&n.op.to_src_line(), 48);
-        let label = if src.is_empty() || src == title {
-            format!("{title}\n{}", n.op.kind_str())
-        } else {
-            format!("{title} · {}\n{src}", n.op.kind_str())
-        };
-        s.push_str(&format!("  n{}[\"{}\"]\n", n.id, mermaid_escape(&label)));
+    let (mut used_src, mut used_sink, mut used_mid) = (false, false, false);
+    for i in 0..n {
+        if !ds[i] {
+            continue;
+        }
+        let (open, close, class) = dataset_shape(&graph.nodes[i].op);
+        match class {
+            ":::src" => used_src = true,
+            ":::sink" => used_sink = true,
+            _ => used_mid = true,
+        }
+        let mut label = format!(
+            "{} {}",
+            role_emoji(&graph.nodes[i].op),
+            dataset_name(graph, i)
+        );
+        if let Some(sc) = &schemas[i] {
+            if !sc.fields.is_empty() {
+                label.push_str("\n\n");
+                let cols: Vec<String> = sc
+                    .fields
+                    .iter()
+                    .map(|f| format!("{}:{}", f.name, f.dtype))
+                    .collect();
+                label.push_str(&cols.join("\n"));
+            }
+        }
+        s.push_str(&format!(
+            "  n{i}{open}\"{}\"{close}{class}\n",
+            mermaid_escape(&label)
+        ));
     }
-    for e in &graph.edges {
-        match e.kind {
-            EdgeKind::Stream => s.push_str(&format!("  n{} --> n{}\n", e.from, e.to)),
-            EdgeKind::Error => s.push_str(&format!("  n{} -. error .-> n{}\n", e.from, e.to)),
+
+    // Edges: for each dataset node (other than a source), contract the chain of
+    // intermediate ops back to its dataset ancestor(s) and label the edge.
+    for i in 0..n {
+        if !ds[i] || is_source(&graph.nodes[i].op) {
+            continue;
+        }
+        for &x in &graph.inputs_of(i) {
+            let mut labels: Vec<String> = Vec::new();
+            let mut cur = x;
+            // Walk back through non-dataset ops, collecting their edge labels.
+            while !ds[cur] {
+                if let Some(l) = edge_op_label(&graph.nodes[cur].op) {
+                    labels.push(l);
+                }
+                let ins = graph.inputs_of(cur);
+                if ins.len() != 1 {
+                    break;
+                }
+                cur = ins[0];
+            }
+            labels.reverse(); // ancestor → … order
+                              // This dataset's own producing op is the final operation on the edge
+                              // (a source has none; a sink's "save" is the node, not an op label).
+            if let Some(l) = edge_op_label(&graph.nodes[i].op) {
+                labels.push(l);
+            }
+            let elabel = labels.join(" + ");
+            if elabel.is_empty() {
+                s.push_str(&format!("  n{cur} --> n{i}\n"));
+            } else {
+                s.push_str(&format!(
+                    "  n{cur} -->|\"{}\"| n{i}\n",
+                    mermaid_escape(&elabel)
+                ));
+            }
         }
     }
+
+    if used_src {
+        s.push_str("  classDef src fill:#e3f2fd,stroke:#1976d2\n");
+    }
+    if used_mid {
+        s.push_str("  classDef mid fill:#fff3e0,stroke:#f57c00\n");
+    }
+    if used_sink {
+        s.push_str("  classDef sink fill:#e8f5e9,stroke:#388e3c\n");
+    }
     s
+}
+
+/// Is this op a data *source* (the head of a flow)?
+fn is_source(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Source { .. } | Op::Read { .. } | Op::StreamRef { .. }
+    )
+}
+
+/// Is this op a *sink* (the tail of a flow)?
+fn is_sink(op: &Op) -> bool {
+    matches!(op, Op::Sink { .. } | Op::SinkPrint)
+}
+
+/// The Mermaid shape + `classDef` for a dataset node by role.
+fn dataset_shape(op: &Op) -> (&'static str, &'static str, &'static str) {
+    if is_source(op) {
+        ("[(", ")]", ":::src") // cylinder
+    } else if is_sink(op) {
+        ("[/", "/]", ":::sink") // parallelogram
+    } else {
+        ("[", "]", ":::mid") // rectangle
+    }
+}
+
+/// The role emoji for a dataset node (🗄️ source / 📄 sink / 📦 intermediate).
+fn role_emoji(op: &Op) -> &'static str {
+    if is_source(op) {
+        "🗄️"
+    } else if is_sink(op) {
+        "📄"
+    } else {
+        "📦"
+    }
+}
+
+/// A display name for a dataset node: its scope label when named, else the
+/// source/sink file basename, else the op kind.
+fn dataset_name(graph: &PlanGraph, i: usize) -> String {
+    if let Some(l) = &graph.nodes[i].label {
+        return l.clone();
+    }
+    match &graph.nodes[i].op {
+        Op::Source { discovery, .. } => basename(discovery.path()),
+        Op::Sink { route, .. } => route
+            .path()
+            .map(basename)
+            .unwrap_or_else(|| "output".into()),
+        op => op.kind_str().to_string(),
+    }
+}
+
+/// The last path component (`a/b/c.csv` → `c.csv`), for a compact node name.
+fn basename(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+/// The edge label for an operation that transforms one dataset into the next —
+/// an emoji plus the surface form. `None` for nodes that are not operations on
+/// an edge (sources, sinks, branch tees).
+fn edge_op_label(op: &Op) -> Option<String> {
+    let emoji = match op.kind_str() {
+        "filter" | "validate" => "🔍",
+        "join" => "🔗",
+        "project" | "fused" => "📋",
+        "group" => "📊",
+        "sort" => "🔀",
+        "take" => "🏆",
+        "distinct" | "dropna" | "fill" | "cast" | "rename" | "drop" | "reorder" => "🔧",
+        "merge" => "➕",
+        _ => return None, // branch, source, sink, stream, describe, print
+    };
+    let text = surface(&op.to_src_line());
+    if text.is_empty() {
+        Some(emoji.to_string())
+    } else {
+        Some(format!("{emoji} {text}"))
+    }
+}
+
+/// Surface form of an op's source line for an edge label: drop a leading flow
+/// operator (`|?`/`|>`/`|#`/`|!`), the `$_.` field sigil and any inert `# …`
+/// annotation, and truncate at a token boundary.
+fn surface(src_line: &str) -> String {
+    let line = match src_line.split_once("  #") {
+        Some((before, _)) => before.trim_end(),
+        None => src_line,
+    };
+    let line = line.replace("$_.", "");
+    let line = line.trim_start();
+    let line = ["|?", "|>", "|#", "|!"]
+        .iter()
+        .find_map(|p| line.strip_prefix(p))
+        .unwrap_or(line)
+        .trim();
+    truncate(line, 40)
 }
 
 /// Sanitize text for a Mermaid quoted node label `["…"]`: quotes/backticks →
@@ -712,71 +884,90 @@ mod ux_j_tests {
         );
     }
 
-    // §31.4: the Mermaid emitter is a pure, output-only view of the IR — a
-    // `flowchart` with one node per IR node and solid stream / dotted error
-    // edges. Deterministic (node order = IR order), so it's idempotent.
+    // A line that *defines* a node (`nN[…"…"…]`), as opposed to an edge
+    // (`nN -->| … | nM`). Used to scope label assertions to node boxes.
+    fn is_node_def(line: &str) -> bool {
+        let t = line.trim_start();
+        t.starts_with('n') && t.contains('[') && !t.contains("-->")
+    }
+
+    // §32.5: the Mermaid emitter is a pure, output-only **dataset-centric**
+    // lineage — boxes are datasets (source/named-scope/sink) carrying their
+    // columns + a role emoji; edges are the operations between them. Pure and
+    // deterministic, so it's idempotent.
     #[test]
-    fn mermaid_renders_nodes_and_edges() {
-        let g = rivus_parser::parse("F:\n open data.csv\n |? age >= 20\n sort age desc\n;")
-            .expect("parse");
+    fn mermaid_renders_dataset_lineage() {
+        let g = rivus_parser::parse(
+            "Adults:\n open u.csv (uid:str age:i64 city:str)\n |? age >= 18\n;\n\
+             Summary:\n Adults\n |# city sum:age\n;",
+        )
+        .expect("parse");
         let m = render_mermaid(&g);
         assert!(m.starts_with("flowchart TD\n"), "header missing:\n{m}");
-        // One node-definition line per IR node (each holds a quoted label), and a
-        // solid stream edge between them.
-        assert_eq!(
-            m.lines()
-                .filter(|l| l.trim_start().starts_with('n') && l.contains('"'))
-                .count(),
-            g.nodes.len(),
-            "one node per IR node:\n{m}"
+        // Source box: cylinder + 🗄️ + its declared columns (static schema, §32.1).
+        assert!(m.contains("[(\"🗄️ u.csv"), "source box missing:\n{m}");
+        assert!(m.contains("age:i64"), "declared column/type missing:\n{m}");
+        // Named scopes are 📦 dataset boxes; the group output is statically typed.
+        assert!(m.contains("📦 Adults"), "Adults dataset missing:\n{m}");
+        assert!(m.contains("📦 Summary"), "Summary dataset missing:\n{m}");
+        assert!(
+            m.contains("sum_age:i64"),
+            "group output schema missing:\n{m}"
         );
-        assert!(m.contains(" --> n"), "missing a stream edge:\n{m}");
+        // Edges carry the operation (emoji + surface form), not the data.
+        assert!(
+            m.contains("-->|\"🔍 age &gt;= 18\"|"),
+            "filter edge missing:\n{m}"
+        );
+        assert!(m.contains("📊 city sum:age"), "group edge missing:\n{m}");
+        assert!(m.contains("classDef src "), "missing classDef:\n{m}");
         // Pure / deterministic → byte-identical on a second call.
         assert_eq!(m, render_mermaid(&g), "mermaid must be deterministic");
     }
 
-    // The render-error fix that is kept from the polish work: `<`/`>` in a label
-    // (a predicate like `age < 18`) are HTML-escaped so they can't start a tag or
-    // collide with the `-->` edge arrow and break the Mermaid render. The
-    // op-graph styling (shapes / colors / surface labels) was dropped — the
-    // approved dataset-centric view is built in §32 (#161).
+    // A folded edge: a chain of intermediate ops between two datasets collapses
+    // onto one edge label (`sort … + take …`).
     #[test]
-    fn mermaid_escapes_angle_brackets() {
-        let g = rivus_parser::parse("U:\n open u.csv\n |? age < 20\n;").expect("parse");
+    fn mermaid_folds_op_chain_onto_one_edge() {
+        let g = rivus_parser::parse(
+            "Top:\n open u.csv (city:str amount:i64)\n sort amount desc\n take 5\n save out.csv\n;",
+        )
+        .expect("parse");
         let m = render_mermaid(&g);
-        assert!(m.contains("&lt;"), "`<` not HTML-escaped:\n{m}");
-        // No bare `<` survives inside a node label (would break the render); the
-        // only `<`/`>` left are in the `<br/>` line breaks we emit ourselves.
-        for line in m
-            .lines()
-            .filter(|l| l.trim_start().starts_with('n') && l.contains('"'))
-        {
-            assert!(
-                !line.replace("<br/>", "").contains('<'),
-                "bare `<` leaked into a label: {line}"
-            );
-        }
+        assert!(
+            m.contains("🔀 sort amount desc + 🏆 take 5"),
+            "op chain not folded onto one edge:\n{m}"
+        );
+        // The sink is a 📄 parallelogram dataset box.
+        assert!(m.contains("[/\"📄"), "sink box missing:\n{m}");
     }
 
-    // Each node label is wrapped in exactly two double quotes (the openers/closers)
-    // with no inner quote, and no flow-operator pipe leaks into a label.
+    // `<`/`>` in an edge label (a predicate like `age < 18`) are HTML-escaped so
+    // they can't collide with the `-->` arrow and break the render.
     #[test]
-    fn mermaid_labels_are_well_formed() {
-        let g =
-            rivus_parser::parse("U:\n open u.csv\n |? age >= 20\n |> name age\n;").expect("parse");
+    fn mermaid_escapes_angle_brackets() {
+        let g = rivus_parser::parse("U:\n open u.csv (age:i64)\n |? age < 20\n;").expect("parse");
         let m = render_mermaid(&g);
-        for line in m
-            .lines()
-            .filter(|l| l.trim_start().starts_with('n') && l.contains('"'))
-        {
+        assert!(m.contains("&lt;"), "`<` not HTML-escaped:\n{m}");
+        // No bare `<` survives anywhere except the `<br/>` line breaks we emit.
+        assert!(
+            !m.replace("<br/>", "").contains('<'),
+            "bare `<` leaked (would break the render):\n{m}"
+        );
+    }
+
+    // Each node box's label is wrapped in exactly two double quotes (no inner
+    // quote that would break Mermaid).
+    #[test]
+    fn mermaid_node_labels_well_formed() {
+        let g = rivus_parser::parse("U:\n open u.csv (name:str age:i64)\n |? age >= 20\n;")
+            .expect("parse");
+        let m = render_mermaid(&g);
+        for line in m.lines().filter(|l| is_node_def(l)) {
             assert_eq!(
                 line.matches('"').count(),
                 2,
-                "label must have exactly the wrapping quotes: {line}"
-            );
-            assert!(
-                !line.contains('|'),
-                "pipe leaked into a Mermaid label: {line}"
+                "node label must have exactly the wrapping quotes: {line}"
             );
         }
     }
