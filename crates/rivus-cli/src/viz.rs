@@ -596,16 +596,29 @@ pub fn render_explain(graph: &PlanGraph) -> String {
 pub fn render_mermaid(graph: &PlanGraph) -> String {
     let n = graph.nodes.len();
     let schemas = graph.node_schemas();
-    // A node is a *dataset* node (a box) vs. an intermediate op (an edge): the
-    // boxes are sources, sinks, joins/merges, any named scope, and the leaf.
+    // A schema-changing op (group/join/project/…) must be its own dataset node
+    // so the reshape — especially an aggregate — reads as a distinct step
+    // (#166 review B); a schema-invariant row op (filter/sort/take/distinct)
+    // folds onto an edge. A foldable op that *feeds* a schema-changing op also
+    // becomes a node, so the schema-changing op keeps its own clean edge rather
+    // than folding the filter and the aggregate onto one.
+    let feeds_hard: Vec<bool> = (0..n)
+        .map(|i| {
+            graph
+                .outputs_of(i)
+                .iter()
+                .any(|&j| is_schema_changing(&graph.nodes[j].op))
+        })
+        .collect();
     let ds: Vec<bool> = (0..n)
         .map(|i| {
             let node = &graph.nodes[i];
             is_source(&node.op)
                 || is_sink(&node.op)
                 || node.label.is_some()
-                || matches!(node.op, Op::Join { .. } | Op::Merge)
                 || graph.outputs_of(i).is_empty()
+                || is_schema_changing(&node.op)
+                || feeds_hard[i]
         })
         .collect();
 
@@ -615,7 +628,9 @@ pub fn render_mermaid(graph: &PlanGraph) -> String {
         if !ds[i] {
             continue;
         }
-        let (open, close, class) = dataset_shape(&graph.nodes[i].op);
+        // All nodes are plain rectangles (target #161); role is conveyed by the
+        // emoji + `classDef` tint, not the box shape (#166 review A).
+        let class = role_class(&graph.nodes[i].op);
         match class {
             ":::src" => used_src = true,
             ":::sink" => used_sink = true,
@@ -637,10 +652,7 @@ pub fn render_mermaid(graph: &PlanGraph) -> String {
                 label.push_str(&cols.join("\n"));
             }
         }
-        s.push_str(&format!(
-            "  n{i}{open}\"{}\"{close}{class}\n",
-            mermaid_escape(&label)
-        ));
+        s.push_str(&format!("  n{i}[\"{}\"]{class}\n", mermaid_escape(&label)));
     }
 
     // Edges: for each dataset node (other than a source), contract the chain of
@@ -706,15 +718,35 @@ fn is_sink(op: &Op) -> bool {
     matches!(op, Op::Sink { .. } | Op::SinkPrint)
 }
 
-/// The Mermaid shape + `classDef` for a dataset node by role.
-fn dataset_shape(op: &Op) -> (&'static str, &'static str, &'static str) {
+/// The `classDef` tint suffix for a dataset node by role. All nodes are plain
+/// rectangles (#166 review A); only the colour + emoji differ.
+fn role_class(op: &Op) -> &'static str {
     if is_source(op) {
-        ("[(", ")]", ":::src") // cylinder
+        ":::src"
     } else if is_sink(op) {
-        ("[/", "/]", ":::sink") // parallelogram
+        ":::sink"
     } else {
-        ("[", "]", ":::mid") // rectangle
+        ":::mid"
     }
+}
+
+/// Does this op change the schema (column set / names / types), so it must be
+/// its own dataset node (#166 review B)? Reshapers (project / group / join /
+/// merge) and column edits (cast / rename / drop / reorder) do; schema-invariant
+/// row ops (filter / sort / take / distinct / dropna / fill) do not.
+fn is_schema_changing(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Project { .. }
+            | Op::ProjectExpr { .. }
+            | Op::GroupBy { .. }
+            | Op::Join { .. }
+            | Op::Merge
+            | Op::Cast { .. }
+            | Op::Rename { .. }
+            | Op::Drop { .. }
+            | Op::Reorder { .. }
+    )
 }
 
 /// The role emoji for a dataset node (🗄️ source / 📄 sink / 📦 intermediate).
@@ -904,8 +936,16 @@ mod ux_j_tests {
         .expect("parse");
         let m = render_mermaid(&g);
         assert!(m.starts_with("flowchart TD\n"), "header missing:\n{m}");
-        // Source box: cylinder + 🗄️ + its declared columns (static schema, §32.1).
-        assert!(m.contains("[(\"🗄️ u.csv"), "source box missing:\n{m}");
+        // All boxes are plain rectangles (#166 review A): source = `["🗄️ …"]`,
+        // never a cylinder. The declared columns ride the box (static schema).
+        assert!(
+            m.contains("[\"🗄️ u.csv"),
+            "source box missing/not a rectangle:\n{m}"
+        );
+        assert!(
+            !m.contains("[("),
+            "no cylinder shapes (#166 review A):\n{m}"
+        );
         assert!(m.contains("age:i64"), "declared column/type missing:\n{m}");
         // Named scopes are 📦 dataset boxes; the group output is statically typed.
         assert!(m.contains("📦 Adults"), "Adults dataset missing:\n{m}");
@@ -925,10 +965,10 @@ mod ux_j_tests {
         assert_eq!(m, render_mermaid(&g), "mermaid must be deterministic");
     }
 
-    // A folded edge: a chain of intermediate ops between two datasets collapses
-    // onto one edge label (`sort … + take …`).
+    // Only schema-invariant row ops fold: a `sort` + `take` chain into a sink
+    // collapses onto one edge (#166 review B — these don't change the schema).
     #[test]
-    fn mermaid_folds_op_chain_onto_one_edge() {
+    fn mermaid_folds_schema_invariant_chain_onto_one_edge() {
         let g = rivus_parser::parse(
             "Top:\n open u.csv (city:str amount:i64)\n sort amount desc\n take 5\n save out.csv\n;",
         )
@@ -936,10 +976,43 @@ mod ux_j_tests {
         let m = render_mermaid(&g);
         assert!(
             m.contains("🔀 sort amount desc + 🏆 take 5"),
-            "op chain not folded onto one edge:\n{m}"
+            "schema-invariant chain not folded onto one edge:\n{m}"
         );
-        // The sink is a 📄 parallelogram dataset box.
-        assert!(m.contains("[/\"📄"), "sink box missing:\n{m}");
+        // The sink is a plain rectangle (#166 review A), not a parallelogram.
+        assert!(
+            m.contains("[\"📄"),
+            "sink box missing/not a rectangle:\n{m}"
+        );
+        assert!(
+            !m.contains("[/"),
+            "no parallelogram shapes (#166 review A):\n{m}"
+        );
+    }
+
+    // #166 review B: a schema-changing op (group) is its **own** step — the
+    // aggregate is never folded onto the same edge as a preceding filter.
+    #[test]
+    fn mermaid_aggregate_is_its_own_step() {
+        let g = rivus_parser::parse(
+            "ByCity:\n open u.csv (city:str age:i64)\n |? age >= 18\n |# city sum:age\n;",
+        )
+        .expect("parse");
+        let m = render_mermaid(&g);
+        // The filter and the group are on *separate* edges (not "🔍 … + 📊 …").
+        assert!(
+            m.contains("|\"🔍 age &gt;= 18\"|"),
+            "filter not its own edge:\n{m}"
+        );
+        assert!(
+            m.contains("|\"📊 city sum:age\"|"),
+            "group not its own edge:\n{m}"
+        );
+        for line in m.lines() {
+            assert!(
+                !(line.contains("🔍") && line.contains("📊")),
+                "filter and aggregate folded onto one edge:\n{line}"
+            );
+        }
     }
 
     // `<`/`>` in an edge label (a predicate like `age < 18`) are HTML-escaped so
