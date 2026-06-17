@@ -763,16 +763,22 @@ fn role_emoji(op: &Op) -> &'static str {
 /// A display name for a dataset node: its scope label when named, else the
 /// source/sink file basename, else the op kind.
 fn dataset_name(graph: &PlanGraph, i: usize) -> String {
-    if let Some(l) = &graph.nodes[i].label {
-        return l.clone();
-    }
     match &graph.nodes[i].op {
+        // I/O endpoints (source / sink) are identified by their **file path**,
+        // not a scope/leaf label — so `🗄️ users.csv` and `📄 top.csv` stay
+        // symmetric (#166 review). The path wins over a label that happens to
+        // sit on the endpoint node.
         Op::Source { discovery, .. } => basename(discovery.path()),
         Op::Sink { route, .. } => route
             .path()
             .map(basename)
+            .or_else(|| graph.nodes[i].label.clone())
             .unwrap_or_else(|| "output".into()),
-        op => op.kind_str().to_string(),
+        // Intermediate nodes use their scope label, else the op kind.
+        _ => graph.nodes[i]
+            .label
+            .clone()
+            .unwrap_or_else(|| graph.nodes[i].op.kind_str().to_string()),
     }
 }
 
@@ -978,10 +984,12 @@ mod ux_j_tests {
             m.contains("🔀 sort amount desc + 🏆 take 5"),
             "schema-invariant chain not folded onto one edge:\n{m}"
         );
-        // The sink is a plain rectangle (#166 review A), not a parallelogram.
+        // The sink is a plain rectangle (#166 review A), not a parallelogram,
+        // and is named by its **file path** (symmetric with the source), not the
+        // leaf scope label (#166 review).
         assert!(
-            m.contains("[\"📄"),
-            "sink box missing/not a rectangle:\n{m}"
+            m.contains("[\"📄 out.csv"),
+            "sink not a rectangle / not named by its file path:\n{m}"
         );
         assert!(
             !m.contains("[/"),
