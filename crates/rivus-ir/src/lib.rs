@@ -6,6 +6,7 @@
 
 pub mod expr;
 pub mod graph;
+pub mod schema_prop;
 
 pub use expr::{is_type_word, Access, ArithOp, CmpOp, Expr, Func};
 pub use graph::{
