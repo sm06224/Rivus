@@ -312,8 +312,15 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             cast_fails: 0,
         }),
         Op::Take { n } => Box::new(Take { remaining: *n }),
-        Op::Sort { keys } => Box::new(Sort::new(keys.clone())),
-        Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
+        // §32 s2: keys are `PathExpr`; the runtime resolves them by flat column
+        // name today — a bare path is its plain name (byte-identical), a nested
+        // path stringifies and simply misses a flat column until s3/s4.
+        Op::Sort { keys } => Box::new(Sort::new(
+            keys.iter().map(|(k, d)| (k.column_name(), *d)).collect(),
+        )),
+        Op::Distinct { keys } => Box::new(Distinct::new(
+            keys.iter().map(|k| k.column_name()).collect(),
+        )),
         Op::Describe => Box::new(Describe::default()),
         Op::DropNa { cols } => Box::new(DropNa { cols: cols.clone() }),
         Op::Fill { col, method } => match method {
@@ -349,7 +356,10 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             fields: fields.clone(),
             cast_fails: 0,
         }),
-        Op::GroupBy { keys, aggs } => Box::new(GroupBy::new(keys.clone(), aggs.clone())),
+        Op::GroupBy { keys, aggs } => Box::new(GroupBy::new(
+            keys.iter().map(|k| k.column_name()).collect(),
+            aggs.clone(),
+        )),
         Op::Merge => Box::new(Merge),
         Op::Branch => Box::new(Merge), // identity forwarder; fan-out is structural
         Op::Join {
@@ -357,8 +367,8 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             right_keys,
             kind,
         } => Box::new(Join::new(
-            left_keys.clone(),
-            right_keys.clone(),
+            left_keys.iter().map(|k| k.column_name()).collect(),
+            right_keys.iter().map(|k| k.column_name()).collect(),
             *kind,
             inputs.first().copied().unwrap_or(usize::MAX),
         )),

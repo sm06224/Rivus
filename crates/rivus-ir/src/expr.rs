@@ -272,6 +272,19 @@ impl PathExpr {
         self.segs.is_empty().then_some(self.root.as_str())
     }
 
+    /// The flat-column name this path resolves against today (§32 s2). A bare
+    /// path is its own name (`country`), preserving the existing fast path
+    /// byte-for-byte; a nested path has no flat column yet (nested resolution is
+    /// s4 / structured data is s3), so it stringifies to its surface spelling
+    /// (`user.age`), which simply doesn't match a flat column and is surfaced as
+    /// missing — never-silent — until the nested lanes land.
+    pub fn column_name(&self) -> String {
+        match self.as_bare() {
+            Some(name) => name.to_string(),
+            None => self.to_string(),
+        }
+    }
+
     /// Parse a path from its surface spelling `root ('.' field | '[' int ']')*`.
     /// A plain `name` (no segments) is the degenerate form. Returns `None` on a
     /// malformed path (empty root / field, unterminated `[`, non-numeric index)
