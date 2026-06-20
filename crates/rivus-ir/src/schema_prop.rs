@@ -18,7 +18,7 @@
 //!   type-checking, deliberately separate from the observed lane; it never
 //!   drives execution.
 
-use crate::expr::{Access, ArithOp, Func};
+use crate::expr::{Access, ArithOp, Func, PathExpr};
 use crate::graph::{AggFunc, Codec, Op, PlanGraph};
 use crate::Expr;
 use rivus_core::{DataType, Field, Schema};
@@ -177,10 +177,10 @@ fn source_schema(codec: &Codec) -> Option<Schema> {
 /// GroupBy output: each key column (runtime materializes keys on the `Str` lane,
 /// design 26 §26.2), then the always-emitted `count:i64`, then one column per
 /// aggregate named `{label}_{col}` with its nominal type.
-fn group_schema(keys: &[String], aggs: &[(AggFunc, String)], input: &Schema) -> Schema {
+fn group_schema(keys: &[PathExpr], aggs: &[(AggFunc, String)], input: &Schema) -> Schema {
     let mut fields: Vec<Field> = keys
         .iter()
-        .map(|k| Field::new(k.clone(), DataType::Str))
+        .map(|k| Field::new(k.column_name(), DataType::Str))
         .collect();
     fields.push(Field::new("count", DataType::I64));
     for (func, col) in aggs {
@@ -214,12 +214,12 @@ fn agg_type(func: &AggFunc, col_ty: DataType) -> DataType {
 /// Join output (matches the runtime, join.rs): the left schema followed by the
 /// right schema with the right join-keys dropped and name collisions suffixed
 /// `_r`. `None` if either side's schema is unknown.
-fn join_schema(inputs: &[Option<Schema>], right_keys: &[String]) -> Option<Schema> {
+fn join_schema(inputs: &[Option<Schema>], right_keys: &[PathExpr]) -> Option<Schema> {
     let left = inputs.first().and_then(|s| s.clone())?;
     let right = inputs.get(1).and_then(|s| s.clone())?;
     let mut fields = left.fields.clone();
     for f in &right.fields {
-        if right_keys.contains(&f.name) {
+        if right_keys.iter().any(|k| k.column_name() == f.name) {
             continue;
         }
         let name = if left.index_of(&f.name).is_some() {
@@ -414,7 +414,7 @@ mod tests {
         let mut g = PlanGraph::new();
         let s = g.add_node(declared_csv());
         let gb = g.add_node(Op::GroupBy {
-            keys: vec!["city".into()],
+            keys: vec![PathExpr::bare("city")],
             aggs: vec![(AggFunc::Sum, "age".into())],
         });
         g.add_edge(s, gb, EdgeKind::Stream);

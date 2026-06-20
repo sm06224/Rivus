@@ -566,7 +566,12 @@ pub(crate) fn group_parallel_safe(
 /// other op.
 pub(crate) fn new_group(op: &Op) -> Option<GroupBy> {
     match op {
-        Op::GroupBy { keys, aggs } => Some(GroupBy::new(keys.clone(), aggs.clone())),
+        // §32 s2: `PathExpr` keys resolve by flat column name in the runtime
+        // (bare = the plain name; nested misses a flat column until s3/s4).
+        Op::GroupBy { keys, aggs } => Some(GroupBy::new(
+            keys.iter().map(|k| k.column_name()).collect(),
+            aggs.clone(),
+        )),
         _ => None,
     }
 }

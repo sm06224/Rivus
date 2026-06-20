@@ -6,7 +6,7 @@
 //! that the optimizer rewrites and that [`PlanGraph::to_source`] regenerates
 //! back into readable Rivus source (Master principle #5: IR reversibility).
 
-use crate::expr::{Access, CmpOp, Expr};
+use crate::expr::{Access, CmpOp, Expr, PathExpr};
 use rivus_core::{DataType, Mode, Severity, Value};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -681,12 +681,12 @@ pub enum Op {
     /// `sort KEY [asc|desc] [KEY [asc|desc] ...]` — order the whole stream by
     /// one or more keys, each with its own direction (default ascending).
     /// Blocking (buffers all rows) → serial path.
-    Sort { keys: Vec<(String, bool)> },
+    Sort { keys: Vec<(PathExpr, bool)> },
     /// `distinct [KEY ...]` — drop duplicate rows, keeping the first occurrence.
     /// With no keys, the whole row is the dedup key; otherwise only the named
     /// columns. Streaming (emits as it goes) but stateful (a global seen-set),
     /// so it runs on the serial path. Output order = first-occurrence order.
-    Distinct { keys: Vec<String> },
+    Distinct { keys: Vec<PathExpr> },
     /// `describe` — replace the stream with a one-row-per-column summary
     /// (column, type, count, min, max, mean). A streaming, single-pass
     /// accumulator that emits on finish; stateful → serial path.
@@ -722,7 +722,7 @@ pub enum Op {
     /// emits a `count`; each `(func, col)` adds an aggregate column (e.g.
     /// `sum:score`, `avg:age`). Each key becomes a column in the output.
     GroupBy {
-        keys: Vec<String>,
+        keys: Vec<PathExpr>,
         aggs: Vec<(AggFunc, String)>,
     },
     /// Fused linear chain of filters and an optional trailing projection,
@@ -742,8 +742,8 @@ pub enum Op {
     /// two vectors have equal length (≥1). An outer join keeps unmatched rows on
     /// the kept side, filling the other side's columns with type defaults.
     Join {
-        left_keys: Vec<String>,
-        right_keys: Vec<String>,
+        left_keys: Vec<PathExpr>,
+        right_keys: Vec<PathExpr>,
         kind: JoinKind,
     },
     /// `print` / default leaf sink — a display leaf, not an encoded file write,
@@ -772,13 +772,15 @@ pub const COMMA: u8 = b',';
 /// pair, `lk` when the two names are equal else `lk:rk`, space-separated. So
 /// `on id`, `on uid:oid`, and `on a b c` all round-trip, as does a mixed
 /// `on a x:y`.
-pub fn join_on_clause(left_keys: &[String], right_keys: &[String]) -> String {
+pub fn join_on_clause(left_keys: &[PathExpr], right_keys: &[PathExpr]) -> String {
     let parts: Vec<String> = left_keys
         .iter()
         .zip(right_keys.iter())
         .map(|(l, r)| {
+            // A bare key path round-trips as its plain name (§32 s2 pin), so a
+            // same-named pair stays `on uid`, never `on uid()`/`on uid:uid`.
             if l == r {
-                l.clone()
+                l.to_string()
             } else {
                 format!("{l}:{r}")
             }
@@ -1204,7 +1206,7 @@ impl Op {
                         if *desc {
                             format!("{k} desc")
                         } else {
-                            k.clone()
+                            k.to_string()
                         }
                     })
                     .collect();
@@ -1214,7 +1216,8 @@ impl Op {
                 if keys.is_empty() {
                     "distinct".to_string()
                 } else {
-                    format!("distinct {}", keys.join(" "))
+                    let parts: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+                    format!("distinct {}", parts.join(" "))
                 }
             }
             Op::Describe => "describe".to_string(),
@@ -1250,7 +1253,8 @@ impl Op {
                 s.trim_end().to_string()
             }
             Op::GroupBy { keys, aggs } => {
-                let mut s = format!("|# {}", keys.join(" "));
+                let key_parts: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+                let mut s = format!("|# {}", key_parts.join(" "));
                 for (f, c) in aggs {
                     s.push_str(&format!(" {}:{c}", f.label()));
                 }

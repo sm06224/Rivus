@@ -225,6 +225,133 @@ impl Access {
     }
 }
 
+/// A **path expression** key (§32.3): a root column plus a chain of nested
+/// access segments. Generalizes the bare-column keys of group / sort / distinct
+/// / join (today `Vec<String>`) so a key can reach into structured (Struct /
+/// List) values — `user.age`, `tags[0]`, `user.address.city`.
+///
+/// **The degenerate form is pinned.** A depth-0 path (no segments) *is* a bare
+/// column name and must stay byte-identical: it resolves on the existing flat
+/// fast path (`Schema::index_of`) and round-trips through `to_source` as the
+/// plain name `country` — never `country()` / `path(country)` (§32.3, ratified
+/// #161 ②). [`PathExpr::fmt`] prints just the root when there are no segments,
+/// and the parser yields a bare path for a plain name, so the round-trip holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathExpr {
+    pub root: String,
+    pub segs: Vec<PathSeg>,
+}
+
+/// One step of a [`PathExpr`] after the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSeg {
+    /// `.name` — a struct field.
+    Field(String),
+    /// `[i]` — a list index (0-based).
+    Index(u32),
+}
+
+impl PathExpr {
+    /// A bare-column (depth-0) path — the degenerate form that preserves every
+    /// existing behaviour byte-for-byte.
+    pub fn bare(name: impl Into<String>) -> Self {
+        PathExpr {
+            root: name.into(),
+            segs: Vec::new(),
+        }
+    }
+
+    /// Is this the degenerate (bare-column) form? Such a path resolves on the
+    /// flat fast path and round-trips as a plain name.
+    pub fn is_bare(&self) -> bool {
+        self.segs.is_empty()
+    }
+
+    /// The bare column name when this is the degenerate form, else `None`.
+    pub fn as_bare(&self) -> Option<&str> {
+        self.segs.is_empty().then_some(self.root.as_str())
+    }
+
+    /// The flat-column name this path resolves against today (§32 s2). A bare
+    /// path is its own name (`country`), preserving the existing fast path
+    /// byte-for-byte; a nested path has no flat column yet (nested resolution is
+    /// s4 / structured data is s3), so it stringifies to its surface spelling
+    /// (`user.age`), which simply doesn't match a flat column and is surfaced as
+    /// missing — never-silent — until the nested lanes land.
+    pub fn column_name(&self) -> String {
+        match self.as_bare() {
+            Some(name) => name.to_string(),
+            None => self.to_string(),
+        }
+    }
+
+    /// Parse a path from its surface spelling `root ('.' field | '[' int ']')*`.
+    /// A plain `name` (no segments) is the degenerate form. Returns `None` on a
+    /// malformed path (empty root / field, unterminated `[`, non-numeric index)
+    /// — never-silent: the caller surfaces the error.
+    pub fn parse(s: &str) -> Option<PathExpr> {
+        let bytes = s.as_bytes();
+        // root = leading run up to the first '.' or '['.
+        let mut i = 0;
+        while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
+            i += 1;
+        }
+        if i == 0 {
+            return None;
+        }
+        let root = s[..i].to_string();
+        let rest = &s[i..];
+        let rb = rest.as_bytes();
+        let mut segs = Vec::new();
+        let mut j = 0;
+        while j < rb.len() {
+            match rb[j] {
+                b'.' => {
+                    j += 1;
+                    let start = j;
+                    while j < rb.len() && rb[j] != b'.' && rb[j] != b'[' {
+                        j += 1;
+                    }
+                    if j == start {
+                        return None; // empty field name
+                    }
+                    segs.push(PathSeg::Field(rest[start..j].to_string()));
+                }
+                b'[' => {
+                    j += 1;
+                    let start = j;
+                    while j < rb.len() && rb[j] != b']' {
+                        j += 1;
+                    }
+                    if j >= rb.len() {
+                        return None; // unterminated '['
+                    }
+                    let idx: u32 = rest[start..j].parse().ok()?;
+                    segs.push(PathSeg::Index(idx));
+                    j += 1; // skip ']'
+                }
+                _ => return None,
+            }
+        }
+        Some(PathExpr { root, segs })
+    }
+}
+
+impl fmt::Display for PathExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Degenerate form prints as the bare name (the round-trip pin); deeper
+        // paths append `.field` / `[i]`.
+        f.write_str(&self.root)?;
+        for seg in &self.segs {
+            match seg {
+                PathSeg::Field(n) => write!(f, ".{n}")?,
+                PathSeg::Index(i) => write!(f, "[{i}]")?,
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     /// Reference to a field of the current object, with an access strategy.
@@ -586,8 +713,41 @@ pub fn is_type_word(w: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::Expr;
+    use super::{Expr, PathExpr, PathSeg};
     use rivus_core::{Resource, Value};
+
+    // §32.3 #161 ②: the degenerate (bare) path round-trips as the plain name —
+    // never `name()` / `path(name)` — so existing keys stay byte-identical.
+    #[test]
+    fn bare_path_round_trips_as_plain_name() {
+        let p = PathExpr::bare("country");
+        assert!(p.is_bare());
+        assert_eq!(p.as_bare(), Some("country"));
+        assert_eq!(p.to_string(), "country");
+        assert_eq!(PathExpr::parse("country"), Some(p));
+    }
+
+    #[test]
+    fn nested_paths_parse_and_round_trip() {
+        for s in ["user.age", "tags[0]", "user.address.city", "a[3].b[12]"] {
+            let p = PathExpr::parse(s).unwrap_or_else(|| panic!("parse {s}"));
+            assert!(!p.is_bare(), "{s} is not bare");
+            assert_eq!(p.to_string(), s, "round-trip {s}");
+        }
+        let p = PathExpr::parse("user.age").unwrap();
+        assert_eq!(p.root, "user");
+        assert_eq!(p.segs, vec![PathSeg::Field("age".into())]);
+        let t = PathExpr::parse("tags[0]").unwrap();
+        assert_eq!(t.segs, vec![PathSeg::Index(0)]);
+    }
+
+    #[test]
+    fn malformed_paths_are_rejected() {
+        // Empty root, empty field, unterminated index, non-numeric index.
+        for s in [".x", "a.", "a[", "a[x]", ""] {
+            assert!(PathExpr::parse(s).is_none(), "should reject {s:?}");
+        }
+    }
 
     #[test]
     fn resource_literal_to_source_is_uri_only() {

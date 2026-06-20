@@ -32,9 +32,18 @@ use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value
 use rivus_ir::{
     is_type_word, parse_route_template, Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery,
     Disposition, EdgeKind, Endian, Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind,
-    NodeId, Op, PlanGraph, Provenance, ReadFmt, Route, RouteSeg, SinkCodec, SubView, Transport,
-    ViewDef,
+    NodeId, Op, PathExpr, PlanGraph, Provenance, ReadFmt, Route, RouteSeg, SinkCodec, SubView,
+    Transport, ViewDef,
 };
+
+/// Lower a surface key token to a [`PathExpr`] (§32 s2). A plain `name` becomes
+/// the degenerate bare path (round-trips byte-for-byte and resolves on the flat
+/// fast path); a dotted / indexed spelling (`user.age`, `tags[0]`) parses to a
+/// nested path. A spelling that doesn't parse falls back to a bare path of the
+/// whole token, so nothing is silently dropped.
+fn key_path(s: String) -> PathExpr {
+    PathExpr::parse(&s).unwrap_or_else(|| PathExpr::bare(s))
+}
 
 pub fn parse(src: &str) -> Result<PlanGraph, RivusError> {
     // Strip a leading UTF-8 BOM (BUG-E): editors on Windows often save a flow
@@ -373,6 +382,7 @@ impl Parser {
                             _ => break,
                         }
                     }
+                    let keys = keys.into_iter().map(key_path).collect();
                     let n = self.g.add_node(Op::GroupBy { keys, aggs });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
@@ -652,6 +662,7 @@ impl Parser {
                     if keys.is_empty() {
                         return Err(self.err("sort expects at least one key"));
                     }
+                    let keys = keys.into_iter().map(|(s, d)| (key_path(s), d)).collect();
                     let n = self.g.add_node(Op::Sort { keys });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
@@ -668,6 +679,7 @@ impl Parser {
                         self.bump();
                         keys.push(name);
                     }
+                    let keys = keys.into_iter().map(key_path).collect();
                     let n = self.g.add_node(Op::Distinct { keys });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
@@ -1226,6 +1238,8 @@ impl Parser {
                     if left_keys.is_empty() {
                         return Err(self.err("join `on` requires at least one key"));
                     }
+                    let left_keys = left_keys.into_iter().map(key_path).collect();
+                    let right_keys = right_keys.into_iter().map(key_path).collect();
                     let join = self.g.add_node(Op::Join {
                         left_keys,
                         right_keys,
@@ -3958,8 +3972,10 @@ Import:
         }) {
             Some((kind, lk, rk)) => {
                 assert_eq!(kind, JoinKind::Left);
-                assert_eq!(lk, vec!["uid".to_string()]);
-                assert_eq!(rk, vec!["oid".to_string()]);
+                let names =
+                    |ks: Vec<PathExpr>| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+                assert_eq!(names(lk), vec!["uid"]);
+                assert_eq!(names(rk), vec!["oid"]);
             }
             None => panic!("expected a join node"),
         }
@@ -3978,8 +3994,9 @@ Import:
                 _ => None,
             })
             .expect("a join node");
-        assert_eq!(lk, vec!["country".to_string(), "region".to_string()]);
-        assert_eq!(rk, vec!["country".to_string(), "region".to_string()]);
+        let names = |ks: Vec<PathExpr>| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        assert_eq!(names(lk), vec!["country", "region"]);
+        assert_eq!(names(rk), vec!["country", "region"]);
 
         // right/full lower to their kinds.
         match parse("U: open u.csv ;\nO: open o.csv ;\nJ: U &right O on id ;")
@@ -4008,6 +4025,63 @@ Import:
             let s = parse(prog).unwrap().to_source();
             assert_eq!(s, parse(&s).unwrap().to_source(), "round-trip: {s}");
         }
+    }
+
+    // §32 s2: group / sort / distinct / join keys are `PathExpr`. A **bare** key
+    // round-trips as its plain name (the degenerate pin — byte-identical), and a
+    // **nested** key (`user.age`) round-trips as `user.age`.
+    #[test]
+    fn path_expr_keys_round_trip_bare_and_nested() {
+        // Bare keys stay plain across group / sort / distinct.
+        let g =
+            parse("G:\n open g.csv\n |# city sum:amount\n sort sum_amount desc\n distinct city\n;")
+                .unwrap();
+        let src = g.to_source();
+        assert!(
+            src.contains("|# city sum:amount"),
+            "bare group key changed: {src}"
+        );
+        assert!(
+            src.contains("sort sum_amount desc"),
+            "bare sort key changed: {src}"
+        );
+        assert!(
+            src.contains("distinct city"),
+            "bare distinct key changed: {src}"
+        );
+        assert_eq!(
+            src,
+            parse(&src).unwrap().to_source(),
+            "bare not idempotent: {src}"
+        );
+
+        // The group key is the degenerate (bare) PathExpr form.
+        let key = g.nodes.iter().find_map(|n| match &n.op {
+            Op::GroupBy { keys, .. } => keys.first().cloned(),
+            _ => None,
+        });
+        assert_eq!(key.as_ref().and_then(|k| k.as_bare()), Some("city"));
+
+        // A nested key parses to a path and round-trips as `user.age`.
+        let d = parse("D:\n open d.csv\n |# user.age count\n;").unwrap();
+        let dsrc = d.to_source();
+        assert!(
+            dsrc.contains("|# user.age"),
+            "nested key not round-tripped: {dsrc}"
+        );
+        assert_eq!(
+            dsrc,
+            parse(&dsrc).unwrap().to_source(),
+            "nested not idempotent: {dsrc}"
+        );
+        let nested = d.nodes.iter().find_map(|n| match &n.op {
+            Op::GroupBy { keys, .. } => keys.first().cloned(),
+            _ => None,
+        });
+        assert!(
+            nested.is_some_and(|k| !k.is_bare()),
+            "nested key should not be bare"
+        );
     }
 
     #[test]
