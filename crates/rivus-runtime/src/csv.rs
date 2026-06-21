@@ -2329,10 +2329,14 @@ mod tests {
         }
         let swar = t.elapsed();
 
-        let avx = if cfg!(target_arch = "x86_64") && std::is_x86_feature_detected!("avx2") {
+        // AVX2 path is x86_64-only: `is_x86_feature_detected!` doesn't exist on
+        // other targets, so the whole block must be guarded by an *attribute*
+        // `cfg` (compile-time), not `cfg!(...)` (which still expands the macro
+        // on non-x86 and fails to compile — #168). On non-x86 there's no AVX.
+        #[cfg(target_arch = "x86_64")]
+        let avx = if std::is_x86_feature_detected!("avx2") {
             let t = Instant::now();
             for _ in 0..iters {
-                #[cfg(target_arch = "x86_64")]
                 // SAFETY: guarded by runtime AVX2 detection.
                 let _ = unsafe { split_offsets_avx2(line, &mut out, b',') };
                 acc += out.len();
@@ -2341,6 +2345,8 @@ mod tests {
         } else {
             None
         };
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx: Option<std::time::Duration> = None;
 
         let mbps = |d: std::time::Duration| (bytes_per * iters) as f64 / d.as_secs_f64() / 1e6;
         println!("\n[#71 split-scan] line={bytes_per}B iters={iters} (acc={acc})");
