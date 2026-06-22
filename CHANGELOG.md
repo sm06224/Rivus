@@ -27,6 +27,18 @@ All notable changes to Rivus. Format loosely follows
     documented WIP (off by default, excluded from `full`).
   - Capability denials name only the target, never the allowlist (§28.12.4);
     credentials never ride the IR / telemetry / error stream.
+- **Transport architecture: logical channel separation + event-centric
+  observability (design §34, the maintainer's transport memo).** The distributed
+  wire protocol now tags every frame with a logical **channel** — Control
+  (lifecycle/credit), Data (result chunks), Telemetry (events) — multiplexed on
+  one connection (the QUIC stream-separation lesson, without N sockets). The
+  worker narrates structured events on the telemetry channel (`flow.started` /
+  `flow.completed result_bytes=… ms=…` / `transfer.done frames=… bytes=…`)
+  instead of the client packet-sniffing; `run_remote_observed` / `rivus run --on`
+  surface them on stderr while the result flows on the data channel (clean
+  stdout). Staged next (design only): explicit CPU-budget/affinity (`cpubudget`),
+  a host-shared Transport Service over UDS/SHM (consolidate comms for co-located
+  Rivus processes; reduce SIMD contention), and DPU/SmartNIC offload.
 - **Networking transport (design §33, feature `net`, std-only / zero new deps).**
   Two client-side network transports behind the off-by-default `net` feature —
   the default build stays zero-dependency, parsing / `rivus explain` are always

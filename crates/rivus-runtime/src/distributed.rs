@@ -40,6 +40,18 @@ const CREDIT: u8 = 3;
 const CHUNK: u8 = 4;
 const END: u8 = 5;
 const ERR: u8 = 6;
+/// A structured telemetry event (on the [`TELE`] channel) — event-centric
+/// observability (§34): the worker narrates `flow.started` / `flow.completed` /
+/// `transfer.done` etc. instead of the client having to packet-sniff.
+const EVENT: u8 = 7;
+
+/// **Logical channels** multiplexed over the one connection (§34, the QUIC
+/// stream-separation lesson): control (lifecycle/credit), data (result chunks)
+/// and telemetry (events) are tagged so a consumer can demux and budget them
+/// apart — without N physical connections.
+const CTRL: u8 = 1;
+const DATA: u8 = 2;
+const TELE: u8 = 3;
 
 /// One streamed data frame's max payload (bounded memory per hop).
 const FRAME: usize = 32 * 1024;
@@ -163,27 +175,32 @@ fn is_loopback(host: &str) -> bool {
 }
 
 // ----------------------------------------------------------------- framing
+//
+// Frame = `[channel:u8][kind:u8][len:u32 BE][payload]`. The leading channel byte
+// (§34) lets one connection carry control / data / telemetry logically apart.
 
-fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
-    w.write_all(&[kind])?;
+fn write_frame(w: &mut impl Write, channel: u8, kind: u8, payload: &[u8]) -> io::Result<()> {
+    w.write_all(&[channel, kind])?;
     w.write_all(&(payload.len() as u32).to_be_bytes())?;
     w.write_all(payload)?;
     w.flush()
 }
 
-/// Read one frame: `(kind, payload)`. A clean EOF before a frame returns `None`.
-fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
-    let mut hdr = [0u8; 5];
+/// Read one frame: `(channel, kind, payload)`. A clean EOF before a frame
+/// returns `None`.
+fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, u8, Vec<u8>)>> {
+    let mut hdr = [0u8; 6];
     match r.read_exact(&mut hdr) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let kind = hdr[0];
-    let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+    let channel = hdr[0];
+    let kind = hdr[1];
+    let len = u32::from_be_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]) as usize;
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
-    Ok(Some((kind, payload)))
+    Ok(Some((channel, kind, payload)))
 }
 
 // --------------------------------------------------------------- worker side
@@ -280,25 +297,45 @@ fn handle_conn(stream: TcpStream, cfg: &LinkConfig, handler: &Handler) -> Result
 
     // HELLO exchange (static-key identities — a boundary, not a secret).
     let peer_id = match read_frame(&mut r).map_err(|e| e.to_string())? {
-        Some((HELLO, p)) => String::from_utf8_lossy(&p).into_owned(),
+        Some((_, HELLO, p)) => String::from_utf8_lossy(&p).into_owned(),
         _ => return Err(format!("peer {peer_ip}: expected HELLO")),
     };
-    write_frame(&mut w, HELLO, cfg.identity.as_bytes()).map_err(|e| e.to_string())?;
+    write_frame(&mut w, CTRL, HELLO, cfg.identity.as_bytes()).map_err(|e| e.to_string())?;
 
     // JOB = the IR source (the deployment artifact).
     let job = match read_frame(&mut r).map_err(|e| e.to_string())? {
-        Some((JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
+        Some((_, JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
         _ => return Err(format!("peer {peer_id}: expected JOB")),
     };
 
+    // Event-centric observability (§34): narrate the job on the telemetry channel.
+    let _ = write_frame(
+        &mut w,
+        TELE,
+        EVENT,
+        format!("flow.started job_bytes={}", job.len()).as_bytes(),
+    );
+    let t0 = std::time::Instant::now();
     // Run the artifact via the injected handler, then stream the result bytes
     // under the client's credit (bounded pull).
     match handler(&job) {
         Ok(bytes) => {
+            let _ = write_frame(
+                &mut w,
+                TELE,
+                EVENT,
+                format!(
+                    "flow.completed result_bytes={} ms={}",
+                    bytes.len(),
+                    t0.elapsed().as_millis()
+                )
+                .as_bytes(),
+            );
             stream_with_credit(&mut r, &mut w, &bytes).map_err(|e| e.to_string())?;
         }
         Err(e) => {
-            write_frame(&mut w, ERR, e.as_bytes()).map_err(|e| e.to_string())?;
+            let _ = write_frame(&mut w, TELE, EVENT, b"flow.failed");
+            write_frame(&mut w, CTRL, ERR, e.as_bytes()).map_err(|e| e.to_string())?;
         }
     }
     Ok(peer_id)
@@ -310,20 +347,28 @@ fn handle_conn(stream: TcpStream, cfg: &LinkConfig, handler: &Handler) -> Result
 fn stream_with_credit(r: &mut impl Read, w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     let mut credit: u64 = 0;
     let mut off = 0;
+    let mut frames = 0u64;
     while off < bytes.len() {
         while credit == 0 {
             match read_frame(r)? {
-                Some((CREDIT, p)) => credit += credit_value(&p),
+                Some((_, CREDIT, p)) => credit += credit_value(&p),
                 Some(_) => {}          // ignore stray control while draining
                 None => return Ok(()), // client gone
             }
         }
         let end = (off + FRAME).min(bytes.len());
-        write_frame(w, CHUNK, &bytes[off..end])?;
+        write_frame(w, DATA, CHUNK, &bytes[off..end])?;
         off = end;
         credit -= 1;
+        frames += 1;
     }
-    write_frame(w, END, &[])
+    let _ = write_frame(
+        w,
+        TELE,
+        EVENT,
+        format!("transfer.done frames={frames} bytes={}", bytes.len()).as_bytes(),
+    );
+    write_frame(w, CTRL, END, &[])
 }
 
 fn credit_value(p: &[u8]) -> u64 {
@@ -341,6 +386,19 @@ fn credit_value(p: &[u8]) -> u64 {
 /// must be loopback or allowlisted; `iface` (if set) binds the outgoing socket to
 /// the trusted interface. A worker `ERR` becomes an `Err` here (never silent).
 pub fn run_remote(peer: &str, cfg: &LinkConfig, ir_source: &str) -> Result<Vec<u8>, String> {
+    run_remote_observed(peer, cfg, ir_source, |_| {})
+}
+
+/// Like [`run_remote`], but `on_event` receives each structured **telemetry**
+/// event the worker narrates (`flow.started` / `flow.completed` / `transfer.done`
+/// …) — event-centric observability (§34), demuxed off the telemetry channel
+/// while the data channel carries the result.
+pub fn run_remote_observed(
+    peer: &str,
+    cfg: &LinkConfig,
+    ir_source: &str,
+    mut on_event: impl FnMut(String),
+) -> Result<Vec<u8>, String> {
     let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
     cfg.peer_allowed(host)?;
     let stream = dial(peer, cfg)?;
@@ -350,12 +408,12 @@ pub fn run_remote(peer: &str, cfg: &LinkConfig, ir_source: &str) -> Result<Vec<u
     let mut w = stream.try_clone().map_err(|e| e.to_string())?;
     let mut r = BufReader::new(stream);
 
-    write_frame(&mut w, HELLO, cfg.identity.as_bytes()).map_err(|e| e.to_string())?;
+    write_frame(&mut w, CTRL, HELLO, cfg.identity.as_bytes()).map_err(|e| e.to_string())?;
     match read_frame(&mut r).map_err(|e| e.to_string())? {
-        Some((HELLO, _)) => {}
+        Some((_, HELLO, _)) => {}
         _ => return Err(format!("peer {peer}: no HELLO")),
     }
-    write_frame(&mut w, JOB, ir_source.as_bytes()).map_err(|e| e.to_string())?;
+    write_frame(&mut w, CTRL, JOB, ir_source.as_bytes()).map_err(|e| e.to_string())?;
 
     // Grant an initial credit window, then refill one per consumed chunk —
     // bounded pull (at most `window` frames buffered in flight).
@@ -363,15 +421,19 @@ pub fn run_remote(peer: &str, cfg: &LinkConfig, ir_source: &str) -> Result<Vec<u
     let mut out = Vec::new();
     loop {
         match read_frame(&mut r).map_err(|e| e.to_string())? {
-            Some((CHUNK, p)) => {
+            // Data channel: a result chunk.
+            Some((DATA, CHUNK, p)) => {
                 out.extend_from_slice(&p);
                 // Refill one credit (bounded pull). Best-effort: the last refill
                 // races the worker's END+close, so a broken pipe here is benign —
                 // the queued END is still buffered for the read below.
                 let _ = grant(&mut w, 1);
             }
-            Some((END, _)) => return Ok(out),
-            Some((ERR, p)) => return Err(String::from_utf8_lossy(&p).into_owned()),
+            // Telemetry channel: a structured event — surface it, don't block data.
+            Some((TELE, EVENT, p)) => on_event(String::from_utf8_lossy(&p).into_owned()),
+            // Control channel: end / error.
+            Some((_, END, _)) => return Ok(out),
+            Some((_, ERR, p)) => return Err(String::from_utf8_lossy(&p).into_owned()),
             Some(_) => {}
             None => return Err(format!("peer {peer}: connection closed before END")),
         }
@@ -379,7 +441,7 @@ pub fn run_remote(peer: &str, cfg: &LinkConfig, ir_source: &str) -> Result<Vec<u
 }
 
 fn grant(w: &mut impl Write, n: u32) -> io::Result<()> {
-    write_frame(w, CREDIT, &n.to_be_bytes())
+    write_frame(w, CTRL, CREDIT, &n.to_be_bytes())
 }
 
 /// Dial `peer`, binding the source to the trusted interface when one is granted
@@ -422,12 +484,16 @@ mod tests {
     }
 
     #[test]
-    fn frame_round_trip() {
+    fn frame_round_trip_carries_channel() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, JOB, b"hello").unwrap();
+        write_frame(&mut buf, CTRL, JOB, b"hello").unwrap();
+        write_frame(&mut buf, TELE, EVENT, b"flow.started").unwrap();
         let mut r = &buf[..];
-        let (k, p) = read_frame(&mut r).unwrap().unwrap();
-        assert_eq!(k, JOB);
+        let (ch, k, p) = read_frame(&mut r).unwrap().unwrap();
+        assert_eq!((ch, k), (CTRL, JOB));
         assert_eq!(p, b"hello");
+        let (ch, k, p) = read_frame(&mut r).unwrap().unwrap();
+        assert_eq!((ch, k), (TELE, EVENT));
+        assert_eq!(p, b"flow.started");
     }
 }

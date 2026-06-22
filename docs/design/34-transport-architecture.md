@@ -1,0 +1,106 @@
+# 34. Transport architecture — CPU-budgeted, channel-separated, host-shared
+
+> 状態：**一部実装（チャネル分離＋イベント中心の可観測性＝landed）／設計（CPU 予算・
+> ホスト共有 Transport Service・DPU オフロード＝批准待ち）。** 統括の意見具申
+> （2026 トランスポート層検討メモ）を取り込み、§33（保護チャネル分散実行）の上に据える。
+> §00 ピラー3/4・§17・§0.15 と整合。**設計先行・批准必須・自己マージ禁止**（CPU 予算以降）。
+
+## 34.0 中心命題：通信は「速くする」より「CPU 消費を制御する」
+
+Rivus は SIMD でデータ処理を行い、理想は **CPU を使い切る**こと。分散では通信・制御・
+テレメトリ・データ処理が**同一 CPU 資源を奪い合う**。特に WireGuard/QUIC/TLS の暗号は
+SIMD を使うため **Rivus SIMD vs 通信 SIMD の競合**が起きる。よって一般 Web と異なり、
+**通信速度の最大化でなく、通信の CPU 消費を予測可能に制御する**ことが要件。
+
+二つの先行事例の教訓を組み合わせる：
+- **PMCN（通信責務の集約）**：通信を賢くするのでなく、**通信の存在をアプリから隠蔽**し、
+  複雑な通信制御を**基盤側へ集約**する。
+- **QUIC（チャネルの論理分離）**：1 接続上で Telemetry/Control/Data を**論理的に分離**。
+  Rivus が学ぶのは QUIC の通信機能でなく、この**論理分離**。
+
+## 34.1 論理チャネル分離（**landed**・§33 wire に実装）
+
+`crates/rivus-runtime/src/distributed.rs` のフレームに**先頭チャネルバイト**を追加：
+`[channel:u8][kind:u8][len:u32][payload]`。チャネルは：
+
+```
+Transport (one connection)
+ ├ Control   (CTRL)  : HELLO / JOB / CREDIT / END / ERR — ライフサイクル・背圧
+ ├ Data      (DATA)  : CHUNK — 実データ（結果・将来は shuffle/中間成果物）
+ └ Telemetry (TELE)  : EVENT — 構造化イベント（下記）
+```
+
+消費側はチャネルで demux し、**Data を止めずに Telemetry を surface**できる（`run_remote_observed`）。
+QUIC のストリーム分離を、物理 N 接続でなく**フレームのチャネルタグ**で実現（QUIC backend では
+本物のストリームに 1:1 で載る）。
+
+## 34.2 イベント中心の可観測性（**landed**）
+
+「パケットを監視する（tcpdump）」から「**イベントを監視する**」へ。ワーカが Telemetry
+チャネルで構造化イベントを narrate：
+
+```
+flow.started   job_bytes=<n>
+flow.completed result_bytes=<n> ms=<t>
+flow.failed
+transfer.done  frames=<n> bytes=<n>
+```
+
+将来追加：`node.joined` / `node.lost` / `transfer.retry` / `transfer.throughput`
+（§17.7 coordinator 集約・既存 `RuntimeSnapshot`/`--json` と同系）。CLI `--on` は
+イベントを stderr に出し（`[rivus @addr] …`）、結果（Data）は stdout に流す。
+
+## 34.3 CPU 予算の明示管理（**設計・批准待ち**）
+
+OS 任せでなく **CPU 利用率自体を設計対象**にする。例：
+
+```
+1.0 core  Transport (暗号・I/O)
+0.5 core  Telemetry
+0.5 core  Control
+残り       Data Processing (Rivus SIMD)
+```
+
+- **CPU affinity**：暗号/通信を限定コアに隔離し、Rivus SIMD と競合させない。Linux は
+  `sched_setaffinity`（libc・`unsafe`・Linux 限定）、他 OS は no-op。**off-by-default
+  feature `cpubudget`** 裏に隔離（依存ゼロ既定を保つ）。env `RIVUS_NET_TRANSPORT_CORES` 等。
+- byte-identity 契約**不変**：affinity は性能ノブであってデータに影響しない（§0.14 の
+  「環境設定であってデータでない」運用ノブ＝`watch` の queue budget と同類）。
+
+## 34.4 ホスト共有 Transport Service（**設計・批准待ち**）
+
+1 台に Rivus A/B/C が同居すると、各々が QUIC/TLS/WG を持つと**通信だけで複数コア消費**＋
+SIMD 競合。PMCN の集約思想で、**ホスト単位の通信専用サービス**へ責務を集約：
+
+```
+Machine
+ ├ Rivus Transport Service   (QUIC / TLS / WireGuard / Telemetry / Routing)
+ ├ Rivus A ─┐
+ ├ Rivus B ─┼─ IPC / SHM / Unix Domain Socket
+ └ Rivus C ─┘
+```
+
+- 各 Rivus は **UDS/SHM** 経由で Transport Service を使う（ネットワーク endpoint は
+  サービスが一手に持つ）。プロトコルは §34.1 のチャネル分離フレームを UDS に流すだけ
+  （transport が TCP/UDS/QUIC でも論理は不変＝直交）。
+- **利点**：CPU 固定化（Core0-1 Transport / Core2- Rivus）・**SIMD 競合削減**（暗号を限定
+  コアへ隔離）・**セッション共有**（TLS/QUIC/WG を複数 Rivus で共用）・**Telemetry 集約**。
+- **capability（§28.12.4）不変**：allowlist・identity はサービスが境界として強制。秘匿
+  資格情報（wg 秘密鍵）はサービス内に留め、IR/テレメトリに写さない。
+- スライス案：s1 UDS フロント（`rivus serve --uds PATH`／クライアントは `--on uds://PATH`）→
+  s2 セッション共有 → s3 ルーティング/集約。
+
+## 34.5 将来：DPU / SmartNIC オフロード（**設計**）
+
+Transport Service を一枚噛ませたので、将来 **SmartNIC / DPU / QUIC offload / WireGuard
+offload** を入れる際は **Transport Service のみ差し替え**ればよい（Rivus 本体・IR 不変）。
+これは §0.1「エッジ＝同一の直交基盤」「transport を差し替える」の具現。
+
+## MVP / 次 / 将来
+
+- **landed**：§34.1 論理チャネル分離（Control/Data/Telemetry）＋§34.2 イベント中心可観測性
+  （`distributed.rs`・`run_remote_observed`・CLI `--on` の stderr イベント・test
+  `distributed_emits_telemetry_events`）。byte-identity 不変。
+- **次（批准後）**：§34.3 CPU 予算/affinity（feature `cpubudget`・Linux）→ §34.4 ホスト
+  共有 Transport Service（UDS フロント）→ QUIC backend をチャネルに 1:1 マップ。
+- **将来**：§34.5 DPU/SmartNIC オフロード・§17 stage 分割 shuffle・制御プレーン（ピラー4）。

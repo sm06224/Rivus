@@ -332,6 +332,35 @@ fn distributed_exec_round_trips_byte_identical() {
 }
 
 #[test]
+fn distributed_emits_telemetry_events() {
+    // §34 channel separation + event-centric observability: the worker narrates
+    // structured events on the telemetry channel while the data channel carries
+    // the result. The client demuxes both.
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("rivus_evt_{}.csv", std::process::id()));
+    std::fs::write(&path, "name,age\nalice,30\nbob,17\n").unwrap();
+    let src = format!("R:\n open {}\n |> name\n;", path.display());
+
+    let (addr, listener) = distributed::bind_ephemeral().unwrap();
+    let cfg = LinkConfig::default();
+    let h = handler();
+    let worker = thread::spawn(move || distributed::serve_on(&listener, &cfg, h));
+
+    let mut events = Vec::new();
+    let got =
+        distributed::run_remote_observed(&addr, &LinkConfig::default(), &src, |e| events.push(e))
+            .expect("remote run");
+    let _ = worker.join();
+    std::fs::remove_file(&path).ok();
+
+    assert!(!got.is_empty(), "result still flows on the data channel");
+    let joined = events.join(" | ");
+    assert!(joined.contains("flow.started"), "events: {joined}");
+    assert!(joined.contains("flow.completed"), "events: {joined}");
+    assert!(joined.contains("transfer.done"), "events: {joined}");
+}
+
+#[test]
 fn distributed_worker_error_propagates() {
     let (addr, listener) = distributed::bind_ephemeral().unwrap();
     let cfg = LinkConfig::default();

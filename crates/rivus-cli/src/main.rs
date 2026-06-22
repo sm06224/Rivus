@@ -652,9 +652,14 @@ fn run_serve(_args: &[String]) -> ExitCode {
 /// streamed result. `PEER` is `rivus://host:port` or `host:port`. Needs `net`.
 #[cfg(feature = "net")]
 fn run_on_peer(peer: &str, ir_source: &str) -> ExitCode {
-    use rivus_runtime::distributed::{run_remote, LinkConfig};
+    use rivus_runtime::distributed::{run_remote_observed, LinkConfig};
     let addr = peer.strip_prefix("rivus://").unwrap_or(peer);
-    match run_remote(addr, &LinkConfig::from_env(), ir_source) {
+    // The worker narrates structured telemetry events on the telemetry channel
+    // (§34, event-centric observability); surface them on stderr while the data
+    // channel's result goes to stdout (clean for pipes).
+    match run_remote_observed(addr, &LinkConfig::from_env(), ir_source, |ev| {
+        eprintln!("[rivus @{addr}] {ev}");
+    }) {
         Ok(bytes) => {
             let _ = std::io::stdout().write_all(&bytes);
             ExitCode::SUCCESS
