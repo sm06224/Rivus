@@ -30,8 +30,12 @@ unbounded = ["rivus-runtime/unbounded"]
 # (no new deps); off by default — parse/explain always work, running a network
 # flow needs this feature.
 net = ["rivus-runtime/net"]
+# §28.12.5-3: QUIC transport (the feature-gated alternative to kernel WireGuard).
+# Heavy deps (quinn/tokio/rustls/ring); off by default.
+quic = ["rivus-runtime/quic"]
 # The curated full-feature set for distributed binaries (#149 ⑤): the source
 # tree's cargo default stays lean (zero-dep), but releases ship fat — Rivus as
 # a future compiler can only emit what it embeds. release.yml builds with
 # `--features full`; add new ratified features here so distribution follows.
+# `quic` is deliberately NOT in `full` yet: its result-stream round-trip is WIP.
 full = ["regex", "gzip", "zstd", "unbounded", "net"]

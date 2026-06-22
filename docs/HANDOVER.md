@@ -23,17 +23,27 @@
 > （`full` feature・release.yml・RELEASE.md）。**`unbounded` を `full` に入れるかは
 > 統括判断待ち**。後続スライス：socket/http（方向性は §28.12.5 裁可済）・窓・watermark。
 >
-> **§33 ネットワーキング実行＝landed（feature `net`・std-only・依存追加ゼロ）。**
-> §28.12.5 に忠実な**クライアント側のみ**の2トランスポート：`open "http://…"`
-> （有界 GET・CSV+JSON・content-length/chunked/close・redirect5回・単一パス＝非シーク・
-> chunk-size 非依存）／`subscribe "tcp://…"`（非有界 client feed・CSV+JSON・ロスレス背圧・
-> `watch` と同じ非有界/決定性タグ規律）。capability＝loopback 既定＋`RIVUS_CAP_NET_HOSTS`
-> allowlist（拒否は対象のみ surface）・`RIVUS_NET_TIMEOUT_MS`。std 最小 HTTP/1.1 クライアント
-> （`net.rs`）。評価は `net` ゲート、parse/explain は常時 std。`open` は `path_word` が
-> 引用符付き文字列を受理（URL 用）。CSV は既存 `CompressedCsvReader::from_reader` 再利用、
-> JSONL は新 `StreamJsonlReader`（単一パス・サンプル推論）。`full` に `net` 追加済。
-> demo＝`examples/networking-demo.sh`・設計＝`docs/design/33`・test＝`tests/net.rs`（9件・全 loopback）。
-> 残：HTTP POST sink（§28.7 出力の鏡像）／`read` の `http://`／scheduled-get／将来 WireGuard/QUIC。
+> **§33 ネットワーキング実行＝landed（設計＝`docs/design/33`・#149 裁定附記に忠実）。本命は
+> 保護チャネル分散実行（ピラー3・§17）。** 単なるリモート取得ではなく**IR を配備成果物として
+> 遠隔ワーカで実行し結果を返す**（interpret==distribute byte-identical）。
+> - **(A) 本命＝保護チャネル分散実行（`distributed.rs`・feature `net`・std/依存ゼロ）**：
+>   `rivus serve` ワーカ＋`rivus run --on rivus://host:port`。**素のリスナー無し**（#149-1）＝
+>   wg-iface/loopback バインド（`RIVUS_CAP_NET_IFACE`・`may_bind`）＋peer allowlist
+>   （`RIVUS_CAP_NET_PEERS`・`peer_allowed`）。**暗号は委譲**（#149-2＝カーネル WireGuard・
+>   Rivus に暗号コード無し）。HELLO/JOB/CHUNK/CREDIT/END 多重＋credit bounded pull。
+>   完動・テスト済（`tests/net.rs::distributed_*` 4件・byte-identity）。
+> - **(B) 代替＝QUIC（`distributed_quic.rs`・feature `quic`・#149-3）**：quinn/rustls+ring/
+>   rcgen/tokio。身元＝証明書公開鍵フィンガープリント・allowlist pin（`RIVUS_CAP_NET_PEER_KEYS`）。
+>   相互認証＋pin は完動・テスト済（`quic_wrong_static_key_pin_rejected`＋unit）。**結果
+>   ストリームのラウンドトリップは dual-runtime loopback の async ライフサイクル問題で WIP・
+>   `#[ignore]`**（off-by-default・`full` 未収載）。次セッションの最優先修正候補。
+> - **(C) loopback 例外層＝クライアント取得（`net.rs`）**：`open "http://…"`（有界 GET・
+>   CSV+JSON・chunked/redirect）／`subscribe "tcp://…"`（非有界）。capability＝loopback＋
+>   `RIVUS_CAP_NET_HOSTS`。CSV は `CompressedCsvReader::from_reader` 再利用・JSONL は
+>   `StreamJsonlReader`。`open` の `path_word` が引用符付き URL を受理。
+> - parse/explain 常時 std・評価のみ feature ゲート。`net` は `full` 収載済（`quic` は WIP ゆえ未）。
+> demo＝`examples/networking-demo.sh`（http/subscribe/分散実行）。
+> 残：QUIC ストリーム修正→`full`／§17.3 stage 分割＋Arrow shuffle／coordinator telemetry 集約／HTTP POST sink。
 
 ---
 

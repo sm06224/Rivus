@@ -40,6 +40,14 @@ fn main() -> ExitCode {
         return run_gen(&args[2..]);
     }
 
+    // `rivus serve [--bind ADDR]` — a protected-channel distributed worker
+    // (§33 / §17): accept allowlisted peers, run the IR they ship, stream the
+    // result back. Needs `--features net`; the bind/peer capability comes from
+    // the environment (RIVUS_CAP_NET_IFACE / RIVUS_CAP_NET_PEERS).
+    if cmd == "serve" {
+        return run_serve(&args[2..]);
+    }
+
     // Bare Unix-filter form: `rivus '|? age >= 20 |> name age'` (no subcommand).
     // If arg 1 is a transform-only program rather than a known subcommand, run
     // it as a stdin→stdout filter. Flags still parse from arg 2.
@@ -69,11 +77,25 @@ fn main() -> ExitCode {
     let mut tui = false;
     // `--memory low|auto|fast|unbounded` (Pillar C): reader memory/speed strategy.
     let mut memory = MemoryPref::default();
+    // `--on rivus://host:port` (or `host:port`): run this flow on a remote
+    // protected-channel worker (§33 / §17) — ship the IR, print the streamed
+    // result. Needs `--features net`.
+    let mut on_peer: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--no-opt" => optimize = false,
             "--write" | "-w" => fmt_write = true,
+            "--on" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => on_peer = Some(a.clone()),
+                    None => {
+                        eprintln!("error: --on requires a peer address (rivus://host:port)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             // Emit machine-readable JSONL telemetry to stderr (Observability
             // spec §19: base for editor/GUI). `--telemetry json` or `--json`.
             "--json" => telemetry_json = true,
@@ -350,6 +372,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "run" => {
+            // `--on PEER`: distributed execution (§33 / §17). Ship the IR (the
+            // deployment artifact) to a remote protected-channel worker and print
+            // the streamed result. The flow was already parsed above (so we ship a
+            // validated artifact); we transmit the canonical source.
+            if let Some(peer) = &on_peer {
+                return run_on_peer(peer, &parsed.to_source());
+            }
             // Human-facing visualization goes to STDERR so that a `save stdout`
             // sink leaves STDOUT as clean data for shell pipes (`… | rivus run
             // flow.riv | …`). Interactive terminals still show stderr. With
@@ -561,6 +590,89 @@ fn run_tui(graph: &rivus_ir::PlanGraph, chunk_size: usize, memory: MemoryPref) -
             ExitCode::FAILURE
         }
     }
+}
+
+/// `rivus serve [--bind ADDR]` — a protected-channel distributed worker
+/// (§33 / §17). Binds to a capability-gated address (loopback, or the trusted
+/// WireGuard interface via `RIVUS_CAP_NET_IFACE`), accepts allowlisted peers
+/// (`RIVUS_CAP_NET_PEERS`), and runs each shipped IR, streaming the rendered
+/// result back under the client's credit (bounded pull). Needs `--features net`.
+#[cfg(feature = "net")]
+fn run_serve(args: &[String]) -> ExitCode {
+    use rivus_runtime::distributed::{self, Handler, LinkConfig};
+    let mut bind = "127.0.0.1:9001".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => bind = a.clone(),
+                    None => {
+                        eprintln!("error: --bind requires an address (host:port)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("error: serve: unknown argument '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let cfg = LinkConfig::from_env();
+    // The worker handler: the IR is the deployment artifact — parse, optimize,
+    // run, render the outputs to bytes (the same bytes a local run produces).
+    let handler: Handler = std::sync::Arc::new(|src: &str| {
+        let graph = rivus_parser::parse(src).map_err(|e| format!("parse: {e:?}"))?;
+        let (graph, _report) = rivus_optimizer::optimize(graph);
+        let res = run(&graph, RunOptions::default()).map_err(|e| format!("run: {e:?}"))?;
+        Ok(viz::render_outputs(&res.outputs).into_bytes())
+    });
+    match distributed::serve(&bind, &cfg, handler, |ev| eprintln!("[rivus serve] {ev}")) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("serve error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "net"))]
+fn run_serve(_args: &[String]) -> ExitCode {
+    eprintln!(
+        "`rivus serve` is a network feature — rebuild with `--features net` \
+         (the default build stays zero-dependency)"
+    );
+    ExitCode::from(2)
+}
+
+/// `rivus run flow.riv --on PEER` — ship the IR to a remote worker and print the
+/// streamed result. `PEER` is `rivus://host:port` or `host:port`. Needs `net`.
+#[cfg(feature = "net")]
+fn run_on_peer(peer: &str, ir_source: &str) -> ExitCode {
+    use rivus_runtime::distributed::{run_remote, LinkConfig};
+    let addr = peer.strip_prefix("rivus://").unwrap_or(peer);
+    match run_remote(addr, &LinkConfig::from_env(), ir_source) {
+        Ok(bytes) => {
+            let _ = std::io::stdout().write_all(&bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("remote run error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "net"))]
+fn run_on_peer(_peer: &str, _ir_source: &str) -> ExitCode {
+    eprintln!(
+        "`--on` (distributed execution) is a network feature — rebuild with \
+         `--features net` (the default build stays zero-dependency)"
+    );
+    ExitCode::from(2)
 }
 
 /// `rivus gen <shape> [--rows N] [--seed S] [--ratio R]` — write deterministic,

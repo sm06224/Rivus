@@ -30,6 +30,35 @@ ruzstd = { version = "0.8", optional = true }
 notify = { version = "8.2", optional = true, default-features = false, features = [
     "macos_fsevent",
 ] }
+# Off-by-default (§33 / §28.12.5-3): the QUIC protected-channel transport — the
+# feature-gated *alternative* to riding kernel WireGuard. `quinn` (pure-Rust
+# QUIC, rustls with the pure-Rust-ish `ring` provider), `rcgen` to mint the
+# static self-signed identity cert, `tokio` current-thread runtime bridged to the
+# sync engine. Identity = the cert's public key (SPKI/DER fingerprint); the
+# allowlist pins allowed peer fingerprints. All isolated behind `quic`; the
+# default and `net` builds never compile or link it. See SUPPLY-CHAIN.md.
+quinn = { version = "0.11", optional = true, default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+] }
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+] }
+rcgen = { version = "0.13", optional = true, default-features = false, features = [
+    "ring",
+] }
+tokio = { version = "1", optional = true, default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+] }
+# SHA-256 for the static-key identity / peer pin (already in the `quic` tree via
+# rustls-ring; used directly for the cert-DER fingerprint).
+ring = { version = "0.17", optional = true }
 
 [features]
 default = []
@@ -45,6 +74,11 @@ unbounded = ["dep:notify"]
 # always-std; only evaluation needs this feature; feature-off runs refuse
 # pre-run (the `regex`/`gzip`/`unbounded` shape, §28.12 / §33).
 net = []
+# §28.12.5-3: QUIC transport as the feature-gated alternative to kernel
+# WireGuard. Implies `net` (shares the distributed protocol/capability). Heavy
+# deps (tokio/quinn/rustls/ring) — off by default; the lean and `net` builds stay
+# free of it. Distribution (`full`) opts in.
+quic = ["net", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio", "dep:ring"]
 
 [dev-dependencies]
 rivus-parser.workspace = true

@@ -32,6 +32,16 @@ third-party crate as untrusted-until-vetted and minimizes the trusted surface.
   dependency-free as the core. (Per §28.12.1a, deps are taken only when a
   capability can't be done in std — HTTP can.)
 
+- **The `quic` feature (§28.12.5-3, distributed-execution alternative) pulls a
+  vetted async/TLS stack — off by default, isolated.** `quinn` (pure-Rust QUIC,
+  the de-facto standard), `rustls` + `ring` (the pure-Rust TLS + crypto provider,
+  no OpenSSL), `rcgen` (self-signed identity certs), `tokio` (async runtime,
+  bridged to the sync engine). All gated behind `quic`; the default, `net` and
+  `full` builds do **not** compile or link them (`quic` is intentionally excluded
+  from `full` while its result-stream round-trip is WIP). The *primary*
+  distributed transport rides **kernel WireGuard** and embeds **no** crypto
+  (§28.12.5-2). Vet `--all-features` with `cargo deny` before adopting into `full`.
+
 - **Dev-only dependencies are isolated.** `criterion` (benchmarks) and its tree
   are `[dev-dependencies]`; they never ship in a release build.
 

@@ -70,5 +70,28 @@ $RIVUS run -c "Live:
   print
 ;"
 
+# ── 3) Protected-channel distributed execution (the headline) ─────────────
 echo
-echo "── done.  (capability: remote hosts need RIVUS_CAP_NET_HOSTS; loopback is free) ─"
+echo "── 3) distributed: ship the IR to a remote worker, stream the result ─"
+printf 'name,age,country\nalice,30,JP\nbob,17,US\ncarol,42,JP\ndave,55,FR\n' > /tmp/rivus_dist_demo.csv
+# Start a protected-channel worker (loopback = the §28.12.5-1 exception; a real
+# deployment binds the WireGuard interface via RIVUS_CAP_NET_IFACE).
+$RIVUS serve --bind 127.0.0.1:9077 2>/tmp/rivus_serve.log &
+SERVE_PID=$!
+sleep 0.6
+echo "   worker: $(cat /tmp/rivus_serve.log)"
+cat > /tmp/rivus_dist_demo.riv <<'RIV'
+Adults:
+  open /tmp/rivus_dist_demo.csv
+  |? age >= 18, country == "JP"
+  |> name age
+;
+RIV
+echo "   coordinator: rivus run … --on rivus://127.0.0.1:9077  (IR is the artifact)"
+$RIVUS run /tmp/rivus_dist_demo.riv --on rivus://127.0.0.1:9077
+kill $SERVE_PID 2>/dev/null
+rm -f /tmp/rivus_dist_demo.csv /tmp/rivus_dist_demo.riv /tmp/rivus_serve.log
+
+echo
+echo "── done.  primary transport = kernel WireGuard (crypto delegated), loopback for the demo;"
+echo "         remote hosts/peers need RIVUS_CAP_NET_HOSTS / RIVUS_CAP_NET_PEERS / RIVUS_CAP_NET_IFACE. ─"

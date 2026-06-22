@@ -1,92 +1,91 @@
-# 33. Networking execution — `http://` pull source ＋ `tcp://` subscribe stream
+# 33. Networking execution — protected-channel distributed execution (Pillar 3)
 
-> 状態：実装（feature `net`・std-only・依存ゼロ）。§28.10 slice 5 の後続＝§28.12.1
-> 「含まない（後続スライス）：socket/http transport」を、§28.12.5 の方向性
-> （統括裁可済）に忠実な形で着地させる。本書は §28 I/O substrate の直交4層
-> （Discovery → Transport → Codec → Provenance）の上に **Transport を
-> ネットワークへ** 広げる最初のスライス。
+> 状態：実装（feature `net` ＝ std-only・依存ゼロの本命／feature `quic` ＝ 重い
+> 依存の代替）。§00 ピラー3（分散＝ネットワーク transport）と §28.12.5（socket/http
+> の方向性・#149 裁定附記）を実体化する。**本命はネットワーク越しのフロー実行**であり、
+> 単なるリモート CSV 取得ではない。
 
-## 33.0 狙い
+## 33.0 狙い（#149 裁定附記に忠実）
 
-North Star ピラー3（分散＝transport をネットワークに）の最小実体。既存の有界・
-決定的経路のバイトを 1 ビットも変えずに、**ネットワーク越しの実行**を一級にする：
+North Star §0.1：**IR を唯一の通貨とし、実行は「解釈 or コンパイル or 分散」でバイト
+同一**。分散とは「同じ IR の別配置」（§17.1）＝**IR を配備成果物として遠隔ワーカへ運び、
+そこで実行して結果を返す**こと。#149 裁定附記（socket/http 後続スライスの方向性）：
 
-- **`open "http://host[:port]/path.csv"`** — 有界 HTTP GET。リモートの CSV/JSON を
-  そのまま既存の codec が decode（transport だけが変わる＝§28.2 の直交性の実証）。
-- **`subscribe "tcp://host:port"`** — 非有界 TCP クライアント・ストリーム。行区切り
-  レコードを購読し、`watch` と同じ非有界・決定性タグ規律に乗る（§28.12 / §0.14）。
+1. **素のリスナーは存在しない** — 「保護されたチャネルか、無しか」。例外は loopback のみ・
+   capability 明示許可制。
+2. **既定態＝カーネル WireGuard に乗る（埋め込まない）** — capability で「信頼インター
+   フェース（wg 等）にしかバインドしない」を強制。**Rivus 本体に暗号コード・依存は入らない**。
+3. **feature-gated 代替＝QUIC（候補 quinn）** — 1 接続にコントロール＋データのストリーム
+   多重・ストリーム毎流量制御が背圧（§28.12.2 ④）の bounded pull と整合。
+4. **身元＝静的公開鍵。allowlist＝許可ピア公開鍵リスト。配備成果物は IR そのもの。**
+5. userspace WG 埋め込み・TLS+CA は非推奨。
 
-両者とも **off-by-default feature `net`** の裏。feature off のビルドはネットワーク
-コードを一切コンパイルせず、有界フローのバイト・テスト・依存グラフは完全不変
-（slice 1〜5 の stress / optimizer_equiv はそのまま緑）。parse / `to_source` /
-`rivus explain` は **常時 std**（IR 可逆）— 評価のみ feature ゲート。feature-off で
-ネットワーク源を実行＝実行前 `RivusError::Build` で明示拒否（`regex`/`gzip`/
-`unbounded` と同型・never-silent）。
+## 33.1 二層のトランスポート
 
-## 33.1 依存ゼロの HTTP/1.1 クライアント（std のみ）
+### (A) 保護チャネル分散実行 ＝ 本命（`crates/rivus-runtime/src/distributed.rs`）
 
-統括方針「依存ゼロは原則・依存なしで実装可能になるまでは依存ありで可」（§28.12.1a）に
-従い、**HTTP は std で実装可能**なので依存を入れない。`std::net::TcpStream` 上に
-最小の HTTP/1.1 GET クライアントを実装（`crates/rivus-runtime/src/net.rs`）：
+`feature = "net"`・**std のみ・依存ゼロ**。`Discovery→Transport→Codec` の Transport を
+ネットワークへ広げる中核：
 
-- `GET path HTTP/1.1` ＋ `Host` ＋ `Connection: close` ＋ `User-Agent: rivus/<ver>`。
-- ステータス行＋ヘッダをパース。2xx 以外は明示エラー（`3xx` の `Location` を
-  最大 5 回まで追従＝同一スキーム・capability 再チェック）。
-- ボディは `Transfer-Encoding: chunked`／`Content-Length`／close-delimited の3形を
-  扱う `BodyReader`（`BufRead`）として返す。codec はこれを通常のバイトストリーム
-  として読む（CSV は単一パス・サンプル推論＝非シーク経路は圧縮リーダーと共有）。
-- **TLS は入れない**（§28.12.5-5：証明書ライフサイクルの運用負荷で非推奨）。`https://`
-  は明示エラー（誘導：保護は WireGuard/QUIC レーン＝後続）。
+- **ワーカ** `rivus serve [--bind ADDR]`：信頼インターフェース（wg）または loopback に
+  だけ bind し（`may_bind`＝#149-1）、**allowlist のピアのみ**受け付け（`peer_allowed`）、
+  受領した **IR（正準ソース＝配備成果物）**を既存エンジンで実行し、結果を client の
+  **credit（bounded pull）**でストリーム返却する。**素のリスナーではない**——loopback /
+  wg-iface ＋ peer allowlist で締めた保護チャネル。
+- **コーディネータ** `rivus run flow.riv --on rivus://host:port`：ローカル IR を遠隔
+  ワーカへ送り、結果を受け取って表示。
+- **暗号は委譲（#149-2）**：confidentiality/authentication は**カーネル WireGuard** の仕事。
+  Rivus は wg インターフェースへのバインドと peer allowlist（静的公開鍵 ↔ wg-IP の対応）を
+  **強制するだけ**で、暗号コード・依存を持たない。
+- **プロトコル**（コントロール＋データ多重・1 接続）：`HELLO`（静的鍵 identity 交換）→
+  `JOB`（IR ソース）→ `CHUNK`×n（credit で律速）→ `END`（or `ERR`）。長さ前置フレーム。
+- **capability（§28.12.4）**：`RIVUS_CAP_NET_IFACE`（bind 可能な wg アドレス）・
+  `RIVUS_CAP_NET_PEERS`（許可ピア）・`RIVUS_NET_IDENTITY`（自分の静的鍵 identity）・
+  `RIVUS_NET_CREDIT`（窓）。allowlist は**境界であって秘密ではない**——拒否イベントは対象
+  のみを載せ allowlist 全体を漏らさない。資格情報（wg 秘密鍵）は Rivus に一切写らない。
+- **byte-identity（§0.5）**：ワーカの結果は**ローカル実行と同一バイト**（interpret==
+  distribute）。`tests/net.rs::distributed_*` で固定。
 
-## 33.2 capability — loopback 既定・allowlist は境界（§28.12.4/5）
+### (B) QUIC ＝ feature-gated 代替（`distributed_quic.rs`・#149-3）
 
-§28.12.5-1「素のリスナーは存在しない（保護されたチャネルか、無しか・例外は loopback）」
-に忠実に、本スライスは **クライアント接続のみ**（`open`=GET、`subscribe`=dial）＝
-リスナーを一切 bind しない。到達先は capability で締める：
+`feature = "quic"`。カーネル wg が無い環境向け。**同一プロトコルを 1 本の双方向 QUIC
+ストリーム上**で。身元＝自己署名証明書の **公開鍵フィンガープリント（SHA-256/DER）**、
+allowlist＝許可ピアのフィンガープリント（`RIVUS_CAP_NET_PEER_KEYS`）。TLS は accept-any＋
+**アプリ層でフィンガープリント pin**（境界・秘匿に依らない）。秘密鍵はプロセス外に出ない。
+依存：`quinn`/`rustls`+`ring`/`rcgen`/`tokio`（off-by-default・`full` 未収載）。
+**現状**：相互認証ハンドシェイク・静的鍵 pin は動作・テスト済み（`quic_wrong_static_key_pin_rejected`＋
+unit）。credit ストリームの結果ラウンドトリップは dual-runtime loopback での async ライフ
+サイクル問題で**未完（WIP・`#[ignore]`）**。本命の (A) は完動なので分散の能力は (A) が担う。
 
-- 既定で **loopback のみ**到達可（`127.0.0.0/8` / `::1` / `localhost`）。
-- 非 loopback ホストは環境変数 **`RIVUS_CAP_NET_HOSTS`**（カンマ区切りの
-  `host` または `host:port`）の allowlist にある時のみ到達可。
-- 違反は **拒否イベント**で surface（§28.12.4：拒否対象のみを載せ allowlist 全体は
-  漏らさない・never-silent）。源が開けない＝そのフローはデータ無し＝Fatal（ファイル
-  not-found と同型）。
-- allowlist は秘匿ではなく **境界**。秘匿すべき資格情報（トークン等）は本レーンに
-  一切写さない（IR・to_source・テレメトリ・エラーに出さない＝§28.12.4）。
+### (C) loopback 例外層 ＝ クライアント取得（HTTP/subscribe）
 
-## 33.3 IR / 構文（可逆・既存ノード非再形）
+#149-1 の **loopback 例外**として、保護チャネル不要の単純なクライアント取得も持つ
+（`net.rs`・std HTTP/1.1）：
 
-- `Discovery::Subscribe(addr)`（非有界）を `Watch` の隣に追加（**新 Op なし**＝
-  §28.12.2 と同じ slot 追加方式）。`is_unbounded()` は `Watch | Subscribe`。
-  `subscribe "tcp://…"` で desugar、`to_source` 復元（可逆）。
-- HTTP は `open "http://…"` のまま＝`Discovery::Fixed(url)`＋拡張子/明示 codec。
-  transport は **path スキームから導出**（`Scheme::Http`）＝既存の `Local`/`Stdin`/
-  `Compressed` と同じ「IR は Local・runtime が scheme で選択」方式（§28.2）。
-- `PlanGraph::uses_net()`（http 源 or `Subscribe`）／`uses_watch()`（`Watch`）を分離。
-  engine は前者で `net` feature、後者で `unbounded` feature を別々にゲート。共通の
-  `uses_unbounded()`（`Watch | Subscribe`）は窓無しブロッキング op の拒否と直列実行を
-  従来どおり駆動。
+- **`open "http://host/path"`** — 有界 GET（CSV+JSON・content-length/chunked/close・
+  redirect5・単一パス・chunk-size 非依存）。`https`/TLS は範囲外。
+- **`subscribe "tcp://host:port"`** — 非有界 TCP クライアント購読（CSV+JSON・ロスレス背圧・
+  `watch` と同じ非有界/決定性タグ）。
+- capability：loopback 既定＋`RIVUS_CAP_NET_HOSTS` allowlist。`RIVUS_NET_TIMEOUT_MS`。
 
-## 33.4 決定性境界（§0.14）
+## 33.2 決定性境界（§0.14）
 
-- **HTTP GET は有界**だが、ネットワークは外部要因（再試行・部分応答）。本スライスは
-  「1 回 GET して全ボディを decode」＝**到着順に依存しない**（行順＝バイト順）ので
-  byte-identity 契約の内側に置ける（serial==chunk-size）。並列 byte-range は
-  非シークなので不可＝直列固定（圧縮源と同型）。
-- **`subscribe` は非有界・到着順依存**＝決定性 op 集合の外側。`watch` と同じく
-  決定性タグで最適化・並列再結合から外す。終了は下流飽和（`take N`）かピア close。
+- 保護チャネル分散実行：ワーカの実行は**有界・決定的サブ DAG**なら byte-identity 契約内
+  （interpret==distribute）。源が非有界（subscribe）なら従来どおり契約外。
+- HTTP GET は有界（到着順非依存＝行順）で契約内。subscribe は非有界・到着順依存で契約外。
 
-## 33.5 背圧・メモリ有界（§28.12.0）
+## 33.3 feature ゲートと never-silent
 
-- HTTP：codec が逐次 pull＝有界メモリ（全ボディを抱えない・行ストリーム）。
-- subscribe：ソケット読みは `read_line` の逐次 pull＝有界。下流が遅ければ TCP の
-  受信ウィンドウが詰まり生成側が自然に待つ（ロスレス・drop しない）。
+parse / `to_source` / `rivus explain` は**常時 std**（IR 可逆）。評価のみ feature ゲート：
+`net` 無しでネットワークに触れる flow は実行前 `RivusError::Build` で明示拒否（`regex`/
+`gzip`/`unbounded` と同型）。`serve`/`--on` は `net` 無しで明示エラー。
 
 ## MVP / 次 / 将来
 
-- **MVP（本スライス）**：`open http://`（CSV＋JSON）／`subscribe tcp://`（CSV 行）・
-  loopback capability・std HTTP クライアント・feature `net`・英日ガイド・demo・test。
-- **次**：JSONL の単一パス購読／`read` が Resource 列の `http://` を開く（多ファイル
-  ネット連結）／HTTP POST sink（出力の鏡像・§28.7）。
-- **将来（§28.12.5）**：保護チャネル＝カーネル WireGuard に乗る（埋め込まない）／
-  feature-gated QUIC（quinn）＝1 接続多重＋ストリーム毎流量制御が bounded pull と整合／
-  身元＝静的公開鍵 allowlist。本スライスの capability・決定性境界がその前提。
+- **MVP（本書）**：保護チャネル分散実行（IR 配備・peer allowlist・wg バインド capability・
+  credit 背圧・byte-identity）＝完動・テスト済／QUIC 代替＝ハンドシェイク/認証/pin 完動・
+  ストリーム WIP／loopback 例外層（http/subscribe）＝完動。CLI `serve`/`--on`・英日ガイド・demo。
+- **次**：QUIC ストリームのライフサイクル修正（`full` 収載）／§17.3 stage 分割＋shuffle
+  （DAG を複数ワーカへ）／Arrow IPC shuffle／コーディネータの telemetry 集約（§17.7）／
+  checkpoint/replay（§17.8）。
+- **将来**：制御プレーン（§0.7・ピラー4）からの allowlist 署名更新・無停止スケール。

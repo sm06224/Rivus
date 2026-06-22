@@ -7,7 +7,27 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Added
-- **Networking execution (design §33, feature `net`, std-only / zero new deps).**
+- **Protected-channel distributed execution (design §33 / §17, Pillar 3).** Run a
+  flow across the network by shipping its **IR as the deployment artifact**
+  (§28.12.5-4) to a remote worker that executes it on the same chunk engine and
+  streams the result back — **byte-identical to a local run** (interpret==
+  distribute, §0.5). `rivus serve [--bind ADDR]` is the worker; `rivus run
+  flow.riv --on rivus://host:port` is the coordinator. The channel is **never a
+  raw listener** (§28.12.5-1):
+  - **Primary = ride kernel WireGuard, embed no crypto (§28.12.5-2).** std-only,
+    **zero new dependencies**; Rivus only *enforces* binding to the trusted
+    interface (`RIVUS_CAP_NET_IFACE`) and an **allowlist of peer identities**
+    (`RIVUS_CAP_NET_PEERS`, the static-public-key ↔ wg-IP boundary). Loopback is
+    the one exception. Control+data are multiplexed with **credit-based bounded
+    pull** (§28.12.2 ④). Fully working and tested (`tests/net.rs::distributed_*`).
+  - **Alternative = QUIC (feature `quic`, §28.12.5-3):** `quinn` + `rustls`/`ring`
+    + `rcgen`, identity = the cert's public-key **fingerprint**, allowlist pins
+    allowed peer fingerprints (`RIVUS_CAP_NET_PEER_KEYS`). Mutual-auth handshake
+    and static-key pinning work and are tested; the result-stream round-trip is a
+    documented WIP (off by default, excluded from `full`).
+  - Capability denials name only the target, never the allowlist (§28.12.4);
+    credentials never ride the IR / telemetry / error stream.
+- **Networking transport (design §33, feature `net`, std-only / zero new deps).**
   Two client-side network transports behind the off-by-default `net` feature —
   the default build stays zero-dependency, parsing / `rivus explain` are always
   std, and *running* a network flow without the feature is refused up front with

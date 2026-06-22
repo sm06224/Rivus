@@ -263,3 +263,104 @@ fn subscribe_connect_failure_is_fatal_not_panic() {
         res.errors
     );
 }
+
+// ─── Protected-channel distributed execution (§33 / §17) ──────────────────────
+//
+// Ship the IR (the deployment artifact) to a worker over the capability-gated
+// channel; the worker runs it and streams the rendered result back. We assert
+// the bytes equal a *local* run's render — interpret==distribute byte-identity
+// (§0.5). Everything is loopback (the §28.12.5-1 exception).
+use rivus_runtime::distributed::{self, LinkConfig};
+use std::sync::Arc;
+
+/// Render a flow's outputs to deterministic bytes — used both as the worker's
+/// handler and as the local expected value, so equality is real byte-identity.
+fn render_flow(src: &str) -> Result<Vec<u8>, String> {
+    let graph = rivus_parser::parse(src).map_err(|e| format!("{e:?}"))?;
+    let (graph, _r) = rivus_optimizer::optimize(graph);
+    let res = run(&graph, RunOptions::default()).map_err(|e| format!("{e:?}"))?;
+    let mut out = String::new();
+    for o in &res.outputs {
+        out.push_str(o.label.as_deref().unwrap_or("-"));
+        out.push('\n');
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let row: Vec<String> = (0..c.schema.fields.len())
+                    .map(|i| c.value(r, i).to_string())
+                    .collect();
+                out.push_str(&row.join(","));
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out.into_bytes())
+}
+
+fn handler() -> distributed::Handler {
+    Arc::new(render_flow)
+}
+
+#[test]
+fn distributed_exec_round_trips_byte_identical() {
+    // A self-contained flow over a small CSV file (worker and client share the
+    // same filesystem here — they're both loopback for the test).
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("rivus_dist_{}.csv", std::process::id()));
+    std::fs::write(&path, "name,age\nalice,30\nbob,17\ncarol,42\n").unwrap();
+    let src = format!(
+        "Adults:\n open {}\n |? age >= 18\n |> name age\n;",
+        path.display()
+    );
+
+    let (addr, listener) = distributed::bind_ephemeral().unwrap();
+    let cfg = LinkConfig::default();
+    let h = handler();
+    let worker = thread::spawn(move || distributed::serve_on(&listener, &cfg, h));
+
+    let client_cfg = LinkConfig::default();
+    let got = distributed::run_remote(&addr, &client_cfg, &src).expect("remote run");
+    let _ = worker.join().unwrap();
+
+    let expected = render_flow(&src).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(
+        got, expected,
+        "distribute == interpret (byte-identical render)"
+    );
+    assert!(String::from_utf8_lossy(&got).contains("alice,30"));
+    assert!(!String::from_utf8_lossy(&got).contains("bob"));
+}
+
+#[test]
+fn distributed_worker_error_propagates() {
+    let (addr, listener) = distributed::bind_ephemeral().unwrap();
+    let cfg = LinkConfig::default();
+    let h = handler();
+    let worker = thread::spawn(move || distributed::serve_on(&listener, &cfg, h));
+    // A flow that fails to parse → the worker returns ERR, surfaced as Err here.
+    let err = distributed::run_remote(&addr, &LinkConfig::default(), "this is not rivus !!!")
+        .expect_err("worker error propagates");
+    let _ = worker.join();
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn distributed_peer_allowlist_denies_remote() {
+    // A non-loopback peer with no allowlist is refused before dialing.
+    let cfg = LinkConfig::default();
+    let err = distributed::run_remote("10.0.0.7:9000", &cfg, "X:\n open x.csv\n;")
+        .expect_err("peer not allowlisted");
+    assert!(err.contains("10.0.0.7"), "names the peer: {err}");
+}
+
+#[test]
+fn distributed_no_raw_public_listener() {
+    // Binding a non-loopback address without the trusted-interface capability is
+    // refused (§28.12.5-1: no raw listeners).
+    let cfg = LinkConfig::default();
+    let err = distributed::serve_once("0.0.0.0:0", &cfg, handler()).expect_err("no raw listener");
+    assert!(
+        err.contains("trusted interface") || err.contains("§28.12.5"),
+        "{err}"
+    );
+}
