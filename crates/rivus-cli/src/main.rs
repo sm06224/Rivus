@@ -602,6 +602,7 @@ fn run_serve(args: &[String]) -> ExitCode {
     use rivus_runtime::distributed::{self, Handler, LinkConfig};
     let mut bind = "127.0.0.1:9001".to_string();
     let mut quic = false;
+    let mut uds: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -618,6 +619,18 @@ fn run_serve(args: &[String]) -> ExitCode {
             // §28.12.5-3: serve over the QUIC transport instead of the kernel-
             // WireGuard-bound std channel.
             "--quic" => quic = true,
+            // §34.4: serve over a Unix-domain socket (the host Transport Service
+            // front for co-located Rivus processes) — same channel protocol.
+            "--uds" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => uds = Some(a.clone()),
+                    None => {
+                        eprintln!("error: --uds requires a socket path");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             other => {
                 eprintln!("error: serve: unknown argument '{other}'");
                 return ExitCode::from(2);
@@ -633,6 +646,21 @@ fn run_serve(args: &[String]) -> ExitCode {
         let res = run(&graph, RunOptions::default()).map_err(|e| format!("run: {e:?}"))?;
         Ok(viz::render_outputs(&res.outputs).into_bytes())
     });
+    #[cfg(unix)]
+    if let Some(path) = uds {
+        let cfg = LinkConfig::from_env();
+        return match distributed::serve_uds(&path, &cfg.identity, handler, |ev| {
+            eprintln!("[rivus serve] {ev}")
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("serve error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(not(unix))]
+    let _ = &uds;
     if quic {
         #[cfg(feature = "quic")]
         {
@@ -683,8 +711,25 @@ fn run_serve(_args: &[String]) -> ExitCode {
 #[cfg(feature = "net")]
 fn run_on_peer(peer: &str, ir_source: &str) -> ExitCode {
     use rivus_runtime::distributed::{run_remote_observed, LinkConfig};
-    // `quic://host:port` selects the QUIC transport (§28.12.5-3); `rivus://` or a
-    // bare `host:port` use the kernel-WireGuard-bound std channel.
+    // `uds://path` selects the host Transport Service over a Unix-domain socket
+    // (§34.4); `quic://…` the QUIC transport; `rivus://` / bare `host:port` the
+    // kernel-WireGuard-bound std channel.
+    #[cfg(unix)]
+    if let Some(p) = peer.strip_prefix("uds://") {
+        use rivus_runtime::distributed::run_remote_uds;
+        return match run_remote_uds(p, &LinkConfig::from_env().identity, ir_source, 64, |ev| {
+            eprintln!("[rivus @uds://{p}] {ev}")
+        }) {
+            Ok(bytes) => {
+                let _ = std::io::stdout().write_all(&bytes);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("remote run error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(q) = peer.strip_prefix("quic://") {
         #[cfg(feature = "quic")]
         {

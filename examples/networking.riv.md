@@ -189,6 +189,27 @@ silent empty result).
 this is deliberately not a valid Rivus flow
 ```
 
+### Case A4 — host Transport Service over a Unix-domain socket (§34.4, pre-impl)
+
+**Scenario.** Co-located Rivus processes share one comms front instead of each
+owning a network stack (the PMCN "consolidate responsibility" idea). The worker
+fronts a UDS; the coordinator ships the IR over `uds://`. The **same
+channel-tagged frames** as the TCP path run over the socket — proving the
+protocol is transport-agnostic (§34.1).
+
+**Expected.** Byte-identical result to A1; telemetry events on the telemetry
+channel. UDS is local + filesystem-permission-gated, so no IP allowlist applies —
+the capability boundary is the socket file's path/permissions.
+
+**Pinned by.** `tests/net.rs::distributed_uds_transport_service_round_trips`.
+
+```sh
+rivus serve --uds /run/rivus.sock
+rivus run examples/networking.riv.md --on uds:///run/rivus.sock
+```
+
+The shipped flow is the same A1 flow.
+
 ---
 
 ## Tier B — QUIC alternative identity & pinning (§28.12.5-3/4)

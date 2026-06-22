@@ -280,8 +280,8 @@ fn describe_allowlist(cfg: &LinkConfig) -> String {
     }
 }
 
-/// Handle one connection: peer allowlist → HELLO → JOB → credit-gated result
-/// stream. Returns the served peer identity, or an error note to surface.
+/// Handle one **TCP** connection: peer allowlist → the transport-agnostic
+/// protocol. Returns the served peer identity, or an error note to surface.
 fn handle_conn(stream: TcpStream, cfg: &LinkConfig, handler: &Handler) -> Result<String, String> {
     let peer_ip = stream
         .peer_addr()
@@ -298,34 +298,46 @@ fn handle_conn(stream: TcpStream, cfg: &LinkConfig, handler: &Handler) -> Result
     let _ = stream.set_nodelay(true);
     let mut w = stream.try_clone().map_err(|e| e.to_string())?;
     let mut r = BufReader::new(stream);
+    serve_protocol(&mut r, &mut w, &cfg.identity, &peer_ip, handler)
+}
 
+/// The **transport-agnostic** worker protocol (§34): HELLO exchange → JOB → run
+/// the IR handler → credit-gated result stream + telemetry events → graceful
+/// drain. Generic over the byte streams, so the *same frames* run over TCP, a
+/// Unix-domain socket (the host Transport Service, §34.4), or any future
+/// transport — only the connection setup differs.
+fn serve_protocol(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    identity: &str,
+    label: &str,
+    handler: &Handler,
+) -> Result<String, String> {
     // HELLO exchange (static-key identities — a boundary, not a secret).
-    let peer_id = match read_frame(&mut r).map_err(|e| e.to_string())? {
+    let peer_id = match read_frame(r).map_err(|e| e.to_string())? {
         Some((_, HELLO, p)) => String::from_utf8_lossy(&p).into_owned(),
-        _ => return Err(format!("peer {peer_ip}: expected HELLO")),
+        _ => return Err(format!("peer {label}: expected HELLO")),
     };
-    write_frame(&mut w, CTRL, HELLO, cfg.identity.as_bytes()).map_err(|e| e.to_string())?;
+    write_frame(w, CTRL, HELLO, identity.as_bytes()).map_err(|e| e.to_string())?;
 
     // JOB = the IR source (the deployment artifact).
-    let job = match read_frame(&mut r).map_err(|e| e.to_string())? {
+    let job = match read_frame(r).map_err(|e| e.to_string())? {
         Some((_, JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
         _ => return Err(format!("peer {peer_id}: expected JOB")),
     };
 
     // Event-centric observability (§34): narrate the job on the telemetry channel.
     let _ = write_frame(
-        &mut w,
+        w,
         TELE,
         EVENT,
         format!("flow.started job_bytes={}", job.len()).as_bytes(),
     );
     let t0 = std::time::Instant::now();
-    // Run the artifact via the injected handler, then stream the result bytes
-    // under the client's credit (bounded pull).
     match handler(&job) {
         Ok(bytes) => {
             let _ = write_frame(
-                &mut w,
+                w,
                 TELE,
                 EVENT,
                 format!(
@@ -335,16 +347,16 @@ fn handle_conn(stream: TcpStream, cfg: &LinkConfig, handler: &Handler) -> Result
                 )
                 .as_bytes(),
             );
-            stream_with_credit(&mut r, &mut w, &bytes).map_err(|e| e.to_string())?;
+            stream_with_credit(r, w, &bytes).map_err(|e| e.to_string())?;
             // Graceful close: wait for the client to finish reading and close its
             // side before we drop the socket — otherwise dropping with a large
             // result still in flight RSTs the connection and the client sees a
             // reset mid-stream (only visible on big transfers).
-            drain_until_eof(&mut r);
+            drain_until_eof(r);
         }
         Err(e) => {
-            let _ = write_frame(&mut w, TELE, EVENT, b"flow.failed");
-            write_frame(&mut w, CTRL, ERR, e.as_bytes()).map_err(|e| e.to_string())?;
+            let _ = write_frame(w, TELE, EVENT, b"flow.failed");
+            write_frame(w, CTRL, ERR, e.as_bytes()).map_err(|e| e.to_string())?;
         }
     }
     Ok(peer_id)
@@ -420,7 +432,7 @@ pub fn run_remote_observed(
     peer: &str,
     cfg: &LinkConfig,
     ir_source: &str,
-    mut on_event: impl FnMut(String),
+    on_event: impl FnMut(String),
 ) -> Result<Vec<u8>, String> {
     let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
     cfg.peer_allowed(host)?;
@@ -431,41 +443,140 @@ pub fn run_remote_observed(
     let _ = stream.set_nodelay(true); // see handle_conn — avoid Nagle ping-pong stalls
     let mut w = stream.try_clone().map_err(|e| e.to_string())?;
     let mut r = BufReader::new(stream);
+    client_protocol(
+        &mut r,
+        &mut w,
+        &cfg.identity,
+        ir_source,
+        cfg.window,
+        peer,
+        on_event,
+    )
+}
 
-    write_frame(&mut w, CTRL, HELLO, cfg.identity.as_bytes()).map_err(|e| e.to_string())?;
-    match read_frame(&mut r).map_err(|e| e.to_string())? {
+/// The **transport-agnostic** client protocol (§34): HELLO → JOB → grant a credit
+/// window → demux the result on the data channel and telemetry events on the
+/// telemetry channel until END/ERR. Generic over the byte streams (TCP / UDS / …).
+fn client_protocol(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    identity: &str,
+    ir_source: &str,
+    window: u32,
+    label: &str,
+    mut on_event: impl FnMut(String),
+) -> Result<Vec<u8>, String> {
+    write_frame(w, CTRL, HELLO, identity.as_bytes()).map_err(|e| e.to_string())?;
+    match read_frame(r).map_err(|e| e.to_string())? {
         Some((_, HELLO, _)) => {}
-        _ => return Err(format!("peer {peer}: no HELLO")),
+        _ => return Err(format!("peer {label}: no HELLO")),
     }
-    write_frame(&mut w, CTRL, JOB, ir_source.as_bytes()).map_err(|e| e.to_string())?;
-
+    write_frame(w, CTRL, JOB, ir_source.as_bytes()).map_err(|e| e.to_string())?;
     // Grant an initial credit window, then refill one per consumed chunk —
     // bounded pull (at most `window` frames buffered in flight).
-    grant(&mut w, cfg.window).map_err(|e| e.to_string())?;
+    grant(w, window.max(1)).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     loop {
-        match read_frame(&mut r).map_err(|e| e.to_string())? {
-            // Data channel: a result chunk.
+        match read_frame(r).map_err(|e| e.to_string())? {
             Some((DATA, CHUNK, p)) => {
                 out.extend_from_slice(&p);
-                // Refill one credit (bounded pull). Best-effort: the last refill
-                // races the worker's END+close, so a broken pipe here is benign —
-                // the queued END is still buffered for the read below.
-                let _ = grant(&mut w, 1);
+                let _ = grant(w, 1); // best-effort refill (races the final close)
             }
-            // Telemetry channel: a structured event — surface it, don't block data.
             Some((TELE, EVENT, p)) => on_event(String::from_utf8_lossy(&p).into_owned()),
-            // Control channel: end / error.
             Some((_, END, _)) => return Ok(out),
             Some((_, ERR, p)) => return Err(String::from_utf8_lossy(&p).into_owned()),
             Some(_) => {}
-            None => return Err(format!("peer {peer}: connection closed before END")),
+            None => return Err(format!("peer {label}: connection closed before END")),
         }
     }
 }
 
 fn grant(w: &mut impl Write, n: u32) -> io::Result<()> {
     write_frame(w, CTRL, CREDIT, &n.to_be_bytes())
+}
+
+// ----------------------------------------------- host Transport Service (UDS)
+//
+// §34.4 pre-implementation: the host-shared Transport Service fronts a **Unix
+// domain socket** that co-located Rivus processes use, instead of each owning a
+// network stack (PMCN "consolidate comms responsibility"). It runs the *same*
+// channel-tagged protocol as the TCP path (`serve_protocol` / `client_protocol`)
+// — proving the protocol is transport-agnostic (§34.1). UDS is local-only and
+// filesystem-permission-gated, so there is no IP allowlist here; the capability
+// boundary is the socket file's path/permissions (set by whoever creates it).
+
+/// Run a UDS worker at `path` forever (the Transport Service front). The socket
+/// file is created on bind and removed on a clean return. `identity` rides HELLO.
+#[cfg(unix)]
+pub fn serve_uds(
+    path: &str,
+    identity: &str,
+    handler: Handler,
+    mut on_event: impl FnMut(String),
+) -> Result<(), String> {
+    use std::os::unix::net::UnixListener;
+    let _ = std::fs::remove_file(path); // clear a stale socket
+    let listener = UnixListener::bind(path).map_err(|e| format!("cannot bind uds {path}: {e}"))?;
+    on_event(format!(
+        "transport service on uds://{path} as identity '{identity}'"
+    ));
+    for conn in listener.incoming() {
+        match conn {
+            Ok(stream) => {
+                if let Err(e) = handle_uds(stream, identity, &handler) {
+                    on_event(e);
+                }
+            }
+            Err(e) => on_event(format!("accept error: {e}")),
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// Accept exactly one UDS connection (tests / one-shot).
+#[cfg(unix)]
+pub fn serve_uds_once(path: &str, identity: &str, handler: Handler) -> Result<String, String> {
+    use std::os::unix::net::UnixListener;
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path).map_err(|e| format!("cannot bind uds {path}: {e}"))?;
+    let (stream, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
+    let r = handle_uds(stream, identity, &handler);
+    let _ = std::fs::remove_file(path);
+    r
+}
+
+#[cfg(unix)]
+fn handle_uds(
+    stream: std::os::unix::net::UnixStream,
+    identity: &str,
+    handler: &Handler,
+) -> Result<String, String> {
+    stream
+        .set_read_timeout(Some(read_timeout()))
+        .map_err(|e| e.to_string())?;
+    let mut w = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut r = BufReader::new(stream);
+    serve_protocol(&mut r, &mut w, identity, "uds", handler)
+}
+
+/// Ship `ir_source` to a UDS Transport Service at `path`; collect the result.
+#[cfg(unix)]
+pub fn run_remote_uds(
+    path: &str,
+    identity: &str,
+    ir_source: &str,
+    window: u32,
+    on_event: impl FnMut(String),
+) -> Result<Vec<u8>, String> {
+    use std::os::unix::net::UnixStream;
+    let stream = UnixStream::connect(path).map_err(|e| format!("connect uds {path}: {e}"))?;
+    stream
+        .set_read_timeout(Some(read_timeout()))
+        .map_err(|e| e.to_string())?;
+    let mut w = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut r = BufReader::new(stream);
+    client_protocol(&mut r, &mut w, identity, ir_source, window, path, on_event)
 }
 
 /// Dial `peer`, binding the source to the trusted interface when one is granted

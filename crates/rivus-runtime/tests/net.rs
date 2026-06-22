@@ -360,6 +360,52 @@ fn distributed_emits_telemetry_events() {
     assert!(joined.contains("transfer.done"), "events: {joined}");
 }
 
+#[cfg(unix)]
+#[test]
+fn distributed_uds_transport_service_round_trips() {
+    // §34.4 pre-implementation: the host Transport Service fronts a Unix-domain
+    // socket and runs the *same* channel-tagged protocol as TCP — proving the
+    // protocol is transport-agnostic. Byte-identical to a local run, with the
+    // telemetry events demuxed on the telemetry channel.
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_uds_{}.csv", std::process::id()));
+    std::fs::write(&csv, "name,age\nalice,30\nbob,17\ncarol,42\n").unwrap();
+    let sock = dir.join(format!("rivus_uds_{}.sock", std::process::id()));
+    let sock_s = sock.to_string_lossy().into_owned();
+    let src = format!(
+        "Adults:\n open {}\n |? age >= 18\n |> name age\n;",
+        csv.display()
+    );
+
+    let h = handler();
+    let sock_w = sock_s.clone();
+    let worker = thread::spawn(move || distributed::serve_uds_once(&sock_w, "svc", h));
+    // Wait for the socket file to appear (bind races the client connect).
+    for _ in 0..200 {
+        if sock.exists() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let mut events = Vec::new();
+    let got = distributed::run_remote_uds(&sock_s, "client", &src, 64, |e| events.push(e))
+        .expect("uds remote run");
+    let _ = worker.join();
+
+    let expected = render_flow(&src).unwrap();
+    std::fs::remove_file(&csv).ok();
+    std::fs::remove_file(&sock).ok();
+    assert_eq!(
+        got, expected,
+        "UDS distribute == interpret (byte-identical)"
+    );
+    assert!(String::from_utf8_lossy(&got).contains("alice,30"));
+    assert!(!String::from_utf8_lossy(&got).contains("bob"));
+    let joined = events.join(" | ");
+    assert!(joined.contains("flow.completed"), "events: {joined}");
+}
+
 #[test]
 fn distributed_worker_error_propagates() {
     let (addr, listener) = distributed::bind_ephemeral().unwrap();

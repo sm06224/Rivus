@@ -41,9 +41,20 @@ All notable changes to Rivus. Format loosely follows
   `flow.completed result_bytes=… ms=…` / `transfer.done frames=… bytes=…`)
   instead of the client packet-sniffing; `run_remote_observed` / `rivus run --on`
   surface them on stderr while the result flows on the data channel (clean
-  stdout). Staged next (design only): explicit CPU-budget/affinity (`cpubudget`),
-  a host-shared Transport Service over UDS/SHM (consolidate comms for co-located
-  Rivus processes; reduce SIMD contention), and DPU/SmartNIC offload.
+  stdout). Staged next (design only): explicit CPU-budget/affinity (`cpubudget`)
+  and DPU/SmartNIC offload.
+- **Host Transport Service over a Unix-domain socket — §34.4 slice 1
+  (pre-implementation, `feature net`, unix-only).** A worker fronts a UDS that
+  co-located Rivus processes use instead of each owning a network stack (the PMCN
+  "consolidate comms responsibility" idea). `rivus serve --uds PATH` / `rivus run
+  --on uds://PATH`; `distributed::{serve_uds, run_remote_uds}`. The worker/client
+  protocol cores were extracted **transport-agnostic** (`serve_protocol` /
+  `client_protocol`), so the **same channel-tagged frames** (Control/Data/
+  Telemetry + credit + `flow.*` events) run over UDS and yield a byte-identical
+  round-trip — proving §34.1's transport orthogonality. UDS is local +
+  filesystem-permission-gated, so no IP allowlist applies. Remaining slices
+  (consolidate the network endpoints into the service, session sharing, core
+  pinning) stay design-gated.
 - **Networking transport (design §33, feature `net`, std-only / zero new deps).**
   Two client-side network transports behind the off-by-default `net` feature —
   the default build stays zero-dependency, parsing / `rivus explain` are always
