@@ -42,14 +42,22 @@ pub(crate) enum Scheme {
     File,
     Stdin,
     Compressed,
+    /// An `http://` URL fetched over the network (design §33, feature `net`): a
+    /// bounded GET whose body is a non-seekable byte stream, so it reads on the
+    /// single-pass streaming path (like `Compressed`).
+    Http,
 }
 
 impl Scheme {
-    /// Classify a source path: `-` is stdin; a `.gz` / `.zst` / `.zstd` suffix
+    /// Classify a source path: `-` is stdin; an `http://` / `https://` URL is the
+    /// network transport (§33); a `.gz` / `.zst` / `.zstd` suffix
     /// (case-insensitive) is compressed; everything else is a plain local file.
     pub(crate) fn of(path: &str) -> Scheme {
         if path == "-" {
             return Scheme::Stdin;
+        }
+        if rivus_ir::is_http_url(path) {
+            return Scheme::Http;
         }
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".gz") || lower.ends_with(".zst") || lower.ends_with(".zstd") {
@@ -60,9 +68,9 @@ impl Scheme {
     }
 
     /// Can this source be seeked — i.e. byte-range split for parallel reads? Only
-    /// a plain local file qualifies: stdin can't be re-read, and a compressed
-    /// stream can't be seeked (its on-disk size is the *compressed* size). Both
-    /// of those stay on the serial reader.
+    /// a plain local file qualifies: stdin can't be re-read, a compressed stream
+    /// can't be seeked, and an HTTP body is a forward-only network stream. All
+    /// non-`File` schemes stay on the serial reader.
     pub(crate) fn is_seekable(self) -> bool {
         matches!(self, Scheme::File)
     }

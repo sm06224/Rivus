@@ -153,10 +153,22 @@ pub fn run_with_progress(
     // feature cannot evaluate an unbounded source (`watch`). Refuse the plan
     // explicitly before running — the same shape as `regex`/`gzip`. Parsing and
     // `rivus explain` stay always-std.
-    if cfg!(not(feature = "unbounded")) && graph.uses_unbounded() {
+    if cfg!(not(feature = "unbounded")) && graph.uses_watch() {
         return Err(RivusError::Build(
             "this flow uses an unbounded source (`watch`), but this build has the \
              `unbounded` feature disabled — rebuild with `--features unbounded` (the \
+             default build stays zero-dependency)"
+                .into(),
+        ));
+    }
+    // §33 (never-silent): a build without the `net` feature cannot reach the
+    // network — an `http://` source or the unbounded `subscribe` stream. Refuse
+    // the plan explicitly before running (the `regex`/`gzip`/`unbounded` shape).
+    // Parsing and `rivus explain` stay always-std.
+    if cfg!(not(feature = "net")) && graph.uses_net() {
+        return Err(RivusError::Build(
+            "this flow reaches the network (`open \"http://…\"` or `subscribe`), but this \
+             build has the `net` feature disabled — rebuild with `--features net` (the \
              default build stays zero-dependency)"
                 .into(),
         ));

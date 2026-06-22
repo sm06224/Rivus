@@ -39,6 +39,12 @@ zstd = ["dep:ruzstd"]
 # #149 ⑤: unbounded transport skeleton (watch). parse/to_source stay always-std;
 # only evaluation needs this feature; feature-off runs refuse pre-run (§28.12).
 unbounded = ["dep:notify"]
+# §33 networking execution: `open "http://…"` (bounded HTTP GET) and
+# `subscribe "tcp://…"` (unbounded TCP client stream). std-only (a minimal
+# HTTP/1.1 client over `std::net`) — zero third-party deps. parse/to_source stay
+# always-std; only evaluation needs this feature; feature-off runs refuse
+# pre-run (the `regex`/`gzip`/`unbounded` shape, §28.12 / §33).
+net = []
 
 [dev-dependencies]
 rivus-parser.workspace = true

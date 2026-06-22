@@ -6,6 +6,28 @@ All notable changes to Rivus. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+- **Networking execution (design §33, feature `net`, std-only / zero new deps).**
+  Two client-side network transports behind the off-by-default `net` feature —
+  the default build stays zero-dependency, parsing / `rivus explain` are always
+  std, and *running* a network flow without the feature is refused up front with
+  rebuild guidance (never silent):
+  - **`open "http://host[:port]/path"`** — a bounded HTTP/1.1 GET (a minimal
+    client over `std::net`): fetch a remote **CSV or JSON** and wrangle it like a
+    local file (filter pushdown and all). Body framing handles `Content-Length`,
+    `Transfer-Encoding: chunked` and connection-close; up to 5 redirects are
+    followed; the body decodes single-pass in bounded memory and is chunk-size
+    independent. `https://` is rejected with guidance (TLS is out of scope).
+  - **`subscribe "tcp://host:port"`** — an unbounded TCP client feed (CSV or
+    `as json`): newline-delimited records streamed with lossless backpressure.
+    Like `watch` it is outside the determinism contract (§0.14) — the optimizer
+    and the parallel executor leave it alone and a whole-stream aggregate
+    downstream is refused (needs a window); it ends on peer close or `take N`.
+  - **Capability boundary** (§28.12.4/5): loopback is always reachable; any other
+    host must be in `RIVUS_CAP_NET_HOSTS` (else rejected, naming only the target).
+    Read timeout via `RIVUS_NET_TIMEOUT_MS` (default 30 s). No listener is ever
+    bound (§28.12.5). Runnable demo: `examples/networking-demo.sh`.
+
 ### Changed
 - **Expression `cast` to a temporal lane now parses a string source (BUG-D) —
   behavior change.** `cast ts:datetime` / `(ts:datetime) as t` (and `date`/`time`)

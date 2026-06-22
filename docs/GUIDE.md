@@ -259,6 +259,66 @@ watch "in/*.csv"        # a row per created/modified file, forever
   the error stream. Both env knobs are environment configuration, not data.
 - Deletions/renames emit nothing (there is nothing to read).
 
+### Networking — `open "http://…"` and `subscribe "tcp://…"`
+
+Rivus reads over the network with the same flow vocabulary — only the
+**transport** changes (design §33). Both are **client-side only** (Rivus never
+binds a listener) and feature-gated behind `--features net` (std-only, **no new
+dependencies** — a minimal HTTP/1.1 client over `std::net`). Parsing and
+`rivus explain` always work; *running* a network flow in a default build is
+refused up front with rebuild guidance (never a silent wrong answer).
+
+**`open "http://host[:port]/path"` — a bounded HTTP GET.** Fetch a remote CSV or
+JSON and wrangle it exactly like a local file (filter pushdown and all):
+
+```
+rivus run --features net -c '
+Adults:
+  open "http://127.0.0.1:8080/data.csv"   # CSV; .jsonl / `as json` for JSON
+  |? age >= 18, country == "JP"
+  |> name age country
+  print
+;'
+```
+
+- Body framing handles `Content-Length`, `Transfer-Encoding: chunked`, and
+  connection-close; up to 5 `3xx` redirects are followed. `https://` is **not**
+  supported (TLS/cert lifecycle is out of scope, §28.12.5) — use a protected
+  channel (loopback, or the future WireGuard/QUIC slice).
+- Bounded and decoded in **streaming, bounded memory** (the body is read
+  single-pass — a network stream can't be seeked, so reads stay serial, like a
+  compressed file). The result is **chunk-size independent**.
+
+**`subscribe "tcp://host:port"` — an unbounded TCP feed.** Dial a producer and
+stream newline-delimited records (CSV by default, `as json` for JSON Lines):
+
+```
+rivus run --features net -c '
+Live:
+  subscribe "tcp://127.0.0.1:9000"
+  |? age >= 18
+  |> name age
+  take 100        # bound it; or it ends when the peer closes
+  print
+;'
+```
+
+- Like `watch`, it is **unbounded** (§0.14): the optimizer and the parallel
+  executor leave it alone, and a whole-stream aggregate downstream is refused
+  (needs a window — a later slice); pass-through (filter / project / take) flows.
+- **Lossless backpressure**: a slow consumer fills the OS TCP receive window and
+  the producer naturally waits — nothing is dropped.
+
+**Capability boundary** (both transports, §28.12.4/5): a **loopback** host
+(`127.0.0.1` / `::1` / `localhost`) is always reachable; any other host must be
+listed in `RIVUS_CAP_NET_HOSTS` (comma-separated `host` or `host:port`) or it is
+**rejected** with a message that names only the target — the allowlist is a
+*boundary*, not a secret, and credentials never ride the plan, telemetry or
+error stream. A read timeout is set via `RIVUS_NET_TIMEOUT_MS` (default 30 s).
+
+A runnable, self-contained end-to-end demo (loopback HTTP server + TCP feed) is
+in [`examples/networking-demo.sh`](../examples/networking-demo.sh).
+
 ---
 
 ## 4. Transforms

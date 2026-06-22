@@ -48,17 +48,17 @@ impl fmt::Display for OptReport {
 /// and a report of what changed.
 pub fn optimize(graph: PlanGraph) -> (PlanGraph, OptReport) {
     let mut report = OptReport::default();
-    // §28.12 (ratified #149 ③): an unbounded sub-DAG (`watch`) is outside the
-    // deterministic-op set — the optimizer must not re-order, re-combine or
-    // rewrite it (the boundedness-derived determinism tag). Skeleton posture:
-    // skip every pass when the plan contains an unbounded source, and say so in
-    // the report (observable-first, surfaced by `rivus explain`). Conservative:
-    // bounded sibling scopes in the same file also stay unoptimized for now —
-    // per-subtree refinement is a later slice.
+    // §28.12 (ratified #149 ③) / §33: an unbounded sub-DAG (`watch` /
+    // `subscribe`) is outside the deterministic-op set — the optimizer must not
+    // re-order, re-combine or rewrite it (the boundedness-derived determinism
+    // tag). Skeleton posture: skip every pass when the plan contains an unbounded
+    // source, and say so in the report (observable-first, surfaced by `rivus
+    // explain`). Conservative: bounded sibling scopes in the same file also stay
+    // unoptimized for now — per-subtree refinement is a later slice.
     if graph.uses_unbounded() {
         report.applied.push(
-            "unbounded source (`watch`) present → optimizer passes skipped on this plan \
-             (determinism tag, §28.12; per-subtree refinement is a later slice)"
+            "unbounded source (`watch`/`subscribe`) present → optimizer passes skipped on \
+             this plan (determinism tag, §28.12/§33; per-subtree refinement is a later slice)"
                 .to_string(),
         );
         return (graph, report);

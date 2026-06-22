@@ -22,6 +22,18 @@
 > ループ不変を test pin・英日ガイド更新）。配布 fat 是正は #150 で landed
 > （`full` feature・release.yml・RELEASE.md）。**`unbounded` を `full` に入れるかは
 > 統括判断待ち**。後続スライス：socket/http（方向性は §28.12.5 裁可済）・窓・watermark。
+>
+> **§33 ネットワーキング実行＝landed（feature `net`・std-only・依存追加ゼロ）。**
+> §28.12.5 に忠実な**クライアント側のみ**の2トランスポート：`open "http://…"`
+> （有界 GET・CSV+JSON・content-length/chunked/close・redirect5回・単一パス＝非シーク・
+> chunk-size 非依存）／`subscribe "tcp://…"`（非有界 client feed・CSV+JSON・ロスレス背圧・
+> `watch` と同じ非有界/決定性タグ規律）。capability＝loopback 既定＋`RIVUS_CAP_NET_HOSTS`
+> allowlist（拒否は対象のみ surface）・`RIVUS_NET_TIMEOUT_MS`。std 最小 HTTP/1.1 クライアント
+> （`net.rs`）。評価は `net` ゲート、parse/explain は常時 std。`open` は `path_word` が
+> 引用符付き文字列を受理（URL 用）。CSV は既存 `CompressedCsvReader::from_reader` 再利用、
+> JSONL は新 `StreamJsonlReader`（単一パス・サンプル推論）。`full` に `net` 追加済。
+> demo＝`examples/networking-demo.sh`・設計＝`docs/design/33`・test＝`tests/net.rs`（9件・全 loopback）。
+> 残：HTTP POST sink（§28.7 出力の鏡像）／`read` の `http://`／scheduled-get／将来 WireGuard/QUIC。
 
 ---
 

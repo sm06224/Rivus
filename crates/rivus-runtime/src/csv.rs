@@ -1822,7 +1822,7 @@ fn split_record_q(line: &str, delim: u8) -> Vec<(String, bool)> {
 /// a sample, so on a column whose type only "widens" after the sample (e.g. an
 /// int column that turns float/text deep in the file) it can mis-type — the
 /// documented trade-off for not being able to re-read a compressed stream.
-#[cfg(any(feature = "gzip", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "zstd", feature = "net"))]
 pub struct CompressedCsvReader {
     reader: Box<dyn BufRead + Send>,
     ncols: usize,
@@ -1840,10 +1840,11 @@ pub struct CompressedCsvReader {
     pub bad_rows: usize,
 }
 
-#[cfg(any(feature = "gzip", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "zstd", feature = "net"))]
 impl CompressedCsvReader {
     /// Open `path`, wrap it in the right decoder, read the CSV header + a sample
     /// to infer the schema, and return the reader positioned to yield every row.
+    #[cfg(any(feature = "gzip", feature = "zstd"))]
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         path: &str,
@@ -1854,13 +1855,32 @@ impl CompressedCsvReader {
         dt_formats: &[(String, String)],
         delim: u8,
     ) -> Result<(Schema, CompressedCsvReader), String> {
-        let mut reader = crate::transport::open_compressed(path)?;
+        let reader = crate::transport::open_compressed(path)?;
+        Self::from_reader(
+            reader, allow, chunk_size, header, declared, dt_formats, delim,
+        )
+    }
 
+    /// The single-pass core: infer the schema from a buffered sample of an
+    /// already-opened **non-seekable** byte stream (a compressed file, or — with
+    /// feature `net`, §33 — an HTTP body / TCP feed), then yield every row. Same
+    /// sample-inference trade-off as [`Self::open`] (a type that only widens past
+    /// the sample can mis-type, since the stream can't be re-read).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_reader(
+        mut reader: Box<dyn BufRead + Send>,
+        allow: Option<&[String]>,
+        chunk_size: usize,
+        header: bool,
+        declared: Option<&[(String, Option<DataType>)]>,
+        dt_formats: &[(String, String)],
+        delim: u8,
+    ) -> Result<(Schema, CompressedCsvReader), String> {
         // Column names: a declared schema, else the header line, else c0,c1,….
         // A header line is consumed when `header` even if `declared` overrides.
         let mut first = String::new();
         if reader.read_line(&mut first).map_err(|e| e.to_string())? == 0 {
-            return Err("empty compressed CSV".to_string());
+            return Err("empty CSV stream".to_string());
         }
         let mut pending: Vec<String> = Vec::new();
         let names: Vec<String> = if let Some(d) = declared {
@@ -1877,7 +1897,7 @@ impl CompressedCsvReader {
         };
         let ncols = names.len();
         if ncols == 0 {
-            return Err("compressed CSV has no columns".to_string());
+            return Err("CSV stream has no columns".to_string());
         }
         let keep: Vec<usize> = match allow {
             None => (0..ncols).collect(),
@@ -2017,7 +2037,7 @@ impl CompressedCsvReader {
 /// Codec face (§28.5) for the single-pass compressed reader. It has no
 /// prefilter/parse-failure accounting (those are the seekable reader's), so it
 /// uses the trait defaults — matching the source's prior behavior for this path.
-#[cfg(any(feature = "gzip", feature = "zstd"))]
+#[cfg(any(feature = "gzip", feature = "zstd", feature = "net"))]
 impl crate::codec::Decoder for CompressedCsvReader {
     fn decode_chunk(&mut self) -> Option<Vec<Column>> {
         self.next_columns()

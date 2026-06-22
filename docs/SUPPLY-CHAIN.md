@@ -23,6 +23,15 @@ third-party crate as untrusted-until-vetted and minimizes the trusted surface.
   - a user opts in explicitly, pulling a *vetted* crate and its reviewed tree;
   - the core engine never depends on them.
 
+- **Some opt-in features add *no* dependency at all.** The `net` feature
+  (networking execution, §33 — `open "http://…"` / `subscribe "tcp://…"`) is
+  implemented entirely on `std::net` (a minimal HTTP/1.1 client), so it pulls
+  **zero** third-party crates: `cargo tree -p rivus-runtime --features net
+  --edges normal` shows only `rivus-*`. It is gated off-by-default purely so the
+  *lean* build's surface is mechanically minimal; the transport itself is as
+  dependency-free as the core. (Per §28.12.1a, deps are taken only when a
+  capability can't be done in std — HTTP can.)
+
 - **Dev-only dependencies are isolated.** `criterion` (benchmarks) and its tree
   are `[dev-dependencies]`; they never ship in a release build.
 

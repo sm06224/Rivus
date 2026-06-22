@@ -13,6 +13,10 @@ mod engine;
 mod eval;
 mod jsonl;
 mod kernel;
+// §33 networking transport (feature `net`): a std-only HTTP/1.1 GET client and a
+// TCP subscribe dial. The default build does not compile it (zero-dep invariant).
+#[cfg(feature = "net")]
+mod net;
 mod operators;
 mod route;
 mod telemetry;

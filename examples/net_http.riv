@@ -1,0 +1,16 @@
+# Networking execution (design §33) — fetch a CSV over HTTP and wrangle it.
+#
+# `open "http://…"` is a bounded GET: only the transport changes, so the whole
+# language (filter pushdown, computed columns, group-by, …) works unchanged on a
+# remote source. Requires `--features net`; the host must be loopback or granted
+# via RIVUS_CAP_NET_HOSTS (capability boundary, §28.12.4/5).
+#
+#   rivus run --features net examples/net_http.riv   # (after starting a server)
+#
+# See examples/networking-demo.sh for a self-contained, runnable end-to-end demo.
+Adults:
+  open "http://127.0.0.1:8080/data.csv"
+  |? age >= 18, country == "JP"
+  |> name age country
+  print
+;

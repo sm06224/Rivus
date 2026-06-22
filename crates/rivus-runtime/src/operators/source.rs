@@ -155,10 +155,13 @@ impl SourceCsv {
 
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
+        let scheme = Scheme::of(&self.path);
         if self.path == "-" {
             self.load_stdin(ctx);
-        } else if Scheme::of(&self.path).is_compressed() {
+        } else if scheme.is_compressed() {
             self.load_compressed(ctx);
+        } else if matches!(scheme, Scheme::Http) {
+            self.load_http(ctx);
         } else {
             match csv::CsvChunker::open(
                 &self.path,
@@ -246,6 +249,70 @@ impl SourceCsv {
                 ErrorScope::Graph,
                 format!(
                     "'{}' is compressed; rebuild with `--features {feat}` to read it",
+                    self.path
+                ),
+            )
+            .at_node(ctx.label.clone()),
+        );
+    }
+
+    /// Open an `http://` CSV source (design §33, feature `net`): GET the URL and
+    /// decode its body with the single-pass streaming reader (a network body is
+    /// non-seekable, exactly like a compressed stream — same sample-inference
+    /// path). A capability denial or a transport/HTTP error is fatal (the source
+    /// has no data), surfaced with the transport's own message.
+    #[cfg(feature = "net")]
+    fn load_http(&mut self, ctx: &mut OpCtx) {
+        let reader = match crate::net::http_get(&self.path) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.raise(
+                    ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
+                        .at_node(ctx.label.clone()),
+                );
+                return;
+            }
+        };
+        match csv::CompressedCsvReader::from_reader(
+            reader,
+            self.projection.as_deref(),
+            self.chunk_size,
+            self.header,
+            self.declared.as_deref(),
+            &self.dt_formats,
+            self.delim,
+        ) {
+            Ok((schema, rdr)) => {
+                if rdr.bad_rows > 0 {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Recoverable,
+                            ErrorScope::Item,
+                            format!("{} malformed row(s) skipped", rdr.bad_rows),
+                        )
+                        .at_node(ctx.label.clone()),
+                    );
+                }
+                self.schema = Arc::new(schema);
+                self.decoder = Some(Box::new(rdr));
+            }
+            Err(e) => ctx.raise(
+                ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
+            ),
+        }
+    }
+
+    /// Defense-in-depth (the engine refuses a `net`-less plan pre-run, §33): a
+    /// build without the `net` feature cannot open an `http://` source.
+    #[cfg(not(feature = "net"))]
+    fn load_http(&mut self, ctx: &mut OpCtx) {
+        ctx.raise(
+            ErrorEvent::new(
+                Severity::Fatal,
+                ErrorScope::Graph,
+                format!(
+                    "'{}' is a network source; rebuild with `--features net` to read it \
+                     (the default build stays zero-dependency)",
                     self.path
                 ),
             )
@@ -812,8 +879,66 @@ impl SourceJsonl {
         }
     }
 
+    /// Open an `http://` JSONL source (§33, feature `net`): GET the URL and decode
+    /// its body with the single-pass streaming JSONL reader. A capability denial
+    /// or transport/HTTP error is fatal (the source has no data).
+    #[cfg(feature = "net")]
+    fn load_http(&mut self, ctx: &mut OpCtx) {
+        let reader = match crate::net::http_get(&self.path) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.raise(
+                    ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
+                        .at_node(ctx.label.clone()),
+                );
+                return;
+            }
+        };
+        match jsonl::StreamJsonlReader::from_reader(reader, self.chunk_size) {
+            Ok((schema, rdr)) => {
+                if rdr.bad_rows > 0 {
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Recoverable,
+                            ErrorScope::Item,
+                            format!("{} malformed JSONL line(s) skipped", rdr.bad_rows),
+                        )
+                        .at_node(ctx.label.clone()),
+                    );
+                }
+                self.schema = Arc::new(schema);
+                self.decoder = Some(Box::new(rdr));
+            }
+            Err(e) => ctx.raise(
+                ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e).at_node(ctx.label.clone()),
+            ),
+        }
+    }
+
+    /// Defense-in-depth (the engine refuses a `net`-less plan pre-run, §33).
+    #[cfg(not(feature = "net"))]
+    fn load_http(&mut self, ctx: &mut OpCtx) {
+        ctx.raise(
+            ErrorEvent::new(
+                Severity::Fatal,
+                ErrorScope::Graph,
+                format!(
+                    "'{}' is a network source; rebuild with `--features net` to read it",
+                    self.path
+                ),
+            )
+            .at_node(ctx.label.clone()),
+        );
+    }
+
     fn load(&mut self, ctx: &mut OpCtx) {
         self.loaded = true;
+        // An `http://` source (§33) streams the GET body single-pass (a network
+        // body can't be re-read for the two-pass inference) — handled apart.
+        if matches!(Scheme::of(&self.path), Scheme::Http) {
+            self.load_http(ctx);
+            return;
+        }
         // Line-oriented JSONL → bounded streaming reader; top-level array → the
         // whole-file parse (can't be streamed).
         if !jsonl::is_json_array(&self.path) {
@@ -1082,6 +1207,33 @@ impl Operator for SourceUnboundedStub {
             ErrorScope::Graph,
             "unbounded `watch` source cannot run in this build — rebuild with \
              `--features unbounded` (the default build stays zero-dependency)"
+                .to_string(),
+        ));
+        None
+    }
+    fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        Vec::new()
+    }
+}
+
+/// Defense-in-depth stub for the network `subscribe` source (§33) reaching the
+/// engine without the `net` feature: `run_with_progress` refuses a `net`-less
+/// plan pre-run, so this only fires if a caller builds operators directly —
+/// then it fails loudly (Fatal). Feature-on builds dispatch `SourceSubscribe`.
+#[cfg(not(feature = "net"))]
+pub(crate) struct SourceNetStub;
+
+#[cfg(not(feature = "net"))]
+impl Operator for SourceNetStub {
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
+        ctx.raise(ErrorEvent::new(
+            Severity::Fatal,
+            ErrorScope::Graph,
+            "network `subscribe` source cannot run in this build — rebuild with \
+             `--features net` (the default build stays zero-dependency)"
                 .to_string(),
         ));
         None
