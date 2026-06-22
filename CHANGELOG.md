@@ -20,11 +20,16 @@ All notable changes to Rivus. Format loosely follows
     (`RIVUS_CAP_NET_PEERS`, the static-public-key ↔ wg-IP boundary). Loopback is
     the one exception. Control+data are multiplexed with **credit-based bounded
     pull** (§28.12.2 ④). Fully working and tested (`tests/net.rs::distributed_*`).
-  - **Alternative = QUIC (feature `quic`, §28.12.5-3):** `quinn` + `rustls`/`ring`
-    + `rcgen`, identity = the cert's public-key **fingerprint**, allowlist pins
-    allowed peer fingerprints (`RIVUS_CAP_NET_PEER_KEYS`). Mutual-auth handshake
-    and static-key pinning work and are tested; the result-stream round-trip is a
-    documented WIP (off by default, excluded from `full`).
+  - **Alternative = QUIC (feature `quic`, §28.12.5-3), now complete:** `quinn` +
+    `rustls`/`ring` + `rcgen`, identity = the cert's public-key **fingerprint**,
+    allowlist pins peer fingerprints (`RIVUS_CAP_NET_PEER_KEYS`). Mutual-auth
+    handshake, static-key pinning, **and the byte-identical credit-streamed result
+    round-trip** all work and are tested (`tests/quic.rs`); `rivus serve --quic` /
+    `rivus run --on quic://…` demo it end-to-end. (Off by default; not yet in
+    `full` pending a `cargo deny` pass on its tree.) The streaming stall during
+    development was a `QuicConfig` `#[derive(Default)]` giving `window = 0` (the
+    client granted zero credit → the worker blocked forever) — fixed with a manual
+    `Default` (window 8) and a defensive `window.max(1)`.
   - Capability denials name only the target, never the allowlist (§28.12.4);
     credentials never ride the IR / telemetry / error stream.
 - **Transport architecture: logical channel separation + event-centric

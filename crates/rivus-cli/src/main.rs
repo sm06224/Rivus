@@ -601,6 +601,7 @@ fn run_tui(graph: &rivus_ir::PlanGraph, chunk_size: usize, memory: MemoryPref) -
 fn run_serve(args: &[String]) -> ExitCode {
     use rivus_runtime::distributed::{self, Handler, LinkConfig};
     let mut bind = "127.0.0.1:9001".to_string();
+    let mut quic = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -614,6 +615,9 @@ fn run_serve(args: &[String]) -> ExitCode {
                     }
                 }
             }
+            // §28.12.5-3: serve over the QUIC transport instead of the kernel-
+            // WireGuard-bound std channel.
+            "--quic" => quic = true,
             other => {
                 eprintln!("error: serve: unknown argument '{other}'");
                 return ExitCode::from(2);
@@ -621,7 +625,6 @@ fn run_serve(args: &[String]) -> ExitCode {
         }
         i += 1;
     }
-    let cfg = LinkConfig::from_env();
     // The worker handler: the IR is the deployment artifact — parse, optimize,
     // run, render the outputs to bytes (the same bytes a local run produces).
     let handler: Handler = std::sync::Arc::new(|src: &str| {
@@ -630,6 +633,33 @@ fn run_serve(args: &[String]) -> ExitCode {
         let res = run(&graph, RunOptions::default()).map_err(|e| format!("run: {e:?}"))?;
         Ok(viz::render_outputs(&res.outputs).into_bytes())
     });
+    if quic {
+        #[cfg(feature = "quic")]
+        {
+            use rivus_runtime::distributed_quic::{quic_worker, QuicConfig};
+            let worker = match quic_worker(&bind, QuicConfig::from_env()) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("serve error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprintln!("[rivus serve] QUIC identity key {}", worker.identity());
+            return match worker.serve(handler, |ev| eprintln!("[rivus serve] {ev}")) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("serve error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        #[cfg(not(feature = "quic"))]
+        {
+            eprintln!("`serve --quic` needs `--features quic`");
+            return ExitCode::from(2);
+        }
+    }
+    let cfg = LinkConfig::from_env();
     match distributed::serve(&bind, &cfg, handler, |ev| eprintln!("[rivus serve] {ev}")) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -653,6 +683,30 @@ fn run_serve(_args: &[String]) -> ExitCode {
 #[cfg(feature = "net")]
 fn run_on_peer(peer: &str, ir_source: &str) -> ExitCode {
     use rivus_runtime::distributed::{run_remote_observed, LinkConfig};
+    // `quic://host:port` selects the QUIC transport (§28.12.5-3); `rivus://` or a
+    // bare `host:port` use the kernel-WireGuard-bound std channel.
+    if let Some(q) = peer.strip_prefix("quic://") {
+        #[cfg(feature = "quic")]
+        {
+            use rivus_runtime::distributed_quic::{quic_run_remote, QuicConfig};
+            return match quic_run_remote(q, &QuicConfig::from_env(), ir_source) {
+                Ok(bytes) => {
+                    let _ = std::io::stdout().write_all(&bytes);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("remote run error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        #[cfg(not(feature = "quic"))]
+        {
+            let _ = q;
+            eprintln!("`--on quic://…` needs `--features quic`");
+            return ExitCode::from(2);
+        }
+    }
     let addr = peer.strip_prefix("rivus://").unwrap_or(peer);
     // The worker narrates structured telemetry events on the telemetry channel
     // (§34, event-centric observability); surface them on stderr while the data

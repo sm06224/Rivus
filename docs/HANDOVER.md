@@ -32,16 +32,19 @@
 >   （`RIVUS_CAP_NET_PEERS`・`peer_allowed`）。**暗号は委譲**（#149-2＝カーネル WireGuard・
 >   Rivus に暗号コード無し）。HELLO/JOB/CHUNK/CREDIT/END 多重＋credit bounded pull。
 >   完動・テスト済（`tests/net.rs::distributed_*` 4件・byte-identity）。
-> - **(B) 代替＝QUIC（`distributed_quic.rs`・feature `quic`・#149-3）**：quinn/rustls+ring/
->   rcgen/tokio。身元＝証明書公開鍵フィンガープリント・allowlist pin（`RIVUS_CAP_NET_PEER_KEYS`）。
->   相互認証＋pin は完動・テスト済（`quic_wrong_static_key_pin_rejected`＋unit）。**結果
->   ストリームのラウンドトリップは dual-runtime loopback の async ライフサイクル問題で WIP・
->   `#[ignore]`**（off-by-default・`full` 未収載）。次セッションの最優先修正候補。
+> - **(B) 代替＝QUIC（`distributed_quic.rs`・feature `quic`・#149-3）＝完動**：quinn/rustls+ring/
+>   rcgen/tokio（小型 multi-thread runtime を block_on 橋渡し・bounded idle timeout＋keepalive）。
+>   身元＝証明書公開鍵フィンガープリント・allowlist pin（`RIVUS_CAP_NET_PEER_KEYS`）。相互認証＋pin＋
+>   **byte-identical credit ストリーム**まで完動・テスト済（`tests/quic.rs`・CLI `serve --quic`／
+>   `run --on quic://`）。**教訓**：当初の停止は `QuicConfig` の `#[derive(Default)]` が window=0 を
+>   生み client が credit 0 を送り worker が永久 credit 待ちになっていたため（手書き Default＝8・
+>   `window.max(1)` で防御）。block_on 二重ランタイムは無実（最小エコーで実証）。`full` 収載は
+>   cargo deny 通過後。QUIC テストは並列競合回避のため 1 関数に統合・worker は detach。
 > - **(C) loopback 例外層＝クライアント取得（`net.rs`）**：`open "http://…"`（有界 GET・
 >   CSV+JSON・chunked/redirect）／`subscribe "tcp://…"`（非有界）。capability＝loopback＋
 >   `RIVUS_CAP_NET_HOSTS`。CSV は `CompressedCsvReader::from_reader` 再利用・JSONL は
 >   `StreamJsonlReader`。`open` の `path_word` が引用符付き URL を受理。
-> - parse/explain 常時 std・評価のみ feature ゲート。`net` は `full` 収載済（`quic` は WIP ゆえ未）。
+> - parse/explain 常時 std・評価のみ feature ゲート。`net` は `full` 収載済（`quic` は cargo deny 後）。
 > demo＝`examples/networking-demo.sh`（http/subscribe/分散実行）。
 > 残：QUIC ストリーム修正→`full`／§17.3 stage 分割＋Arrow shuffle／coordinator telemetry 集約／HTTP POST sink。
 

@@ -84,7 +84,8 @@ pub struct LinkConfig {
     /// `RIVUS_CAP_NET_PEERS` (comma-separated). `None` ⇒ loopback peers only.
     pub peers: Option<Vec<String>>,
     /// Credit window for the result stream (bounded pull). `RIVUS_NET_CREDIT`,
-    /// default 8 frames in flight.
+    /// default 64 frames (× 32 KiB ≈ 2 MiB) in flight — large enough to keep the
+    /// pipe full on a fast link, small enough to stay bounded-memory.
     pub window: u32,
 }
 
@@ -94,7 +95,7 @@ impl Default for LinkConfig {
             identity: "anon".to_string(),
             iface: None,
             peers: None,
-            window: 8,
+            window: 64,
         }
     }
 }
@@ -292,6 +293,9 @@ fn handle_conn(stream: TcpStream, cfg: &LinkConfig, handler: &Handler) -> Result
     stream
         .set_read_timeout(Some(read_timeout()))
         .map_err(|e| e.to_string())?;
+    // TCP_NODELAY: the protocol is a small-frame request/response ping-pong, which
+    // Nagle + delayed-ACK would stall ~40 ms per round-trip — disable it.
+    let _ = stream.set_nodelay(true);
     let mut w = stream.try_clone().map_err(|e| e.to_string())?;
     let mut r = BufReader::new(stream);
 
@@ -332,6 +336,11 @@ fn handle_conn(stream: TcpStream, cfg: &LinkConfig, handler: &Handler) -> Result
                 .as_bytes(),
             );
             stream_with_credit(&mut r, &mut w, &bytes).map_err(|e| e.to_string())?;
+            // Graceful close: wait for the client to finish reading and close its
+            // side before we drop the socket — otherwise dropping with a large
+            // result still in flight RSTs the connection and the client sees a
+            // reset mid-stream (only visible on big transfers).
+            drain_until_eof(&mut r);
         }
         Err(e) => {
             let _ = write_frame(&mut w, TELE, EVENT, b"flow.failed");
@@ -371,6 +380,20 @@ fn stream_with_credit(r: &mut impl Read, w: &mut impl Write, bytes: &[u8]) -> io
     write_frame(w, CTRL, END, &[])
 }
 
+/// Read and discard until the peer closes (EOF) — the worker's half of the
+/// graceful close: it keeps the socket open until the client has drained the
+/// result and dropped its side, so a large in-flight transfer is never RST.
+fn drain_until_eof(r: &mut impl Read) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,  // client closed
+            Ok(_) => {}      // stray refill credit after END — ignore
+            Err(_) => break, // timeout / reset — stop waiting
+        }
+    }
+}
+
 fn credit_value(p: &[u8]) -> u64 {
     if p.len() == 4 {
         u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as u64
@@ -405,6 +428,7 @@ pub fn run_remote_observed(
     stream
         .set_read_timeout(Some(read_timeout()))
         .map_err(|e| e.to_string())?;
+    let _ = stream.set_nodelay(true); // see handle_conn — avoid Nagle ping-pong stalls
     let mut w = stream.try_clone().map_err(|e| e.to_string())?;
     let mut r = BufReader::new(stream);
 

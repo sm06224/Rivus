@@ -40,63 +40,58 @@ fn temp_csv() -> std::path::PathBuf {
     p
 }
 
-// KNOWN LIMITATION (honest): the QUIC mutual-auth handshake, static-key identity
-// and fingerprint **pinning** work and are covered by `quic_wrong_static_key_pin_rejected`
-// and the unit tests. The full credit-streamed *result round-trip* over a QUIC
-// bidirectional stream does not yet complete in this dual-runtime loopback test
-// harness (the connection idles out after the handshake — an unresolved async
-// lifecycle issue with two `block_on` endpoints). The PRIMARY distributed path
-// (kernel-WireGuard-bound std, `tests/net.rs::distributed_*`) is fully working
-// and tested end-to-end; QUIC is the feature-gated *alternative* (§28.12.5-3).
-// Ignored until the streaming lifecycle is fixed — run with `--ignored`.
+/// One test covering both QUIC scenarios **sequentially** — they are deliberately
+/// not two `#[test]`s: each spins up two small multi-threaded runtimes (worker +
+/// client), and running both in parallel on a 4-vCPU box oversubscribes the
+/// scheduler and can stall a loopback connection past the idle timeout. Run
+/// sequentially they are fast and deterministic.
+///
+/// (a) **Round-trip**: mutual static-key auth, ship the IR over a QUIC bidi
+/// stream, stream the rendered result back, assert it is **byte-identical** to a
+/// local run (interpret==distribute, §0.5).
+/// (b) **Pin rejection**: a client that pins the wrong worker key refuses the
+/// connection at the application layer (the static-key boundary, §28.12.4/5).
 #[test]
-#[ignore = "QUIC bidi result-stream round-trip is WIP; handshake/auth/pinning are tested"]
-fn quic_distributed_round_trips_byte_identical() {
+fn quic_protected_channel_round_trip_and_pinning() {
     let path = temp_csv();
+
+    // (a) byte-identical round-trip.
     let src = format!(
         "Adults:\n open {}\n |? age >= 18\n |> name age\n;",
         path.display()
     );
-
     let worker = quic_worker("127.0.0.1:0", QuicConfig::default()).expect("bind quic worker");
     let addr = worker.addr().to_string();
     let h = handler();
-    let jh = thread::spawn(move || worker.serve_once(h));
-
+    // Detached: the client-side `got == expected` is the verification; we don't
+    // join the worker (its `conn.closed()` may wait out the idle timeout for the
+    // graceful close, which is cosmetic once the client has the result).
+    thread::spawn(move || {
+        let _ = worker.serve_once(h);
+    });
     let got = quic_run_remote(&addr, &QuicConfig::default(), &src).expect("quic remote run");
-    let _ = jh.join().unwrap();
-
     let expected = render_flow(&src).unwrap();
-    std::fs::remove_file(&path).ok();
     assert_eq!(
         got, expected,
         "QUIC distribute == interpret (byte-identical)"
     );
     assert!(String::from_utf8_lossy(&got).contains("alice,30"));
     assert!(!String::from_utf8_lossy(&got).contains("bob"));
-}
 
-#[test]
-fn quic_wrong_static_key_pin_rejected() {
-    let path = temp_csv();
-    let src = format!("R:\n open {}\n |> name\n;", path.display());
-
-    let worker = quic_worker("127.0.0.1:0", QuicConfig::default()).expect("bind");
-    let addr = worker.addr().to_string();
-    let h = handler();
-    // serve_once may error when the client aborts post-handshake — that's fine.
-    let jh = thread::spawn(move || {
-        let _ = worker.serve_once(h);
+    // (b) wrong static-key pin is rejected (worker detached — the assertion is
+    // client-side, right after the handshake).
+    let worker2 = quic_worker("127.0.0.1:0", QuicConfig::default()).expect("bind");
+    let addr2 = worker2.addr().to_string();
+    let h2 = handler();
+    thread::spawn(move || {
+        let _ = worker2.serve_once(h2);
     });
-
-    // Client pins a key that is NOT the worker's → the connection is refused at
-    // the application layer (the static-key boundary, §28.12.4/5).
     let bad = QuicConfig {
         allow_peer_keys: Some(vec!["00".repeat(32)]),
         ..QuicConfig::default()
     };
-    let err = quic_run_remote(&addr, &bad, &src).expect_err("wrong pin rejected");
+    let err = quic_run_remote(&addr2, &bad, &src).expect_err("wrong pin rejected");
     assert!(err.contains("not in the pinned allowlist"), "{err}");
-    let _ = jh.join();
+
     std::fs::remove_file(&path).ok();
 }

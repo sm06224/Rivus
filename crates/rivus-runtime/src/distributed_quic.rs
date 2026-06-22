@@ -12,9 +12,10 @@
 //! allowlist is a boundary, not a secret (§28.12.4); private keys never leave
 //! this process and never touch the IR/telemetry.
 //!
-//! Async `quinn`/`tokio` is bridged to Rivus's synchronous engine with a
-//! current-thread runtime and `block_on`, so the public API mirrors the std
-//! transport (`serve_once` / `run_remote`).
+//! Async `quinn`/`tokio` is bridged to Rivus's synchronous engine with a small
+//! multi-threaded runtime + `block_on`, so the public API mirrors the std
+//! transport (`quic_worker` / `quic_run_remote`). A bounded idle timeout +
+//! keep-alive ([`transport_config`]) keeps an aborted peer from lingering.
 
 use std::sync::Arc;
 
@@ -33,21 +34,30 @@ const ERR: u8 = 6;
 const FRAME: usize = 32 * 1024;
 
 /// QUIC capability/identity (the static-key allowlist lane, §28.12.4).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct QuicConfig {
     /// Allowed peer cert fingerprints (hex SHA-256 of the DER). `None` ⇒ accept
     /// any peer but surface its fingerprint (dev/loopback). `RIVUS_CAP_NET_PEER_KEYS`.
     pub allow_peer_keys: Option<Vec<String>>,
-    /// Credit window for the result stream (bounded pull). Default 8.
+    /// Credit window for the result stream (bounded pull). Default 64.
     pub window: u32,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        // `window` MUST be >= 1: a 0 window means the client grants no credit and
+        // the worker blocks forever awaiting more (the bug that stalled the QUIC
+        // round-trip — `#[derive(Default)]` would have made it 0).
+        QuicConfig {
+            allow_peer_keys: None,
+            window: 64,
+        }
+    }
 }
 
 impl QuicConfig {
     pub fn from_env() -> Self {
-        let mut c = QuicConfig {
-            window: 8,
-            ..Default::default()
-        };
+        let mut c = QuicConfig::default();
         if let Ok(p) = std::env::var("RIVUS_CAP_NET_PEER_KEYS") {
             let v: Vec<String> = p
                 .split(',')
@@ -184,6 +194,23 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// A bounded idle timeout (10 s) + keep-alive (3 s): an aborted or stalled peer
+/// is detected promptly instead of lingering on the protocol default, and a live
+/// idle connection is kept up by keep-alives (`RIVUS_NET_TIMEOUT_MS` tunes it).
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut t = quinn::TransportConfig::default();
+    let ms = std::env::var("RIVUS_NET_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(10_000);
+    if let Ok(idle) = std::time::Duration::from_millis(ms).try_into() {
+        t.max_idle_timeout(Some(idle));
+    }
+    t.keep_alive_interval(Some(std::time::Duration::from_millis((ms / 3).max(1))));
+    Arc::new(t)
+}
+
 fn server_config(id: &Identity) -> Result<ServerConfig, String> {
     let p = provider();
     let verifier = Arc::new(AcceptAnyClient(p.clone()));
@@ -195,7 +222,9 @@ fn server_config(id: &Identity) -> Result<ServerConfig, String> {
         .map_err(|e| format!("server tls config: {e}"))?;
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|e| format!("quic server config: {e}"))?;
-    Ok(ServerConfig::with_crypto(Arc::new(qsc)))
+    let mut sc = ServerConfig::with_crypto(Arc::new(qsc));
+    sc.transport_config(transport_config());
+    Ok(sc)
 }
 
 fn client_config(id: &Identity) -> Result<ClientConfig, String> {
@@ -210,7 +239,9 @@ fn client_config(id: &Identity) -> Result<ClientConfig, String> {
         .map_err(|e| format!("client tls config: {e}"))?;
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|e| format!("quic client config: {e}"))?;
-    Ok(ClientConfig::new(Arc::new(qcc)))
+    let mut cc = ClientConfig::new(Arc::new(qcc));
+    cc.transport_config(transport_config());
+    Ok(cc)
 }
 
 /// The fingerprint of the peer's certificate on a live connection (the static
@@ -311,10 +342,20 @@ impl QuicWorker {
     /// Accept one connection, run the shipped IR, stream the result. Returns the
     /// authenticated peer fingerprint.
     pub fn serve_once(&self, handler: Handler) -> Result<String, String> {
-        self.rt.block_on(self.handle_one(handler))
+        self.rt.block_on(async {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .ok_or_else(|| "endpoint closed".to_string())?;
+            process_conn(incoming, self.cfg.clone(), self.identity.clone(), handler).await
+        })
     }
 
-    /// Serve forever; surface each lifecycle/rejection note via `on_event`.
+    /// Serve forever, handling each connection on its **own task** so a slow
+    /// peer (or the graceful-close wait) never blocks the next handshake — the
+    /// idiomatic quinn server shape, and what lets the worker serve many
+    /// coordinators concurrently.
     pub fn serve(&self, handler: Handler, mut on_event: impl FnMut(String)) -> Result<(), String> {
         on_event(format!(
             "QUIC serving on {} as key {} (peers: {})",
@@ -325,60 +366,62 @@ impl QuicWorker {
                 None => "any (dev)".to_string(),
             }
         ));
-        loop {
-            match self.rt.block_on(self.handle_one(handler.clone())) {
-                Ok(peer) => on_event(format!("served peer {peer}")),
-                Err(e) => on_event(e),
+        self.rt.block_on(async {
+            while let Some(incoming) = self.endpoint.accept().await {
+                let cfg = self.cfg.clone();
+                let id = self.identity.clone();
+                let h = handler.clone();
+                tokio::spawn(async move {
+                    let _ = process_conn(incoming, cfg, id, h).await;
+                });
             }
-        }
+        });
+        Ok(())
     }
+}
 
-    async fn handle_one(&self, handler: Handler) -> Result<String, String> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| "endpoint closed".to_string())?;
-        let conn = incoming.await.map_err(|e| format!("handshake: {e}"))?;
-        let fp =
-            peer_fingerprint(&conn).ok_or_else(|| "peer presented no certificate".to_string())?;
-        // Capability: pin the peer's static key (boundary, not secret).
-        self.cfg.peer_pinned(&fp)?;
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| format!("accept stream: {e}"))?;
+/// Handle one accepted connection: pin the peer, HELLO/JOB exchange, run the IR
+/// handler, stream the result. A free async fn (owned args) so `serve` can run it
+/// on a spawned task.
+async fn process_conn(
+    incoming: quinn::Incoming,
+    cfg: QuicConfig,
+    identity: Arc<Identity>,
+    handler: Handler,
+) -> Result<String, String> {
+    let conn = incoming.await.map_err(|e| format!("handshake: {e}"))?;
+    let fp = peer_fingerprint(&conn).ok_or_else(|| "peer presented no certificate".to_string())?;
+    // Capability: pin the peer's static key (boundary, not secret).
+    cfg.peer_pinned(&fp)?;
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| format!("accept stream: {e}"))?;
 
-        match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
-            Some((HELLO, _)) => {}
-            _ => return Err(format!("peer {fp}: expected HELLO")),
-        }
-        write_frame(&mut send, HELLO, self.identity.fingerprint.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        let job = match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
-            Some((JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
-            _ => return Err(format!("peer {fp}: expected JOB")),
-        };
-        // Run the (synchronous) IR handler off the async runtime so the QUIC
-        // endpoint driver keeps running while the flow executes.
-        let h = handler.clone();
-        let result = tokio::task::spawn_blocking(move || h(&job))
-            .await
-            .map_err(|e| format!("handler task: {e}"))?;
-        match result {
-            Ok(bytes) => stream_with_credit(&mut send, &mut recv, &bytes)
-                .await
-                .map_err(|e| e.to_string())?,
-            Err(e) => write_frame(&mut send, ERR, e.as_bytes())
-                .await
-                .map_err(|e| e.to_string())?,
-        }
-        let _ = send.finish();
-        // Give the peer a moment to drain before the connection drops.
-        conn.closed().await;
-        Ok(fp)
+    match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
+        Some((HELLO, _)) => {}
+        _ => return Err(format!("peer {fp}: expected HELLO")),
     }
+    write_frame(&mut send, HELLO, identity.fingerprint.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    let job = match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
+        Some((JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
+        _ => return Err(format!("peer {fp}: expected JOB")),
+    };
+    let result = handler(&job);
+    match result {
+        Ok(bytes) => stream_with_credit(&mut send, &mut recv, &bytes)
+            .await
+            .map_err(|e| e.to_string())?,
+        Err(e) => write_frame(&mut send, ERR, e.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?,
+    }
+    let _ = send.finish();
+    // Wait for the peer to drain and close before the connection drops.
+    conn.closed().await;
+    Ok(fp)
 }
 
 async fn stream_with_credit(
@@ -440,10 +483,16 @@ async fn quic_client(
         .map_err(|e| format!("connect {peer}: {e}"))?
         .await
         .map_err(|e| format!("handshake {peer}: {e}"))?;
-    // Pin the worker's static key (boundary, not secret).
+    // Pin the worker's static key (boundary, not secret). On a mismatch, close
+    // the connection explicitly so the worker's `accept_bi` returns at once
+    // (otherwise it would wait out the idle timeout) — then surface the denial.
     let fp =
         peer_fingerprint(&conn).ok_or_else(|| "worker presented no certificate".to_string())?;
-    cfg.peer_pinned(&fp)?;
+    if let Err(e) = cfg.peer_pinned(&fp) {
+        conn.close(1u32.into(), b"pin");
+        endpoint.wait_idle().await;
+        return Err(e);
+    }
 
     let (mut send, mut recv) = conn
         .open_bi()
@@ -459,7 +508,8 @@ async fn quic_client(
     write_frame(&mut send, JOB, ir_source.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
-    write_frame(&mut send, CREDIT, &cfg.window.to_be_bytes())
+    // Grant a non-zero credit window (a 0 window would deadlock the worker).
+    write_frame(&mut send, CREDIT, &cfg.window.max(1).to_be_bytes())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -506,5 +556,86 @@ mod tests {
         c.allow_peer_keys = Some(vec!["abc123".to_string()]);
         assert!(c.peer_pinned("abc123").is_ok());
         assert!(c.peer_pinned("deadbeef").is_err());
+    }
+
+    /// Isolation probe: does a quinn bidi stream echo work in THIS environment
+    /// with OUR configs, on a single runtime with the server spawned as a task
+    /// (the idiomatic pattern)? If this passes, the dual-runtime harness is the
+    /// suspect; if it hangs, it is config/env.
+    #[test]
+    fn quic_bidi_echo_single_runtime() {
+        let rt = runtime().unwrap();
+        rt.block_on(async {
+            let sid = mint_identity().unwrap();
+            let cid = mint_identity().unwrap();
+            let sc = server_config(&sid).unwrap();
+            let ep = Endpoint::server(sc, "127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = ep.local_addr().unwrap();
+
+            // Server task: accept one conn, echo one bidi message.
+            let sep = ep.clone();
+            let server = tokio::spawn(async move {
+                let conn = sep.accept().await.unwrap().await.unwrap();
+                let (mut s, mut r) = conn.accept_bi().await.unwrap();
+                let mut buf = [0u8; 5];
+                r.read_exact(&mut buf).await.unwrap();
+                s.write_all(&buf).await.unwrap();
+                s.finish().unwrap();
+                conn.closed().await;
+            });
+
+            // Client.
+            let mut cep = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            cep.set_default_client_config(client_config(&cid).unwrap());
+            let conn = cep.connect(addr, "rivus").unwrap().await.unwrap();
+            let (mut s, mut r) = conn.open_bi().await.unwrap();
+            s.write_all(b"hello").await.unwrap();
+            let mut got = [0u8; 5];
+            r.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"hello");
+            conn.close(0u32.into(), b"ok");
+            let _ = server.await;
+        });
+    }
+
+    /// Reproduce the real worker/client split: TWO runtimes on TWO threads, each
+    /// `block_on` (exactly what `serve_once`/`run_remote` do across processes).
+    #[test]
+    fn quic_bidi_echo_two_runtimes() {
+        let sid = mint_identity().unwrap();
+        let sc = server_config(&sid).unwrap();
+        let srt = runtime().unwrap();
+        let ep = srt
+            .block_on(async { Endpoint::server(sc, "127.0.0.1:0".parse().unwrap()) })
+            .unwrap();
+        let addr = ep.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            srt.block_on(async {
+                let conn = ep.accept().await.unwrap().await.unwrap();
+                let (mut s, mut r) = conn.accept_bi().await.unwrap();
+                let mut buf = [0u8; 5];
+                r.read_exact(&mut buf).await.unwrap();
+                s.write_all(&buf).await.unwrap();
+                s.finish().unwrap();
+                conn.closed().await;
+            });
+        });
+
+        let cid = mint_identity().unwrap();
+        let crt = runtime().unwrap();
+        let got = crt.block_on(async {
+            let mut cep = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            cep.set_default_client_config(client_config(&cid).unwrap());
+            let conn = cep.connect(addr, "rivus").unwrap().await.unwrap();
+            let (mut s, mut r) = conn.open_bi().await.unwrap();
+            s.write_all(b"world").await.unwrap();
+            let mut g = [0u8; 5];
+            r.read_exact(&mut g).await.unwrap();
+            conn.close(0u32.into(), b"ok");
+            g
+        });
+        assert_eq!(&got, b"world");
+        let _ = server.join();
     }
 }
