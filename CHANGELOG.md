@@ -68,7 +68,15 @@ All notable changes to Rivus. Format loosely follows
     is **1.4× on std** (per-call 0.633 → session 0.441 ms/job) and is the lever
     for QUIC's 8.6 ms per-call cost (#176). A bonus: the job loop's read-until-EOF
     structurally subsumes the old single-job graceful drain (no large-result RST).
-  Remaining (routing, core pinning, QUIC session reuse) stay design-gated.
+  - **s2' for QUIC (`QuicSession`, feature `quic`):** the same reuse applied to the
+    protected channel — `connect` performs the TLS handshake + static-key pin
+    **once**, then each `run` opens a fresh QUIC **bidi stream** (native stream
+    multiplexing, no cross-job head-of-line blocking); the worker handshakes/pins
+    once and loops `accept_bi`. Measured **4.3× faster** (per-call 7.891 → reused
+    1.815 ms/job, 20 jobs), confirming #176's hypothesis that reuse collapses
+    QUIC's handshake-dominated per-call cost toward the std figure. Tested
+    (`tests/quic.rs` case (c)) and benched (`bench_quic_distributed_latency`).
+  Remaining (routing, core pinning, session pooling/aggregation) stay design-gated.
 - **Networking transport (design §33, feature `net`, std-only / zero new deps).**
   Two client-side network transports behind the off-by-default `net` feature —
   the default build stays zero-dependency, parsing / `rivus explain` are always

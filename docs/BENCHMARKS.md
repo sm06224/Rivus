@@ -1381,10 +1381,12 @@ transport_bench -- --ignored --nocapture`.
 | distributed **end-to-end** (200 k-row CSV → 3 MB result) | **689 ms/iter** | — | dominated by the worker's flow exec + render, *not* transport |
 
 ¹ The QUIC per-call figure includes a **fresh connection + full TLS 1.3
-handshake + a freshly-minted self-signed cert** every iteration (the current API
-opens a connection per job); connection reuse would collapse this toward the std
-number. It is the honest cost of the protected-channel alternative when there is
-no kernel WireGuard to ride.
+handshake + a freshly-minted self-signed cert** every iteration. Connection reuse
+collapses this dramatically — **now measured at 4.3× via `QuicSession`** (per-call
+7.9 ms/job → reused 1.8 ms/job, see Findings below) — confirming the #176
+hypothesis. The per-call figure is the honest cost of the protected-channel
+alternative when there is no kernel WireGuard to ride *and* the connection is not
+amortised.
 
 ### Findings (insights for the transport memo, §34)
 
@@ -1410,8 +1412,20 @@ no kernel WireGuard to ride.
 - **Connection reuse (§34.4 s2', a `Session` of many jobs over one connection):**
   per-call **0.633 ms/job** vs reused session **0.441 ms/job** = **1.4× on the
   std path** (300 jobs). The std win is modest because a TCP connect is already
-  cheap; the payoff is for **QUIC**, whose per-call 8.6 ms is dominated by the
-  TLS handshake + cert mint — reusing one session there should collapse it toward
-  the std figure (the lever in #176). The host Transport Service's forwarding
-  gateway uses `forwarding_session_handler` to share one persistent upstream
-  connection across all co-located Rivus (the PMCN consolidation).
+  cheap; the payoff is for **QUIC**, whose per-call cost is dominated by the
+  TLS 1.3 handshake + cert mint. **Now measured (§34.4 s2' applied to QUIC, the
+  lever in #176): per-call 7.891 ms/job (new conn + TLS + cert) vs reused session
+  1.815 ms/job (one handshake, a fresh bidi stream per job) = 4.3× faster reused**
+  (20 jobs). This confirms the #176 hypothesis: QUIC's handshake-dominated per-call
+  cost collapses toward the std figure once the connection is amortised — the
+  protected channel is cheap *per job* once established, so the cost to budget is
+  the *handshake*, paid once. The host Transport Service's forwarding gateway uses
+  `forwarding_session_handler` to share one persistent upstream connection across
+  all co-located Rivus (the PMCN consolidation), so even per-call downstream jobs
+  ride one amortised upstream handshake.
+
+  The `QuicSession` mirrors the std `Session`: `connect` performs the handshake +
+  static-key pin once, then each `run` opens a new QUIC bidi stream — QUIC's native
+  stream multiplexing is exactly the right primitive for "many jobs, one secured
+  connection" (no head-of-line blocking between concurrent jobs, unlike a single
+  TCP byte-stream).

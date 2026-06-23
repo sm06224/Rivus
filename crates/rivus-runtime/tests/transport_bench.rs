@@ -227,7 +227,7 @@ fn bench_std_distributed_endtoend() {
 #[test]
 #[ignore = "benchmark — run with --features quic --ignored --nocapture"]
 fn bench_quic_distributed_latency() {
-    use rivus_runtime::distributed_quic::{quic_run_remote, quic_worker, QuicConfig};
+    use rivus_runtime::distributed_quic::{quic_run_remote, quic_worker, QuicConfig, QuicSession};
     let path = big_csv(100, "qlat");
     let src = format!(
         "R:\n open {}\n |? age >= 40\n |> name age\n;",
@@ -241,21 +241,33 @@ fn bench_quic_distributed_latency() {
     });
     thread::sleep(std::time::Duration::from_millis(1000)); // endpoint readiness
     let cfg = QuicConfig::default();
+    let iters = 20usize;
+
+    // (a) per-call: a fresh connection (TLS handshake + cert mint) every job.
     for _ in 0..3 {
         let _ = quic_run_remote(&addr, &cfg, &src).unwrap();
     }
-    let iters = 20usize;
     let t0 = Instant::now();
-    let mut bytes = 0usize;
     for _ in 0..iters {
-        bytes += quic_run_remote(&addr, &cfg, &src).unwrap().len();
+        let _ = quic_run_remote(&addr, &cfg, &src).unwrap();
     }
-    let el = t0.elapsed();
+    let per_call = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+    // (b) session: one connection (one handshake), N jobs each a new bidi stream.
+    let session = QuicSession::connect(&addr, &cfg).unwrap();
+    for _ in 0..3 {
+        let _ = session.run(&src).unwrap();
+    }
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        let _ = session.run(&src).unwrap();
+    }
+    let sess = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
     println!(
-        "[bench] QUIC distributed per-call (new conn+handshake+cert each): {iters} iters, {:.3} ms/iter, \
-         {} result bytes/iter",
-        el.as_secs_f64() * 1e3 / iters as f64,
-        bytes / iters
+        "[bench] QUIC reuse: per-call {per_call:.3} ms/job (new conn+TLS+cert) vs \
+         session {sess:.3} ms/job (reused conn, new stream) ({:.1}× faster reused, {iters} jobs)",
+        per_call / sess
     );
     std::fs::remove_file(&path).ok();
 }

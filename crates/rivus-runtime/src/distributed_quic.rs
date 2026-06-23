@@ -391,26 +391,40 @@ async fn process_conn(
 ) -> Result<String, String> {
     let conn = incoming.await.map_err(|e| format!("handshake: {e}"))?;
     let fp = peer_fingerprint(&conn).ok_or_else(|| "peer presented no certificate".to_string())?;
-    // Capability: pin the peer's static key (boundary, not secret).
+    // Capability: pin the peer's static key once per **connection** (boundary,
+    // not secret) — the expensive part (handshake + cert) is then reused.
     cfg.peer_pinned(&fp)?;
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| format!("accept stream: {e}"))?;
+    // §34.4 s2'/§34.1: each job is a fresh **bidi stream** on the reused
+    // connection (streams are cheap; the connection's TLS handshake is the cost).
+    // Loop accepting streams until the peer closes the connection.
+    // Until the peer closes the connection, each accepted bidi stream is one job.
+    while let Ok((send, recv)) = conn.accept_bi().await {
+        let _ = serve_stream(send, recv, &identity, &handler).await;
+    }
+    Ok(fp)
+}
 
+/// Serve one job on one bidi stream: HELLO exchange → JOB → run the handler →
+/// credit-gated result. The connection (and its handshake) is reused across many
+/// of these (a session).
+async fn serve_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    identity: &Identity,
+    handler: &Handler,
+) -> Result<(), String> {
     match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
         Some((HELLO, _)) => {}
-        _ => return Err(format!("peer {fp}: expected HELLO")),
+        _ => return Err("expected HELLO".to_string()),
     }
     write_frame(&mut send, HELLO, identity.fingerprint.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     let job = match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
         Some((JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
-        _ => return Err(format!("peer {fp}: expected JOB")),
+        _ => return Err("expected JOB".to_string()),
     };
-    let result = handler(&job);
-    match result {
+    match handler(&job) {
         Ok(bytes) => stream_with_credit(&mut send, &mut recv, &bytes)
             .await
             .map_err(|e| e.to_string())?,
@@ -419,9 +433,7 @@ async fn process_conn(
             .map_err(|e| e.to_string())?,
     }
     let _ = send.finish();
-    // Wait for the peer to drain and close before the connection drops.
-    conn.closed().await;
-    Ok(fp)
+    Ok(())
 }
 
 async fn stream_with_credit(
@@ -452,64 +464,110 @@ async fn stream_with_credit(
 
 // --------------------------------------------------------------- client side
 
-/// Ship `ir_source` to a QUIC worker at `peer` and collect the result bytes.
-/// The worker's static key must be pinned (or `allow_peer_keys` unset for dev).
+/// Ship `ir_source` to a QUIC worker at `peer` and collect the result bytes
+/// (one-shot: connect, run one job, close). For many jobs, hold a [`QuicSession`]
+/// and reuse the connection (the expensive TLS handshake) — that is the lever for
+/// QUIC's per-call cost (#176 / §34.4 s2').
 pub fn quic_run_remote(peer: &str, cfg: &QuicConfig, ir_source: &str) -> Result<Vec<u8>, String> {
-    let rt = runtime()?;
-    let id = mint_identity()?;
-    rt.block_on(quic_client(peer, cfg, ir_source, &id))
+    let session = QuicSession::connect(peer, cfg)?;
+    session.run(ir_source)
 }
 
-async fn quic_client(
-    peer: &str,
-    cfg: &QuicConfig,
-    ir_source: &str,
-    id: &Identity,
-) -> Result<Vec<u8>, String> {
-    let sockaddr: std::net::SocketAddr = peer
-        .parse()
-        .map_err(|e| format!("bad peer address '{peer}': {e}"))?;
-    // Bind the client to loopback (not 0.0.0.0): a 0.0.0.0-bound source dialing
-    // 127.0.0.1 can mis-route the return path on some hosts.
-    let bind: std::net::SocketAddr = if sockaddr.ip().is_loopback() {
-        "127.0.0.1:0".parse().unwrap()
-    } else {
-        "0.0.0.0:0".parse().unwrap()
-    };
-    let mut endpoint = Endpoint::client(bind).map_err(|e| format!("client endpoint: {e}"))?;
-    endpoint.set_default_client_config(client_config(id)?);
-    let conn = endpoint
-        .connect(sockaddr, "rivus")
-        .map_err(|e| format!("connect {peer}: {e}"))?
-        .await
-        .map_err(|e| format!("handshake {peer}: {e}"))?;
-    // Pin the worker's static key (boundary, not secret). On a mismatch, close
-    // the connection explicitly so the worker's `accept_bi` returns at once
-    // (otherwise it would wait out the idle timeout) — then surface the denial.
-    let fp =
-        peer_fingerprint(&conn).ok_or_else(|| "worker presented no certificate".to_string())?;
-    if let Err(e) = cfg.peer_pinned(&fp) {
-        conn.close(1u32.into(), b"pin");
-        endpoint.wait_idle().await;
-        return Err(e);
+/// A **persistent QUIC session** (§34.4 s2' / §28.12.5-3): one connection — and
+/// its TLS handshake + minted identity — reused across many jobs, each a cheap
+/// new **bidi stream** (the QUIC stream-multiplexing of §34.1). The static-key
+/// pin is checked once at [`QuicSession::connect`]. Dropping it closes the
+/// connection (the worker's stream-accept loop ends).
+pub struct QuicSession {
+    // The endpoint must outlive the connection (it drives it); keep it alive.
+    _endpoint: Endpoint,
+    conn: quinn::Connection,
+    rt: tokio::runtime::Runtime,
+    identity: Identity,
+    window: u32,
+}
+
+impl QuicSession {
+    /// Open a session to `peer`: handshake, then pin the worker's static key.
+    pub fn connect(peer: &str, cfg: &QuicConfig) -> Result<QuicSession, String> {
+        let rt = runtime()?;
+        let identity = mint_identity()?;
+        let window = cfg.window;
+        let cfg = cfg.clone();
+        let (endpoint, conn) = rt.block_on(async {
+            let sockaddr: std::net::SocketAddr = peer
+                .parse()
+                .map_err(|e| format!("bad peer address '{peer}': {e}"))?;
+            // Bind the client to loopback (not 0.0.0.0): a 0.0.0.0-bound source
+            // dialing 127.0.0.1 can mis-route the return path on some hosts.
+            let bind: std::net::SocketAddr = if sockaddr.ip().is_loopback() {
+                "127.0.0.1:0".parse().unwrap()
+            } else {
+                "0.0.0.0:0".parse().unwrap()
+            };
+            let mut endpoint =
+                Endpoint::client(bind).map_err(|e| format!("client endpoint: {e}"))?;
+            endpoint.set_default_client_config(client_config(&identity)?);
+            let conn = endpoint
+                .connect(sockaddr, "rivus")
+                .map_err(|e| format!("connect {peer}: {e}"))?
+                .await
+                .map_err(|e| format!("handshake {peer}: {e}"))?;
+            // Pin the worker's static key once. On mismatch, close so the worker
+            // notices at once, then surface the denial.
+            let fp = peer_fingerprint(&conn)
+                .ok_or_else(|| "worker presented no certificate".to_string())?;
+            if let Err(e) = cfg.peer_pinned(&fp) {
+                conn.close(1u32.into(), b"pin");
+                endpoint.wait_idle().await;
+                return Err(e);
+            }
+            Ok::<_, String>((endpoint, conn))
+        })?;
+        Ok(QuicSession {
+            _endpoint: endpoint,
+            conn,
+            rt,
+            identity,
+            window,
+        })
     }
 
+    /// Run one job over a fresh bidi stream on the reused connection.
+    pub fn run(&self, ir_source: &str) -> Result<Vec<u8>, String> {
+        self.rt.block_on(client_stream(
+            &self.conn,
+            &self.identity.fingerprint,
+            ir_source,
+            self.window,
+        ))
+    }
+}
+
+/// One job on one bidi stream (the connection is reused): HELLO → JOB → credit →
+/// collect the result. Does **not** close the connection (the session owns it).
+async fn client_stream(
+    conn: &quinn::Connection,
+    id_fp: &str,
+    ir_source: &str,
+    window: u32,
+) -> Result<Vec<u8>, String> {
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| format!("open stream: {e}"))?;
-    write_frame(&mut send, HELLO, id.fingerprint.as_bytes())
+    write_frame(&mut send, HELLO, id_fp.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
         Some((HELLO, _)) => {}
-        _ => return Err(format!("peer {peer}: no HELLO")),
+        _ => return Err("no HELLO".to_string()),
     }
     write_frame(&mut send, JOB, ir_source.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     // Grant a non-zero credit window (a 0 window would deadlock the worker).
-    write_frame(&mut send, CREDIT, &cfg.window.max(1).to_be_bytes())
+    write_frame(&mut send, CREDIT, &window.max(1).to_be_bytes())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -521,16 +579,12 @@ async fn quic_client(
                 let _ = write_frame(&mut send, CREDIT, &1u32.to_be_bytes()).await;
             }
             Some((END, _)) => {
-                // Graceful close so the worker's `conn.closed()` returns promptly.
-                conn.close(0u32.into(), b"ok");
+                let _ = send.finish(); // FIN our side of the stream; keep the conn
                 return Ok(out);
             }
-            Some((ERR, p)) => {
-                conn.close(0u32.into(), b"err");
-                return Err(String::from_utf8_lossy(&p).into_owned());
-            }
+            Some((ERR, p)) => return Err(String::from_utf8_lossy(&p).into_owned()),
             Some(_) => {}
-            None => return Err(format!("peer {peer}: closed before END")),
+            None => return Err("closed before END".to_string()),
         }
     }
 }

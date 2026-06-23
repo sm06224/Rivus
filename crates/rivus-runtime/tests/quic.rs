@@ -6,7 +6,7 @@
 #![cfg(feature = "quic")]
 
 use rivus_runtime::distributed::Handler;
-use rivus_runtime::distributed_quic::{quic_run_remote, quic_worker, QuicConfig};
+use rivus_runtime::distributed_quic::{quic_run_remote, quic_worker, QuicConfig, QuicSession};
 use rivus_runtime::{run, RunOptions};
 use std::sync::Arc;
 use std::thread;
@@ -92,6 +92,30 @@ fn quic_protected_channel_round_trip_and_pinning() {
     };
     let err = quic_run_remote(&addr2, &bad, &src).expect_err("wrong pin rejected");
     assert!(err.contains("not in the pinned allowlist"), "{err}");
+
+    // (c) session reuse (§34.4 s2'): one QUIC connection (one handshake), many
+    // jobs each on a fresh bidi stream — all byte-identical.
+    let worker3 = quic_worker("127.0.0.1:0", QuicConfig::default()).expect("bind3");
+    let addr3 = worker3.addr().to_string();
+    let h3 = handler();
+    thread::spawn(move || {
+        let _ = worker3.serve(h3, |_| {});
+    });
+    thread::sleep(std::time::Duration::from_millis(300));
+    let session = QuicSession::connect(&addr3, &QuicConfig::default()).expect("quic session");
+    let queries = [
+        format!("R:\n open {}\n |? age >= 18\n |> name\n;", path.display()),
+        format!("R:\n open {}\n |? age >= 40\n |> name\n;", path.display()),
+        format!("R:\n open {}\n |> name\n;", path.display()),
+    ];
+    for q in &queries {
+        let got = session.run(q).expect("session job");
+        assert_eq!(
+            got,
+            render_flow(q).unwrap(),
+            "QUIC session job byte-identical"
+        );
+    }
 
     std::fs::remove_file(&path).ok();
 }
