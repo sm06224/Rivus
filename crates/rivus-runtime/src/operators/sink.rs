@@ -199,6 +199,21 @@ pub(crate) fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8)
                 line.push_str(cell);
             }
         }
+        // §32 s3a: a nested lane renders its `Value` text form (e.g. `{a: 1}` /
+        // `[1, 2]`), quoted like any other text cell. No flow yields a nested
+        // column to CSV today, so this is here for exhaustiveness.
+        ColumnData::Struct(_) | ColumnData::List(_) => {
+            let cell = col.value_at(row).to_string();
+            line.push('"');
+            for ch in cell.chars() {
+                if ch == '"' {
+                    line.push_str("\"\"");
+                } else {
+                    line.push(ch);
+                }
+            }
+            line.push('"');
+        }
     }
 }
 
@@ -469,6 +484,32 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
         ),
         // A resource handle → its uri as a quoted JSON string.
         ColumnData::Str(s) | ColumnData::Resource(s) => json_string(out, s.get(row)),
+        // §32 s3a: a nested lane renders as a real JSON object/array, recursing
+        // into the child columns (so a struct/list round-trips to JSON). No flow
+        // yields a nested column today; this keeps the sink faithful for s3b.
+        ColumnData::Struct(st) => {
+            out.push('{');
+            for (i, (name, child)) in st.names.iter().zip(st.columns.iter()).enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                json_string(out, name);
+                out.push(':');
+                write_json_cell(out, child, row);
+            }
+            out.push('}');
+        }
+        ColumnData::List(l) => {
+            out.push('[');
+            let (start, end) = (l.offsets[row] as usize, l.offsets[row + 1] as usize);
+            for (i, idx) in (start..end).enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_cell(out, &l.child, idx);
+            }
+            out.push(']');
+        }
     }
 }
 

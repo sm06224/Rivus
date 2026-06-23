@@ -1428,6 +1428,12 @@ pub enum Value {
     Str(String),
     /// I/O resource handle lane (design §28.1).
     Resource(Resource),
+    /// **Struct** scalar (§32 s3): ordered named fields. The columnar form is
+    /// [`crate::ColumnData::Struct`].
+    Struct(Vec<(String, Value)>),
+    /// **List** scalar (§32 s3): an ordered sequence of element values. The
+    /// columnar form is [`crate::ColumnData::List`].
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -1444,6 +1450,8 @@ impl Value {
             Value::Time(_) => DataType::Time,
             Value::Str(_) => DataType::Str,
             Value::Resource(_) => DataType::Resource,
+            Value::Struct(_) => DataType::Struct,
+            Value::List(_) => DataType::List,
         }
     }
 
@@ -1481,6 +1489,17 @@ impl fmt::Display for Value {
             Value::Time(t) => write!(f, "{t}"),
             Value::Str(s) => write!(f, "{s}"),
             Value::Resource(r) => write!(f, "{r}"),
+            // Nested (§32 s3): a readable, brace/bracket rendering. (A sink that
+            // needs faithful nested encoding handles that in its codec; this is
+            // the generic scalar form.)
+            Value::Struct(fields) => {
+                let parts: Vec<String> = fields.iter().map(|(n, v)| format!("{n}: {v}")).collect();
+                write!(f, "{{{}}}", parts.join(", "))
+            }
+            Value::List(items) => {
+                let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();
+                write!(f, "[{}]", parts.join(", "))
+            }
         }
     }
 }
@@ -1515,6 +1534,16 @@ pub enum DataType {
     /// I/O resource handle lane (design §28.1): a uri-identified handle. The
     /// meta (`size`/`mtime`) is out of the determinism contract (§00 0.14).
     Resource,
+    /// **Struct** lane (§32 s3): an Arrow-style bundle of named child columns.
+    /// An *opaque lane marker* — `DataType` stays `Copy` ("type = lane", §06);
+    /// the field names + child types live in the columnar data
+    /// ([`crate::ColumnData::Struct`]) and in the static [`crate::Field`] nested
+    /// detail, not in this enum.
+    Struct,
+    /// **List** lane (§32 s3): an Arrow-style offsets + child column. An opaque
+    /// lane marker like [`DataType::Struct`]; the element type lives in the data
+    /// / the static [`crate::Field`] nested detail.
+    List,
 }
 
 impl fmt::Display for DataType {
@@ -1535,6 +1564,8 @@ impl fmt::Display for DataType {
             DataType::Time => f.write_str("time"),
             DataType::Str => f.write_str("str"),
             DataType::Resource => f.write_str("resource"),
+            DataType::Struct => f.write_str("struct"),
+            DataType::List => f.write_str("list"),
         }
     }
 }
