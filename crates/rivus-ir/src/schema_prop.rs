@@ -208,6 +208,8 @@ fn agg_type(func: &AggFunc, col_ty: DataType) -> DataType {
         },
         // Mean / spread / percentile are nominally float.
         AggFunc::Avg | AggFunc::Std | AggFunc::Pct(_) => DataType::F64,
+        // Array aggregation yields a serialized JSON string.
+        AggFunc::ArrayAgg => DataType::Str,
     }
 }
 

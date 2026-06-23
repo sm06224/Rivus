@@ -137,6 +137,17 @@ impl Parser {
         }
     }
 
+    fn peek_is_keyword_except_map(&self) -> bool {
+        if self.pos + 1 < self.toks.len() {
+            match &self.toks[self.pos + 1].0 {
+                Tok::Word(w) => is_keyword(w) && w != "map",
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
     fn err(&self, msg: impl Into<String>) -> RivusError {
         RivusError::Parse(format!("line {}: {}", self.line(), msg.into()))
     }
@@ -281,6 +292,9 @@ impl Parser {
             // whatever node the matched transform creates first carries them.
             let lead = self.take_leading_comments();
             let mark = self.g.nodes.len();
+            if self.at(&Tok::Pipe) && self.peek_is_keyword_except_map() {
+                self.bump();
+            }
             match self.tok().clone() {
                 // `|? pred` / `|? a, b` (comma = AND). `where` is a readable alias.
                 Tok::PipeFilter => {
@@ -341,41 +355,11 @@ impl Parser {
                 }
                 Tok::PipeGroup => {
                     self.bump();
-                    // One or more group keys, then optional aggregates. A word is
-                    // an aggregate (not a key) when it's a known func immediately
-                    // followed by `:` (e.g. `sum:score`); every other leading
-                    // word is a key. At least one key is required.
-                    let is_agg = |p: &Self| {
-                        matches!(p.tok(), Tok::Word(w)
-                            if AggFunc::parse(w).is_some()
-                                && p.toks[p.pos + 1].0 == Tok::Colon)
-                    };
-                    let mut keys = Vec::new();
-                    while let Tok::Word(_) = self.tok() {
-                        if is_agg(self) {
-                            break;
-                        }
-                        keys.push(self.word()?);
-                    }
-                    if keys.is_empty() {
-                        return Err(self.err("group `|#` requires at least one key"));
-                    }
-                    // Aggregates: `func:col` repeated.
-                    let mut aggs = Vec::new();
-                    while let Tok::Word(w) = self.tok().clone() {
-                        match AggFunc::parse(&w) {
-                            Some(func) if self.toks[self.pos + 1].0 == Tok::Colon => {
-                                self.bump(); // func
-                                self.bump(); // ':'
-                                let col = self.word()?;
-                                aggs.push((func, col));
-                            }
-                            _ => break,
-                        }
-                    }
-                    let n = self.g.add_node(Op::GroupBy { keys, aggs });
-                    self.g.add_edge(current, n, EdgeKind::Stream);
-                    current = n;
+                    current = self.parse_group_tail(current)?;
+                }
+                Tok::Word(w) if w == "group" => {
+                    self.bump();
+                    current = self.parse_group_tail(current)?;
                 }
                 Tok::Pipe => {
                     self.bump(); // `|`
@@ -815,6 +799,40 @@ impl Parser {
             }
         }
         Ok(current)
+    }
+
+    fn parse_group_tail(&mut self, current: NodeId) -> Result<NodeId, RivusError> {
+        let is_agg = |p: &Self| {
+            matches!(p.tok(), Tok::Word(w)
+                if AggFunc::parse(w).is_some()
+                    && p.toks[p.pos + 1].0 == Tok::Colon)
+        };
+        let mut keys = Vec::new();
+        while let Tok::Word(_) = self.tok() {
+            if is_agg(self) {
+                break;
+            }
+            keys.push(self.word()?);
+        }
+        if keys.is_empty() {
+            return Err(self.err("group requires at least one key"));
+        }
+        // Aggregates: `func:col` repeated.
+        let mut aggs = Vec::new();
+        while let Tok::Word(w) = self.tok().clone() {
+            match AggFunc::parse(&w) {
+                Some(func) if self.toks[self.pos + 1].0 == Tok::Colon => {
+                    self.bump(); // func
+                    self.bump(); // ':'
+                    let col = self.word()?;
+                    aggs.push((func, col));
+                }
+                _ => break,
+            }
+        }
+        let n = self.g.add_node(Op::GroupBy { keys, aggs });
+        self.g.add_edge(current, n, EdgeKind::Stream);
+        Ok(n)
     }
 
     /// Parse the first element of a body: a source, a stream replay, a
@@ -2076,6 +2094,7 @@ fn is_keyword(w: &str) -> bool {
             | "reorder"
             | "rename"
             | "where"
+            | "group"
             | "on"
             | "map"
             | "mode"
@@ -3867,6 +3886,33 @@ Import:
     }
 
     #[test]
+    fn group_parses_array_aggregates_and_aliases() {
+        use rivus_ir::AggFunc;
+        // Test array_agg, list_agg, and arr
+        let op = nth_op(
+            "G:\n open a.csv\n |# team array_agg:score list_agg:p arr:name\n;",
+            1,
+        );
+        let Op::GroupBy { aggs, .. } = op else {
+            panic!("expected GroupBy, got {op:?}");
+        };
+        let funcs: Vec<AggFunc> = aggs.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            funcs,
+            vec![
+                AggFunc::ArrayAgg,
+                AggFunc::ArrayAgg,
+                AggFunc::ArrayAgg,
+            ]
+        );
+        // Reversible: canonical name is array_agg
+        let g = parse("G:\n open a.csv\n |# team arr:score\n;").unwrap();
+        let s = g.to_source();
+        assert!(s.contains("array_agg:score"), "got: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source());
+    }
+
+    #[test]
     fn rename_and_drop_parse_and_round_trip() {
         // `rename OLD NEW ...` lowers to Op::Rename with ordered pairs.
         match nth_op("F:\n open a.csv\n rename age years city loc\n;", 1) {
@@ -4113,5 +4159,39 @@ Import:
             })
             .unwrap();
         assert_eq!(sink, "-");
+    }
+
+    #[test]
+    fn optional_leading_pipe_and_group_keyword_parse() {
+        // Test that optional leading pipe before stages parses correctly.
+        let src_pipe = "F:\n open a.csv\n | where age >= 30\n | sort score desc\n | save out.csv\n;";
+        let g1 = parse(src_pipe).unwrap();
+        assert_eq!(g1.nodes.len(), 4);
+
+        // A leading pipe before the source (head of body) must fail parsing.
+        assert!(parse("F:\n | open a.csv\n;").is_err());
+
+        // Test that group keyword (bare-word or with pipe) parses correctly.
+        let src_group1 = "F:\n open a.csv\n group country sum:score\n;";
+        let g2 = parse(src_group1).unwrap();
+        assert!(matches!(&g2.nodes[1].op, Op::GroupBy { .. }));
+
+        let src_group2 = "F:\n open a.csv\n | group country sum:score\n;";
+        let g3 = parse(src_group2).unwrap();
+        assert!(matches!(&g3.nodes[1].op, Op::GroupBy { .. }));
+
+        // Test single-line parsing (spaces instead of newlines) with optional pipes.
+        let src_single = "F:\n open a.csv | where age >= 30 | sort score desc | save out.csv\n;";
+        let g4 = parse(src_single).unwrap();
+        assert_eq!(g4.nodes.len(), 4);
+
+        // Test single-line parsing without pipes at all (bare keywords).
+        let src_single_bare = "F:\n open a.csv where age >= 30 sort score desc save out.csv\n;";
+        let g5 = parse(src_single_bare).unwrap();
+        assert_eq!(g5.nodes.len(), 4);
+
+        // Reversibility: to_source should yield a valid output that parses identically.
+        let s = g1.to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source());
     }
 }

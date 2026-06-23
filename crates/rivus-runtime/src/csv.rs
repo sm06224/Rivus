@@ -1499,11 +1499,15 @@ impl ColBuilder {
 // plain u64 arithmetic — no `core::arch`, no feature gate, host-endian
 // independent (words are read little-endian so byte `i` maps to bits
 // `i*8..i*8+7`).
+#[allow(dead_code)]
 const SWAR_LO: u64 = 0x0101_0101_0101_0101;
+#[allow(dead_code)]
 const SWAR_HI: u64 = 0x8080_8080_8080_8080;
+#[allow(dead_code)]
 const SWAR_LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F; // !SWAR_HI
 
 /// Broadcast byte `b` into every lane of a u64.
+#[allow(dead_code)]
 #[inline(always)]
 fn swar_splat(b: u8) -> u64 {
     SWAR_LO.wrapping_mul(b as u64)
@@ -1519,20 +1523,21 @@ fn swar_splat(b: u8) -> u64 {
 /// borrows (a zero byte followed by a `0x01` lane false-positives), which makes
 /// it wrong for *locating* matches. This borrow-free variant is exact:
 /// `(b & 0x7F) + 0x7F` stays ≤ `0xFE`, so no carry crosses a byte boundary.
+#[allow(dead_code)]
 #[inline(always)]
 fn swar_eq_mask(word: u64, splat: u64) -> u64 {
     let t = word ^ splat; // 0x00 lanes where the byte matches
-                          // 0x80 per lane iff that lane is non-zero (carry-free), then flip so 0x80
-                          // marks the matching (zero) lanes.
+    // 0x80 per lane iff that lane is non-zero (carry-free), then flip so 0x80
+    // marks the matching (zero) lanes.
     let nonzero = ((t & SWAR_LO7).wrapping_add(SWAR_LO7) | t) & SWAR_HI;
     nonzero ^ SWAR_HI
 }
 
 /// Split an unquoted record into field byte-ranges. Dispatches to a SIMD
-/// (AVX2, 32 bytes/step) scan when the host supports it, else the SWAR
-/// (8 bytes/step, std-only) scan — both byte-identical to a scalar split:
-/// identical delimiter offsets and the identical quote-bail decision (returns
-/// `false`, `out` partially filled, when the line contains a `"`). #71.
+/// (AVX2, 32 bytes/step) scan when the host supports it, or NEON (16 bytes/step)
+/// on AArch64, else the SWAR (8 bytes/step, std-only) scan. Both SIMD paths are
+/// byte-identical to a scalar split: identical delimiter offsets and the
+/// identical quote-bail decision. #71.
 #[inline]
 fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -1542,8 +1547,17 @@ fn split_offsets(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
             // SAFETY: only called after confirming the CPU supports AVX2.
             return unsafe { split_offsets_avx2(line, out, delim) };
         }
+        split_offsets_swar(line, out, delim)
     }
-    split_offsets_swar(line, out, delim)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { split_offsets_neon(line, out, delim) }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        split_offsets_swar(line, out, delim)
+    }
 }
 
 /// AVX2 structural-character scan (`PCMPEQB` + `movemask`, 32 bytes/step):
@@ -1594,11 +1608,65 @@ unsafe fn split_offsets_avx2(line: &str, out: &mut Vec<(usize, usize)>, delim: u
     true
 }
 
+/// NEON structural-character scan (vceqq_u8 + vshrn_n_u16, 16 bytes/step):
+/// build a quote/delimiter bitmask per 16-byte block, bail on any `"`, and
+/// extract every delimiter offset branch-free via `trailing_zeros`. Byte-
+/// identical to [`split_offsets_swar`] and [`split_offsets_avx2`].
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn split_offsets_neon(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
+    use std::arch::aarch64::*;
+    out.clear();
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+    let dvec = vdupq_n_u8(delim);
+    let qvec = vdupq_n_u8(b'"');
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let chunk = vld1q_u8(bytes.as_ptr().add(i));
+        // Check for quotes in the chunk
+        let qmask = vceqq_u8(chunk, qvec);
+        if vmaxvq_u8(qmask) != 0 {
+            return false;
+        }
+        let dmask_vec = vceqq_u8(chunk, dvec);
+        let dmask16 = vreinterpretq_u16_u8(dmask_vec);
+        let narrowed = vshrn_n_u16(dmask16, 4);
+        // Each original match (0xFF) results in 0x0F or 0xF0 in the narrowed bytes.
+        // Bitwise AND with 0x1111111111111111u64 selects exactly the low bit (bit 0 or bit 4)
+        // for each byte, yielding exactly 1 bit per match, spaced 4 bits apart.
+        let mut dmask = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0) & 0x1111111111111111u64;
+        while dmask != 0 {
+            let j = i + (dmask.trailing_zeros() as usize >> 2);
+            out.push((start, j));
+            start = j + 1;
+            dmask &= dmask - 1;
+        }
+        i += 16;
+    }
+    // Scalar tail (< 16 bytes), same predicate as the SIMD body.
+    while i < n {
+        let b = bytes[i];
+        if b == b'"' {
+            return false;
+        }
+        if b == delim {
+            out.push((start, i));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push((start, n));
+    true
+}
+
 /// Split an unquoted record into field byte-ranges. Scans 8 bytes at a time
 /// (SWAR), recording every `delim` position; bails to the owned slow path
 /// (returns `false`, leaving `out` partially filled — callers re-split and
 /// ignore it) the moment a `"` appears. Byte-identical to a scalar scan: it
 /// finds the exact same delimiter offsets and the exact same quote condition.
+#[allow(dead_code)]
 fn split_offsets_swar(line: &str, out: &mut Vec<(usize, usize)>, delim: u8) -> bool {
     out.clear();
     let bytes = line.as_bytes();
@@ -2329,10 +2397,10 @@ mod tests {
         }
         let swar = t.elapsed();
 
-        let avx = if cfg!(target_arch = "x86_64") && std::is_x86_feature_detected!("avx2") {
+        #[cfg(target_arch = "x86_64")]
+        let avx = if std::is_x86_feature_detected!("avx2") {
             let t = Instant::now();
             for _ in 0..iters {
-                #[cfg(target_arch = "x86_64")]
                 // SAFETY: guarded by runtime AVX2 detection.
                 let _ = unsafe { split_offsets_avx2(line, &mut out, b',') };
                 acc += out.len();
@@ -2341,6 +2409,21 @@ mod tests {
         } else {
             None
         };
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx = None;
+
+        #[cfg(target_arch = "aarch64")]
+        let neon = {
+            let t = Instant::now();
+            for _ in 0..iters {
+                // SAFETY: NEON is always available on aarch64.
+                let _ = unsafe { split_offsets_neon(line, &mut out, b',') };
+                acc += out.len();
+            }
+            Some(t.elapsed())
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let neon = None;
 
         let mbps = |d: std::time::Duration| (bytes_per * iters) as f64 / d.as_secs_f64() / 1e6;
         println!("\n[#71 split-scan] line={bytes_per}B iters={iters} (acc={acc})");
@@ -2351,6 +2434,14 @@ mod tests {
                 a,
                 mbps(a),
                 swar.as_secs_f64() / a.as_secs_f64()
+            );
+        }
+        if let Some(n) = neon {
+            println!(
+                "  NEON: {:?}  {:.0} MB/s  ({:.2}x SWAR)",
+                n,
+                mbps(n),
+                swar.as_secs_f64() / n.as_secs_f64()
             );
         }
     }
@@ -2400,6 +2491,17 @@ mod tests {
                     assert_eq!(rv, rw, "AVX2 bail mismatch on {case:?} delim={delim}");
                     if rw {
                         assert_eq!(v, want, "AVX2 offset mismatch on {case:?} delim={delim}");
+                    }
+                }
+
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let mut v = Vec::new();
+                    // SAFETY: NEON is always available on aarch64.
+                    let rv = unsafe { split_offsets_neon(case, &mut v, delim) };
+                    assert_eq!(rv, rw, "Neon bail mismatch on {case:?} delim={delim}");
+                    if rw {
+                        assert_eq!(v, want, "Neon offset mismatch on {case:?} delim={delim}");
                     }
                 }
             }

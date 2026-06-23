@@ -252,3 +252,52 @@ fn group_percentiles_are_correct_and_chunk_independent() {
         }
     }
 }
+
+#[test]
+fn group_array_agg_behavior() {
+    // Array aggregation collects values into a JSON array string.
+    let text = "team,v_int,v_str,b\n\
+                A,10,hello,true\n\
+                A,,world,false\n\
+                A,20,,true\n\
+                B,30,,false\n\
+                B,40,again,true\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_array_agg", text.as_bytes()));
+    let p = f.0.display();
+    let src = format!("G:\n open {p}\n |# team array_agg:v_int array_agg:v_str array_agg:b\n;");
+
+    let base = run_src(&src, 4096);
+    let bchunk = &base.outputs[0].chunks[0];
+    assert_eq!(
+        bchunk.schema.field_names(),
+        vec!["team", "count", "array_agg_v_int", "array_agg_v_str", "array_agg_b"]
+    );
+    
+    // Check results (BTreeMap key order: A, B)
+    // Row 0 = A
+    assert_eq!(bchunk.value(0, 0).to_string(), "A");
+    assert_eq!(bchunk.value(0, 2).to_string(), "[10, 20]");
+    assert_eq!(bchunk.value(0, 3).to_string(), "[\"hello\", \"world\"]");
+    assert_eq!(bchunk.value(0, 4).to_string(), "[true, false, true]");
+    
+    // Row 1 = B
+    assert_eq!(bchunk.value(1, 0).to_string(), "B");
+    assert_eq!(bchunk.value(1, 2).to_string(), "[30, 40]");
+    assert_eq!(bchunk.value(1, 3).to_string(), "[\"again\"]");
+    assert_eq!(bchunk.value(1, 4).to_string(), "[false, true]");
+
+    // Chunk-size independence
+    for cs in [1usize, 2, 3, 5] {
+        let r = run_src(&src, cs);
+        let c = &r.outputs[0].chunks[0];
+        for row in 0..c.len {
+            for col in 0..bchunk.schema.fields.len() {
+                assert_eq!(
+                    c.value(row, col).to_string(),
+                    bchunk.value(row, col).to_string(),
+                    "cell[{row}][{col}] @cs={cs}"
+                );
+            }
+        }
+    }
+}

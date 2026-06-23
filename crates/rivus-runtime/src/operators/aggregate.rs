@@ -64,6 +64,7 @@ pub(crate) struct AggAcc {
     has_time: bool,
     time_min: i64,
     time_max: i64,
+    list: Vec<Value>,
 }
 
 /// Extra fractional digits an exact decimal `avg` carries beyond the input scale
@@ -122,6 +123,7 @@ impl AggAcc {
             has_time: false,
             time_min: i64::MAX,
             time_max: i64::MIN,
+            list: Vec::new(),
         }
     }
 
@@ -223,6 +225,11 @@ impl AggAcc {
                     self.values.push(x);
                 }
             }
+            AggFunc::ArrayAgg => {
+                if !v.is_null() {
+                    self.list.push(v.clone());
+                }
+            }
         }
     }
 
@@ -298,6 +305,7 @@ impl AggAcc {
             self.last = other.last.clone();
         }
         self.values.extend_from_slice(&other.values);
+        self.list.extend(other.list.iter().cloned());
     }
 
     /// Numeric aggregate value (sum/avg/min/max/std). `0.0` for an empty group.
@@ -355,6 +363,19 @@ impl AggAcc {
         let hi = rank.ceil() as usize;
         let frac = rank - lo as f64;
         v[lo] + (v[hi] - v[lo]) * frac
+    }
+
+    pub(crate) fn array_value(&self) -> String {
+        let mut out = String::new();
+        out.push('[');
+        for (i, v) in self.list.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            value_to_json(v, &mut out);
+        }
+        out.push(']');
+        out
     }
 
     /// Exact decimal result for `sum`/`min`/`max`/`avg` on a decimal column, or
@@ -548,7 +569,8 @@ pub(crate) fn group_parallel_safe(
         | AggFunc::CountDistinct
         | AggFunc::First
         | AggFunc::Last
-        | AggFunc::Pct(_) => true,
+        | AggFunc::Pct(_)
+        | AggFunc::ArrayAgg => true,
         // Exact integer lanes (decimal i128, duration i64) make sum/avg
         // associative → parallel byte-identical; f64 sum/avg are not. #57.
         AggFunc::Sum | AggFunc::Avg => {
@@ -706,6 +728,19 @@ impl Operator for GroupBy {
                         Column::new(ColumnData::Str(sc), Validity::from_bits(&valid)),
                     )
                 }
+                AggFunc::ArrayAgg => {
+                    let mut sc = StrColumn::default();
+                    let mut valid = Vec::with_capacity(self.groups.len());
+                    for s in self.groups.values() {
+                        let arr = s.accs[j].array_value();
+                        sc.push(&arr);
+                        valid.push(true); // JSON arrays (even empty "[]") are non-null
+                    }
+                    (
+                        DataType::Str,
+                        Column::new(ColumnData::Str(sc), Validity::from_bits(&valid)),
+                    )
+                }
                 // sum/avg/min/max/std/pct. On a decimal column these stay exact
                 // (i128) when every group produced an exact result; if any group
                 // overflowed i128 the whole column degrades to f64 (continue-first,
@@ -840,4 +875,42 @@ impl Operator for Merge {
     fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
         vec![chunk]
     }
+}
+
+fn value_to_json(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::I64(n) => out.push_str(&n.to_string()),
+        Value::F64(n) => {
+            if n.is_nan() || n.is_infinite() {
+                out.push_str("null");
+            } else {
+                out.push_str(&n.to_string());
+            }
+        }
+        Value::Dec(d) => out.push_str(&d.to_string()),
+        Value::DateTime(dt) => json_string(out, &dt.to_string()),
+        Value::Duration(d) => json_string(out, &d.to_string()),
+        Value::Date(d) => json_string(out, &d.to_string()),
+        Value::Time(t) => json_string(out, &t.to_string()),
+        Value::Str(s) => json_string(out, s),
+        Value::Resource(r) => json_string(out, r.uri()),
+    }
+}
+
+fn json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }

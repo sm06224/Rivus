@@ -151,6 +151,8 @@ pub enum AggFunc {
     /// `median` is p50. These buffer every numeric value per group, so — like
     /// `sort`/`join` — they are pipeline-breakers bounded by group cardinality.
     Pct(u8),
+    /// Collect non-null values of the group into a list/array serialized as a JSON string.
+    ArrayAgg,
 }
 
 impl AggFunc {
@@ -166,6 +168,7 @@ impl AggFunc {
             "first" => AggFunc::First,
             "last" => AggFunc::Last,
             "median" => AggFunc::Pct(50),
+            "array_agg" | "list_agg" | "arr" => AggFunc::ArrayAgg,
             // `pN` / `pNN` percentile, N in 0..=100 (e.g. `p50`, `p90`, `p99`).
             other => {
                 let n = other.strip_prefix('p')?;
@@ -202,6 +205,7 @@ impl AggFunc {
             AggFunc::First => "first",
             AggFunc::Last => "last",
             AggFunc::Pct(_) => "pct",
+            AggFunc::ArrayAgg => "array_agg",
         }
     }
 }
