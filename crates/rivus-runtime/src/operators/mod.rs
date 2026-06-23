@@ -15,12 +15,30 @@ use rivus_core::{
 };
 use rivus_ir::{
     AggFunc, BinType, CmpOp, Codec, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
-    SinkCodec,
+    PathExpr, SinkCodec,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
+
+/// Surface aggregated nested key-path **structural misses** (§32.8③) on the
+/// error stream — counted, recoverable (continue-first). Pure null propagation
+/// never increments the counter, so this fires only on a genuine miss (field
+/// absent from the struct schema / out-of-range index / type mismatch) in a
+/// group / sort / distinct / join key.
+pub(crate) fn surface_key_path_fails(n: u64, kind: &str, ctx: &mut OpCtx) {
+    if n > 0 {
+        ctx.raise(
+            ErrorEvent::new(
+                Severity::Warn,
+                ErrorScope::Chunk,
+                format!("{n} nested {kind} key value(s) had an unresolvable path; keyed as null"),
+            )
+            .at_node(ctx.label.clone()),
+        );
+    }
+}
 
 /// An incremental sink writer: opens the file (or stdout for `-`) on the first
 /// chunk and appends as chunks arrive, so a sink never buffers the whole output
@@ -312,15 +330,11 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             cast_fails: 0,
         }),
         Op::Take { n } => Box::new(Take { remaining: *n }),
-        // §32 s2: keys are `PathExpr`; the runtime resolves them by flat column
-        // name today — a bare path is its plain name (byte-identical), a nested
-        // path stringifies and simply misses a flat column until s3/s4.
-        Op::Sort { keys } => Box::new(Sort::new(
-            keys.iter().map(|(k, d)| (k.column_name(), *d)).collect(),
-        )),
-        Op::Distinct { keys } => Box::new(Distinct::new(
-            keys.iter().map(|k| k.column_name()).collect(),
-        )),
+        // §32 s4b: keys are `PathExpr`. A bare key resolves on the existing flat
+        // fast path (byte-identical); a nested key (`user.age`) is materialized
+        // into a derived key column at resolution time (`resolve_key_indices`).
+        Op::Sort { keys } => Box::new(Sort::new(keys.clone())),
+        Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
         Op::Describe => Box::new(Describe::default()),
         Op::DropNa { cols } => Box::new(DropNa { cols: cols.clone() }),
         Op::Fill { col, method } => match method {
@@ -356,10 +370,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             fields: fields.clone(),
             cast_fails: 0,
         }),
-        Op::GroupBy { keys, aggs } => Box::new(GroupBy::new(
-            keys.iter().map(|k| k.column_name()).collect(),
-            aggs.clone(),
-        )),
+        Op::GroupBy { keys, aggs } => Box::new(GroupBy::new(keys.clone(), aggs.clone())),
         Op::Merge => Box::new(Merge),
         Op::Branch => Box::new(Merge), // identity forwarder; fan-out is structural
         Op::Join {
@@ -367,8 +378,8 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             right_keys,
             kind,
         } => Box::new(Join::new(
-            left_keys.iter().map(|k| k.column_name()).collect(),
-            right_keys.iter().map(|k| k.column_name()).collect(),
+            left_keys.clone(),
+            right_keys.clone(),
             *kind,
             inputs.first().copied().unwrap_or(usize::MAX),
         )),

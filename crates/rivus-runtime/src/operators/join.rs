@@ -14,8 +14,8 @@ use super::*;
 /// collides with a left column is suffixed `_r`. Keys compare by string value,
 /// so `30` (i64) and `"30"` (str) match — convenient for loosely-typed CSV.
 pub(crate) struct Join {
-    left_keys: Vec<String>,
-    right_keys: Vec<String>,
+    left_keys: Vec<PathExpr>,
+    right_keys: Vec<PathExpr>,
     kind: JoinKind,
     left_id: NodeId,
     left_buf: Vec<Chunk>,
@@ -24,8 +24,8 @@ pub(crate) struct Join {
 
 impl Join {
     pub(crate) fn new(
-        left_keys: Vec<String>,
-        right_keys: Vec<String>,
+        left_keys: Vec<PathExpr>,
+        right_keys: Vec<PathExpr>,
         kind: JoinKind,
         left_id: NodeId,
     ) -> Self {
@@ -132,22 +132,33 @@ impl Operator for Join {
             );
         };
         // Resolve each key column on both sides (composite key, in key order).
+        // §32 s4b: a bare key uses the flat fast path; a nested key (`user.id`)
+        // is materialized into a derived column appended past the original
+        // columns (`base_left` / `base_right`), used only to build the join key —
+        // the output gathers only the original columns.
+        // Right derived key columns never reach the output (it is built from
+        // `right.schema.fields`), so only the left base count must be tracked.
+        let (mut left, mut right) = (left, right);
+        let base_left = left.columns.len();
+        let mut key_fails = 0u64;
+        let lresolved = eval::resolve_key_indices(&mut left, &self.left_keys, &mut key_fails);
+        let rresolved = eval::resolve_key_indices(&mut right, &self.right_keys, &mut key_fails);
         let mut lk = Vec::with_capacity(self.left_keys.len());
-        for k in &self.left_keys {
-            match left.schema.index_of(k) {
-                Some(i) => lk.push(i),
+        for (k, idx) in self.left_keys.iter().zip(&lresolved) {
+            match idx {
+                Some(i) => lk.push(*i),
                 None => {
-                    warn(ctx, "left", k);
+                    warn(ctx, "left", &k.column_name());
                     return Vec::new();
                 }
             }
         }
         let mut rk = Vec::with_capacity(self.right_keys.len());
-        for k in &self.right_keys {
-            match right.schema.index_of(k) {
-                Some(i) => rk.push(i),
+        for (k, idx) in self.right_keys.iter().zip(&rresolved) {
+            match idx {
+                Some(i) => rk.push(*i),
                 None => {
-                    warn(ctx, "right", k);
+                    warn(ctx, "right", &k.column_name());
                     return Vec::new();
                 }
             }
@@ -219,8 +230,10 @@ impl Operator for Join {
         // Left columns: gather by `lidx`. A join-key column borrows the matching
         // right key when the left side is absent (key-preservation for
         // right/full joins); a non-key left column pads with the type default.
+        // Gather only the original left columns (skip any derived nested-key
+        // columns appended past `base_left`).
         let mut out: Vec<Column> = Vec::with_capacity(fields.len());
-        for (ci, col) in left.columns.iter().enumerate() {
+        for (ci, col) in left.columns[..base_left].iter().enumerate() {
             match lk.iter().position(|&k| k == ci) {
                 Some(kpos) => {
                     out.push(join_key_column(col, &lidx, &ridx, &right.columns[rk[kpos]]))
@@ -231,6 +244,7 @@ impl Operator for Join {
         for &ci in &right_cols {
             out.push(right.columns[ci].gather_opt(&ridx));
         }
+        super::surface_key_path_fails(key_fails, "join", ctx);
         vec![Chunk::new(
             ctx.fresh_id(),
             Arc::new(Schema::new(fields)),

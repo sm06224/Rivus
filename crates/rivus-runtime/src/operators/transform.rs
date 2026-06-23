@@ -229,13 +229,13 @@ impl Operator for Take {
 /// the output independent of `chunk_size`; ties keep source order for both
 /// ascending and descending.
 pub(crate) struct Sort {
-    keys: Vec<(String, bool)>,
+    keys: Vec<(PathExpr, bool)>,
     buf: Vec<Chunk>,
     emitted: bool,
 }
 
 impl Sort {
-    pub(crate) fn new(keys: Vec<(String, bool)>) -> Self {
+    pub(crate) fn new(keys: Vec<(PathExpr, bool)>) -> Self {
         Sort {
             keys,
             buf: Vec::new(),
@@ -440,23 +440,32 @@ impl Operator for Sort {
         }
         let total = cols.first().map(|c| c.len()).unwrap_or(0);
 
-        // Resolve each sort key to (column index, descending). An unknown key
-        // warns once and is skipped (continue-first); if none resolve the stream
-        // is emitted in source order.
+        // Resolve each sort key to (column index, descending). §32 s4b: a bare
+        // key uses the flat fast path; a nested key (`user.age`) is materialized
+        // into a derived column appended to `work` (past the original columns).
+        // An unknown bare key warns once and is skipped (continue-first); if none
+        // resolve the stream is emitted in source order. The derived columns are
+        // only used to sort — the output gathers the original columns.
+        let base = cols.len();
+        let mut work = Chunk::new(0, schema.clone(), cols);
+        let paths: Vec<PathExpr> = self.keys.iter().map(|(k, _)| k.clone()).collect();
+        let mut nested_fails = 0u64;
+        let resolved = eval::resolve_key_indices(&mut work, &paths, &mut nested_fails);
         let mut key_cols: Vec<(usize, bool)> = Vec::with_capacity(self.keys.len());
-        for (k, desc) in &self.keys {
-            match schema.index_of(k) {
-                Some(ki) => key_cols.push((ki, *desc)),
+        for ((k, desc), idx) in self.keys.iter().zip(&resolved) {
+            match idx {
+                Some(ki) => key_cols.push((*ki, *desc)),
                 None => ctx.raise(
                     ErrorEvent::new(
                         Severity::Warn,
                         ErrorScope::Chunk,
-                        format!("sort: unknown key '{k}' (ignored)"),
+                        format!("sort: unknown key '{}' (ignored)", k.column_name()),
                     )
                     .at_node(ctx.label.clone()),
                 ),
             }
         }
+        let cols = &work.columns;
 
         let idx: Vec<usize> = if key_cols.len() == 1 {
             // Single key — the common case, and every sort benchmark. Decorate:
@@ -490,7 +499,12 @@ impl Operator for Sort {
             idx
         };
 
-        let sorted: Vec<Column> = cols.iter().map(|c| c.gather(&idx)).collect();
+        // Gather only the original columns (drop any derived nested-key columns).
+        let sorted: Vec<Column> = work.columns[..base]
+            .iter()
+            .map(|c| c.gather(&idx))
+            .collect();
+        super::surface_key_path_fails(nested_fails, "sort", ctx);
         vec![Chunk::new(ctx.fresh_id(), schema, sorted)]
     }
 }
@@ -516,29 +530,40 @@ pub(crate) fn push_group_key_field(key: &mut String, chunk: &Chunk, ci: usize, r
 /// stateful: a global seen-set spans chunks, so it runs serially. Output order
 /// is first-occurrence order, independent of `chunk_size`.
 pub(crate) struct Distinct {
-    keys: Vec<String>,
+    keys: Vec<PathExpr>,
     seen: std::collections::HashSet<String>,
+    /// Nested key-path structural misses (§32.8③), surfaced once on finish.
+    key_fails: u64,
 }
 
 impl Distinct {
-    pub(crate) fn new(keys: Vec<String>) -> Self {
+    pub(crate) fn new(keys: Vec<PathExpr>) -> Self {
         Distinct {
             keys,
             seen: std::collections::HashSet::new(),
+            key_fails: 0,
         }
     }
 }
 
 impl Operator for Distinct {
     fn process(&mut self, _from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
-        // Columns that form the dedup key: the named ones, or every column.
+        let mut chunk = chunk;
+        let base = chunk.columns.len();
+        // Columns that form the dedup key: every column, or the resolved keys.
+        // A nested key (§32 s4b) is materialized into a derived column appended
+        // past `base`; an unknown *bare* key is skipped (continue-first), as
+        // before. The derived columns are dropped before the chunk is emitted.
         let idxs: Vec<usize> = if self.keys.is_empty() {
-            (0..chunk.columns.len()).collect()
+            (0..base).collect()
         } else {
-            self.keys
-                .iter()
-                .filter_map(|k| chunk.schema.index_of(k))
-                .collect()
+            let mut nested_fails = 0u64;
+            let r = eval::resolve_key_indices(&mut chunk, &self.keys, &mut nested_fails)
+                .into_iter()
+                .flatten()
+                .collect();
+            self.key_fails += nested_fails;
+            r
         };
 
         let mut keep = Vec::new();
@@ -556,6 +581,9 @@ impl Operator for Distinct {
             }
         }
 
+        // Drop any derived nested-key columns so the output keeps only the
+        // original columns (the schema never gained the derived ones).
+        chunk.columns.truncate(base);
         if keep.is_empty() {
             return Vec::new();
         }
@@ -563,6 +591,11 @@ impl Operator for Distinct {
             return vec![chunk];
         }
         vec![chunk.gather(&keep)]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        super::surface_key_path_fails(self.key_fails, "distinct", ctx);
+        Vec::new()
     }
 }
 

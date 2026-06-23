@@ -601,6 +601,78 @@ fn parallel_jsonl_nested_byte_identical() {
 }
 
 #[test]
+fn parallel_jsonl_nested_key_group_byte_identical() {
+    // §32 s4b: a group-by **key** can be a nested path. The byte-range parallel
+    // group path resolves the nested key column per range against the same
+    // globally-inferred shape, so a group-by on `user.country` is byte-identical
+    // serial == parallel, with parallel-safe aggregates. >1 MiB + Fast forces it.
+    let rows = 120_000usize;
+    let countries = ["JP", "US", "DE", "FR"];
+    let mut text = String::new();
+    for i in 0..rows {
+        text.push_str(&format!(
+            "{{\"user\":{{\"country\":\"{}\"}},\"amount\":{}}}\n",
+            countries[i % countries.len()],
+            i % 1000
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_jsonl_nkey_group",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+    let flow =
+        format!("G:\n open {p}\n |# user.country min:amount max:amount count_distinct:amount\n;");
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        let mut lines = Vec::new();
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join(","));
+            }
+        }
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+    let (serial, serial_par) = collect(rivus_runtime::MemoryPref::Low);
+    let (parallel, par) = collect(rivus_runtime::MemoryPref::Fast);
+    assert!(!serial_par, "low must be serial");
+    assert!(
+        par,
+        "fast should engage the bounded JSONL byte-range group path"
+    );
+    // The output key column is named `user.country` (the path's column name).
+    assert!(
+        serial
+            .iter()
+            .all(|l| ["JP", "US", "DE", "FR"].iter().any(|c| l.starts_with(c))),
+        "group key should resolve the nested `user.country` value, got {:?}",
+        serial.first()
+    );
+    assert_eq!(parallel, serial, "nested-key group parallel != serial");
+}
+
+#[test]
 fn parallel_jsonl_path_resolve_byte_identical() {
     // §32 s4: nested-path resolution (`user.age`, `tags[0]`) is a deterministic
     // pure function of the row, so a flow that filters on a struct-field path and

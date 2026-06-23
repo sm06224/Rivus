@@ -6,6 +6,49 @@
 use super::*;
 
 #[test]
+fn inner_join_on_nested_key_matches_oracle() {
+    // §32 s4b: a join key can be a nested path. Left is JSONL with a `user`
+    // struct; the join keys on `user.id` against the right's flat `id`. The
+    // matched row count + joined value must equal an independent oracle and be
+    // chunk-size independent (the nested key resolves to a deterministic value).
+    let users = 2_000usize;
+    let mut u = String::new();
+    for i in 0..users {
+        u.push_str(&format!("{{\"user\":{{\"id\":{i}}},\"name\":\"u{i}\"}}\n"));
+    }
+    let uf = TempCsv(gendata::write_temp_bytes("join_nested_u", u.as_bytes()));
+    let ujson = uf.0.with_extension("jsonl");
+    std::fs::rename(&uf.0, &ujson).unwrap();
+    let _uc = TempCsv(ujson.clone());
+
+    let orders = 6_000usize;
+    let mut o = String::from("id,amount\n");
+    let mut rng = Rng::new(5);
+    let mut expected = 0u64;
+    for _ in 0..orders {
+        let id = rng.below((users * 2) as u64);
+        o.push_str(&format!("{id},10\n"));
+        if (id as usize) < users {
+            expected += 1; // each order with id < users matches exactly one user
+        }
+    }
+    let of = TempCsv(gendata::write_temp_bytes("join_nested_o", o.as_bytes()));
+    let (up, op) = (ujson.display(), of.0.display());
+
+    for cs in [1, 7, 1024, orders] {
+        // Join the nested `user.id` against the flat `id`.
+        let src =
+            format!("U: open {up} ;\nO: open {op} ;\nJ: U & O on user.id:id |> name amount\n;");
+        let res = run_src(&src, cs);
+        assert_eq!(
+            res.total_rows_out(),
+            expected,
+            "nested-key join rows @cs={cs}"
+        );
+    }
+}
+
+#[test]
 fn inner_hash_join_matches_oracle() {
     // Left: users (id, name). Right: orders (id, amount), many-to-one. The inner
     // join row count must equal an independent count of matching pairs, and be
