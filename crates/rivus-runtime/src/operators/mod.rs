@@ -147,14 +147,14 @@ pub fn collector() -> Box<dyn Operator> {
 pub fn jsonl_range_source(
     path: &str,
     names: Vec<String>,
-    dtypes: Vec<rivus_core::DataType>,
+    jtypes: Vec<jsonl::JType>,
     schema: Arc<Schema>,
     start: u64,
     end: u64,
     chunk_size: usize,
     provenance: rivus_ir::Provenance,
 ) -> Box<dyn Operator> {
-    match jsonl::JsonlChunker::for_range(path, names, dtypes, start, end, chunk_size) {
+    match jsonl::JsonlChunker::for_range(path, names, jtypes, start, end, chunk_size) {
         Ok(ch) => Box::new(SourceJsonl::from_chunker(schema, ch).with_provenance(provenance, path)),
         Err(_) => Box::new(MemSource {
             chunks: std::collections::VecDeque::new(),

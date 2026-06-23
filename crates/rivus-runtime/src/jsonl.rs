@@ -1,20 +1,29 @@
-//! Minimal JSON Lines (NDJSON) reader: one flat JSON object per line.
+//! Minimal JSON Lines (NDJSON) reader: one JSON object per line.
 //!
-//! MVP scope (continue-first):
+//! Scope (continue-first):
 //! - Each non-empty line must be a JSON object `{ "k": value, ... }`. Lines that
 //!   aren't are counted as `bad_rows` and skipped (never panics).
 //! - Scalar values (string / number / bool / null) map onto the columnar lanes.
-//!   A nested `{...}` / `[...]` value is captured as its raw JSON text on the
-//!   string lane (degraded, not an error).
+//! - **Nested values are first-class (§32 s3b):** a `{...}` value becomes a
+//!   `Struct` lane, a `[...]` value becomes a `List` lane, both inferred
+//!   recursively and fixed globally at schema time (so every chunk / parallel
+//!   range builds byte-identically). There is no degrade-to-string: a JSON
+//!   `null` / missing key on a nested column is a *typed null* (validity = 0),
+//!   never a silent `""`. Only a genuinely heterogeneous column (a key seen as
+//!   both scalar and nested, or both object and array) falls back to the string
+//!   lane, rendering each cell as its JSON text — the one documented fallback,
+//!   which clean data never hits.
 //! - The column set and order come from the first valid object; later objects
-//!   fill by key (missing key → null/default, extra keys ignored).
+//!   fill by key (missing key → null/default, extra keys ignored). The same rule
+//!   applies recursively to a struct's child fields.
 //!
 //! A flat, allocation-conscious parser — no external dependencies (the shipped
-//! runtime stays std-only). Nested objects and arrays as first-class columns
-//! are future work (design doc 03 nested columns / doc 18).
+//! runtime stays std-only).
 
 use crate::transport::FileTransport;
-use rivus_core::{Column, ColumnData, DataType, Field, Schema, StrColumn, Validity};
+use rivus_core::{
+    Column, ColumnData, DataType, Field, ListColumn, Schema, StrColumn, StructColumn, Validity,
+};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
@@ -31,8 +40,25 @@ enum JVal {
     Int(i64),
     Float(f64),
     Str(String),
-    /// Nested object/array kept as raw JSON text (degraded scalar).
-    Raw(String),
+    /// A nested JSON object, parsed structurally (§32 s3b).
+    Obj(Vec<(String, JVal)>),
+    /// A nested JSON array, parsed structurally (§32 s3b).
+    Arr(Vec<JVal>),
+}
+
+/// A recursively-inferred JSON column type (§32 s3b): either a scalar lane, or a
+/// nested `Struct`/`List` whose shape is fixed globally in pass 1 so every chunk
+/// / parallel range builds against the same shape (byte-identity).
+#[derive(Clone, Debug)]
+pub enum JType {
+    Scalar(DataType),
+    /// Named child types, parallel arrays (`names[i]` ↔ `children[i]`).
+    Struct {
+        names: Vec<String>,
+        children: Vec<JType>,
+    },
+    /// The element type of a list lane.
+    List(Box<JType>),
 }
 
 pub fn parse(text: &str) -> Result<JsonlData, String> {
@@ -67,7 +93,9 @@ pub fn parse(text: &str) -> Result<JsonlData, String> {
         return Err("JSON has no valid objects".to_string());
     }
 
-    // Gather per-column values (by key), then infer a lane and build.
+    // Gather per-column values (by key), then infer a (possibly nested) type and
+    // build. Inference uses the same recursive accumulator as the streaming
+    // reader, so the two paths derive byte-identical schemas.
     let nrows = rows.len();
     let mut columns = Vec::with_capacity(names.len());
     let mut fields = Vec::with_capacity(names.len());
@@ -77,9 +105,13 @@ pub fn parse(text: &str) -> Result<JsonlData, String> {
             let v = obj.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
             vals.push(v.unwrap_or(JVal::Null));
         }
-        let dtype = infer(&vals);
-        columns.push(build_column(dtype, &vals));
-        fields.push(Field::new(name.clone(), dtype));
+        let mut inf = Infer::new();
+        for v in &vals {
+            inf.observe(v);
+        }
+        let jt = inf.resolve();
+        columns.push(build_column(&jt, &vals));
+        fields.push(jtype_to_field(name.clone(), &jt));
     }
 
     Ok(JsonlData {
@@ -113,7 +145,7 @@ fn collect_array(
             Some(b'{') => {
                 let start = i;
                 // Capture the balanced object, then parse it.
-                if parse_nested(b, &mut i, b'{', b'}').is_some() {
+                if skip_balanced(b, &mut i, b'{', b'}') {
                     if let Some(obj) = parse_object(&text[start..i]) {
                         if !*started {
                             *names = obj.iter().map(|(k, _)| k.clone()).collect();
@@ -138,54 +170,170 @@ fn collect_array(
     }
 }
 
-fn infer(vals: &[JVal]) -> DataType {
-    let mut any = false;
-    let mut all_int = true;
-    let mut all_num = true;
-    let mut all_bool = true;
-    for v in vals {
+// --------------------------------------------------------------- type inference
+
+/// Streaming, recursive per-key type accumulator (§32 s3b). One value at a time
+/// so the reader needn't buffer a whole column; `resolve` is deterministic over
+/// what was observed and identical regardless of partitioning.
+#[derive(Clone)]
+struct Infer {
+    scalar: Flags,
+    saw_scalar: bool,
+    structs: Option<StructInfer>,
+    list: Option<Box<Infer>>,
+}
+
+#[derive(Clone)]
+struct StructInfer {
+    /// Child field order, fixed by the first object seen for this column.
+    names: Vec<String>,
+    children: Vec<Infer>,
+}
+
+impl Infer {
+    fn new() -> Self {
+        Infer {
+            scalar: Flags::new(),
+            saw_scalar: false,
+            structs: None,
+            list: None,
+        }
+    }
+
+    fn observe(&mut self, v: &JVal) {
         match v {
+            // A `null` (or missing key, assembled as `JVal::Null`) does not force
+            // a lane — it becomes a typed null at build time (validity = 0).
             JVal::Null => {}
-            JVal::Int(_) => {
-                any = true;
-                all_bool = false;
+            JVal::Bool(_) | JVal::Int(_) | JVal::Float(_) | JVal::Str(_) => {
+                self.saw_scalar = true;
+                self.scalar.observe(v);
             }
-            JVal::Float(_) => {
-                any = true;
-                all_int = false;
-                all_bool = false;
+            JVal::Obj(fields) => {
+                let st = self.structs.get_or_insert_with(|| StructInfer {
+                    names: fields.iter().map(|(k, _)| k.clone()).collect(),
+                    children: fields.iter().map(|_| Infer::new()).collect(),
+                });
+                for (k, val) in fields {
+                    if let Some(idx) = st.names.iter().position(|n| n == k) {
+                        st.children[idx].observe(val);
+                    }
+                    // Extra keys (absent from the first-seen object) are ignored,
+                    // mirroring the flat "column set comes from the first object".
+                }
             }
-            JVal::Bool(_) => {
-                any = true;
-                all_int = false;
-                all_num = false;
-            }
-            JVal::Str(_) | JVal::Raw(_) => {
-                any = true;
-                all_int = false;
-                all_num = false;
-                all_bool = false;
+            JVal::Arr(elems) => {
+                let el = self.list.get_or_insert_with(|| Box::new(Infer::new()));
+                for e in elems {
+                    el.observe(e);
+                }
             }
         }
     }
-    if !any {
-        DataType::Str
-    } else if all_int {
-        DataType::I64
-    } else if all_num {
-        DataType::F64
-    } else if all_bool {
-        DataType::Bool
-    } else {
-        DataType::Str
+
+    fn resolve(&self) -> JType {
+        let cats = self.structs.is_some() as u8 + self.list.is_some() as u8 + self.saw_scalar as u8;
+        if cats > 1 {
+            // Heterogeneous column (scalar mixed with nested, or object+array):
+            // no single typed lane fits → string lane, each cell rendered as its
+            // JSON text. The one documented fallback; clean data never hits it.
+            return JType::Scalar(DataType::Str);
+        }
+        if let Some(st) = &self.structs {
+            JType::Struct {
+                names: st.names.clone(),
+                children: st.children.iter().map(|c| c.resolve()).collect(),
+            }
+        } else if let Some(el) = &self.list {
+            JType::List(Box::new(el.resolve()))
+        } else {
+            JType::Scalar(self.scalar.resolve())
+        }
     }
 }
 
-/// Build one typed column, tracking **validity** (design 26 §26.3): a JSON
-/// `null` — and a **missing key** (assembled as `JVal::Null` upstream) — becomes
-/// a `null` (validity = 0), never a silent `0`/`""`. A JSON empty string `""`
-/// stays a real empty string (validity = 1).
-fn build_column(dtype: DataType, vals: &[JVal]) -> Column {
+/// A recursive [`Field`] (with nested detail) for an inferred [`JType`].
+fn jtype_to_field(name: String, jt: &JType) -> Field {
+    match jt {
+        JType::Scalar(dt) => Field::new(name, *dt),
+        JType::Struct { names, children } => {
+            let kids = names
+                .iter()
+                .zip(children)
+                .map(|(n, c)| jtype_to_field(n.clone(), c))
+                .collect();
+            Field::struct_(name, kids)
+        }
+        // A list's element field is conventionally named `item` (§32 s3).
+        JType::List(elem) => Field::list(name, jtype_to_field("item".to_string(), elem)),
+    }
+}
+
+/// Build one (possibly nested) column for `jt` over `vals` (§32 s3b). A struct
+/// row is valid iff the cell is an object; a list row iff the cell is an array;
+/// any other cell is a typed null (validity = 0) — never silent. Children /
+/// elements recurse, so the null model (§26) recurses too.
+fn build_column(jt: &JType, vals: &[JVal]) -> Column {
+    match jt {
+        JType::Scalar(dt) => build_scalar(*dt, vals),
+        JType::Struct { names, children } => {
+            let valid: Vec<bool> = vals.iter().map(|v| matches!(v, JVal::Obj(_))).collect();
+            let mut cols = Vec::with_capacity(children.len());
+            for (ci, child_jt) in children.iter().enumerate() {
+                let key = &names[ci];
+                let child_vals: Vec<JVal> = vals
+                    .iter()
+                    .map(|v| match v {
+                        JVal::Obj(fs) => fs
+                            .iter()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, x)| x.clone())
+                            .unwrap_or(JVal::Null),
+                        _ => JVal::Null,
+                    })
+                    .collect();
+                cols.push(build_column(child_jt, &child_vals));
+            }
+            Column::new(
+                ColumnData::Struct(StructColumn {
+                    names: names.clone(),
+                    columns: cols,
+                    len: vals.len(),
+                }),
+                Validity::from_bits(&valid),
+            )
+        }
+        JType::List(elem) => {
+            let valid: Vec<bool> = vals.iter().map(|v| matches!(v, JVal::Arr(_))).collect();
+            let mut offsets = Vec::with_capacity(vals.len() + 1);
+            offsets.push(0i32);
+            let mut flat: Vec<JVal> = Vec::new();
+            let mut acc = 0i32;
+            for v in vals {
+                if let JVal::Arr(elems) = v {
+                    flat.extend(elems.iter().cloned());
+                    acc += elems.len() as i32;
+                }
+                offsets.push(acc);
+            }
+            let child = build_column(elem, &flat);
+            Column::new(
+                ColumnData::List(ListColumn {
+                    offsets,
+                    child: Box::new(child),
+                }),
+                Validity::from_bits(&valid),
+            )
+        }
+    }
+}
+
+/// Build one **scalar** column, tracking **validity** (design 26 §26.3): a JSON
+/// `null` — and a **missing key** (assembled as `JVal::Null`) — becomes a `null`
+/// (validity = 0), never a silent `0`/`""`. A JSON empty string `""` stays a
+/// real empty string (validity = 1). A nested cell only reaches here when the
+/// column is the heterogeneous string fallback; it is rendered as JSON text.
+fn build_scalar(dtype: DataType, vals: &[JVal]) -> Column {
     let mut valid = Vec::with_capacity(vals.len());
     let data = match dtype {
         DataType::I64 => ColumnData::I64(
@@ -256,8 +404,16 @@ fn build_column(dtype: DataType, vals: &[JVal]) -> Column {
                         s.push(&f.to_string());
                         valid.push(true);
                     }
-                    JVal::Str(x) | JVal::Raw(x) => {
+                    JVal::Str(x) => {
                         s.push(x);
+                        valid.push(true);
+                    }
+                    // Heterogeneous fallback only: render the nested value as its
+                    // JSON text so nothing is silently dropped.
+                    JVal::Obj(_) | JVal::Arr(_) => {
+                        let mut t = String::new();
+                        jval_json(v, &mut t);
+                        s.push(&t);
                         valid.push(true);
                     }
                 }
@@ -268,10 +424,61 @@ fn build_column(dtype: DataType, vals: &[JVal]) -> Column {
     Column::new(data, Validity::from_bits(&valid))
 }
 
+/// Serialize a [`JVal`] back to compact JSON text — used only for the
+/// heterogeneous string fallback (so a nested cell is never silently dropped).
+fn jval_json(v: &JVal, out: &mut String) {
+    match v {
+        JVal::Null => out.push_str("null"),
+        JVal::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        JVal::Int(i) => out.push_str(&i.to_string()),
+        JVal::Float(f) => out.push_str(&f.to_string()),
+        JVal::Str(s) => json_string(out, s),
+        JVal::Obj(fs) => {
+            out.push('{');
+            for (i, (k, val)) in fs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                json_string(out, k);
+                out.push(':');
+                jval_json(val, out);
+            }
+            out.push('}');
+        }
+        JVal::Arr(es) => {
+            out.push('[');
+            for (i, e) in es.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                jval_json(e, out);
+            }
+            out.push(']');
+        }
+    }
+}
+
+/// Append `s` as a quoted, escaped JSON string.
+fn json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 // ------------------------------------------------------------- streaming reader
 
-/// Streaming per-key type flags — `infer` accumulated one value at a time so the
-/// reader needn't buffer a whole column. Resolves identically to [`infer`].
+/// Streaming scalar-type flags — the scalar leaf of [`Infer`]. Accumulated one
+/// value at a time; resolves to the narrowest scalar lane that fits.
 #[derive(Clone)]
 struct Flags {
     any: bool,
@@ -306,7 +513,9 @@ impl Flags {
                 self.all_int = false;
                 self.all_num = false;
             }
-            JVal::Str(_) | JVal::Raw(_) => {
+            // A scalar `Flags` only ever observes scalars; a nested value (only
+            // possible in the heterogeneous fallback) forces the string lane.
+            JVal::Str(_) | JVal::Obj(_) | JVal::Arr(_) => {
                 self.any = true;
                 self.all_int = false;
                 self.all_num = false;
@@ -352,13 +561,13 @@ pub fn is_json_array(path: &str) -> bool {
     }
 }
 
-/// Global schema for a JSON-Lines file (pass 1): the column order from the first
-/// valid object and each key's lane inferred over every row, plus the malformed
-/// line count. Byte-identical to the schema [`parse`] derives.
-fn infer_global(path: &str) -> Result<(Vec<String>, Vec<DataType>, usize), String> {
+/// Global type plan for a JSON-Lines file (pass 1): the column order from the
+/// first valid object and each key's (possibly nested) type inferred over every
+/// row, plus the malformed line count. Byte-identical to what [`parse`] derives.
+fn infer_global(path: &str) -> Result<(Vec<String>, Vec<JType>, usize), String> {
     let mut r = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
     let mut names: Vec<String> = Vec::new();
-    let mut flags: Vec<Flags> = Vec::new();
+    let mut infers: Vec<Infer> = Vec::new();
     let mut bad_rows = 0usize;
     let mut started = false;
     let mut line = String::new();
@@ -377,12 +586,12 @@ fn infer_global(path: &str) -> Result<(Vec<String>, Vec<DataType>, usize), Strin
             Some(obj) => {
                 if !started {
                     names = obj.iter().map(|(k, _)| k.clone()).collect();
-                    flags = names.iter().map(|_| Flags::new()).collect();
+                    infers = names.iter().map(|_| Infer::new()).collect();
                     started = true;
                 }
                 for (k, v) in &obj {
                     if let Some(i) = names.iter().position(|n| n == k) {
-                        flags[i].observe(v);
+                        infers[i].observe(v);
                     }
                 }
             }
@@ -392,8 +601,19 @@ fn infer_global(path: &str) -> Result<(Vec<String>, Vec<DataType>, usize), Strin
     if !started {
         return Err("JSON has no valid objects".to_string());
     }
-    let dtypes = flags.iter().map(|f| f.resolve()).collect();
-    Ok((names, dtypes, bad_rows))
+    let jtypes = infers.iter().map(|f| f.resolve()).collect();
+    Ok((names, jtypes, bad_rows))
+}
+
+/// Build a [`Schema`] from inferred column names + types (nested detail carried).
+fn schema_from(names: &[String], jtypes: &[JType]) -> Schema {
+    Schema::new(
+        names
+            .iter()
+            .zip(jtypes)
+            .map(|(n, t)| jtype_to_field(n.clone(), t))
+            .collect(),
+    )
 }
 
 /// A streaming JSON-Lines reader (bounded memory), two-pass like the CSV reader:
@@ -403,7 +623,7 @@ fn infer_global(path: &str) -> Result<(Vec<String>, Vec<DataType>, usize), Strin
 pub struct JsonlChunker {
     reader: BufReader<File>,
     names: Vec<String>,
-    dtypes: Vec<DataType>,
+    jtypes: Vec<JType>,
     chunk_size: usize,
     line: String,
     eof: bool,
@@ -415,21 +635,15 @@ pub struct JsonlChunker {
 impl JsonlChunker {
     /// Open `path` for whole-file streaming (serial, bounded memory).
     pub fn open(path: &str, chunk_size: usize) -> Result<(Schema, JsonlChunker), String> {
-        let (names, dtypes, bad_rows) = infer_global(path)?;
-        let schema = Schema::new(
-            names
-                .iter()
-                .zip(&dtypes)
-                .map(|(n, d)| Field::new(n.clone(), *d))
-                .collect(),
-        );
+        let (names, jtypes, bad_rows) = infer_global(path)?;
+        let schema = schema_from(&names, &jtypes);
         let reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
         Ok((
             schema,
             JsonlChunker {
                 reader,
                 names,
-                dtypes,
+                jtypes,
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
                 eof: false,
@@ -445,7 +659,7 @@ impl JsonlChunker {
     pub fn for_range(
         path: &str,
         names: Vec<String>,
-        dtypes: Vec<DataType>,
+        jtypes: Vec<JType>,
         start: u64,
         end: u64,
         chunk_size: usize,
@@ -458,7 +672,7 @@ impl JsonlChunker {
         Ok(JsonlChunker {
             reader,
             names,
-            dtypes,
+            jtypes,
             chunk_size: chunk_size.max(1),
             line: String::new(),
             eof: false,
@@ -515,10 +729,10 @@ impl JsonlChunker {
             return None;
         }
         Some(
-            self.dtypes
+            self.jtypes
                 .iter()
                 .zip(&per_col)
-                .map(|(d, vals)| build_column(*d, vals))
+                .map(|(t, vals)| build_column(t, vals))
                 .collect(),
         )
     }
@@ -535,26 +749,20 @@ impl crate::codec::Decoder for JsonlChunker {
 /// Plan a byte-range parallel read of a JSON-Lines file: the global schema and
 /// `nparts` newline-aligned ranges covering the file exactly once. Returns
 /// `None` for a top-level array (not splittable) — the caller stays serial.
-/// `(schema, column names, lanes, newline-aligned byte ranges, malformed rows)`.
-pub type JsonlPlan = (Schema, Vec<String>, Vec<DataType>, Vec<(u64, u64)>, usize);
+/// `(schema, column names, types, newline-aligned byte ranges, malformed rows)`.
+pub type JsonlPlan = (Schema, Vec<String>, Vec<JType>, Vec<(u64, u64)>, usize);
 
 pub fn plan_parallel(path: &str, nparts: usize) -> Option<JsonlPlan> {
     if is_json_array(path) {
         return None;
     }
-    let (names, dtypes, bad_rows) = infer_global(path).ok()?;
+    let (names, jtypes, bad_rows) = infer_global(path).ok()?;
     let ranges = snap_ranges(path, nparts)?;
     if ranges.len() < 2 {
         return None;
     }
-    let schema = Schema::new(
-        names
-            .iter()
-            .zip(&dtypes)
-            .map(|(n, d)| Field::new(n.clone(), *d))
-            .collect(),
-    );
-    Some((schema, names, dtypes, ranges, bad_rows))
+    let schema = schema_from(&names, &jtypes);
+    Some((schema, names, jtypes, ranges, bad_rows))
 }
 
 /// Split the file into ≤ `nparts` newline-aligned `[start, end)` ranges (no
@@ -589,39 +797,82 @@ fn snap_ranges(path: &str, nparts: usize) -> Option<Vec<(u64, u64)>> {
 
 // ----------------------------------------------------------------- JSON parsing
 
-/// Parse a single flat JSON object line into `(key, value)` pairs. Returns
-/// `None` if the line is not a well-formed object (→ counted as a bad row).
+/// Parse a single JSON object line into `(key, value)` pairs. Returns `None` if
+/// the line is not a well-formed object (→ counted as a bad row). Nested values
+/// are parsed structurally by [`parse_value`].
 fn parse_object(line: &str) -> Option<Vec<(String, JVal)>> {
     let b = line.as_bytes();
     let mut i = 0usize;
     skip_ws(b, &mut i);
-    if i >= b.len() || b[i] != b'{' {
+    parse_obj(b, &mut i)
+}
+
+/// Parse an object starting at `b[*i] == '{'`, consuming through its matching
+/// `}`. Shared by the top-level line parser and nested values.
+fn parse_obj(b: &[u8], i: &mut usize) -> Option<Vec<(String, JVal)>> {
+    if *i >= b.len() || b[*i] != b'{' {
         return None;
     }
-    i += 1;
+    *i += 1;
     let mut out = Vec::new();
-    skip_ws(b, &mut i);
-    if i < b.len() && b[i] == b'}' {
+    skip_ws(b, i);
+    if *i < b.len() && b[*i] == b'}' {
+        *i += 1;
         return Some(out); // empty object
     }
     loop {
-        skip_ws(b, &mut i);
-        let key = parse_string(b, &mut i)?;
-        skip_ws(b, &mut i);
-        if i >= b.len() || b[i] != b':' {
+        skip_ws(b, i);
+        let key = parse_string(b, i)?;
+        skip_ws(b, i);
+        if *i >= b.len() || b[*i] != b':' {
             return None;
         }
-        i += 1;
-        skip_ws(b, &mut i);
-        let val = parse_value(b, &mut i)?;
+        *i += 1;
+        skip_ws(b, i);
+        let val = parse_value(b, i)?;
         out.push((key, val));
-        skip_ws(b, &mut i);
-        match b.get(i) {
+        skip_ws(b, i);
+        match b.get(*i) {
             Some(b',') => {
-                i += 1;
+                *i += 1;
                 continue;
             }
-            Some(b'}') => break, // object closed; `i` no longer needed
+            Some(b'}') => {
+                *i += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Parse an array starting at `b[*i] == '['`, consuming through its matching `]`.
+fn parse_arr(b: &[u8], i: &mut usize) -> Option<Vec<JVal>> {
+    if *i >= b.len() || b[*i] != b'[' {
+        return None;
+    }
+    *i += 1;
+    let mut out = Vec::new();
+    skip_ws(b, i);
+    if *i < b.len() && b[*i] == b']' {
+        *i += 1;
+        return Some(out); // empty array
+    }
+    loop {
+        skip_ws(b, i);
+        let val = parse_value(b, i)?;
+        out.push(val);
+        skip_ws(b, i);
+        match b.get(*i) {
+            Some(b',') => {
+                *i += 1;
+                continue;
+            }
+            Some(b']') => {
+                *i += 1;
+                break;
+            }
             _ => return None,
         }
     }
@@ -686,8 +937,8 @@ fn parse_value(b: &[u8], i: &mut usize) -> Option<JVal> {
     skip_ws(b, i);
     match b.get(*i)? {
         b'"' => parse_string(b, i).map(JVal::Str),
-        b'{' => parse_nested(b, i, b'{', b'}').map(JVal::Raw),
-        b'[' => parse_nested(b, i, b'[', b']').map(JVal::Raw),
+        b'{' => parse_obj(b, i).map(JVal::Obj),
+        b'[' => parse_arr(b, i).map(JVal::Arr),
         b't' => parse_lit(b, i, "true", JVal::Bool(true)),
         b'f' => parse_lit(b, i, "false", JVal::Bool(false)),
         b'n' => parse_lit(b, i, "null", JVal::Null),
@@ -734,9 +985,10 @@ fn parse_number(b: &[u8], i: &mut usize) -> Option<JVal> {
     }
 }
 
-/// Capture a balanced `{...}` or `[...]` (string-aware) as raw text.
-fn parse_nested(b: &[u8], i: &mut usize, open: u8, close: u8) -> Option<String> {
-    let start = *i;
+/// Advance `*i` past a balanced `{...}` / `[...]` (string-aware), without
+/// materializing it — used by [`collect_array`] to find object boundaries in a
+/// multi-line top-level array.
+fn skip_balanced(b: &[u8], i: &mut usize, open: u8, close: u8) -> bool {
     let mut depth = 0i32;
     let mut in_str = false;
     while *i < b.len() {
@@ -758,15 +1010,13 @@ fn parse_nested(b: &[u8], i: &mut usize, open: u8, close: u8) -> Option<String> 
             x if x == close => {
                 depth -= 1;
                 if depth == 0 {
-                    return std::str::from_utf8(&b[start..*i])
-                        .ok()
-                        .map(|s| s.to_string());
+                    return true;
                 }
             }
             _ => {}
         }
     }
-    None
+    false
 }
 
 #[cfg(test)]
@@ -815,13 +1065,63 @@ mod tests {
     }
 
     #[test]
-    fn nested_value_kept_as_raw_string() {
-        let text = "{\"id\":1,\"meta\":{\"x\":2}}\n";
+    fn nested_object_becomes_struct_column() {
+        // §32 s3b: a nested object is a typed Struct lane (not raw text).
+        let text = "{\"id\":1,\"meta\":{\"x\":2,\"y\":\"a\"}}\n\
+                    {\"id\":2,\"meta\":{\"x\":5,\"y\":\"b\"}}\n";
         let d = parse(text).unwrap();
         let idx = d.schema.index_of("meta").unwrap();
+        assert_eq!(d.schema.fields[idx].dtype, DataType::Struct);
         match d.columns[idx].data() {
-            ColumnData::Str(s) => assert!(s.get(0).contains("\"x\"")),
-            _ => panic!("expected raw string column"),
+            ColumnData::Struct(s) => {
+                assert_eq!(s.names, vec!["x", "y"]);
+                assert_eq!(s.len, 2);
+                assert_eq!(s.columns[0].data().dtype(), DataType::I64);
+                assert_eq!(s.columns[1].data().dtype(), DataType::Str);
+                assert_eq!(s.columns[0].value_at(1), rivus_core::Value::I64(5));
+            }
+            _ => panic!("expected struct column"),
         }
+    }
+
+    #[test]
+    fn nested_array_becomes_list_column() {
+        // §32 s3b: a nested array is a typed List lane with i32 offsets.
+        let text = "{\"id\":1,\"tags\":[10,20]}\n{\"id\":2,\"tags\":[30]}\n";
+        let d = parse(text).unwrap();
+        let idx = d.schema.index_of("tags").unwrap();
+        assert_eq!(d.schema.fields[idx].dtype, DataType::List);
+        match d.columns[idx].data() {
+            ColumnData::List(l) => {
+                assert_eq!(l.offsets, vec![0, 2, 3]);
+                assert_eq!(l.child.data().dtype(), DataType::I64);
+                assert_eq!(l.child.value_at(2), rivus_core::Value::I64(30));
+            }
+            _ => panic!("expected list column"),
+        }
+    }
+
+    #[test]
+    fn missing_or_null_nested_is_typed_null_not_silent() {
+        // §32 s3b: a row missing the nested key (or with `null`) is a typed null
+        // (validity = 0) on the struct lane — never a silent empty struct.
+        let text = "{\"id\":1,\"meta\":{\"x\":2}}\n{\"id\":2}\n{\"id\":3,\"meta\":null}\n";
+        let d = parse(text).unwrap();
+        let idx = d.schema.index_of("meta").unwrap();
+        assert_eq!(d.schema.fields[idx].dtype, DataType::Struct);
+        let col = &d.columns[idx];
+        assert!(!col.is_null(0));
+        assert!(col.is_null(1));
+        assert!(col.is_null(2));
+    }
+
+    #[test]
+    fn broken_nested_line_counted_as_bad_row() {
+        // An unterminated nested object makes the whole line malformed → counted,
+        // never a silent partial row.
+        let text = "{\"id\":1,\"meta\":{\"x\":2}}\n{\"id\":2,\"meta\":{\"x\":}\n{\"id\":3,\"meta\":{\"x\":9}}\n";
+        let d = parse(text).unwrap();
+        assert_eq!(d.bad_rows, 1);
+        assert_eq!(d.columns[0].len(), 2);
     }
 }

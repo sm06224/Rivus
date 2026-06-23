@@ -1643,7 +1643,7 @@ enum ParSource {
     },
     Jsonl {
         names: Vec<String>,
-        dtypes: Vec<DataType>,
+        jtypes: Vec<crate::jsonl::JType>,
     },
     Binary {
         fields: Vec<(String, rivus_ir::BinType)>,
@@ -1683,10 +1683,10 @@ impl ParPlan {
                 *delim,
                 self.provenance,
             ),
-            ParSource::Jsonl { names, dtypes } => operators::jsonl_range_source(
+            ParSource::Jsonl { names, jtypes } => operators::jsonl_range_source(
                 &self.path,
                 names.clone(),
-                dtypes.clone(),
+                jtypes.clone(),
                 self.schema.clone(),
                 a,
                 b,
@@ -1778,7 +1778,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
             if path == "-" {
                 return None;
             }
-            let (schema, names, dtypes, ranges, bad_rows) =
+            let (schema, names, jtypes, ranges, bad_rows) =
                 crate::jsonl::plan_parallel(path, threads)?;
             Some(ParPlan {
                 schema: std::sync::Arc::new(schema),
@@ -1786,7 +1786,7 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
                 path: path.to_string(),
                 bad_rows,
                 header_warning: None,
-                src: ParSource::Jsonl { names, dtypes },
+                src: ParSource::Jsonl { names, jtypes },
                 provenance,
             })
         }
