@@ -13,7 +13,7 @@
 //! results are identical.
 
 use rivus_core::{Chunk, Column, ColumnData, DataType, Resource, StrColumn, Validity, Value};
-use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func};
+use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func, PathExpr, PathSeg};
 use std::cmp::Ordering;
 
 /// Apply a scalar function to argument values for one row.
@@ -896,6 +896,15 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
                 .collect();
             column_from_values(vals)
         }
+        // `user.age` / `tags[0]` — nested path (§32 s4). Row-wise resolution into
+        // the Struct/List lanes; the narrowest fitting scalar lane is chosen (a
+        // null/missing/out-of-range cell stays null, never-silent).
+        Expr::Path(_) => {
+            let vals: Vec<Value> = (0..chunk.len)
+                .map(|r| eval_acc(expr, chunk, r, fails))
+                .collect();
+            column_from_values(vals)
+        }
         // Compare / And / Or are predicates → a boolean column.
         _ => {
             let v: Vec<bool> = (0..chunk.len)
@@ -1303,6 +1312,10 @@ pub fn eval_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> Valu
         Expr::SubView {
             base, start, end, ..
         } => eval_subview(base, *start, *end, chunk, row, fails),
+        // `user.age` / `tags[0]` — nested path (§32 s4). Walk the Struct/List
+        // lanes at the root column; a missing field / out-of-range index / type
+        // mismatch is a never-silent failure (counted, continue-first null).
+        Expr::Path(p) => eval_path(p, chunk, row, fails),
         Expr::Compare { left, op, right } => {
             Value::Bool(compare_fast(left, *op, right, chunk, row, fails))
         }
@@ -1436,6 +1449,60 @@ fn eval_subview(
     // Byte offset of the k-th character boundary (k == char_count → end of cell).
     let byte_at = |k: usize| cell.char_indices().nth(k).map_or(cell.len(), |(i, _)| i);
     Value::Str(cell[byte_at(s)..byte_at(e)].to_string())
+}
+
+/// Resolve a nested path `user.age` / `tags[0]` (§32 s4) at `row`. Walks the
+/// `ColumnData::{Struct,List}` lanes from the root column, honoring each level's
+/// validity (§26): a null cell at any level is a null result (not a failure). A
+/// missing field, an out-of-range index, or a type mismatch (`.field` on a
+/// non-struct, `[i]` on a non-list) is a never-silent failure — counted in
+/// `fails`, continue-first null.
+fn eval_path(p: &PathExpr, chunk: &Chunk, row: usize, fails: &mut u64) -> Value {
+    match chunk.column(&p.root) {
+        Some(col) => resolve_in_column(col, row, &p.segs, fails),
+        None => {
+            *fails += 1; // missing root column → never-silent null
+            Value::Null
+        }
+    }
+}
+
+/// Walk `segs` into `col` at `row` (see [`eval_path`]).
+fn resolve_in_column(col: &Column, row: usize, segs: &[PathSeg], fails: &mut u64) -> Value {
+    // A null cell at this level → null (a valid §26 null, not a failure).
+    if col.is_null(row) {
+        return Value::Null;
+    }
+    let Some((seg, rest)) = segs.split_first() else {
+        return col.value_at(row); // leaf reached
+    };
+    match (col.data(), seg) {
+        (ColumnData::Struct(s), PathSeg::Field(name)) => {
+            match s.names.iter().position(|n| n == name) {
+                Some(ci) => resolve_in_column(&s.columns[ci], row, rest, fails),
+                None => {
+                    *fails += 1; // missing struct field
+                    Value::Null
+                }
+            }
+        }
+        (ColumnData::List(l), PathSeg::Index(i)) => {
+            let (start, end) = (l.offsets[row] as usize, l.offsets[row + 1] as usize);
+            let idx = start + *i as usize;
+            if idx < end {
+                // The child row for element `i` is its flattened offset.
+                resolve_in_column(&l.child, idx, rest, fails)
+            } else {
+                *fails += 1; // index out of range
+                Value::Null
+            }
+        }
+        // Type mismatch: `.field` on a non-struct, or `[i]` on a non-list.
+        _ => {
+            *fails += 1;
+            Value::Null
+        }
+    }
 }
 
 /// Generic field accessor on a [`Resource`] (design §28.6 / §00 0.14), used by

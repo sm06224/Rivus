@@ -601,6 +601,84 @@ fn parallel_jsonl_nested_byte_identical() {
 }
 
 #[test]
+fn parallel_jsonl_path_resolve_byte_identical() {
+    // §32 s4: nested-path resolution (`user.age`, `tags[0]`) is a deterministic
+    // pure function of the row, so a flow that filters on a struct-field path and
+    // projects struct/list paths must be byte-identical serial == parallel ==
+    // chunk-size. The byte-range parallel reader resolves each range against the
+    // same globally-inferred nested shape; output files are compared byte-for-byte.
+    let rows = 120_000usize;
+    let mut text = String::new();
+    let names = ["aa", "bb", "cc", "dd"];
+    for i in 0..rows {
+        // `user` struct (age + name) and a `tags` list. Some rows have an empty
+        // tags list so `tags[0]` exercises the out-of-range → typed null path.
+        let tags = if i % 11 == 0 {
+            "[]".to_string()
+        } else {
+            format!("[{},{}]", i % 100, (i % 100) + 1)
+        };
+        text.push_str(&format!(
+            "{{\"id\":{i},\"user\":{{\"age\":{},\"name\":\"{}\"}},\"tags\":{tags}}}\n",
+            i % 90,
+            names[i % names.len()],
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_jsonl_path",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+
+    let run_to = |pref: rivus_runtime::MemoryPref, cs: usize, out: &std::path::Path| -> bool {
+        // Filter on a struct-field path; project the struct field and a list
+        // index (out-of-range on empty lists → typed null).
+        let src = format!(
+            "F:\n open {p}\n |? user.age >= 18\n |> id (user.age) as age (tags[0]) as first\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cs,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        !res.workers.is_empty()
+    };
+
+    let ser = TempCsv(gendata::write_temp_bytes("jsonl_path_serial", b""));
+    assert!(
+        !run_to(rivus_runtime::MemoryPref::Low, 4096, &ser.0),
+        "low must be serial"
+    );
+    let oracle = std::fs::read_to_string(&ser.0).expect("read serial out");
+    assert!(oracle.lines().count() > 1000, "oracle unexpectedly small");
+    assert_eq!(oracle.lines().next(), Some("id,age,first"), "header");
+
+    let par = TempCsv(gendata::write_temp_bytes("jsonl_path_par", b""));
+    assert!(
+        run_to(rivus_runtime::MemoryPref::Fast, 4096, &par.0),
+        "fast should engage the JSONL streaming-parallel path"
+    );
+    let got = std::fs::read_to_string(&par.0).expect("read parallel out");
+    assert_eq!(got, oracle, "parallel path-resolve != serial");
+
+    for cs in [1usize, 1000, rows] {
+        let cz = TempCsv(gendata::write_temp_bytes("jsonl_path_cz", b""));
+        run_to(rivus_runtime::MemoryPref::Low, cs, &cz.0);
+        let got = std::fs::read_to_string(&cz.0).expect("read cz out");
+        assert_eq!(got, oracle, "path-resolve changed @cs={cs}");
+    }
+}
+
+#[test]
 fn sort_by_nested_column_is_deterministic_text_order() {
     // §32 s3a forward-compat behavior is now LIVE (s3b): sorting by a nested
     // column has no native key, so it orders by the `Value` text form

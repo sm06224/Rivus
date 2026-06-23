@@ -32,8 +32,8 @@ use rivus_core::{DataType, Mode, Resource, RivusError, Severity, TimeUnit, Value
 use rivus_ir::{
     is_type_word, parse_route_template, Access, AggFunc, ArithOp, BinType, CmpOp, Codec, Discovery,
     Disposition, EdgeKind, Endian, Expr, FillMethod, Func, Hook, HookAction, HookEvent, JoinKind,
-    NodeId, Op, PathExpr, PlanGraph, Provenance, ReadFmt, Route, RouteSeg, SinkCodec, SubView,
-    Transport, ViewDef,
+    NodeId, Op, PathExpr, PathSeg, PlanGraph, Provenance, ReadFmt, Route, RouteSeg, SinkCodec,
+    SubView, Transport, ViewDef,
 };
 
 /// Lower a surface key token to a [`PathExpr`] (§32 s2). A plain `name` becomes
@@ -1877,11 +1877,28 @@ impl Parser {
             // a genuinely dotted column name is reached with `item("a.b")`.
             Tok::Word(name) => {
                 self.bump();
+                // §32 s4: a nested path into a Struct/List column.
+                // - Flow mode folds `user.age` into one identifier (the lexer
+                //   keeps `.` in a word at paren-depth 0): lower it to a path.
                 if name.contains('.') {
-                    return Err(self.err(format!(
-                        "dotted field `{name}` is ambiguous here; use it in a computed column \
-                         `|> (…)` (e.g. `source.uri`), or `item(\"{name}\")` for a real column"
-                    )));
+                    return match PathExpr::parse(&name) {
+                        // `source.<field>` is the provenance accessor (§28.6), not
+                        // a data path — reserved, and reachable only inside a
+                        // computed column `|> (…)` where the lexer splits it.
+                        Some(p) if p.root == "source" && !p.is_bare() => Err(self.err(
+                            "`source.<field>` (provenance, §28.6) is only valid inside a \
+                             computed column `|> (…)`; a nested data path uses any other root",
+                        )),
+                        Some(p) if !p.is_bare() => Ok(Expr::Path(p)),
+                        // A lone trailing/leading dot etc. — never-silent.
+                        _ => Err(self.err(format!("malformed nested path `{name}`"))),
+                    };
+                }
+                // - Expression mode (inside parens) splits `user . age` and
+                //   `tags [ 0 ]`; a following `.` / `[` is a nested-path tail.
+                //   (`source.field` / a sub-view base were dispatched above.)
+                if matches!(self.tok(), Tok::Dot | Tok::LBracket) {
+                    return self.parse_path_tail_from(name);
                 }
                 Ok(Expr::Field {
                     name,
@@ -1921,6 +1938,35 @@ impl Parser {
         }
         self.bump(); // end
         Ok(Expr::Case { branches, default })
+    }
+
+    /// Build a nested path (§32 s4) from an already-read `root`, consuming the
+    /// expression-mode `.field` / `[i]` tail tokens. Called only when a `.` / `[`
+    /// follows, so the result always has ≥ 1 segment (never the bare form).
+    fn parse_path_tail_from(&mut self, root: String) -> Result<Expr, RivusError> {
+        let mut segs = Vec::new();
+        loop {
+            if self.eat(&Tok::Dot) {
+                segs.push(PathSeg::Field(self.word()?));
+            } else if self.eat(&Tok::LBracket) {
+                // 0-based list index; must fit u32 (the digits round-trip), never
+                // silently truncated.
+                let idx = match self.bump() {
+                    Tok::Int(n) if (0..=u32::MAX as i64).contains(&n) => n as u32,
+                    other => {
+                        return Err(self.err(format!(
+                            "a list index must be in 0..={}, found {other:?}",
+                            u32::MAX
+                        )))
+                    }
+                };
+                self.expect(&Tok::RBracket)?;
+                segs.push(PathSeg::Index(idx));
+            } else {
+                break;
+            }
+        }
+        Ok(Expr::Path(PathExpr { root, segs }))
     }
 
     /// After consuming `$_` / `$_:N`, read the field accessor tail.
@@ -2822,14 +2868,18 @@ mod tests {
     }
 
     #[test]
-    fn dotted_bare_field_is_rejected_outside_a_computed_column() {
-        // A handle accessor (`source.uri`) belongs in a computed column; a bare
-        // dotted field in a predicate is an explicit error (never-silent +
-        // reversibility), not a silently-built field named "source.uri".
+    fn provenance_accessor_is_reserved_but_dotted_data_path_resolves() {
+        // `source.<field>` is the provenance accessor (§28.6): reserved, and
+        // reachable only inside a computed column `|> (…)` — never as a bare
+        // flow-mode predicate (never-silent, not a field literally "source.uri").
         assert!(parse("F:\n open a.csv with source\n |? source.uri == \"x\"\n;").is_err());
-        assert!(parse("L:\n ls \"*.csv\"\n |? path.name == \"a\"\n;").is_err());
         // In a computed column it is the provenance accessor (works, slice 2).
         assert!(parse("F:\n open a.csv with source\n |> (source.uri) as u\n;").is_ok());
+        // §32 s4: any *other* dotted field is now a nested data path (resolved
+        // against the Struct/List lanes), not an error.
+        assert!(parse("L:\n ls \"*.csv\"\n |? path.name == \"a\"\n;").is_ok());
+        assert!(parse("D:\n open d.jsonl\n |? user.age >= 18\n;").is_ok());
+        assert!(parse("D:\n open d.jsonl\n |> (tags[0]) as first\n;").is_ok());
     }
 
     #[test]
@@ -4081,6 +4131,50 @@ Import:
         assert!(
             nested.is_some_and(|k| !k.is_bare()),
             "nested key should not be bare"
+        );
+    }
+
+    // §32 s4: a nested path in *expression* context (predicate / computed column)
+    // lowers to `Expr::Path` and round-trips as `user.age` / `tags[0]`. Covers the
+    // s2 follow-up "`tags[0]` flow round-trip".
+    #[test]
+    fn path_expr_in_predicate_and_projection_round_trips() {
+        // Flow-mode predicate: `user.age` folds to one token, lowers to a path.
+        let g = parse("D:\n open d.jsonl\n |? user.age >= 18\n;").unwrap();
+        let src = g.to_source();
+        assert!(src.contains("user.age >= 18"), "path predicate lost: {src}");
+        assert_eq!(
+            src,
+            parse(&src).unwrap().to_source(),
+            "not idempotent: {src}"
+        );
+
+        // The predicate lowered to an `Expr::Path` (not a flat field).
+        let is_path = g.nodes.iter().any(|n| match &n.op {
+            Op::Filter { pred, .. } => pred.any(&|e| matches!(e, Expr::Path(_))),
+            _ => false,
+        });
+        assert!(is_path, "predicate should contain an Expr::Path");
+
+        // Computed column with a list index `tags[0]` (the s2 follow-up):
+        // expression mode splits `tags [ 0 ]`; it round-trips as `tags[0]`.
+        let p = parse("D:\n open d.jsonl\n |> (tags[0]) as first\n;").unwrap();
+        let psrc = p.to_source();
+        assert!(psrc.contains("tags[0]"), "list-index path lost: {psrc}");
+        assert_eq!(
+            psrc,
+            parse(&psrc).unwrap().to_source(),
+            "not idempotent: {psrc}"
+        );
+
+        // Deeper struct path in a computed column.
+        let q = parse("D:\n open d.jsonl\n |> (user.address.city) as c\n;").unwrap();
+        let qsrc = q.to_source();
+        assert!(qsrc.contains("user.address.city"), "deep path lost: {qsrc}");
+        assert_eq!(
+            qsrc,
+            parse(&qsrc).unwrap().to_source(),
+            "not idempotent: {qsrc}"
         );
     }
 

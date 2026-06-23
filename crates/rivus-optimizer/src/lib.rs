@@ -481,6 +481,9 @@ fn collect_fields(e: &Expr, out: &mut Vec<String>) {
         // A union sub-view `base.name` (§29.3, s2) reads the physical column
         // `base`, so keep `base` live for projection pushdown.
         Expr::SubView { base, .. } => push_unique(out, base),
+        // A nested path (§32 s4) reads its root physical column (`user` in
+        // `user.age`), so keep the root live for projection pushdown.
+        Expr::Path(p) => push_unique(out, &p.root),
         // A value hole references no column. A positional `$_[i]` names no
         // column either — its consumer disables pruning instead (see
         // `project_pushdown`), so collecting nothing here is safe.

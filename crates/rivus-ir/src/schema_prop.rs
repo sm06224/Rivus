@@ -18,10 +18,10 @@
 //!   type-checking, deliberately separate from the observed lane; it never
 //!   drives execution.
 
-use crate::expr::{Access, ArithOp, Func, PathExpr};
+use crate::expr::{Access, ArithOp, Func, PathExpr, PathSeg};
 use crate::graph::{AggFunc, Codec, Op, PlanGraph};
 use crate::Expr;
-use rivus_core::{DataType, Field, Schema};
+use rivus_core::{DataType, Field, Nested, Schema};
 
 impl PlanGraph {
     /// The static output [`Schema`] of every node, indexed by `NodeId`
@@ -269,6 +269,9 @@ fn expr_type(e: &Expr, schema: &Schema) -> DataType {
             .unwrap_or(DataType::Str),
         // A union sub-view is a zero-copy char slice of a string column.
         Expr::SubView { .. } => DataType::Str,
+        // A nested path (§32 s4) resolves its leaf lane through the static nested
+        // schema detail; an unresolvable path is nominal text (and runtime null).
+        Expr::Path(p) => path_type(p, schema),
         Expr::Literal(v) => v.dtype(),
         // A value hole's type isn't known until bound; nominal text.
         Expr::Hole(_) => DataType::Str,
@@ -294,6 +297,32 @@ fn expr_type(e: &Expr, schema: &Schema) -> DataType {
             ty
         }
     }
+}
+
+/// The nominal leaf type of a nested path (§32 s4): walk the static nested
+/// schema detail (`Field.nested`) one segment at a time. An unresolvable step
+/// (missing field, indexing a non-list, a flat leaf with steps remaining) is
+/// nominal text — matching the runtime, which yields a typed null there.
+fn path_type(p: &PathExpr, schema: &Schema) -> DataType {
+    let Some(idx) = schema.index_of(&p.root) else {
+        return DataType::Str;
+    };
+    let mut field = &schema.fields[idx];
+    for seg in &p.segs {
+        match (seg, field.nested.as_ref()) {
+            (PathSeg::Field(name), Some(Nested::Struct(children))) => {
+                match children.iter().find(|c| &c.name == name) {
+                    Some(child) => field = child,
+                    None => return DataType::Str,
+                }
+            }
+            (PathSeg::Index(_), Some(Nested::List(elem))) => field = elem,
+            // Type mismatch (indexing a struct, fielding a list, or any step past
+            // a flat leaf) → unresolvable → nominal text.
+            _ => return DataType::Str,
+        }
+    }
+    field.dtype
 }
 
 /// Nominal widening of two numeric lanes (int ⊆ float ⊆ decimal; §06). A
