@@ -517,6 +517,137 @@ fn parallel_jsonl_stateless_byte_identical() {
 }
 
 #[test]
+fn parallel_jsonl_nested_byte_identical() {
+    // §32 s3b: nested Struct/List columns now have a live generation path (the
+    // JSON reader). This pins the #41 guarantee for that NEW path — serial ==
+    // parallel == chunk-size — end to end: the byte-range parallel reader builds
+    // each range's nested columns against the SAME globally-inferred shape, a
+    // `where` gathers nested rows (exercises ColumnData::{Struct,List}::gather),
+    // and the CSV sink renders the nested cells. Output files are compared
+    // byte-for-byte. >1 MiB + MemoryPref::Fast forces the parallel reader.
+    let rows = 120_000usize;
+    let mut text = String::new();
+    let ys = ["aa", "bb", "cc", "dd"];
+    for i in 0..rows {
+        // A struct column `meta` and a list column `tags` per row.
+        text.push_str(&format!(
+            "{{\"id\":{i},\"meta\":{{\"x\":{},\"y\":\"{}\"}},\"tags\":[{},{}]}}\n",
+            i % 1000,
+            ys[i % ys.len()],
+            i % 7,
+            (i % 7) + 1,
+        ));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_jsonl_nested",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+
+    let run_to = |pref: rivus_runtime::MemoryPref, cs: usize, out: &std::path::Path| -> bool {
+        // Filter (gathers nested rows) + project the nested columns + save.
+        let src = format!(
+            "F:\n open {p}\n |? id >= 1000\n |> id meta tags\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cs,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        !res.workers.is_empty()
+    };
+
+    // Serial oracle (single-threaded reader).
+    let ser = TempCsv(gendata::write_temp_bytes("jsonl_nested_serial", b""));
+    assert!(
+        !run_to(rivus_runtime::MemoryPref::Low, 4096, &ser.0),
+        "low must be serial"
+    );
+    let oracle = std::fs::read_to_string(&ser.0).expect("read serial out");
+    assert!(oracle.lines().count() > 1000, "oracle unexpectedly small");
+    // The nested cells render via the sink (struct → `{x: .., y: ..}`, list →
+    // `[.., ..]`), quoted as CSV text.
+    assert!(
+        oracle.lines().nth(1).is_some_and(|l| l.contains("{x:")),
+        "expected a rendered struct cell, got {:?}",
+        oracle.lines().nth(1)
+    );
+
+    // Parallel must be byte-identical to serial (parts concatenated in order).
+    let par = TempCsv(gendata::write_temp_bytes("jsonl_nested_par", b""));
+    assert!(
+        run_to(rivus_runtime::MemoryPref::Fast, 4096, &par.0),
+        "fast should engage the JSONL streaming-parallel path"
+    );
+    let got = std::fs::read_to_string(&par.0).expect("read parallel out");
+    assert_eq!(got, oracle, "parallel nested JSONL != serial");
+
+    // Chunk-size independence (serial): the result must not depend on chunk_size.
+    for cs in [1usize, 1000, rows] {
+        let cz = TempCsv(gendata::write_temp_bytes("jsonl_nested_cz", b""));
+        run_to(rivus_runtime::MemoryPref::Low, cs, &cz.0);
+        let got = std::fs::read_to_string(&cz.0).expect("read cz out");
+        assert_eq!(got, oracle, "nested JSONL changed @cs={cs}");
+    }
+}
+
+#[test]
+fn sort_by_nested_column_is_deterministic_text_order() {
+    // §32 s3a forward-compat behavior is now LIVE (s3b): sorting by a nested
+    // column has no native key, so it orders by the `Value` text form
+    // (`make_cmp` / `argsort_single`). Confirm the semantics are sound: a defined
+    // total order, deterministic, chunk-size independent, and continue-first (no
+    // panic on a nested key). We sort by the `tags` list column and pin that the
+    // row order is identical across chunk sizes.
+    let mut text = String::new();
+    // Distinct list cells whose text forms have a clear lexicographic order.
+    let lists = ["[3, 1]", "[1, 2]", "[2, 9]", "[1, 0]", "[10, 0]"];
+    for (i, t) in lists.iter().enumerate() {
+        text.push_str(&format!("{{\"id\":{i},\"tags\":{t}}}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_sort_nested",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+    let flow = format!("S:\n open {p}\n sort tags\n |> id tags\n;");
+
+    let order = |cz: usize| -> Vec<i64> {
+        let res = run_src(&flow, cz);
+        // Continue-first: a nested sort key must never raise a fatal.
+        assert!(
+            !res.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+            "sort by a nested column must not be fatal (cz={cz})"
+        );
+        collect_i64(&res, "S", "id")
+    };
+    let reference = order(4096);
+    assert_eq!(reference.len(), lists.len(), "all rows survive the sort");
+    // Text-form ascending order over the list cells:
+    //   "[1, 0]"(3) < "[1, 2]"(1) < "[10, 0]"(4) < "[2, 9]"(2) < "[3, 1]"(0)
+    assert_eq!(
+        reference,
+        vec![3, 1, 4, 2, 0],
+        "nested sort must follow the Value text form's lexicographic order"
+    );
+    for cz in [1usize, 2, 3, lists.len()] {
+        assert_eq!(order(cz), reference, "nested sort order changed @cz={cz}");
+    }
+}
+
+#[test]
 fn parallel_binary_byte_identical() {
     // #49: fixed-width binary is splittable (record-aligned) — its filter and
     // group-by parallelize in the bounded byte-range path, byte-identical to

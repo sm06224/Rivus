@@ -443,6 +443,24 @@ impl ColumnData {
             (ColumnData::Time(a), ColumnData::Time(b)) => a.extend_from_slice(b),
             (ColumnData::Str(a), ColumnData::Str(b)) => a.append(b),
             (ColumnData::Resource(a), ColumnData::Resource(b)) => a.append(b),
+            // Nested (§32 s3): concatenate child-wise. A buffering operator (sort,
+            // group, distinct, unbounded merge) relies on this — a no-op here
+            // silently truncates a nested column to the first chunk.
+            (ColumnData::Struct(a), ColumnData::Struct(b)) => {
+                for (ca, cb) in a.columns.iter_mut().zip(&b.columns) {
+                    ca.append(cb);
+                }
+                a.len += b.len;
+            }
+            (ColumnData::List(a), ColumnData::List(b)) => {
+                // Shift `b`'s offsets by `a`'s current child length, then append
+                // the child elements; `b.offsets[0]` (== 0) is dropped (it is the
+                // same point as `a`'s last offset).
+                let base = *a.offsets.last().unwrap_or(&0);
+                a.offsets
+                    .extend(b.offsets.iter().skip(1).map(|&o| o + base));
+                a.child.append(&b.child);
+            }
             _ => {}
         }
     }
@@ -821,7 +839,7 @@ impl Chunk {
 
 #[cfg(test)]
 mod tests {
-    use super::{Column, ColumnData, StrColumn, Validity};
+    use super::{Column, ColumnData, ListColumn, StrColumn, StructColumn, Validity};
     use crate::value::{DataType, Value};
 
     #[test]
@@ -917,6 +935,53 @@ mod tests {
         a.append(&Column::i64(vec![3, 4]));
         assert!(!a.has_nulls(), "all-valid append must stay None");
         assert_eq!(a.value_at(2), Value::I64(3));
+    }
+
+    #[test]
+    fn nested_append_concatenates_struct_and_list() {
+        // §32 s3: appending nested columns must concatenate child-wise (a buffering
+        // sort/group relies on it). A no-op here silently truncates to chunk 0.
+        // --- List: [[1,2],[3]] ++ [[4,5,6]] = [[1,2],[3],[4,5,6]] ---
+        let mk_list = |offsets: Vec<i32>, child: Vec<i64>| {
+            Column::new(
+                ColumnData::List(ListColumn {
+                    offsets,
+                    child: Box::new(Column::i64(child)),
+                }),
+                Validity::all_valid(),
+            )
+        };
+        let mut la = mk_list(vec![0, 2, 3], vec![1, 2, 3]);
+        la.append(&mk_list(vec![0, 3], vec![4, 5, 6]));
+        assert_eq!(la.len(), 3);
+        assert_eq!(
+            la.value_at(0),
+            Value::List(vec![Value::I64(1), Value::I64(2)])
+        );
+        assert_eq!(
+            la.value_at(2),
+            Value::List(vec![Value::I64(4), Value::I64(5), Value::I64(6)])
+        );
+
+        // --- Struct: {x} with [10] ++ [20,30] = [10,20,30] ---
+        let mk_struct = |xs: Vec<i64>| {
+            let len = xs.len();
+            Column::new(
+                ColumnData::Struct(StructColumn {
+                    names: vec!["x".into()],
+                    columns: vec![Column::i64(xs)],
+                    len,
+                }),
+                Validity::all_valid(),
+            )
+        };
+        let mut sa = mk_struct(vec![10]);
+        sa.append(&mk_struct(vec![20, 30]));
+        assert_eq!(sa.len(), 3);
+        assert_eq!(
+            sa.value_at(2),
+            Value::Struct(vec![("x".into(), Value::I64(30))])
+        );
     }
 
     #[test]
