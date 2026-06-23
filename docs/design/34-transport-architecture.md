@@ -51,6 +51,13 @@ transfer.done  frames=<n> bytes=<n>
 （§17.7 coordinator 集約・既存 `RuntimeSnapshot`/`--json` と同系）。CLI `--on` は
 イベントを stderr に出し（`[rivus @addr] …`）、結果（Data）は stdout に流す。
 
+**QUIC バックエンドも同一イベントを narrate（parity・landed）**：worker が同じ
+`flow.started`/`flow.completed`/`transfer.done` を `EVENT` フレームでストリームに流し、
+`quic_run_observed` / `QuicSession::run_observed`（CLI `--on quic://`）が結果から demux する
+（非観測クライアントは無視＝後方互換）。test `tests/quic.rs` case (d)。**設計（批准待ち）**：
+§34.1 のチャネルを QUIC の*専用ストリーム*へ 1:1 マップ（Telemetry を別 uni-stream に）——
+現状は同一 bidi ストリーム上で kind タグにより多重化（std のチャネルバイト多重化と等価）。
+
 ## 34.3 CPU 予算の明示管理（コア affinity ＝**プレ実装 landed**／細分・QUIC 適用は設計）
 
 OS 任せでなく **CPU 利用率自体を設計対象**にする。例：

@@ -6,7 +6,9 @@
 #![cfg(feature = "quic")]
 
 use rivus_runtime::distributed::Handler;
-use rivus_runtime::distributed_quic::{quic_run_remote, quic_worker, QuicConfig, QuicSession};
+use rivus_runtime::distributed_quic::{
+    quic_run_observed, quic_run_remote, quic_worker, QuicConfig, QuicSession,
+};
 use rivus_runtime::{run, RunOptions};
 use std::sync::Arc;
 use std::thread;
@@ -116,6 +118,42 @@ fn quic_protected_channel_round_trip_and_pinning() {
             "QUIC session job byte-identical"
         );
     }
+
+    // (d) event-centric observability (§34.2): the worker narrates structured
+    // telemetry events over the QUIC stream; an observing client demuxes them off
+    // the result. Parity with the std path's TELE/EVENT channel.
+    let worker4 = quic_worker("127.0.0.1:0", QuicConfig::default()).expect("bind4");
+    let addr4 = worker4.addr().to_string();
+    let h4 = handler();
+    thread::spawn(move || {
+        let _ = worker4.serve_once(h4);
+    });
+    let mut events = Vec::new();
+    let q = format!(
+        "R:\n open {}\n |? age >= 18\n |> name age\n;",
+        path.display()
+    );
+    let got = quic_run_observed(&addr4, &QuicConfig::default(), &q, |e| events.push(e))
+        .expect("observed run");
+    // The result is still byte-identical (events ride the same stream, demuxed).
+    assert_eq!(
+        got,
+        render_flow(&q).unwrap(),
+        "observed result byte-identical"
+    );
+    let joined = events.join("\n");
+    assert!(
+        joined.contains("flow.started"),
+        "expected flow.started in {events:?}"
+    );
+    assert!(
+        joined.contains("flow.completed"),
+        "expected flow.completed in {events:?}"
+    );
+    assert!(
+        joined.contains("transfer.done"),
+        "expected transfer.done in {events:?}"
+    );
 
     std::fs::remove_file(&path).ok();
 }

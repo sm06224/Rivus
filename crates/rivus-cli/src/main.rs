@@ -755,8 +755,10 @@ fn run_on_peer(peer: &str, ir_source: &str) -> ExitCode {
     if let Some(q) = peer.strip_prefix("quic://") {
         #[cfg(feature = "quic")]
         {
-            use rivus_runtime::distributed_quic::{quic_run_remote, QuicConfig};
-            return match quic_run_remote(q, &QuicConfig::from_env(), ir_source) {
+            use rivus_runtime::distributed_quic::{quic_run_observed, QuicConfig};
+            return match quic_run_observed(q, &QuicConfig::from_env(), ir_source, |ev| {
+                eprintln!("[rivus @quic://{q}] {ev}");
+            }) {
                 Ok(bytes) => {
                     let _ = std::io::stdout().write_all(&bytes);
                     ExitCode::SUCCESS

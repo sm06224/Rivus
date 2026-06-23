@@ -41,8 +41,13 @@ All notable changes to Rivus. Format loosely follows
   `flow.completed result_bytes=… ms=…` / `transfer.done frames=… bytes=…`)
   instead of the client packet-sniffing; `run_remote_observed` / `rivus run --on`
   surface them on stderr while the result flows on the data channel (clean
-  stdout). Staged next (design only): explicit CPU-budget/affinity (`cpubudget`)
-  and DPU/SmartNIC offload.
+  stdout). **The QUIC backend now has event parity** — its worker narrates the
+  same `flow.started` / `flow.completed` / `transfer.done` over the stream
+  (`EVENT` frames), demuxed by `quic_run_observed` / `QuicSession::run_observed`
+  (`rivus run --on quic://` surfaces them on stderr); a non-observing client
+  ignores them (backward-compatible). The §34.1 channel→**real-QUIC-stream** 1:1
+  mapping (a dedicated telemetry stream) stays design-gated. Staged next (design
+  only): the finer Telemetry/Control affinity split and DPU/SmartNIC offload.
 - **Host Transport Service over a Unix-domain socket — §34.4 slices 1+2
   (pre-implementation, `feature net`, unix-only).** A worker fronts a UDS that
   co-located Rivus processes use instead of each owning a network stack (the PMCN

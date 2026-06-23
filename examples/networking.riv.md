@@ -255,6 +255,13 @@ the cost to budget is the handshake, paid once.
 **Pinned by.** `tests/quic.rs::quic_protected_channel_round_trip_and_pinning`
 case (c); benched by `transport_bench::bench_quic_distributed_latency`.
 
+> **Event parity (§34.2).** The QUIC worker narrates the same telemetry events as
+> the std path (`flow.started` / `flow.completed` / `transfer.done`) as `EVENT`
+> frames on the stream; `quic_run_observed` / `QuicSession::run_observed` (and
+> `rivus run --on quic://`) demux them onto stderr while the result stays clean on
+> stdout. A non-observing client ignores them. Pinned by case (d) of the same
+> test. (Mapping each channel onto a *dedicated* QUIC stream is design-gated.)
+
 ```flow
 R:
     open examples/users.csv (name:str age:i64 country:str)

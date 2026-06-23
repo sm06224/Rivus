@@ -31,6 +31,14 @@ const CREDIT: u8 = 3;
 const CHUNK: u8 = 4;
 const END: u8 = 5;
 const ERR: u8 = 6;
+// §34.2 event-centric observability over QUIC: the worker narrates structured
+// telemetry events (`flow.started` / `flow.completed` / `transfer.done` …) as
+// `EVENT` frames, demuxed off the result by the observing client (parity with the
+// std path's TELE/EVENT channel). A non-observing client ignores them — they are
+// backward-compatible (the read loop already skips unknown kinds). The §34.1
+// channel→real-QUIC-stream mapping (a dedicated telemetry stream) stays
+// design-gated; here the event rides the same bidi stream, tagged by kind.
+const EVENT: u8 = 7;
 const FRAME: usize = 32 * 1024;
 
 /// QUIC capability/identity (the static-key allowlist lane, §28.12.4).
@@ -424,13 +432,38 @@ async fn serve_stream(
         Some((JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
         _ => return Err("expected JOB".to_string()),
     };
+    // §34.2: narrate the job on the telemetry (EVENT) lane — parity with the std
+    // worker. A non-observing client skips these; an observing one surfaces them.
+    let _ = write_frame(
+        &mut send,
+        EVENT,
+        format!("flow.started job_bytes={}", job.len()).as_bytes(),
+    )
+    .await;
+    let t0 = std::time::Instant::now();
     match handler(&job) {
-        Ok(bytes) => stream_with_credit(&mut send, &mut recv, &bytes)
-            .await
-            .map_err(|e| e.to_string())?,
-        Err(e) => write_frame(&mut send, ERR, e.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?,
+        Ok(bytes) => {
+            let _ = write_frame(
+                &mut send,
+                EVENT,
+                format!(
+                    "flow.completed result_bytes={} ms={}",
+                    bytes.len(),
+                    t0.elapsed().as_millis()
+                )
+                .as_bytes(),
+            )
+            .await;
+            stream_with_credit(&mut send, &mut recv, &bytes)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        Err(e) => {
+            let _ = write_frame(&mut send, EVENT, b"flow.failed").await;
+            write_frame(&mut send, ERR, e.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?
+        }
     }
     let _ = send.finish();
     Ok(())
@@ -443,6 +476,7 @@ async fn stream_with_credit(
 ) -> std::io::Result<()> {
     let mut credit: u64 = 0;
     let mut off = 0;
+    let mut frames = 0u64;
     while off < bytes.len() {
         while credit == 0 {
             match read_frame(recv).await? {
@@ -458,7 +492,14 @@ async fn stream_with_credit(
         write_frame(send, CHUNK, &bytes[off..end]).await?;
         off = end;
         credit -= 1;
+        frames += 1;
     }
+    let _ = write_frame(
+        send,
+        EVENT,
+        format!("transfer.done frames={frames} bytes={}", bytes.len()).as_bytes(),
+    )
+    .await;
     write_frame(send, END, &[]).await
 }
 
@@ -471,6 +512,20 @@ async fn stream_with_credit(
 pub fn quic_run_remote(peer: &str, cfg: &QuicConfig, ir_source: &str) -> Result<Vec<u8>, String> {
     let session = QuicSession::connect(peer, cfg)?;
     session.run(ir_source)
+}
+
+/// Like [`quic_run_remote`], but `on_event` receives each structured **telemetry**
+/// event the worker narrates (`flow.started` / `flow.completed` / `transfer.done`
+/// …) — §34.2 event-centric observability over QUIC, demuxed off the result while
+/// the same stream carries the chunks (parity with `run_remote_observed`).
+pub fn quic_run_observed(
+    peer: &str,
+    cfg: &QuicConfig,
+    ir_source: &str,
+    on_event: impl FnMut(String),
+) -> Result<Vec<u8>, String> {
+    let session = QuicSession::connect(peer, cfg)?;
+    session.run_observed(ir_source, on_event)
 }
 
 /// A **persistent QUIC session** (§34.4 s2' / §28.12.5-3): one connection — and
@@ -535,11 +590,22 @@ impl QuicSession {
 
     /// Run one job over a fresh bidi stream on the reused connection.
     pub fn run(&self, ir_source: &str) -> Result<Vec<u8>, String> {
+        self.run_observed(ir_source, |_| {})
+    }
+
+    /// Like [`QuicSession::run`], but surfaces the worker's telemetry events
+    /// (§34.2) to `on_event` while collecting the result on the same stream.
+    pub fn run_observed(
+        &self,
+        ir_source: &str,
+        on_event: impl FnMut(String),
+    ) -> Result<Vec<u8>, String> {
         self.rt.block_on(client_stream(
             &self.conn,
             &self.identity.fingerprint,
             ir_source,
             self.window,
+            on_event,
         ))
     }
 }
@@ -551,6 +617,7 @@ async fn client_stream(
     id_fp: &str,
     ir_source: &str,
     window: u32,
+    mut on_event: impl FnMut(String),
 ) -> Result<Vec<u8>, String> {
     let (mut send, mut recv) = conn
         .open_bi()
@@ -583,6 +650,7 @@ async fn client_stream(
                 return Ok(out);
             }
             Some((ERR, p)) => return Err(String::from_utf8_lossy(&p).into_owned()),
+            Some((EVENT, p)) => on_event(String::from_utf8_lossy(&p).into_owned()),
             Some(_) => {}
             None => return Err("closed before END".to_string()),
         }
