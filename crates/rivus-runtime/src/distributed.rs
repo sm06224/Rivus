@@ -636,6 +636,14 @@ pub fn serve_uds(
     on_event(format!(
         "transport service on uds://{path} as identity '{identity}'"
     ));
+    // §34.3 (#174): the host Transport Service is *the* process whose comms CPU you
+    // budget (it owns the consolidated crypto/I/O for the co-located Rivus) — pin
+    // it to the Transport core set, off the data-plane cores. No-op unless built
+    // with `cpubudget` on Linux and `RIVUS_NET_TRANSPORT_CORES` is set.
+    let pin = crate::cpu_budget::pin_current_thread(crate::cpu_budget::Role::Transport);
+    if !matches!(pin, crate::cpu_budget::PinOutcome::NoBudget) {
+        on_event(format!("transport cpu budget: {pin}"));
+    }
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
