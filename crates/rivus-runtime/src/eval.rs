@@ -1451,6 +1451,31 @@ fn eval_subview(
     Value::Str(cell[byte_at(s)..byte_at(e)].to_string())
 }
 
+/// Resolve key `PathExpr`s (group / sort / distinct / join, §32 s4b) to column
+/// indices for `chunk`, **appending** a derived column for each *nested* key. A
+/// bare key keeps its existing physical-column index (the byte-identical fast
+/// path); a nested key is materialized once via [`eval_column`] and its
+/// structural-miss failures (§32.8③) accumulate in `fails`. Returns one entry
+/// per key: `Some(index)`, or `None` for an unknown *bare* key (the caller
+/// decides warn / skip). A nested key is always `Some` (a missing root yields a
+/// null column, surfaced via `fails`).
+pub(crate) fn resolve_key_indices(
+    chunk: &mut Chunk,
+    keys: &[PathExpr],
+    fails: &mut u64,
+) -> Vec<Option<usize>> {
+    keys.iter()
+        .map(|k| match k.as_bare() {
+            Some(name) => chunk.schema.index_of(name),
+            None => {
+                let kc = eval_column(&Expr::Path(k.clone()), chunk, fails);
+                chunk.columns.push(kc);
+                Some(chunk.columns.len() - 1)
+            }
+        })
+        .collect()
+}
+
 /// Resolve a nested path `user.age` / `tags[0]` (§32 s4) at `row`. Walks the
 /// `ColumnData::{Struct,List}` lanes from the root column, honoring each level's
 /// validity (§26): a null cell at any level is a null result (not a failure). A

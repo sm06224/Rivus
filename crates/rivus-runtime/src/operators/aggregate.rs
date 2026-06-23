@@ -490,19 +490,23 @@ pub(crate) struct GroupState {
 }
 
 pub(crate) struct GroupBy {
-    keys: Vec<String>,
+    keys: Vec<PathExpr>,
     aggs: Vec<(AggFunc, String)>,
     groups: BTreeMap<String, GroupState>,
     emitted: bool,
+    /// Nested key-path structural misses (§32.8③), accumulated across chunks and
+    /// surfaced once on finish (never-silent, not per-chunk spam).
+    key_fails: u64,
 }
 
 impl GroupBy {
-    pub(crate) fn new(keys: Vec<String>, aggs: Vec<(AggFunc, String)>) -> Self {
+    pub(crate) fn new(keys: Vec<PathExpr>, aggs: Vec<(AggFunc, String)>) -> Self {
         GroupBy {
             keys,
             aggs,
             groups: BTreeMap::new(),
             emitted: false,
+            key_fails: 0,
         }
     }
 
@@ -513,6 +517,9 @@ impl GroupBy {
     /// counts and per-aggregate accumulators via [`AggAcc::merge`]. `other` must
     /// have the same keys and aggregates and follow `self` in source order.
     pub(crate) fn merge_from(&mut self, other: GroupBy) {
+        // Nested key-path misses (§32.8③) sum across merged partitions, like the
+        // per-group counts, so the finish-time surface is the true total.
+        self.key_fails += other.key_fails;
         for (key, ostate) in other.groups {
             match self.groups.get_mut(&key) {
                 Some(s) => {
@@ -566,31 +573,33 @@ pub(crate) fn group_parallel_safe(
 /// other op.
 pub(crate) fn new_group(op: &Op) -> Option<GroupBy> {
     match op {
-        // §32 s2: `PathExpr` keys resolve by flat column name in the runtime
-        // (bare = the plain name; nested misses a flat column until s3/s4).
-        Op::GroupBy { keys, aggs } => Some(GroupBy::new(
-            keys.iter().map(|k| k.column_name()).collect(),
-            aggs.clone(),
-        )),
+        // §32 s4b: `PathExpr` keys — a bare key resolves on the flat fast path, a
+        // nested key is materialized at resolution time (`resolve_key_indices`).
+        Op::GroupBy { keys, aggs } => Some(GroupBy::new(keys.clone(), aggs.clone())),
         _ => None,
     }
 }
 
 impl Operator for GroupBy {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
-        // Resolve every group-key column index; an unknown key warns once and
-        // drops the chunk (continue-first — a later, well-formed chunk still
-        // aggregates).
+        // Resolve every group-key column index (§32 s4b): a bare key on the flat
+        // fast path, a nested key materialized into a derived column appended to
+        // the chunk. An unknown *bare* key warns once and drops the chunk
+        // (continue-first — a later, well-formed chunk still aggregates).
+        let mut chunk = chunk;
+        let mut nested_fails = 0u64;
+        let resolved = eval::resolve_key_indices(&mut chunk, &self.keys, &mut nested_fails);
+        self.key_fails += nested_fails;
         let mut key_idx = Vec::with_capacity(self.keys.len());
-        for k in &self.keys {
-            match chunk.schema.index_of(k) {
-                Some(i) => key_idx.push(i),
+        for (k, idx) in self.keys.iter().zip(&resolved) {
+            match idx {
+                Some(i) => key_idx.push(*i),
                 None => {
                     ctx.raise(
                         ErrorEvent::new(
                             Severity::Warn,
                             ErrorScope::Chunk,
-                            format!("group: unknown key '{k}'"),
+                            format!("group: unknown key '{}'", k.column_name()),
                         )
                         .at_node(ctx.label.clone()),
                     );
@@ -648,13 +657,14 @@ impl Operator for GroupBy {
             return Vec::new();
         }
         self.emitted = true;
+        super::surface_key_path_fails(self.key_fails, "group", ctx);
 
         // One Str column per group key (values pulled from each group's stored
         // key parts), then the count, then the aggregate columns.
         let mut fields: Vec<Field> = self
             .keys
             .iter()
-            .map(|k| Field::new(k.clone(), DataType::Str))
+            .map(|k| Field::new(k.column_name(), DataType::Str))
             .collect();
         fields.push(Field::new("count", DataType::I64));
 

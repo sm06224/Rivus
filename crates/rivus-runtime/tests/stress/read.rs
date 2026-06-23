@@ -32,6 +32,41 @@ fn mk(files: &[(&str, &str)]) -> (TempTree, String) {
 }
 
 #[test]
+fn sort_and_distinct_by_nested_key_resolve_the_path() {
+    // §32 s4b: `sort` / `distinct` keys resolve a nested path to the underlying
+    // value (numeric `user.age`), not the bare struct's text form. Sort orders
+    // numerically; distinct folds equal nested-key values.
+    let (_t, base) = mk(&[(
+        "d.jsonl",
+        "{\"user\":{\"age\":30},\"id\":1}\n\
+         {\"user\":{\"age\":15},\"id\":2}\n\
+         {\"user\":{\"age\":40},\"id\":3}\n\
+         {\"user\":{\"age\":15},\"id\":4}\n",
+    )]);
+    // Sort by the nested key ascending: ages 15,15,30,40 → ids 2,4,1,3 (ties keep
+    // source order).
+    let sorted = run_src(
+        &format!("S:\n open {base}/d.jsonl\n sort user.age\n |> id\n;"),
+        2,
+    );
+    assert_eq!(
+        collect_strings(&sorted, "S", "id"),
+        vec!["2", "4", "1", "3"],
+        "sort must resolve the nested key numerically"
+    );
+    // Distinct by the nested key: keep the first row per distinct age (30,15,40).
+    let distinct = run_src(
+        &format!("D:\n open {base}/d.jsonl\n distinct user.age\n |> id\n;"),
+        2,
+    );
+    assert_eq!(
+        collect_strings(&distinct, "D", "id"),
+        vec!["1", "2", "3"],
+        "distinct must fold equal nested-key values"
+    );
+}
+
+#[test]
 fn nested_path_resolves_with_null_propagation_and_counted_misses() {
     // §32 s4 invalid-path policy (§32.8③): a nested path resolves struct fields
     // (`user.age`) and list indices (`tags[0]`) against the typed nested lanes,
