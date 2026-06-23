@@ -547,7 +547,6 @@ impl DateTime {
         Some(DateTime::new(q * dur_ticks, self.unit))
     }
 
-
     /// Parse `s` with a `strptime`-style `fmt` (tokens `yyyy`/`yy`/`MM`/`dd`/
     /// `ddd`/`HH` or `hh`/`mm`/`ss`/`n…n`; any other char is a literal that must
     /// match) into a `DateTime` at `unit`. A leading `[ja-jp]`/`[en-us]` tag

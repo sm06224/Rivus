@@ -616,12 +616,14 @@ fn test_bucket_tumbling_window_evaluation() {
     let p = f.0.display();
 
     // Evaluate bucket(ts, "15m":duration) and bucket(ts, "1h")
-    let flow = format!("
+    let flow = format!(
+        "
         D:
           open {p}
           |> ts (bucket(ts, \"15m\":duration)) as b15m (bucket(ts, \"1h\")) as b1h
         ;
-    ");
+    "
+    );
 
     let res = run_src(&flow, 1024);
     assert!(res.errors.is_empty());
@@ -652,4 +654,3 @@ fn test_bucket_tumbling_window_evaluation() {
         ]
     );
 }
-
