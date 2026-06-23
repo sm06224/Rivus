@@ -59,6 +59,12 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # SHA-256 for the static-key identity / peer pin (already in the `quic` tree via
 # rustls-ring; used directly for the cert-DER fingerprint).
 ring = { version = "0.17", optional = true }
+# Off-by-default (§34.3 / #174): transport CPU-budget core affinity. Only the
+# `sched_setaffinity` syscall path needs libc, only on Linux, only under
+# `cpubudget`. `libc` is the canonical, rust-lang-maintained, ubiquitous FFI
+# crate (already in the tree transitively via tokio); pinned minor, MIT/Apache.
+# The default / `net` builds never compile or link it. See SUPPLY-CHAIN.md.
+libc = { version = "0.2", optional = true }
 
 [features]
 default = []
@@ -79,6 +85,12 @@ net = []
 # deps (tokio/quinn/rustls/ring) — off by default; the lean and `net` builds stay
 # free of it. Distribution (`full`) opts in.
 quic = ["net", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio", "dep:ring"]
+# §34.3 (#174): pin the transport/crypto threads to a bounded core set so they
+# don't steal SIMD cycles from the data plane. Linux-only syscall path (libc);
+# a no-op `Unsupported` elsewhere. The `cpu_budget` API is always compiled (so
+# callers stay cfg-free); only the syscall needs this feature. Implies `net`
+# (it budgets the distributed transport).
+cpubudget = ["net", "dep:libc"]
 
 [dev-dependencies]
 rivus-parser.workspace = true

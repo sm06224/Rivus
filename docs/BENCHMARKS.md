@@ -1429,3 +1429,18 @@ amortised.
   stream multiplexing is exactly the right primitive for "many jobs, one secured
   connection" (no head-of-line blocking between concurrent jobs, unlike a single
   TCP byte-stream).
+- **CPU-budget core affinity protects the data plane (§34.3, feature `cpubudget`,
+  #174).** This is the §34.0 thesis made measurable. On a 4-core box, run the SIMD
+  *data lane* (a CPU-bound integer reduction, one worker per data core) for a fixed
+  1.5 s wall **while transport-crypto noise contends for the cores**, and count the
+  data work units completed: **unpinned 332–339 vs pinned 553–559 → 1.6–1.7× more
+  data-plane throughput** when the transport is *confined to core 0* (`sched_set‐
+  affinity`) and the data lane is pinned to cores 1–3. Letting the OS freely
+  co-schedule crypto onto the data cores costs ~40 % of the data plane. The lesson
+  for a distributed node: **budget the transport's CPU placement, don't chase wire
+  speed** — the wire was already < 1 % (689 ms job, ~7 ms transfer). The knob is
+  `RIVUS_NET_TRANSPORT_CORES=0[,1…]`; affinity is placement, not data — the byte-
+  identity test `cpu_budget::tests::affinity_does_not_change_output` pins it.
+  (Linux-only syscall path behind `cpubudget`; a no-op `Unsupported` elsewhere.
+  The finer Telemetry/Control core split and pinning the QUIC tokio worker threads
+  are design-gated, §34.3.)

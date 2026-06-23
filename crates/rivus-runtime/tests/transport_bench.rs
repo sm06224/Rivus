@@ -271,3 +271,99 @@ fn bench_quic_distributed_latency() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+#[cfg(feature = "cpubudget")]
+#[test]
+#[ignore = "benchmark — run with --features cpubudget --ignored --nocapture"]
+fn bench_cpubudget_affinity_protects_data_plane() {
+    // §34.3 (#174) acceptance: SIMD data-plane throughput **while a transfer runs**,
+    // on a shared core vs a pinned core. The wire is < 1 % of a distributed job
+    // (#173); the contention is *crypto CPU*. So we model the transport as a busy
+    // CPU loop (its crypto cost) and measure how many data-plane work units the
+    // SIMD lane completes in a fixed wall — once with the OS free to co-schedule
+    // transport onto the data cores (unpinned), once with transport confined to
+    // core 0 and the data lane pinned to the rest (the §34.3 budget).
+    use rivus_runtime::cpu_budget::pin_current_thread_to;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    if ncpu < 2 {
+        eprintln!("[bench] cpubudget: needs >= 2 cores (have {ncpu}); skipping");
+        return;
+    }
+    let data_cores: Vec<usize> = (1..ncpu).collect(); // core 0 reserved for transport
+
+    // A CPU-bound integer reduction — a stand-in for the SIMD data plane. Integer
+    // (associative → byte-identical), and the xor-feedback defeats const-folding.
+    fn data_work() -> u64 {
+        let mut acc = 0u64;
+        for i in 0..1_500_000u64 {
+            acc = acc.wrapping_add(i ^ (acc >> 1));
+        }
+        acc
+    }
+    // Busy CPU loop modelling transport crypto contending for cores.
+    fn crypto_noise(stop: &AtomicBool) {
+        let mut x = 1u64;
+        while !stop.load(Ordering::Relaxed) {
+            for i in 0..1_000_000u64 {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(i);
+            }
+            std::hint::black_box(x);
+        }
+    }
+
+    let run_phase = |pinned: bool| -> u64 {
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicU64::new(0));
+        // One transport-noise thread per data core (enough to oversubscribe).
+        let mut noise = Vec::new();
+        for _ in &data_cores {
+            let stop2 = stop.clone();
+            noise.push(thread::spawn(move || {
+                if pinned {
+                    let _ = pin_current_thread_to(&[0]);
+                }
+                crypto_noise(&stop2);
+            }));
+        }
+        // The data lane: one worker per data core, pinned there in the budget case.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut workers = Vec::new();
+        for &core in &data_cores {
+            let done2 = done.clone();
+            workers.push(thread::spawn(move || {
+                if pinned {
+                    let _ = pin_current_thread_to(&[core]);
+                }
+                let mut n = 0u64;
+                while Instant::now() < deadline {
+                    std::hint::black_box(data_work());
+                    n += 1;
+                }
+                done2.fetch_add(n, Ordering::Relaxed);
+            }));
+        }
+        for w in workers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for nth in noise {
+            nth.join().unwrap();
+        }
+        done.load(Ordering::Relaxed)
+    };
+
+    let unpinned = run_phase(false) as f64;
+    let pinned = run_phase(true) as f64;
+    println!(
+        "[bench] cpubudget affinity ({ncpu} cores, transport→core0, data→cores {data_cores:?}): \
+         data-plane work units in 1.5 s under transport-crypto contention — \
+         unpinned {unpinned:.0} vs pinned {pinned:.0} ({:.2}× data throughput when \
+         transport is confined off the data cores)",
+        pinned / unpinned
+    );
+}

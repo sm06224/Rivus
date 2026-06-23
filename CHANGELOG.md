@@ -76,7 +76,24 @@ All notable changes to Rivus. Format loosely follows
     1.815 ms/job, 20 jobs), confirming #176's hypothesis that reuse collapses
     QUIC's handshake-dominated per-call cost toward the std figure. Tested
     (`tests/quic.rs` case (c)) and benched (`bench_quic_distributed_latency`).
-  Remaining (routing, core pinning, session pooling/aggregation) stay design-gated.
+  Remaining (routing, session pooling/aggregation) stay design-gated.
+- **Transport CPU-budget core affinity — §34.3 (pre-implementation, feature
+  `cpubudget`, Linux-first).** The §34.0 thesis made operable: pin the transport/
+  crypto+I/O threads to a bounded core set (`RIVUS_NET_TRANSPORT_CORES=0[,1…]`,
+  ranges like `0,1,4-6`) so they cannot steal SIMD cycles from the data plane.
+  New `cpu_budget` module: `Role{Transport,Telemetry,Control}`, `CpuBudget::
+  from_env`, `pin_current_thread[_to]` returning a narratable `PinOutcome`
+  (best-effort — a failed pin degrades to "scheduler decides", never fatal). The
+  **API is always compiled** (a no-op `Unsupported` off-Linux / without the
+  feature, so callers stay `cfg`-free); only the `sched_setaffinity` syscall path
+  is feature-gated behind a feature-gated `libc` (the default / `net` builds stay
+  dep-free). The std worker's accept loop pins to the `Transport` set. **Measured:
+  1.6–1.7× more data-plane throughput** under transport-crypto contention on a
+  4-core box when the transport is confined off the data cores (`bench_cpubudget_
+  affinity_protects_data_plane`). **Byte-identity preserved** — affinity is
+  placement, not data (§0.14); pinned by `cpu_budget::tests::affinity_does_not_
+  change_output`. The finer Telemetry/Control split, fractional (cgroup) budgets,
+  and pinning the QUIC tokio worker threads stay design-gated (§34.3).
 - **Networking transport (design §33, feature `net`, std-only / zero new deps).**
   Two client-side network transports behind the off-by-default `net` feature —
   the default build stays zero-dependency, parsing / `rivus explain` are always

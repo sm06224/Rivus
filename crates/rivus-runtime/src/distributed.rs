@@ -231,6 +231,14 @@ pub fn serve(
         cfg.identity,
         describe_allowlist(cfg)
     ));
+    // §34.3 (#174): pin this transport/crypto+I/O thread to the budgeted core set
+    // (env `RIVUS_NET_TRANSPORT_CORES`), keeping it off the SIMD data-plane cores.
+    // No-op unless built with `cpubudget` on Linux and the env is set; narrated on
+    // the telemetry channel. Affinity is placement, never data (byte-identical).
+    let pin = crate::cpu_budget::pin_current_thread(crate::cpu_budget::Role::Transport);
+    if !matches!(pin, crate::cpu_budget::PinOutcome::NoBudget) {
+        on_event(format!("transport cpu budget: {pin}"));
+    }
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
