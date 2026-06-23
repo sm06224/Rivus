@@ -340,15 +340,16 @@ impl RouteWriter {
             return Ok(&mut self.pool.get_mut(path).unwrap().w);
         }
         let first_open = !self.meta.get(path).is_some_and(|m| m.header_done);
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        let adjusted_path = crate::transport::adjust_path(path);
+        if let Some(parent) = adjusted_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
         let file = if first_open {
-            File::create(path)?
+            File::create(&adjusted_path)?
         } else {
-            OpenOptions::new().append(true).open(path)?
+            OpenOptions::new().append(true).open(&adjusted_path)?
         };
         let mut w = BufWriter::with_capacity(64 * 1024, file);
         if first_open {
@@ -433,7 +434,8 @@ pub fn write_routed(
 ) -> Vec<(String, std::io::Error)> {
     let mut failures = Vec::new();
     for (path, parts) in group_by_path(chunks, template, by, flat, codec, exprs, fails) {
-        let res = std::path::Path::new(&path)
+        let adjusted = crate::transport::adjust_path(&path);
+        let res = adjusted
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| match codec {

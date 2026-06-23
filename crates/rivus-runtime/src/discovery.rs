@@ -23,14 +23,52 @@ use std::path::Path;
 /// within a path segment, `?` one char, `[…]` a char class (`[a-z]`, `[!…]`
 /// negation), and `**` matches zero or more whole path segments (recursion).
 pub(crate) fn glob_paths(pattern: &str, name_prefilter: &[String]) -> Vec<String> {
-    let segs: Vec<&str> = pattern.split('/').collect();
-    let mut out = Vec::new();
-    if pattern.starts_with('/') {
-        // Absolute: the leading split element is "" — start at the fs root.
-        walk(Path::new("/"), "/", &segs[1..], name_prefilter, &mut out);
-    } else {
-        walk(Path::new("."), "", &segs, name_prefilter, &mut out);
+    use std::path::{Component, Path, PathBuf};
+
+    let path_pat = Path::new(pattern);
+    let mut root = PathBuf::new();
+    let mut segs = Vec::new();
+    let mut is_absolute = false;
+
+    for comp in path_pat.components() {
+        match comp {
+            Component::Prefix(p) => {
+                root.push(p.as_os_str());
+                is_absolute = true;
+            }
+            Component::RootDir => {
+                root.push(comp.as_os_str());
+                is_absolute = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Normal(_) => {
+                segs.push(comp.as_os_str().to_string_lossy().into_owned());
+            }
+        }
     }
+
+    let mut out = Vec::new();
+    let root_path = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        &root
+    };
+
+    let uri_prefix = if is_absolute {
+        let mut u = root.to_string_lossy().replace('\\', "/");
+        if !u.ends_with('/') {
+            u.push('/');
+        }
+        u
+    } else {
+        "".to_string()
+    };
+
+    let seg_refs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
+    let root_path_adjusted = crate::transport::adjust_path_buf(root_path);
+
+    walk(&root_path_adjusted, &uri_prefix, &seg_refs, name_prefilter, &mut out);
+
     out.sort();
     out.dedup();
     out

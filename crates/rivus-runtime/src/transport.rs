@@ -86,7 +86,8 @@ impl FileTransport {
     /// keeping the exact text the error stream surfaces. Callers that stream a
     /// byte range `seek` the returned reader to their range start.
     pub(crate) fn open(path: &str) -> std::io::Result<BufReader<File>> {
-        Ok(BufReader::with_capacity(READ_BUF, File::open(path)?))
+        let p = adjust_path(path);
+        Ok(BufReader::with_capacity(READ_BUF, File::open(p)?))
     }
 }
 
@@ -102,7 +103,8 @@ pub(crate) fn read_whole(path: &str) -> std::io::Result<String> {
         std::io::stdin().read_to_string(&mut s)?;
         Ok(s)
     } else {
-        std::fs::read_to_string(path)
+        let p = adjust_path(path);
+        std::fs::read_to_string(p)
     }
 }
 
@@ -114,7 +116,8 @@ pub(crate) fn read_whole(path: &str) -> std::io::Result<String> {
 /// byte-range-parallel hot path). Moved here unchanged from `csv::open_decoder`.
 #[cfg(any(feature = "gzip", feature = "zstd"))]
 pub(crate) fn open_compressed(path: &str) -> Result<Box<dyn std::io::BufRead + Send>, String> {
-    let f = File::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let p = adjust_path(path);
+    let f = File::open(&p).map_err(|e| format!("cannot open '{path}': {e}"))?;
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".gz") {
         #[cfg(feature = "gzip")]
@@ -143,3 +146,85 @@ pub(crate) fn open_compressed(path: &str) -> Result<Box<dyn std::io::BufRead + S
     }
     Err(format!("'{path}' has no supported compression extension"))
 }
+
+/// Adjust a path string for Windows extended-length path compatibility (e.g. `\\?\` prefix).
+/// On other platforms, it is a no-op that returns the path unmodified.
+#[cfg(windows)]
+pub(crate) fn adjust_path(path: &str) -> std::path::PathBuf {
+    adjust_path_buf(std::path::Path::new(path))
+}
+
+/// Adjust a Path reference for Windows extended-length path compatibility (e.g. `\\?\` prefix).
+/// On other platforms, it is a no-op that returns the path unmodified.
+#[cfg(windows)]
+pub(crate) fn adjust_path_buf(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Path, PathBuf, Component};
+
+    let path_str = path.to_string_lossy();
+    if path_str == "-" {
+        return PathBuf::from("-");
+    }
+
+    // Convert `/` to `\`.
+    let path_normalized = path_str.replace('/', "\\");
+    if path_normalized.starts_with(r"\\?\") {
+        return PathBuf::from(path_normalized);
+    }
+
+    let p = Path::new(&path_normalized);
+    let abs_path = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        if let Ok(mut cwd) = std::env::current_dir() {
+            cwd.push(p);
+            cwd
+        } else {
+            p.to_path_buf()
+        }
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in abs_path.components() {
+        match component {
+            Component::Prefix(..) | Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(c) => {
+                normalized.push(c);
+            }
+        }
+    }
+
+    let norm_str = normalized.to_string_lossy();
+    if norm_str.starts_with(r"\\?\") {
+        normalized
+    } else if norm_str.starts_with(r"\\") {
+        let stripped = &norm_str[2..];
+        let mut verbatim = PathBuf::from(r"\\?\UNC\");
+        verbatim.push(stripped);
+        verbatim
+    } else {
+        let mut verbatim = PathBuf::from(r"\\?\");
+        verbatim.push(normalized);
+        verbatim
+    }
+}
+
+/// Adjust a path string for Windows extended-length path compatibility (e.g. `\\?\` prefix).
+/// On other platforms, it is a no-op that returns the path unmodified.
+#[cfg(not(windows))]
+pub(crate) fn adjust_path(path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(path)
+}
+
+/// Adjust a Path reference for Windows extended-length path compatibility (e.g. `\\?\` prefix).
+/// On other platforms, it is a no-op that returns the path unmodified.
+#[cfg(not(windows))]
+pub(crate) fn adjust_path_buf(path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+

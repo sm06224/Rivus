@@ -840,12 +840,14 @@ fn concat_parts(final_path: &str, parts: &[String], jsonl: bool) -> std::io::Res
     let sink: Box<dyn Write> = if final_path == "-" {
         Box::new(std::io::stdout())
     } else {
-        Box::new(std::fs::File::create(final_path)?)
+        let p = crate::transport::adjust_path(final_path);
+        Box::new(std::fs::File::create(p)?)
     };
     let mut out = std::io::BufWriter::new(sink);
     let mut header_done = jsonl;
     for part in parts {
-        let f = match std::fs::File::open(part) {
+        let p = crate::transport::adjust_path(part);
+        let f = match std::fs::File::open(p) {
             Ok(f) => f,
             Err(_) => continue,
         };
@@ -865,7 +867,8 @@ fn concat_parts(final_path: &str, parts: &[String], jsonl: bool) -> std::io::Res
     }
     out.flush()?;
     for p in parts {
-        let _ = std::fs::remove_file(p);
+        let adjusted = crate::transport::adjust_path(p);
+        let _ = std::fs::remove_file(adjusted);
     }
     Ok(())
 }
