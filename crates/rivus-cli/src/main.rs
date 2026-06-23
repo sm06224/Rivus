@@ -603,6 +603,7 @@ fn run_serve(args: &[String]) -> ExitCode {
     let mut bind = "127.0.0.1:9001".to_string();
     let mut quic = false;
     let mut uds: Option<String> = None;
+    let mut upstream: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -631,6 +632,18 @@ fn run_serve(args: &[String]) -> ExitCode {
                     }
                 }
             }
+            // §34.4 s2: forwarding gateway — relay each job to this upstream peer
+            // (PMCN consolidation: co-located Rivus share one network egress).
+            "--upstream" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => upstream = Some(a.clone()),
+                    None => {
+                        eprintln!("error: --upstream requires a peer (rivus://host:port)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             other => {
                 eprintln!("error: serve: unknown argument '{other}'");
                 return ExitCode::from(2);
@@ -638,14 +651,21 @@ fn run_serve(args: &[String]) -> ExitCode {
         }
         i += 1;
     }
-    // The worker handler: the IR is the deployment artifact — parse, optimize,
-    // run, render the outputs to bytes (the same bytes a local run produces).
-    let handler: Handler = std::sync::Arc::new(|src: &str| {
-        let graph = rivus_parser::parse(src).map_err(|e| format!("parse: {e:?}"))?;
-        let (graph, _report) = rivus_optimizer::optimize(graph);
-        let res = run(&graph, RunOptions::default()).map_err(|e| format!("run: {e:?}"))?;
-        Ok(viz::render_outputs(&res.outputs).into_bytes())
-    });
+    // The worker handler: either execute the IR locally (parse → optimize → run →
+    // render), or — with `--upstream` — **forward** it to a remote worker (the
+    // host Transport Service gateway, §34.4 s2). The IR is the artifact either way.
+    let handler: Handler = match &upstream {
+        Some(up) => {
+            let addr = up.strip_prefix("rivus://").unwrap_or(up).to_string();
+            distributed::forwarding_handler(addr, LinkConfig::from_env())
+        }
+        None => std::sync::Arc::new(|src: &str| {
+            let graph = rivus_parser::parse(src).map_err(|e| format!("parse: {e:?}"))?;
+            let (graph, _report) = rivus_optimizer::optimize(graph);
+            let res = run(&graph, RunOptions::default()).map_err(|e| format!("run: {e:?}"))?;
+            Ok(viz::render_outputs(&res.outputs).into_bytes())
+        }),
+    };
     #[cfg(unix)]
     if let Some(path) = uds {
         let cfg = LinkConfig::from_env();

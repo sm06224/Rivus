@@ -416,6 +416,17 @@ fn credit_value(p: &[u8]) -> u64 {
 
 // --------------------------------------------------------------- client side
 
+/// A worker [`Handler`] that **forwards** each job to an upstream peer over the
+/// std (kernel-WireGuard-bound) channel and returns its result bytes — the
+/// **forwarding gateway** at the heart of the host Transport Service (§34.4 s2,
+/// PMCN consolidation): co-located Rivus processes reach a remote worker through
+/// one local service that owns the network egress, instead of each opening its
+/// own connection. Pair it with [`serve_uds`] (`rivus serve --uds … --upstream
+/// rivus://host:port`). The IR stays the artifact; the gateway only relays bytes.
+pub fn forwarding_handler(upstream: String, cfg: LinkConfig) -> Handler {
+    Arc::new(move |ir_source: &str| run_remote(&upstream, &cfg, ir_source))
+}
+
 /// Ship `ir_source` to `peer` ("host:port") over the protected channel and
 /// collect the rendered result bytes (credit-refilled bounded pull). The peer
 /// must be loopback or allowlisted; `iface` (if set) binds the outgoing socket to

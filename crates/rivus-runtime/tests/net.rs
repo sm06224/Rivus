@@ -406,6 +406,53 @@ fn distributed_uds_transport_service_round_trips() {
     assert!(joined.contains("flow.completed"), "events: {joined}");
 }
 
+#[cfg(unix)]
+#[test]
+fn distributed_uds_forwarding_gateway() {
+    // §34.4 s2 pre-implementation: a UDS Transport Service that *forwards* each
+    // job to an upstream TCP worker (PMCN consolidation — co-located Rivus reach
+    // the remote worker through one local service that owns the network egress).
+    // Topology: UDS client → UDS service (forwarding_handler) → TCP worker → back.
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_gw_{}.csv", std::process::id()));
+    std::fs::write(&csv, "name,age\nalice,30\nbob,17\ncarol,42\n").unwrap();
+    let src = format!(
+        "Adults:\n open {}\n |? age >= 18\n |> name age\n;",
+        csv.display()
+    );
+
+    // (1) Upstream TCP worker that actually executes the flow.
+    let (tcp_addr, listener) = distributed::bind_ephemeral().unwrap();
+    let exec = handler();
+    let cfg_w = LinkConfig::default();
+    let worker = thread::spawn(move || distributed::serve_on(&listener, &cfg_w, exec));
+
+    // (2) Local UDS Transport Service that forwards to the TCP worker.
+    let sock = dir.join(format!("rivus_gw_{}.sock", std::process::id()));
+    let sock_s = sock.to_string_lossy().into_owned();
+    let fwd = distributed::forwarding_handler(tcp_addr.clone(), LinkConfig::default());
+    let sock_w = sock_s.clone();
+    let gw = thread::spawn(move || distributed::serve_uds_once(&sock_w, "gw", fwd));
+    for _ in 0..200 {
+        if sock.exists() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // (3) Co-located Rivus reaches the worker via the local UDS service.
+    let got =
+        distributed::run_remote_uds(&sock_s, "client", &src, 64, |_| {}).expect("gateway run");
+    let _ = gw.join();
+    let _ = worker.join();
+
+    let expected = render_flow(&src).unwrap();
+    std::fs::remove_file(&csv).ok();
+    std::fs::remove_file(&sock).ok();
+    assert_eq!(got, expected, "gateway relay is byte-identical to local");
+    assert!(String::from_utf8_lossy(&got).contains("alice,30"));
+}
+
 #[test]
 fn distributed_worker_error_propagates() {
     let (addr, listener) = distributed::bind_ephemeral().unwrap();

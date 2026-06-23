@@ -43,18 +43,24 @@ All notable changes to Rivus. Format loosely follows
   surface them on stderr while the result flows on the data channel (clean
   stdout). Staged next (design only): explicit CPU-budget/affinity (`cpubudget`)
   and DPU/SmartNIC offload.
-- **Host Transport Service over a Unix-domain socket — §34.4 slice 1
+- **Host Transport Service over a Unix-domain socket — §34.4 slices 1+2
   (pre-implementation, `feature net`, unix-only).** A worker fronts a UDS that
   co-located Rivus processes use instead of each owning a network stack (the PMCN
-  "consolidate comms responsibility" idea). `rivus serve --uds PATH` / `rivus run
-  --on uds://PATH`; `distributed::{serve_uds, run_remote_uds}`. The worker/client
-  protocol cores were extracted **transport-agnostic** (`serve_protocol` /
-  `client_protocol`), so the **same channel-tagged frames** (Control/Data/
-  Telemetry + credit + `flow.*` events) run over UDS and yield a byte-identical
-  round-trip — proving §34.1's transport orthogonality. UDS is local +
-  filesystem-permission-gated, so no IP allowlist applies. Remaining slices
-  (consolidate the network endpoints into the service, session sharing, core
-  pinning) stay design-gated.
+  "consolidate comms responsibility" idea). `rivus serve --uds PATH
+  [--upstream rivus://host:port]` / `rivus run --on uds://PATH`;
+  `distributed::{serve_uds, run_remote_uds, forwarding_handler}`.
+  - **s1 (UDS front):** the worker/client protocol cores were extracted
+    **transport-agnostic** (`serve_protocol` / `client_protocol`), so the **same
+    channel-tagged frames** (Control/Data/Telemetry + credit + `flow.*` events)
+    run over UDS and yield a byte-identical round-trip — proving §34.1's transport
+    orthogonality. UDS is local + filesystem-permission-gated (no IP allowlist).
+  - **s2 (forwarding gateway):** with `--upstream`, the service's handler is
+    `forwarding_handler` (relay the IR to a remote worker and return its bytes),
+    so co-located Rivus reach the upstream through **one** local service that owns
+    the network egress — the PMCN consolidation, demonstrated end-to-end
+    (UDS client → UDS service → TCP worker → back, byte-identical).
+  Remaining (persistent upstream connection **pooling** = true session sharing,
+  routing, core pinning) stay design-gated.
 - **Networking transport (design §33, feature `net`, std-only / zero new deps).**
   Two client-side network transports behind the off-by-default `net` feature —
   the default build stays zero-dependency, parsing / `rivus explain` are always
