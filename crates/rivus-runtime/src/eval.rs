@@ -150,6 +150,14 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut u
             Some(dt) => Value::DateTime(dt.truncated(arg(1).to_string().trim())),
             None => Value::Null,
         },
+        // `bucket(ts, dur)` → datetime bucketed to the duration boundaries.
+        Func::Bucket => match as_datetime(arg(0)) {
+            Some(dt) => match as_duration(arg(1), dt.unit) {
+                Some(dur) => dt.bucketed(dur).map(Value::DateTime).unwrap_or(Value::Null),
+                None => Value::Null,
+            },
+            None => Value::Null,
+        },
         // `format(ts|dur, "fmt")` → text rendering. A duration renders human by
         // default, or ISO-8601 with `"iso"`/`"iso8601"`. A datetime uses the
         // strptime-style `fmt`. Anything else coerces to its text form (so
@@ -241,6 +249,18 @@ fn as_datetime(v: Value) -> Option<rivus_core::DateTime> {
         Value::DateTime(dt) => Some(dt),
         Value::Str(s) => DateTime::parse_auto(&s, TimeUnit::Sec),
         Value::I64(n) => Some(DateTime::new(n, TimeUnit::Sec)),
+        _ => None,
+    }
+}
+
+/// Coerce a value to a [`Duration`] for the bucket function: a duration cell is
+/// taken as-is; a text value is parsed as an interval (e.g. `15m`, `6h`, `00:15:00`).
+/// Anything else → `None` (continue-first).
+fn as_duration(v: Value, unit: rivus_core::TimeUnit) -> Option<rivus_core::Duration> {
+    use rivus_core::Duration;
+    match v {
+        Value::Duration(d) => Some(d),
+        Value::Str(s) => Duration::parse_interval(&s, unit),
         _ => None,
     }
 }
@@ -523,6 +543,9 @@ fn parse_temporal_str(s: &str, ty: DataType) -> Option<Value> {
         DataType::DateTime { unit } => {
             rivus_core::DateTime::parse_auto(s, unit).map(Value::DateTime)
         }
+        DataType::Duration { unit } => {
+            rivus_core::Duration::parse_interval(s, unit).map(Value::Duration)
+        }
         DataType::Date => rivus_core::Date::parse(s).map(Value::Date),
         DataType::Time => {
             rivus_core::TimeOfDay::parse_at(s, rivus_core::TimeUnit::Sec).map(Value::Time)
@@ -536,7 +559,7 @@ fn parse_temporal_str(s: &str, ty: DataType) -> Option<Value> {
 fn is_temporal(ty: DataType) -> bool {
     matches!(
         ty,
-        DataType::DateTime { .. } | DataType::Date | DataType::Time
+        DataType::DateTime { .. } | DataType::Duration { .. } | DataType::Date | DataType::Time
     )
 }
 
@@ -797,8 +820,8 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
                         .map(|r| to_i64(call_func(*func, args, chunk, r, fails)))
                         .collect(),
                 ),
-                // `trunc` stays on the datetime lane (truncated ticks, same unit).
-                Func::Trunc => {
+                // `trunc` and `bucket` stay on the datetime lane (truncated/bucketed ticks, same unit).
+                Func::Trunc | Func::Bucket => {
                     let vals: Vec<Value> = (0..n)
                         .map(|r| call_func(*func, args, chunk, r, fails))
                         .collect();

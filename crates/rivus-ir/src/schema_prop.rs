@@ -322,8 +322,7 @@ fn func_type(func: Func, args: &[Expr], schema: &Schema) -> DataType {
         Len | Year | Month | Day | Hour | Minute | Second | Weekday | Round | Floor | Ceil => {
             DataType::I64
         }
-        // `abs` and `trunc` keep their (numeric / datetime) argument's lane.
-        Abs | Trunc => args
+        Abs | Trunc | Bucket => args
             .first()
             .map(|a| expr_type(a, schema))
             .unwrap_or(DataType::F64),
