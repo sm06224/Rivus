@@ -34,10 +34,11 @@ const ERR: u8 = 6;
 // §34.2 event-centric observability over QUIC: the worker narrates structured
 // telemetry events (`flow.started` / `flow.completed` / `transfer.done` …) as
 // `EVENT` frames, demuxed off the result by the observing client (parity with the
-// std path's TELE/EVENT channel). A non-observing client ignores them — they are
-// backward-compatible (the read loop already skips unknown kinds). The §34.1
-// channel→real-QUIC-stream mapping (a dedicated telemetry stream) stays
-// design-gated; here the event rides the same bidi stream, tagged by kind.
+// std path's TELE/EVENT channel). By default they ride the result bidi stream,
+// tagged by kind (a non-observing client ignores them — backward-compatible, the
+// read loop skips unknown kinds). With `QuicConfig::telemetry_stream` they instead
+// ride a **dedicated unidirectional QUIC stream** — the §34.1 channel→real-stream
+// mapping spike (independent flow control; opt-in pending ratification).
 const EVENT: u8 = 7;
 const FRAME: usize = 32 * 1024;
 
@@ -49,6 +50,14 @@ pub struct QuicConfig {
     pub allow_peer_keys: Option<Vec<String>>,
     /// Credit window for the result stream (bounded pull). Default 64.
     pub window: u32,
+    /// §34.1 spike (opt-in, default off): carry the Telemetry channel on a
+    /// **dedicated unidirectional QUIC stream** instead of multiplexing `EVENT`
+    /// frames onto the result's bidi stream by kind. This realizes the design's
+    /// channel→real-QUIC-stream 1:1 mapping — independent flow control, so a
+    /// backed-up data stream can't head-of-line-block telemetry (or vice versa).
+    /// Both peers must agree (no negotiation yet — a spike limitation); the proven
+    /// single-stream path stays the default. `RIVUS_NET_QUIC_TELEMETRY_STREAM=1`.
+    pub telemetry_stream: bool,
 }
 
 impl Default for QuicConfig {
@@ -59,6 +68,7 @@ impl Default for QuicConfig {
         QuicConfig {
             allow_peer_keys: None,
             window: 64,
+            telemetry_stream: false,
         }
     }
 }
@@ -82,6 +92,9 @@ impl QuicConfig {
                     c.window = n;
                 }
             }
+        }
+        if let Ok(v) = std::env::var("RIVUS_NET_QUIC_TELEMETRY_STREAM") {
+            c.telemetry_stream = matches!(v.trim(), "1" | "true" | "yes" | "on");
         }
         c
     }
@@ -407,19 +420,34 @@ async fn process_conn(
     // Loop accepting streams until the peer closes the connection.
     // Until the peer closes the connection, each accepted bidi stream is one job.
     while let Ok((send, recv)) = conn.accept_bi().await {
-        let _ = serve_stream(send, recv, &identity, &handler).await;
+        let _ = serve_stream(&conn, send, recv, &identity, &handler, cfg.telemetry_stream).await;
     }
     Ok(fp)
+}
+
+/// Emit a telemetry `EVENT`: to the dedicated uni stream `tel` when present
+/// (§34.1 channel→stream mapping), else multiplexed onto the result bidi `send`.
+async fn emit_event(send: &mut quinn::SendStream, tel: &mut Option<quinn::SendStream>, msg: &[u8]) {
+    match tel {
+        Some(t) => {
+            let _ = write_frame(t, EVENT, msg).await;
+        }
+        None => {
+            let _ = write_frame(send, EVENT, msg).await;
+        }
+    }
 }
 
 /// Serve one job on one bidi stream: HELLO exchange → JOB → run the handler →
 /// credit-gated result. The connection (and its handshake) is reused across many
 /// of these (a session).
 async fn serve_stream(
+    conn: &quinn::Connection,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     identity: &Identity,
     handler: &Handler,
+    telemetry_stream: bool,
 ) -> Result<(), String> {
     match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
         Some((HELLO, _)) => {}
@@ -432,20 +460,26 @@ async fn serve_stream(
         Some((JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
         _ => return Err("expected JOB".to_string()),
     };
-    // §34.2: narrate the job on the telemetry (EVENT) lane — parity with the std
-    // worker. A non-observing client skips these; an observing one surfaces them.
-    let _ = write_frame(
+    // §34.1 spike: when enabled, open a dedicated unidirectional stream for the
+    // Telemetry channel; otherwise events ride the result bidi stream (§34.2).
+    let mut tel: Option<quinn::SendStream> = if telemetry_stream {
+        conn.open_uni().await.ok()
+    } else {
+        None
+    };
+    // §34.2: narrate the job on the telemetry lane — parity with the std worker.
+    emit_event(
         &mut send,
-        EVENT,
+        &mut tel,
         format!("flow.started job_bytes={}", job.len()).as_bytes(),
     )
     .await;
     let t0 = std::time::Instant::now();
     match handler(&job) {
         Ok(bytes) => {
-            let _ = write_frame(
+            emit_event(
                 &mut send,
-                EVENT,
+                &mut tel,
                 format!(
                     "flow.completed result_bytes={} ms={}",
                     bytes.len(),
@@ -454,16 +488,19 @@ async fn serve_stream(
                 .as_bytes(),
             )
             .await;
-            stream_with_credit(&mut send, &mut recv, &bytes)
+            stream_with_credit(&mut send, &mut recv, &mut tel, &bytes)
                 .await
                 .map_err(|e| e.to_string())?
         }
         Err(e) => {
-            let _ = write_frame(&mut send, EVENT, b"flow.failed").await;
+            emit_event(&mut send, &mut tel, b"flow.failed").await;
             write_frame(&mut send, ERR, e.as_bytes())
                 .await
                 .map_err(|e| e.to_string())?
         }
+    }
+    if let Some(mut t) = tel {
+        let _ = t.finish(); // FIN the telemetry stream so the client's reader ends
     }
     let _ = send.finish();
     Ok(())
@@ -472,6 +509,7 @@ async fn serve_stream(
 async fn stream_with_credit(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
+    tel: &mut Option<quinn::SendStream>,
     bytes: &[u8],
 ) -> std::io::Result<()> {
     let mut credit: u64 = 0;
@@ -494,9 +532,9 @@ async fn stream_with_credit(
         credit -= 1;
         frames += 1;
     }
-    let _ = write_frame(
+    emit_event(
         send,
-        EVENT,
+        tel,
         format!("transfer.done frames={frames} bytes={}", bytes.len()).as_bytes(),
     )
     .await;
@@ -540,6 +578,7 @@ pub struct QuicSession {
     rt: tokio::runtime::Runtime,
     identity: Identity,
     window: u32,
+    telemetry_stream: bool,
 }
 
 impl QuicSession {
@@ -548,6 +587,7 @@ impl QuicSession {
         let rt = runtime()?;
         let identity = mint_identity()?;
         let window = cfg.window;
+        let telemetry_stream = cfg.telemetry_stream;
         let cfg = cfg.clone();
         let (endpoint, conn) = rt.block_on(async {
             let sockaddr: std::net::SocketAddr = peer
@@ -585,6 +625,7 @@ impl QuicSession {
             rt,
             identity,
             window,
+            telemetry_stream,
         })
     }
 
@@ -605,6 +646,7 @@ impl QuicSession {
             &self.identity.fingerprint,
             ir_source,
             self.window,
+            self.telemetry_stream,
             on_event,
         ))
     }
@@ -617,6 +659,7 @@ async fn client_stream(
     id_fp: &str,
     ir_source: &str,
     window: u32,
+    telemetry_stream: bool,
     mut on_event: impl FnMut(String),
 ) -> Result<Vec<u8>, String> {
     let (mut send, mut recv) = conn
@@ -638,12 +681,49 @@ async fn client_stream(
         .await
         .map_err(|e| e.to_string())?;
 
+    // §34.1 spike: in dedicated-telemetry-stream mode the result (Data/Control) and
+    // the events (Telemetry) ride **separate** QUIC streams with independent flow
+    // control, so we read them concurrently. The worker opens its uni stream right
+    // after JOB; a bounded `accept_uni` guards against a pre-result error path.
+    if telemetry_stream {
+        // Drive the telemetry-stream reader on its own task (no `tokio::macros`
+        // dependency) while the result is collected on this task; join after.
+        let conn_for_tel = conn.clone();
+        let tel_handle = tokio::spawn(async move { read_telemetry_uni(&conn_for_tel).await });
+        let res = read_result(&mut send, &mut recv).await;
+        let evs = tel_handle.await.unwrap_or_default();
+        for e in evs {
+            on_event(e);
+        }
+        res
+    } else {
+        // Default: events are multiplexed onto the bidi stream — surface inline.
+        read_result_observed(&mut send, &mut recv, on_event).await
+    }
+}
+
+/// Read the result (CHUNK→END/ERR) off the bidi stream, refilling credit; ignores
+/// any inline EVENT (it rode the dedicated telemetry stream in this mode).
+async fn read_result(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+) -> Result<Vec<u8>, String> {
+    read_result_observed(send, recv, |_| {}).await
+}
+
+/// Read the result off the bidi stream, surfacing any **inline** EVENT to
+/// `on_event` (the default single-stream path, §34.2).
+async fn read_result_observed(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    mut on_event: impl FnMut(String),
+) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     loop {
-        match read_frame(&mut recv).await.map_err(|e| e.to_string())? {
+        match read_frame(recv).await.map_err(|e| e.to_string())? {
             Some((CHUNK, p)) => {
                 out.extend_from_slice(&p);
-                let _ = write_frame(&mut send, CREDIT, &1u32.to_be_bytes()).await;
+                let _ = write_frame(send, CREDIT, &1u32.to_be_bytes()).await;
             }
             Some((END, _)) => {
                 let _ = send.finish(); // FIN our side of the stream; keep the conn
@@ -655,6 +735,24 @@ async fn client_stream(
             None => return Err("closed before END".to_string()),
         }
     }
+}
+
+/// Accept the worker's dedicated **telemetry** uni stream and drain its EVENT
+/// frames until FIN. Bounded by a timeout so a missing stream (a pre-result error
+/// path) can never hang the `join!`. Best-effort: errors yield the events so far.
+async fn read_telemetry_uni(conn: &quinn::Connection) -> Vec<String> {
+    let mut evs = Vec::new();
+    let accept = tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_uni()).await;
+    let mut uni = match accept {
+        Ok(Ok(s)) => s,
+        _ => return evs, // timed out or connection error — no telemetry this job
+    };
+    while let Ok(Some((kind, p))) = read_frame(&mut uni).await {
+        if kind == EVENT {
+            evs.push(String::from_utf8_lossy(&p).into_owned());
+        }
+    }
+    evs
 }
 
 #[cfg(test)]

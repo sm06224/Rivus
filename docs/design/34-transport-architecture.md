@@ -54,9 +54,17 @@ transfer.done  frames=<n> bytes=<n>
 **QUIC バックエンドも同一イベントを narrate（parity・landed）**：worker が同じ
 `flow.started`/`flow.completed`/`transfer.done` を `EVENT` フレームでストリームに流し、
 `quic_run_observed` / `QuicSession::run_observed`（CLI `--on quic://`）が結果から demux する
-（非観測クライアントは無視＝後方互換）。test `tests/quic.rs` case (d)。**設計（批准待ち）**：
-§34.1 のチャネルを QUIC の*専用ストリーム*へ 1:1 マップ（Telemetry を別 uni-stream に）——
-現状は同一 bidi ストリーム上で kind タグにより多重化（std のチャネルバイト多重化と等価）。
+（非観測クライアントは無視＝後方互換）。test `tests/quic.rs` case (d)。既定は同一 bidi
+ストリーム上で kind タグにより多重化（std のチャネルバイト多重化と等価）。
+
+**§34.1 チャネル → 専用 QUIC ストリーム・マップ（スパイク・オプトイン landed）**：
+`QuicConfig::telemetry_stream`（`RIVUS_NET_QUIC_TELEMETRY_STREAM=1`・既定 off）で Telemetry を
+**専用の単方向 QUIC ストリーム**へ分離——設計の「チャネル↔実ストリーム 1:1」を実現。独立した
+フロー制御を持つので、滞留した Data ストリームが Telemetry を head-of-line ブロックしない（逆も同様）。
+worker はジョブ毎に uni ストリームを開き、client は結果と Telemetry を**並行**に読む。両端で有効化が
+必要（ネゴシエーション未実装＝スパイク制約）、実証済み単一ストリーム経路を既定のまま温存。test
+`tests/quic.rs` case (e)（結果 byte-identical ＋ 別ストリーム上のイベント）。**設計（批准待ち）**：
+ネゴシエーション・Control/Data も含む全チャネルのストリーム分離・既定化。
 
 ## 34.3 CPU 予算の明示管理（コア affinity ＝**プレ実装 landed**／細分・QUIC 適用は設計）
 

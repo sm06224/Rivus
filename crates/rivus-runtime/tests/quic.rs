@@ -155,5 +155,34 @@ fn quic_protected_channel_round_trip_and_pinning() {
         "expected transfer.done in {events:?}"
     );
 
+    // (e) §34.1 spike — telemetry on a **dedicated unidirectional QUIC stream**
+    // (independent flow control), opt-in via `telemetry_stream`. Result rides the
+    // bidi stream; events ride the uni stream; both must arrive, byte-identical.
+    let cfg_ts = QuicConfig {
+        telemetry_stream: true,
+        ..QuicConfig::default()
+    };
+    let worker5 = quic_worker("127.0.0.1:0", cfg_ts.clone()).expect("bind5");
+    let addr5 = worker5.addr().to_string();
+    let h5 = handler();
+    thread::spawn(move || {
+        let _ = worker5.serve_once(h5);
+    });
+    let mut events5 = Vec::new();
+    let got5 =
+        quic_run_observed(&addr5, &cfg_ts, &q, |e| events5.push(e)).expect("ts observed run");
+    assert_eq!(
+        got5,
+        render_flow(&q).unwrap(),
+        "telemetry-stream result byte-identical"
+    );
+    let joined5 = events5.join("\n");
+    assert!(
+        joined5.contains("flow.started")
+            && joined5.contains("flow.completed")
+            && joined5.contains("transfer.done"),
+        "expected events on the dedicated telemetry stream, got {events5:?}"
+    );
+
     std::fs::remove_file(&path).ok();
 }

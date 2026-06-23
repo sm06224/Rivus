@@ -45,9 +45,17 @@ All notable changes to Rivus. Format loosely follows
   same `flow.started` / `flow.completed` / `transfer.done` over the stream
   (`EVENT` frames), demuxed by `quic_run_observed` / `QuicSession::run_observed`
   (`rivus run --on quic://` surfaces them on stderr); a non-observing client
-  ignores them (backward-compatible). The §34.1 channel→**real-QUIC-stream** 1:1
-  mapping (a dedicated telemetry stream) stays design-gated. Staged next (design
-  only): the finer Telemetry/Control affinity split and DPU/SmartNIC offload.
+  ignores them (backward-compatible). **§34.1 channel→real-QUIC-stream mapping
+  (spike, opt-in `QuicConfig::telemetry_stream` / `RIVUS_NET_QUIC_TELEMETRY_STREAM=1`,
+  default off):** carry the Telemetry channel on a **dedicated unidirectional QUIC
+  stream** instead of multiplexing `EVENT` frames onto the result's bidi stream —
+  realizing the design's 1:1 channel→stream mapping with independent flow control
+  (a backed-up data stream can't head-of-line-block telemetry). The worker opens a
+  uni stream per job; the client reads result + telemetry concurrently. Both peers
+  must enable it (no negotiation yet — a spike limitation); the proven single-
+  stream path stays the default. Tested (`tests/quic.rs` case (e), byte-identical
+  result + events on the separate stream). Staged next (design only): the finer
+  Telemetry/Control affinity split and DPU/SmartNIC offload.
 - **Host Transport Service over a Unix-domain socket — §34.4 slices 1+2
   (pre-implementation, `feature net`, unix-only).** A worker fronts a UDS that
   co-located Rivus processes use instead of each owning a network stack (the PMCN

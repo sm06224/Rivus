@@ -259,8 +259,15 @@ case (c); benched by `transport_bench::bench_quic_distributed_latency`.
 > the std path (`flow.started` / `flow.completed` / `transfer.done`) as `EVENT`
 > frames on the stream; `quic_run_observed` / `QuicSession::run_observed` (and
 > `rivus run --on quic://`) demux them onto stderr while the result stays clean on
-> stdout. A non-observing client ignores them. Pinned by case (d) of the same
-> test. (Mapping each channel onto a *dedicated* QUIC stream is design-gated.)
+> stdout. A non-observing client ignores them. Pinned by case (d) of the same test.
+>
+> **Channel→stream spike (§34.1, opt-in).** With `telemetry_stream` (env
+> `RIVUS_NET_QUIC_TELEMETRY_STREAM=1`) the Telemetry channel rides a **dedicated
+> unidirectional QUIC stream** with independent flow control (no head-of-line
+> blocking between data and telemetry) — the design's 1:1 channel→stream mapping.
+> Both peers must enable it (no negotiation yet); the single-stream path stays the
+> default. Pinned by case (e) (result byte-identical, events on the separate
+> stream). Full channel-stream separation + negotiation stays design-gated.
 
 ```flow
 R:
