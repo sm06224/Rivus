@@ -382,6 +382,16 @@ pub enum Expr {
         start: u32,
         end: u32,
     },
+    /// A **nested path** into a Struct/List column (§32 s4): `user.age`,
+    /// `tags[0]`, `user.address.city`. The degenerate (no-segment) form never
+    /// reaches here — a bare column is `Expr::Field` — so this variant always
+    /// carries at least one `.field` / `[i]` step. Resolution walks the
+    /// `ColumnData::{Struct,List}` lanes at the root column; a missing field /
+    /// out-of-range index / type mismatch is a **typed null + counted** failure
+    /// (continue-first, never silent). A `.` against a §29 fixed-width view base
+    /// is dispatched to [`Expr::SubView`] at parse time, so `.` here is always a
+    /// struct-field step.
+    Path(PathExpr),
     Literal(Value),
     /// A `$x` **value hole** (§25.3): a named placeholder for a value, filled by
     /// a binding (`| clean min=0`) or a scope parameter. It is bound at the
@@ -445,9 +455,11 @@ impl Expr {
                 Some(v) => Expr::Literal(v.clone()),
                 None => Expr::Hole(name.clone()),
             },
-            Expr::Field { .. } | Expr::FieldAt(_) | Expr::SubView { .. } | Expr::Literal(_) => {
-                self.clone()
-            }
+            Expr::Field { .. }
+            | Expr::FieldAt(_)
+            | Expr::SubView { .. }
+            | Expr::Path(_)
+            | Expr::Literal(_) => self.clone(),
             Expr::Compare { left, op, right } => Expr::Compare {
                 left: Box::new(left.bind_holes(bindings)),
                 op: *op,
@@ -489,7 +501,11 @@ impl Expr {
     pub fn collect_holes(&self, out: &mut Vec<String>) {
         match self {
             Expr::Hole(name) => out.push(name.clone()),
-            Expr::Field { .. } | Expr::FieldAt(_) | Expr::SubView { .. } | Expr::Literal(_) => {}
+            Expr::Field { .. }
+            | Expr::FieldAt(_)
+            | Expr::SubView { .. }
+            | Expr::Path(_)
+            | Expr::Literal(_) => {}
             Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
                 left.collect_holes(out);
                 right.collect_holes(out);
@@ -524,6 +540,7 @@ impl Expr {
             Expr::Field { .. }
             | Expr::FieldAt(_)
             | Expr::SubView { .. }
+            | Expr::Path(_)
             | Expr::Literal(_)
             | Expr::Hole(_) => false,
             Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
@@ -622,6 +639,9 @@ impl fmt::Display for Expr {
             // `base.name` — union sub-view accessor (§29.3, s2), same `.` form as
             // the `source.uri` provenance accessor.
             Expr::SubView { base, name, .. } => write!(f, "{base}.{name}"),
+            // `user.age` / `tags[0]` — nested path (§32 s4). `PathExpr::fmt`
+            // prints the root then each `.field` / `[i]` step.
+            Expr::Path(p) => write!(f, "{p}"),
             Expr::Literal(Value::Str(s)) => write!(f, "\"{}\"", Expr::escape_string(s)),
             // A resource literal round-trips its uri **only** — `size`/`mtime` are
             // out of the determinism contract (§00 0.14), so they are never emitted.

@@ -32,6 +32,58 @@ fn mk(files: &[(&str, &str)]) -> (TempTree, String) {
 }
 
 #[test]
+fn nested_path_resolves_with_null_propagation_and_counted_misses() {
+    // §32 s4 invalid-path policy (§32.8③): a nested path resolves struct fields
+    // (`user.age`) and list indices (`tags[0]`) against the typed nested lanes,
+    // and distinguishes two null outcomes:
+    //   * **Null propagation (§26, NOT counted):** a null base (`user` absent on
+    //     a row) makes `user.age` null silently — like SQL `NULL.field = NULL`.
+    //   * **Structural miss (counted, never-silent):** a field absent from the
+    //     struct's schema (`user.weight`), an out-of-range list index
+    //     (`tags[0]` on `[]`), or a type mismatch is a typed null AND a counted
+    //     failure on the error stream.
+    let (_t, base) = mk(&[(
+        "d.jsonl",
+        "{\"id\":1,\"user\":{\"age\":30},\"tags\":[10,20]}\n\
+         {\"id\":2,\"user\":{\"age\":15},\"tags\":[]}\n\
+         {\"id\":3,\"tags\":[99]}\n",
+    )]);
+    let res = run_src(
+        &format!(
+            "P:\n open {base}/d.jsonl\n |> id (user.age) as age (user.weight) as w (tags[0]) as first\n;"
+        ),
+        4,
+    );
+    let id = collect_strings(&res, "P", "id");
+    let age = collect_strings(&res, "P", "age");
+    let w = collect_strings(&res, "P", "w");
+    let first = collect_strings(&res, "P", "first");
+    assert_eq!(id, vec!["1", "2", "3"]);
+    // `user.age`: rows 1-2 resolve; row 3 has no `user` → null *propagation*.
+    assert_eq!(age, vec!["30", "15", ""], "struct field + null propagation");
+    // `user.weight`: `weight` is absent from the `user` schema → structural miss
+    // on rows 1-2 (counted); row 3's null base propagates null (not counted).
+    assert_eq!(w, vec!["", "", ""], "missing struct field → typed null");
+    // `tags[0]`: row 2's `tags` is `[]` → out-of-range structural miss (counted).
+    assert_eq!(
+        first,
+        vec!["10", "", "99"],
+        "list index + out-of-range null"
+    );
+
+    // Structural misses are surfaced per column; pure null propagation is not.
+    let surfaced: String = res.errors.iter().map(|e| e.message.clone()).collect();
+    assert!(
+        surfaced.contains("'w'") && surfaced.contains("'first'"),
+        "structural misses must be surfaced per column, got: {surfaced}"
+    );
+    assert!(
+        !surfaced.contains("'age'"),
+        "null propagation must NOT be counted as a failure, got: {surfaced}"
+    );
+}
+
+#[test]
 fn read_union_by_name_widening_and_provenance() {
     // a/b share `amount` (int then float → widen to float, no truncation); c has
     // a different column `region` → union pads with null. Provenance is per row.
