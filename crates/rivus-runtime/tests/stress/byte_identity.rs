@@ -601,6 +601,77 @@ fn parallel_jsonl_nested_byte_identical() {
 }
 
 #[test]
+fn parallel_jsonl_explode_byte_identical() {
+    // §32 s4c: `explode` is a deterministic, stateless, per-chunk row multiplier
+    // (expansion = the list's physical order), so a flow that explodes a list and
+    // saves must be byte-identical serial == parallel == chunk-size. The
+    // byte-range parallel path explodes each range to a part file; the parts
+    // concatenate in source order. >1 MiB + Fast forces the parallel reader.
+    let rows = 120_000usize;
+    let mut text = String::new();
+    for i in 0..rows {
+        // Mostly 2-element lists; every 13th row an empty list (→ zero output
+        // rows) to exercise the empty-list path across partition boundaries.
+        let tags = if i % 13 == 0 {
+            "[]".to_string()
+        } else {
+            format!("[{},{}]", i % 100, (i % 100) + 1)
+        };
+        text.push_str(&format!("{{\"id\":{i},\"tags\":{tags}}}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_jsonl_explode",
+        text.as_bytes(),
+    ));
+    let jpath = f.0.with_extension("jsonl");
+    std::fs::rename(&f.0, &jpath).unwrap();
+    let _cleanup = TempCsv(jpath.clone());
+    let p = jpath.display();
+
+    let run_to = |pref: rivus_runtime::MemoryPref, cs: usize, out: &std::path::Path| -> bool {
+        let src = format!(
+            "X:\n open {p}\n explode tags\n |> id tags\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cs,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        !res.workers.is_empty()
+    };
+
+    let ser = TempCsv(gendata::write_temp_bytes("jsonl_explode_serial", b""));
+    assert!(
+        !run_to(rivus_runtime::MemoryPref::Low, 4096, &ser.0),
+        "low must be serial"
+    );
+    let oracle = std::fs::read_to_string(&ser.0).expect("read serial out");
+    // Each non-empty row contributes 2 rows; ~1/13 contribute 0 → more than rows.
+    assert!(oracle.lines().count() > rows, "explode should add rows");
+
+    let par = TempCsv(gendata::write_temp_bytes("jsonl_explode_par", b""));
+    assert!(
+        run_to(rivus_runtime::MemoryPref::Fast, 4096, &par.0),
+        "fast should engage the JSONL streaming-parallel path"
+    );
+    let got = std::fs::read_to_string(&par.0).expect("read parallel out");
+    assert_eq!(got, oracle, "parallel explode != serial");
+
+    for cs in [1usize, 1000, rows] {
+        let cz = TempCsv(gendata::write_temp_bytes("jsonl_explode_cz", b""));
+        run_to(rivus_runtime::MemoryPref::Low, cs, &cz.0);
+        let got = std::fs::read_to_string(&cz.0).expect("read cz out");
+        assert_eq!(got, oracle, "explode changed @cs={cs}");
+    }
+}
+
+#[test]
 fn parallel_jsonl_nested_key_group_byte_identical() {
     // §32 s4b: a group-by **key** can be a nested path. The byte-range parallel
     // group path resolves the nested key column per range against the same

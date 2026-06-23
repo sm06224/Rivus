@@ -694,6 +694,13 @@ pub enum Op {
     /// `dropna [col ...]` — drop rows with a missing (empty) value in any of the
     /// named columns (or any column when none named). Streaming, stateless.
     DropNa { cols: Vec<String> },
+    /// `explode COL` (alias `unnest COL`) — multiply rows over a `List` column
+    /// (§32 s4c): one output row per list element, with the other columns
+    /// repeated and `COL` replaced by the element (its lane = the list's element
+    /// type). An empty or null list contributes **zero** rows (Arrow `UNNEST` /
+    /// SQL semantics); expansion order is the list's physical order
+    /// (deterministic). Streaming, stateless per chunk → partition-safe.
+    Explode { col: String },
     /// `fill col VALUE|ffill|bfill` — replace missing (empty) cells of `col`.
     /// `VALUE` substitutes a constant (the column becomes text); `ffill` carries
     /// the last non-empty value forward, `bfill` the next non-empty value back.
@@ -951,6 +958,7 @@ impl Op {
             Op::Distinct { .. } => "distinct",
             Op::Describe => "describe",
             Op::DropNa { .. } => "dropna",
+            Op::Explode { .. } => "explode",
             Op::Fill { .. } => "fill",
             Op::Rename { .. } => "rename",
             Op::Drop { .. } => "drop",
@@ -1228,6 +1236,7 @@ impl Op {
                     format!("dropna {}", cols.join(" "))
                 }
             }
+            Op::Explode { col } => format!("explode {col}"),
             Op::Fill { col, method } => match method {
                 FillMethod::Value(v) => format!("fill {col} \"{v}\""),
                 FillMethod::Ffill => format!("fill {col} ffill"),
