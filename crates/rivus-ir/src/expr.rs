@@ -110,6 +110,8 @@ pub enum Func {
     /// `minute`/`second` boundary (the time-series group-by key); returns a
     /// datetime at the same unit. Design 23.
     Trunc,
+    /// `bucket(ts, dur)` — bucket a datetime into arbitrary dur boundaries (closed-open).
+    Bucket,
     /// `format(ts, "yyyy-MM-dd")` — render a datetime as text. Design 23.
     Format,
     /// `weekday(x)` — ISO day-of-week of a date/datetime: `0 = Mon … 6 = Sun`
@@ -154,6 +156,7 @@ impl Func {
             "minute" => Func::Minute,
             "second" => Func::Second,
             "trunc" => Func::Trunc,
+            "bucket" => Func::Bucket,
             "format" => Func::Format,
             "weekday" => Func::Weekday,
             "is_weekend" => Func::IsWeekend,
@@ -190,6 +193,7 @@ impl Func {
             Func::Minute => "minute",
             Func::Second => "second",
             Func::Trunc => "trunc",
+            Func::Bucket => "bucket",
             Func::Format => "format",
             Func::Weekday => "weekday",
             Func::IsWeekend => "is_weekend",

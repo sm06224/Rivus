@@ -599,3 +599,58 @@ fn duration_read_roundtrip_and_diff() {
         ],
     );
 }
+
+#[test]
+fn test_bucket_tumbling_window_evaluation() {
+    // Generate a set of timestamps and verify they are bucketed correctly
+    // using bucket(ts, "15m") and bucket(ts, "1h").
+    let text = "ts\n\
+                2026-06-23T12:05:00\n\
+                2026-06-23T12:14:59\n\
+                2026-06-23T12:15:00\n\
+                2026-06-23T12:29:59\n\
+                2026-06-23T13:00:00\n\
+                1969-12-31T23:59:00\n"; // Negative tick: before epoch (1970-01-01)
+
+    let f = TempCsv(gendata::write_temp_bytes("stress_bucket", text.as_bytes()));
+    let p = f.0.display();
+
+    // Evaluate bucket(ts, "15m":duration) and bucket(ts, "1h")
+    let flow = format!(
+        "
+        D:
+          open {p}
+          |> ts (bucket(ts, \"15m\":duration)) as b15m (bucket(ts, \"1h\")) as b1h
+        ;
+    "
+    );
+
+    let res = run_src(&flow, 1024);
+    assert!(res.errors.is_empty());
+
+    let b15m_vals = collect_strings(&res, "D", "b15m");
+    assert_eq!(
+        b15m_vals,
+        vec![
+            "2026-06-23T12:00:00".to_string(),
+            "2026-06-23T12:00:00".to_string(),
+            "2026-06-23T12:15:00".to_string(),
+            "2026-06-23T12:15:00".to_string(),
+            "2026-06-23T13:00:00".to_string(),
+            "1969-12-31T23:45:00".to_string(), // correct floor bucketing
+        ]
+    );
+
+    let b1h_vals = collect_strings(&res, "D", "b1h");
+    assert_eq!(
+        b1h_vals,
+        vec![
+            "2026-06-23T12:00:00".to_string(),
+            "2026-06-23T12:00:00".to_string(),
+            "2026-06-23T12:00:00".to_string(),
+            "2026-06-23T12:00:00".to_string(),
+            "2026-06-23T13:00:00".to_string(),
+            "1969-12-31T23:00:00".to_string(),
+        ]
+    );
+}

@@ -519,6 +519,34 @@ impl DateTime {
         DateTime::new(secs * self.unit.per_sec(), self.unit)
     }
 
+    /// Buckets this datetime to an arbitrary duration width `dur` relative to the
+    /// Unix epoch, returning a `DateTime` at the same `unit`. Resolves to the left
+    /// boundary (closed-open `[start, start+dur)`), handling negative ticks (before
+    /// epoch) correctly by performing integer floor division. Returns `None` if
+    /// `dur` is non-positive or if `dur`'s ticks cannot be exactly represented in
+    /// `self.unit` without fractional truncation.
+    pub fn bucketed(&self, dur: Duration) -> Option<DateTime> {
+        if dur.ticks <= 0 {
+            return None;
+        }
+        let self_per_sec = self.unit.per_sec() as i128;
+        let dur_per_sec = dur.unit.per_sec() as i128;
+
+        // Convert dur to self's unit: dur_ticks = dur.ticks * self_unit / dur_unit
+        let dur_ticks_self_128 = dur.ticks as i128 * self_per_sec;
+        if dur_ticks_self_128 % dur_per_sec != 0 {
+            return None; // Cannot represent dur exactly in self's unit without truncation
+        }
+        let dur_ticks = (dur_ticks_self_128 / dur_per_sec) as i64;
+
+        let mut q = self.ticks / dur_ticks;
+        let r = self.ticks % dur_ticks;
+        if r < 0 {
+            q -= 1;
+        }
+        Some(DateTime::new(q * dur_ticks, self.unit))
+    }
+
     /// Parse `s` with a `strptime`-style `fmt` (tokens `yyyy`/`yy`/`MM`/`dd`/
     /// `ddd`/`HH` or `hh`/`mm`/`ss`/`n…n`; any other char is a literal that must
     /// match) into a `DateTime` at `unit`. A leading `[ja-jp]`/`[en-us]` tag
@@ -957,6 +985,67 @@ impl Duration {
         };
         let ticks = whole.checked_add(sub)?;
         Some(Duration::new(if neg { -ticks } else { ticks }, unit))
+    }
+
+    /// Parses an interval string like `15m`, `6h`, `1d`, `500ms`, `00:15:00` at `unit` into exact ticks.
+    /// Returns `None` on any malformed input or if the interval cannot be represented exactly in `unit`.
+    pub fn parse_interval(s: &str, unit: TimeUnit) -> Option<Duration> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        // Try the standard human parse_at first (e.g. 00:15:00)
+        if let Some(d) = Self::parse_at(s, unit) {
+            return Some(d);
+        }
+
+        // Parse suffix form
+        let neg = s.starts_with('-');
+        let rest = if neg { &s[1..] } else { s };
+
+        // Split digits and suffix
+        let first_alpha = rest.find(|c: char| c.is_alphabetic())?;
+        let (digits, suffix) = rest.split_at(first_alpha);
+        let val: i64 = digits.parse().ok()?;
+
+        let suffix = suffix.trim().to_ascii_lowercase();
+        let mult: i64 = match suffix.as_str() {
+            "ns" | "nano" | "nanos" | "nanosecond" | "nanoseconds" => {
+                let ticks = if neg { -val } else { val };
+                return Self::convert_ticks(ticks, TimeUnit::Nano, unit);
+            }
+            "us" | "micro" | "micros" | "microsecond" | "microseconds" => {
+                let ticks = if neg { -val } else { val };
+                return Self::convert_ticks(ticks, TimeUnit::Micro, unit);
+            }
+            "ms" | "milli" | "millis" | "millisecond" | "milliseconds" => {
+                let ticks = if neg { -val } else { val };
+                return Self::convert_ticks(ticks, TimeUnit::Milli, unit);
+            }
+            "s" | "sec" | "secs" | "second" | "seconds" => 1,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "h" | "hour" | "hours" => 3600,
+            "d" | "day" | "days" => 86400,
+            _ => return None,
+        };
+
+        // Multiply by target unit ticks per second
+        let total_secs = val.checked_mul(mult)?;
+        let total_ticks = total_secs.checked_mul(unit.per_sec())?;
+        let ticks = if neg { -total_ticks } else { total_ticks };
+        Some(Duration::new(ticks, unit))
+    }
+
+    fn convert_ticks(ticks: i64, from: TimeUnit, to: TimeUnit) -> Option<Duration> {
+        let from_per_sec = from.per_sec() as i128;
+        let to_per_sec = to.per_sec() as i128;
+        let ticks_to_128 = ticks as i128 * to_per_sec;
+        if ticks_to_128 % from_per_sec != 0 {
+            return None; // Fractional ticks cannot be represented without truncation
+        }
+        let ticks_to = (ticks_to_128 / from_per_sec) as i64;
+        Some(Duration::new(ticks_to, to))
     }
 }
 
