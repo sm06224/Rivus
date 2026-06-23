@@ -96,7 +96,13 @@ Machine
   `serve_uds` に渡すだけで、**同居 Rivus が1つのローカルサービス経由で上流ワーカに到達**する
   （サービスがネットワーク egress を一手に持つ）。topology＝UDS client → UDS service → TCP worker
   → 戻り。byte-identical（`tests/net.rs::distributed_uds_forwarding_gateway`・CLI 実演済）。
-  現状は1ジョブ毎に上流 TCP 接続を張る——**永続接続プール（真のセッション共有）は s2'**（#176）。
+- **s2' 永続セッション＝プレ実装 landed**：プロトコルを **1 接続=複数ジョブ**に拡張
+  （worker の `serve_protocol` がジョブループ・stray credit を読み飛ばす）。クライアント
+  `Session`（`connect` で HELLO 一度・`run` を何度でも）で **connect/handshake を償却**。
+  ゲートウェイは `forwarding_session_handler`（`Mutex<Session>` で**1 つの上流接続を全 downstream
+  で共有**＝真のセッション共有）。測定：std で per-call 0.633ms→session 0.441ms（**1.4×**・
+  QUIC では handshake 支配ゆえ劇的＝#176）。test `distributed_session_reuses_one_connection_for_many_jobs`。
+  副次効果：ジョブループの read-until-EOF が旧 single-job drain を**構造的に包含**（大転送 RST 解消）。
 - **s1 プレ実装で実証されたこと（§34.1 の主張の裏取り）**：TCP の worker/client プロトコル中核を
   `serve_protocol` / `client_protocol` として **transport 非依存に抽出**し、**全く同じチャネル付き
   フレーム**（Control/Data/Telemetry＋credit 背圧＋`flow.*` イベント）を **UDS 上でそのまま**流して

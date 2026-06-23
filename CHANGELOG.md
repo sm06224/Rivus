@@ -59,8 +59,16 @@ All notable changes to Rivus. Format loosely follows
     so co-located Rivus reach the upstream through **one** local service that owns
     the network egress — the PMCN consolidation, demonstrated end-to-end
     (UDS client → UDS service → TCP worker → back, byte-identical).
-  Remaining (persistent upstream connection **pooling** = true session sharing,
-  routing, core pinning) stay design-gated.
+  - **s2' (persistent sessions):** the protocol now carries **many jobs per
+    connection** (the worker's `serve_protocol` is a job loop; stray credit between
+    jobs is skipped). A client `Session` (`connect` HELLOs once, `run` ships each
+    job) amortizes connect/handshake, and the gateway's
+    `forwarding_session_handler` shares **one** persistent upstream connection
+    across all co-located Rivus (`Mutex<Session>`) — true session sharing. Reuse
+    is **1.4× on std** (per-call 0.633 → session 0.441 ms/job) and is the lever
+    for QUIC's 8.6 ms per-call cost (#176). A bonus: the job loop's read-until-EOF
+    structurally subsumes the old single-job graceful drain (no large-result RST).
+  Remaining (routing, core pinning, QUIC session reuse) stay design-gated.
 - **Networking transport (design §33, feature `net`, std-only / zero new deps).**
   Two client-side network transports behind the off-by-default `net` feature —
   the default build stays zero-dependency, parsing / `rivus explain` are always

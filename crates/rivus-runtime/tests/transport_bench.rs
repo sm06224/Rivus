@@ -108,6 +108,55 @@ fn bench_std_distributed_latency() {
 
 #[test]
 #[ignore = "benchmark — run with --ignored --nocapture"]
+fn bench_std_session_reuse_vs_per_call() {
+    // §34.4 s2': quantify the connection-reuse win — a Session running N jobs over
+    // ONE connection vs N fresh per-call connections (each re-connects + re-HELLOs).
+    let path = big_csv(100, "sess");
+    let src = format!(
+        "R:\n open {}\n |? age >= 40\n |> name age\n;",
+        path.display()
+    );
+    let iters = 300usize;
+
+    // (a) per-call: a worker that serves one job per connection.
+    let (addr, _jh) = spawn_std_worker();
+    let cfg = LinkConfig::default();
+    for _ in 0..5 {
+        let _ = distributed::run_remote(&addr, &cfg, &src).unwrap();
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = distributed::run_remote(&addr, &cfg, &src).unwrap();
+    }
+    let per_call = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+    // (b) session: one worker connection, N jobs reused over it.
+    let (addr2, listener2) = distributed::bind_ephemeral().unwrap();
+    let h = handler();
+    let cfg_w = LinkConfig::default();
+    let worker = thread::spawn(move || distributed::serve_on(&listener2, &cfg_w, h));
+    let mut session = distributed::Session::connect(&addr2, &LinkConfig::default()).unwrap();
+    for _ in 0..5 {
+        let _ = session.run(&src).unwrap();
+    }
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        let _ = session.run(&src).unwrap();
+    }
+    let sess = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    drop(session);
+    let _ = worker.join();
+
+    println!(
+        "[bench] std reuse: per-call {per_call:.3} ms/job vs session {sess:.3} ms/job \
+         ({:.1}× faster reused, {iters} jobs)",
+        per_call / sess
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+#[ignore = "benchmark — run with --ignored --nocapture"]
 fn bench_std_transport_throughput() {
     // PURE transport throughput: the worker returns a fixed pre-built buffer (no
     // flow execution), so this isolates the credit-streamed channel's MB/s from

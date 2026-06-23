@@ -430,7 +430,7 @@ fn distributed_uds_forwarding_gateway() {
     // (2) Local UDS Transport Service that forwards to the TCP worker.
     let sock = dir.join(format!("rivus_gw_{}.sock", std::process::id()));
     let sock_s = sock.to_string_lossy().into_owned();
-    let fwd = distributed::forwarding_handler(tcp_addr.clone(), LinkConfig::default());
+    let fwd = distributed::forwarding_session_handler(tcp_addr.clone(), LinkConfig::default());
     let sock_w = sock_s.clone();
     let gw = thread::spawn(move || distributed::serve_uds_once(&sock_w, "gw", fwd));
     for _ in 0..200 {
@@ -451,6 +451,47 @@ fn distributed_uds_forwarding_gateway() {
     std::fs::remove_file(&sock).ok();
     assert_eq!(got, expected, "gateway relay is byte-identical to local");
     assert!(String::from_utf8_lossy(&got).contains("alice,30"));
+}
+
+#[test]
+fn distributed_session_reuses_one_connection_for_many_jobs() {
+    // §34.4 s2': a Session runs many jobs over ONE connection (amortizing
+    // connect/handshake). Each job is byte-identical to a local run; the worker's
+    // job loop handles them in sequence on the same socket.
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_sess_{}.csv", std::process::id()));
+    std::fs::write(&csv, "name,age\nalice,30\nbob,17\ncarol,42\ndave,55\n").unwrap();
+
+    let (addr, listener) = distributed::bind_ephemeral().unwrap();
+    let h = handler();
+    let cfg_w = LinkConfig::default();
+    // The worker serves a whole session (many jobs) on one accepted connection.
+    let worker = thread::spawn(move || distributed::serve_on(&listener, &cfg_w, h));
+
+    let mut session =
+        distributed::Session::connect(&addr, &LinkConfig::default()).expect("open session");
+    let queries = [
+        format!("A:\n open {}\n |? age >= 18\n |> name\n;", csv.display()),
+        format!("A:\n open {}\n |? age >= 50\n |> name\n;", csv.display()),
+        format!("A:\n open {}\n |> name age\n;", csv.display()),
+    ];
+    let mut got = Vec::new();
+    for q in &queries {
+        got.push(session.run(q).expect("session job"));
+    }
+    drop(session); // closes the session → the worker's job loop ends
+    let _ = worker.join();
+
+    for (q, g) in queries.iter().zip(&got) {
+        assert_eq!(
+            *g,
+            render_flow(q).unwrap(),
+            "each session job is byte-identical"
+        );
+    }
+    std::fs::remove_file(&csv).ok();
+    assert!(String::from_utf8_lossy(&got[1]).contains("dave")); // age >= 50
+    assert!(!String::from_utf8_lossy(&got[1]).contains("alice"));
 }
 
 #[test]

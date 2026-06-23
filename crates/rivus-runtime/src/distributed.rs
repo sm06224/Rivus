@@ -320,46 +320,52 @@ fn serve_protocol(
     };
     write_frame(w, CTRL, HELLO, identity.as_bytes()).map_err(|e| e.to_string())?;
 
-    // JOB = the IR source (the deployment artifact).
-    let job = match read_frame(r).map_err(|e| e.to_string())? {
-        Some((_, JOB, p)) => String::from_utf8_lossy(&p).into_owned(),
-        _ => return Err(format!("peer {peer_id}: expected JOB")),
-    };
-
-    // Event-centric observability (§34): narrate the job on the telemetry channel.
-    let _ = write_frame(
-        w,
-        TELE,
-        EVENT,
-        format!("flow.started job_bytes={}", job.len()).as_bytes(),
-    );
-    let t0 = std::time::Instant::now();
-    match handler(&job) {
-        Ok(bytes) => {
-            let _ = write_frame(
-                w,
-                TELE,
-                EVENT,
-                format!(
-                    "flow.completed result_bytes={} ms={}",
-                    bytes.len(),
-                    t0.elapsed().as_millis()
-                )
-                .as_bytes(),
-            );
-            stream_with_credit(r, w, &bytes).map_err(|e| e.to_string())?;
-            // Graceful close: wait for the client to finish reading and close its
-            // side before we drop the socket — otherwise dropping with a large
-            // result still in flight RSTs the connection and the client sees a
-            // reset mid-stream (only visible on big transfers).
-            drain_until_eof(r);
-        }
-        Err(e) => {
-            let _ = write_frame(w, TELE, EVENT, b"flow.failed");
-            write_frame(w, CTRL, ERR, e.as_bytes()).map_err(|e| e.to_string())?;
+    // Job loop (§34.4 s2'): one connection carries **many** jobs — the client
+    // sends a JOB, drains the result + END, then sends the next (or closes).
+    // Reusing the connection amortizes connect/handshake (a session). The loop's
+    // read-until-EOF also subsumes the old single-job graceful drain: the worker
+    // only returns once the client has read everything and closed.
+    loop {
+        // Read the next JOB, skipping any **stray CREDIT** left over from the
+        // previous job: the client's best-effort refill after the last chunk
+        // races END, so a leftover credit token can arrive between jobs.
+        let job = loop {
+            match read_frame(r).map_err(|e| e.to_string())? {
+                Some((_, JOB, p)) => break String::from_utf8_lossy(&p).into_owned(),
+                Some((_, CREDIT, _)) => continue,
+                None => return Ok(peer_id), // client closed the session
+                _ => return Err(format!("peer {peer_id}: expected JOB")),
+            }
+        };
+        // Event-centric observability (§34): narrate on the telemetry channel.
+        let _ = write_frame(
+            w,
+            TELE,
+            EVENT,
+            format!("flow.started job_bytes={}", job.len()).as_bytes(),
+        );
+        let t0 = std::time::Instant::now();
+        match handler(&job) {
+            Ok(bytes) => {
+                let _ = write_frame(
+                    w,
+                    TELE,
+                    EVENT,
+                    format!(
+                        "flow.completed result_bytes={} ms={}",
+                        bytes.len(),
+                        t0.elapsed().as_millis()
+                    )
+                    .as_bytes(),
+                );
+                stream_with_credit(r, w, &bytes).map_err(|e| e.to_string())?;
+            }
+            Err(e) => {
+                let _ = write_frame(w, TELE, EVENT, b"flow.failed");
+                write_frame(w, CTRL, ERR, e.as_bytes()).map_err(|e| e.to_string())?;
+            }
         }
     }
-    Ok(peer_id)
 }
 
 /// Stream `bytes` to the peer in `FRAME`-sized `CHUNK`s, each one gated by a
@@ -392,20 +398,6 @@ fn stream_with_credit(r: &mut impl Read, w: &mut impl Write, bytes: &[u8]) -> io
     write_frame(w, CTRL, END, &[])
 }
 
-/// Read and discard until the peer closes (EOF) — the worker's half of the
-/// graceful close: it keeps the socket open until the client has drained the
-/// result and dropped its side, so a large in-flight transfer is never RST.
-fn drain_until_eof(r: &mut impl Read) {
-    let mut buf = [0u8; 1024];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,  // client closed
-            Ok(_) => {}      // stray refill credit after END — ignore
-            Err(_) => break, // timeout / reset — stop waiting
-        }
-    }
-}
-
 fn credit_value(p: &[u8]) -> u64 {
     if p.len() == 4 {
         u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as u64
@@ -425,6 +417,33 @@ fn credit_value(p: &[u8]) -> u64 {
 /// rivus://host:port`). The IR stays the artifact; the gateway only relays bytes.
 pub fn forwarding_handler(upstream: String, cfg: LinkConfig) -> Handler {
     Arc::new(move |ir_source: &str| run_remote(&upstream, &cfg, ir_source))
+}
+
+/// Like [`forwarding_handler`], but reuses **one upstream [`Session`]** across all
+/// jobs (§34.4 s2', true session sharing): co-located Rivus processes funnel
+/// through a single persistent upstream connection that the gateway owns, instead
+/// of a fresh connect+handshake per job (the big win for QUIC upstreams, #176).
+/// Jobs serialize through the shared connection (a `Mutex`); a dropped upstream
+/// is transparently re-established on the next job.
+pub fn forwarding_session_handler(upstream: String, cfg: LinkConfig) -> Handler {
+    let session: std::sync::Mutex<Option<Session>> = std::sync::Mutex::new(None);
+    Arc::new(move |ir_source: &str| {
+        let mut guard = session.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(Session::connect(&upstream, &cfg)?);
+        }
+        // Run on the reused session; if the upstream dropped, reconnect once.
+        let first = guard.as_mut().unwrap().run(ir_source);
+        match first {
+            Ok(bytes) => Ok(bytes),
+            Err(_) => {
+                let mut s = Session::connect(&upstream, &cfg)?;
+                let retry = s.run(ir_source);
+                *guard = Some(s);
+                retry
+            }
+        }
+    })
 }
 
 /// Ship `ir_source` to `peer` ("host:port") over the protected channel and
@@ -465,9 +484,8 @@ pub fn run_remote_observed(
     )
 }
 
-/// The **transport-agnostic** client protocol (§34): HELLO → JOB → grant a credit
-/// window → demux the result on the data channel and telemetry events on the
-/// telemetry channel until END/ERR. Generic over the byte streams (TCP / UDS / …).
+/// The **transport-agnostic** one-shot client protocol (§34): HELLO then one
+/// job. Generic over the byte streams (TCP / UDS / …).
 fn client_protocol(
     r: &mut impl Read,
     w: &mut impl Write,
@@ -475,13 +493,38 @@ fn client_protocol(
     ir_source: &str,
     window: u32,
     label: &str,
-    mut on_event: impl FnMut(String),
+    on_event: impl FnMut(String),
 ) -> Result<Vec<u8>, String> {
+    client_hello(r, w, identity, label)?;
+    run_job(r, w, ir_source, window, label, on_event)
+}
+
+/// The HELLO handshake (static-key identity exchange) — done once per connection,
+/// before any job (a session may then run many jobs, §34.4 s2').
+fn client_hello(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    identity: &str,
+    label: &str,
+) -> Result<(), String> {
     write_frame(w, CTRL, HELLO, identity.as_bytes()).map_err(|e| e.to_string())?;
     match read_frame(r).map_err(|e| e.to_string())? {
-        Some((_, HELLO, _)) => {}
-        _ => return Err(format!("peer {label}: no HELLO")),
+        Some((_, HELLO, _)) => Ok(()),
+        _ => Err(format!("peer {label}: no HELLO")),
     }
+}
+
+/// Run **one** job over an already-HELLO'd connection: send JOB, grant a credit
+/// window, demux the result on the data channel + telemetry events on the
+/// telemetry channel until END/ERR. The connection stays open for the next job.
+fn run_job(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    ir_source: &str,
+    window: u32,
+    label: &str,
+    mut on_event: impl FnMut(String),
+) -> Result<Vec<u8>, String> {
     write_frame(w, CTRL, JOB, ir_source.as_bytes()).map_err(|e| e.to_string())?;
     // Grant an initial credit window, then refill one per consumed chunk —
     // bounded pull (at most `window` frames buffered in flight).
@@ -491,7 +534,7 @@ fn client_protocol(
         match read_frame(r).map_err(|e| e.to_string())? {
             Some((DATA, CHUNK, p)) => {
                 out.extend_from_slice(&p);
-                let _ = grant(w, 1); // best-effort refill (races the final close)
+                let _ = grant(w, 1); // best-effort refill
             }
             Some((TELE, EVENT, p)) => on_event(String::from_utf8_lossy(&p).into_owned()),
             Some((_, END, _)) => return Ok(out),
@@ -504,6 +547,60 @@ fn client_protocol(
 
 fn grant(w: &mut impl Write, n: u32) -> io::Result<()> {
     write_frame(w, CTRL, CREDIT, &n.to_be_bytes())
+}
+
+/// A **persistent session** to a worker (§34.4 s2'): one connection reused for
+/// many jobs, amortizing the connect/handshake. The HELLO is done once at
+/// [`Session::connect`]; each [`Session::run`] ships one job over the same
+/// connection. Dropping it closes the session (the worker's job loop ends). This
+/// is the reuse primitive a gateway/pool builds on.
+pub struct Session {
+    reader: BufReader<TcpStream>,
+    writer: TcpStream,
+    window: u32,
+}
+
+impl Session {
+    /// Open a session to `peer` ("host:port") — capability-checked, HELLO'd.
+    pub fn connect(peer: &str, cfg: &LinkConfig) -> Result<Session, String> {
+        let host = peer.rsplit_once(':').map(|(h, _)| h).unwrap_or(peer);
+        cfg.peer_allowed(host)?;
+        let stream = dial(peer, cfg)?;
+        stream
+            .set_read_timeout(Some(read_timeout()))
+            .map_err(|e| e.to_string())?;
+        let _ = stream.set_nodelay(true);
+        let writer = stream.try_clone().map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(stream);
+        let mut w = writer.try_clone().map_err(|e| e.to_string())?;
+        client_hello(&mut reader, &mut w, &cfg.identity, peer)?;
+        Ok(Session {
+            reader,
+            writer,
+            window: cfg.window,
+        })
+    }
+
+    /// Run one job over the reused connection; collect the result bytes.
+    pub fn run(&mut self, ir_source: &str) -> Result<Vec<u8>, String> {
+        self.run_observed(ir_source, |_| {})
+    }
+
+    /// Like [`Session::run`], surfacing the worker's telemetry events.
+    pub fn run_observed(
+        &mut self,
+        ir_source: &str,
+        on_event: impl FnMut(String),
+    ) -> Result<Vec<u8>, String> {
+        run_job(
+            &mut self.reader,
+            &mut self.writer,
+            ir_source,
+            self.window,
+            "session",
+            on_event,
+        )
+    }
 }
 
 // ----------------------------------------------- host Transport Service (UDS)

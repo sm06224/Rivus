@@ -656,8 +656,10 @@ fn run_serve(args: &[String]) -> ExitCode {
     // host Transport Service gateway, §34.4 s2). The IR is the artifact either way.
     let handler: Handler = match &upstream {
         Some(up) => {
+            // Reuse one persistent upstream connection across all downstream jobs
+            // (§34.4 s2' session sharing — the consolidation payoff).
             let addr = up.strip_prefix("rivus://").unwrap_or(up).to_string();
-            distributed::forwarding_handler(addr, LinkConfig::from_env())
+            distributed::forwarding_session_handler(addr, LinkConfig::from_env())
         }
         None => std::sync::Arc::new(|src: &str| {
             let graph = rivus_parser::parse(src).map_err(|e| format!("parse: {e:?}"))?;

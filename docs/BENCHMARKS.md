@@ -1407,3 +1407,11 @@ no kernel WireGuard to ride.
   channel byte (Control/Data/Telemetry) and narrating `flow.*` / `transfer.done`
   events on the telemetry channel did not move any number — the data channel is
   unaffected — while giving the coordinator event-centric observability.
+- **Connection reuse (§34.4 s2', a `Session` of many jobs over one connection):**
+  per-call **0.633 ms/job** vs reused session **0.441 ms/job** = **1.4× on the
+  std path** (300 jobs). The std win is modest because a TCP connect is already
+  cheap; the payoff is for **QUIC**, whose per-call 8.6 ms is dominated by the
+  TLS handshake + cert mint — reusing one session there should collapse it toward
+  the std figure (the lever in #176). The host Transport Service's forwarding
+  gateway uses `forwarding_session_handler` to share one persistent upstream
+  connection across all co-located Rivus (the PMCN consolidation).
