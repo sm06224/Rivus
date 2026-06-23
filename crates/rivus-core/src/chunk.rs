@@ -318,6 +318,35 @@ pub enum ColumnData {
     /// determinism contract, §00 0.14) ride on the scalar [`Value::Resource`]
     /// when present and are not stored on the bulk lane.
     Resource(StrColumn),
+    /// **Struct** lane (§32 s3): a bundle of named child columns, all the same
+    /// length as the struct column (Arrow struct layout). Each child carries its
+    /// own validity, so the null model (§26) recurses. The flat scalar lanes
+    /// above are the untouched fast path; nesting is recursive over them.
+    Struct(StructColumn),
+    /// **List** lane (§32 s3): `i32` offsets + a single child column (Arrow list
+    /// layout). Row `i` spans `offsets[i]..offsets[i+1]` of the child; the column
+    /// length is `offsets.len() - 1`.
+    List(ListColumn),
+}
+
+/// Backing for [`ColumnData::Struct`]: named child columns (Arrow struct).
+#[derive(Debug, Clone)]
+pub struct StructColumn {
+    /// Child field names, parallel to `columns`.
+    pub names: Vec<String>,
+    /// Child columns, each the same length as the struct column.
+    pub columns: Vec<Column>,
+    /// Row count (kept explicit so a childless struct still has a length).
+    pub len: usize,
+}
+
+/// Backing for [`ColumnData::List`]: offsets + child column (Arrow list).
+#[derive(Debug, Clone)]
+pub struct ListColumn {
+    /// `len + 1` monotonically non-decreasing offsets into `child`.
+    pub offsets: Vec<i32>,
+    /// The flattened element column.
+    pub child: Box<Column>,
 }
 
 impl ColumnData {
@@ -333,6 +362,8 @@ impl ColumnData {
             ColumnData::Time(v) => v.len(),
             ColumnData::Str(v) => v.len(),
             ColumnData::Resource(v) => v.len(),
+            ColumnData::Struct(s) => s.len,
+            ColumnData::List(l) => l.offsets.len().saturating_sub(1),
         }
     }
 
@@ -352,6 +383,8 @@ impl ColumnData {
             ColumnData::Time(_) => DataType::Time,
             ColumnData::Str(_) => DataType::Str,
             ColumnData::Resource(_) => DataType::Resource,
+            ColumnData::Struct(_) => DataType::Struct,
+            ColumnData::List(_) => DataType::List,
         }
     }
 
@@ -374,6 +407,20 @@ impl ColumnData {
             )),
             ColumnData::Str(v) => Value::Str(v.get(row).to_string()),
             ColumnData::Resource(v) => Value::Resource(crate::value::Resource::new(v.get(row))),
+            // Nested (§32 s3): recurse, honoring each child's validity. A struct
+            // row is its named children at `row`; a list row is its child slice
+            // `offsets[row]..offsets[row+1]`.
+            ColumnData::Struct(s) => Value::Struct(
+                s.names
+                    .iter()
+                    .zip(s.columns.iter())
+                    .map(|(n, c)| (n.clone(), c.value_at(row)))
+                    .collect(),
+            ),
+            ColumnData::List(l) => {
+                let (a, b) = (l.offsets[row] as usize, l.offsets[row + 1] as usize);
+                Value::List((a..b).map(|i| l.child.value_at(i)).collect())
+            }
         }
     }
 
@@ -455,6 +502,33 @@ impl ColumnData {
                 }
                 ColumnData::Resource(out)
             }
+            // Nested (§32 s3): recurse on each child Column (data + validity); a
+            // `None` index contributes a default/empty element, like the flat
+            // lanes above.
+            ColumnData::Struct(s) => ColumnData::Struct(StructColumn {
+                names: s.names.clone(),
+                columns: s
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        Column::new(
+                            c.data().gather_opt(indices),
+                            c.validity().gather_opt(indices),
+                        )
+                    })
+                    .collect(),
+                len: indices.len(),
+            }),
+            ColumnData::List(l) => {
+                let (offsets, child_idx) = list_gather_opt(&l.offsets, indices);
+                ColumnData::List(ListColumn {
+                    offsets,
+                    child: Box::new(Column::new(
+                        l.child.data().gather(&child_idx),
+                        l.child.validity().gather(&child_idx),
+                    )),
+                })
+            }
         }
     }
 
@@ -480,8 +554,50 @@ impl ColumnData {
             ColumnData::Time(v) => ColumnData::Time(indices.iter().map(|&i| v[i]).collect()),
             ColumnData::Str(v) => ColumnData::Str(v.gather(indices)),
             ColumnData::Resource(v) => ColumnData::Resource(v.gather(indices)),
+            // Nested (§32 s3): recurse on each child Column; for a list, rebuild
+            // offsets over the selected sub-lists.
+            ColumnData::Struct(s) => ColumnData::Struct(StructColumn {
+                names: s.names.clone(),
+                columns: s
+                    .columns
+                    .iter()
+                    .map(|c| Column::new(c.data().gather(indices), c.validity().gather(indices)))
+                    .collect(),
+                len: indices.len(),
+            }),
+            ColumnData::List(l) => {
+                let opt: Vec<Option<usize>> = indices.iter().map(|&i| Some(i)).collect();
+                let (offsets, child_idx) = list_gather_opt(&l.offsets, &opt);
+                ColumnData::List(ListColumn {
+                    offsets,
+                    child: Box::new(Column::new(
+                        l.child.data().gather(&child_idx),
+                        l.child.validity().gather(&child_idx),
+                    )),
+                })
+            }
         }
     }
+}
+
+/// Rebuild list offsets when gathering rows (§32 s3): for each selected row,
+/// copy its child slice `offsets[i]..offsets[i+1]` and advance the new offsets;
+/// a `None` index yields an empty sub-list. Returns `(new_offsets, child_idx)`
+/// where `child_idx` selects the flattened child elements to keep.
+fn list_gather_opt(offsets: &[i32], indices: &[Option<usize>]) -> (Vec<i32>, Vec<usize>) {
+    let mut new_offsets = Vec::with_capacity(indices.len() + 1);
+    new_offsets.push(0i32);
+    let mut child_idx = Vec::new();
+    let mut acc = 0i32;
+    for o in indices {
+        if let Some(i) = *o {
+            let (a, b) = (offsets[i] as usize, offsets[i + 1] as usize);
+            child_idx.extend(a..b);
+            acc += (b - a) as i32;
+        }
+        new_offsets.push(acc);
+    }
+    (new_offsets, child_idx)
 }
 
 /// A columnar buffer **with a null model**: a dense value lane ([`ColumnData`])

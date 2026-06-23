@@ -11,13 +11,50 @@ use std::sync::Arc;
 pub struct Field {
     pub name: String,
     pub dtype: DataType,
+    /// Static structural detail for a nested (`Struct`/`List`) field (§32 s3).
+    /// `None` for a flat scalar lane. The `dtype` is the opaque lane marker
+    /// (`Struct`/`List`, kept `Copy`); this carries the shape so `explain` /
+    /// type-checks can show `user:{name:str}` / `tags:[str]` (design §06: the
+    /// *structural* layer, distinct from the lane). Flat fields never set it, so
+    /// existing schemas are unchanged.
+    pub nested: Option<Nested>,
+}
+
+/// Nested structural detail carried by a [`Field`] whose lane is `Struct`/`List`
+/// (§32 s3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Nested {
+    /// A struct's ordered, named child fields.
+    Struct(Vec<Field>),
+    /// A list's element field (its `name` is conventionally `item`).
+    List(Box<Field>),
 }
 
 impl Field {
+    /// A flat (scalar-lane) field — the common case; no nested detail.
     pub fn new(name: impl Into<String>, dtype: DataType) -> Self {
         Field {
             name: name.into(),
             dtype,
+            nested: None,
+        }
+    }
+
+    /// A `Struct`-lane field carrying its named child fields (§32 s3).
+    pub fn struct_(name: impl Into<String>, children: Vec<Field>) -> Self {
+        Field {
+            name: name.into(),
+            dtype: DataType::Struct,
+            nested: Some(Nested::Struct(children)),
+        }
+    }
+
+    /// A `List`-lane field carrying its element field (§32 s3).
+    pub fn list(name: impl Into<String>, element: Field) -> Self {
+        Field {
+            name: name.into(),
+            dtype: DataType::List,
+            nested: Some(Nested::List(Box::new(element))),
         }
     }
 }

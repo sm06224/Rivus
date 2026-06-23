@@ -296,6 +296,11 @@ fn make_cmp(col: &Column) -> RowCmp<'_> {
         ColumnData::Str(v) | ColumnData::Resource(v) => {
             wrap(col, v, |v: &StrColumn, a, b| v.get(a).cmp(v.get(b)))
         }
+        // §32 s3a: a nested lane has no native sort key — order deterministically
+        // by its `Value` text form. No flow yields a nested sort key today.
+        ColumnData::Struct(_) | ColumnData::List(_) => wrap(col, col, |c: &Column, a, b| {
+            c.value_at(a).to_string().cmp(&c.value_at(b).to_string())
+        }),
     }
 }
 
@@ -395,6 +400,16 @@ fn argsort_single(col: &Column, desc: bool) -> Vec<usize> {
             |i| col.is_null(i),
             desc,
             |a: &&str, b: &&str| a.cmp(b),
+        ),
+        // §32 s3a: a nested lane sorts by its `Value` text form (matches
+        // `make_cmp`). Not reachable today (no nested sort key in a flow).
+        ColumnData::Struct(_) | ColumnData::List(_) => argsort_one(
+            n,
+            |i| col.value_at(i).to_string(),
+            nulls,
+            |i| col.is_null(i),
+            desc,
+            |a: &String, b: &String| a.cmp(b),
         ),
     }
 }
@@ -732,6 +747,8 @@ fn parse_fill(value: &str, dtype: DataType) -> Value {
         // Datetime/duration need a format/unit to parse a literal; not supported
         // as a `fill` constant yet (those rows stay null). Tracked for a follow-up.
         DataType::DateTime { .. } | DataType::Duration { .. } | DataType::Null => Value::Null,
+        // §32 s3a: no surface literal for a nested lane → those rows stay null.
+        DataType::Struct | DataType::List => Value::Null,
     }
 }
 

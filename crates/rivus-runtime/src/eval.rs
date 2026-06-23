@@ -494,8 +494,9 @@ fn to_i64(v: Value) -> i64 {
             .or_else(|_| s.trim().parse::<f64>().map(|f| f as i64))
             .unwrap_or(0),
         Value::Null => 0,
-        // A resource handle is a uri, not a number.
+        // A resource handle is a uri, not a number; a nested value isn't scalar.
         Value::Resource(_) => 0,
+        Value::Struct(_) | Value::List(_) => 0,
     }
 }
 
@@ -512,8 +513,9 @@ fn to_f64(v: Value) -> f64 {
         Value::Bool(b) => b as i64 as f64,
         Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
         Value::Null => f64::NAN,
-        // A resource handle is a uri, not a number.
+        // A resource handle is a uri, not a number; a nested value isn't scalar.
         Value::Resource(_) => f64::NAN,
+        Value::Struct(_) | Value::List(_) => f64::NAN,
     }
 }
 
@@ -531,6 +533,7 @@ fn to_bool(v: Value) -> bool {
         Value::Str(s) => s.trim().eq_ignore_ascii_case("true") || s.trim() == "1",
         Value::Null => false,
         Value::Resource(_) => false,
+        Value::Struct(_) | Value::List(_) => false,
     }
 }
 
@@ -610,6 +613,9 @@ fn cast_value(v: Value, ty: DataType, fails: &mut u64) -> Value {
         // identity); `resource->str` above recovers it via `Display`.
         DataType::Resource => Value::Resource(rivus_core::Resource::new(v.to_string())),
         DataType::Null => Value::Null,
+        // Casting *to* a nested lane has no surface syntax (§32 s3); unsupported
+        // → null (never-silent: a cast that can't apply yields null, continue-first).
+        DataType::Struct | DataType::List => Value::Null,
     }
 }
 
@@ -770,6 +776,9 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
             ColumnData::Resource(s)
         }
         DataType::Null => return col,
+        // §32 s3a: nested lanes have no surface cast syntax (unreachable). Keep
+        // the column unchanged rather than panic (continue-first).
+        DataType::Struct | DataType::List => return col,
     };
     Column::new(data, validity)
 }
@@ -1039,6 +1048,12 @@ fn const_column(v: &Value, n: usize) -> Column {
             ColumnData::F64(vec![0.0; n]),
             rivus_core::Validity::all_null(n),
         ),
+        // §32 s3a: no nested literal exists in the syntax (unreachable). Treat a
+        // nested constant as an all-null column rather than panic.
+        Value::Struct(_) | Value::List(_) => Column::new(
+            ColumnData::F64(vec![0.0; n]),
+            rivus_core::Validity::all_null(n),
+        ),
     }
 }
 
@@ -1078,6 +1093,13 @@ fn col_num_lane(col: Column) -> (Vec<f64>, bool) {
                 .map(|i| s.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
                 .collect();
             (lane, false)
+        }
+        // §32 s3a: a nested lane is not numeric → NaN lane (like text). Not
+        // reachable today (no flow yields a nested column into arithmetic).
+        ColumnData::Struct(s) => (vec![f64::NAN; s.len], false),
+        ColumnData::List(l) => {
+            let n = l.offsets.len().saturating_sub(1);
+            (vec![f64::NAN; n], false)
         }
     }
 }
@@ -1589,6 +1611,8 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
             ColumnData::Str(_) => None,
             // A resource handle is a uri, not a number.
             ColumnData::Resource(_) => None,
+            // §32 s3a: a nested lane is not a numeric column.
+            ColumnData::Struct(_) | ColumnData::List(_) => None,
         },
         _ => None,
     }

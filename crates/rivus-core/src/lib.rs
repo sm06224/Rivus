@@ -16,10 +16,11 @@ pub mod schema;
 pub mod value;
 
 pub use chunk::{
-    Chunk, ChunkMeta, Column, ColumnData, DecColumn, DtColumn, DurColumn, Mode, StrColumn, Validity,
+    Chunk, ChunkMeta, Column, ColumnData, DecColumn, DtColumn, DurColumn, ListColumn, Mode,
+    StrColumn, StructColumn, Validity,
 };
 pub use error::{ErrorEvent, ErrorScope, Result, RivusError, Severity};
-pub use schema::{Field, Schema};
+pub use schema::{Field, Nested, Schema};
 pub use value::{
     DataType, Date, DateTime, Decimal, Duration, Resource, TimeOfDay, TimeUnit, Value,
 };

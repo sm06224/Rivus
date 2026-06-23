@@ -120,6 +120,8 @@ fn num_col(e: &Expr, chunk: &Chunk) -> Option<usize> {
                 ColumnData::Str(_) => None,
                 // A resource handle is a uri, not a number → off the f64 kernel.
                 ColumnData::Resource(_) => None,
+                // §32 s3a: a nested lane is not numeric → off the f64 kernel.
+                ColumnData::Struct(_) | ColumnData::List(_) => None,
             }
         }
         _ => None,
@@ -242,7 +244,10 @@ fn write_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         | ColumnData::Date(_)
         | ColumnData::Time(_)
         | ColumnData::Str(_)
-        | ColumnData::Resource(_) => mask.fill(0),
+        | ColumnData::Resource(_)
+        // §32 s3a: nested lanes never reach the kernel (`num_col` → None).
+        | ColumnData::Struct(_)
+        | ColumnData::List(_) => mask.fill(0),
     }
 }
 
@@ -343,7 +348,10 @@ fn and_mask(p: &NumCmp, chunk: &Chunk, mask: &mut [u8]) {
         | ColumnData::Date(_)
         | ColumnData::Time(_)
         | ColumnData::Str(_)
-        | ColumnData::Resource(_) => mask.fill(0),
+        | ColumnData::Resource(_)
+        // §32 s3a: nested lanes never reach the kernel (`num_col` → None).
+        | ColumnData::Struct(_)
+        | ColumnData::List(_) => mask.fill(0),
     }
 }
 
