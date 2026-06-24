@@ -379,16 +379,51 @@ pub enum Discovery {
     /// evaluation requires the off-by-default `unbounded` feature (a
     /// feature-less run refuses pre-run, never-silent).
     Watch(String),
+    /// **Unbounded** network discovery (`subscribe "tcp://host:port"`, design
+    /// §33 / §28.12.5): dial a TCP endpoint as a client and stream newline-
+    /// delimited records — a feed that never ends. Like `Watch` it is outside the
+    /// deterministic-op set (§0.14). Parse / `to_source` are always-std;
+    /// evaluation requires the off-by-default `net` feature (a feature-less run
+    /// refuses pre-run, never-silent). Unlike `Watch` (which needs `unbounded` /
+    /// `notify`) this rides the `net` feature — the two are gated apart.
+    Subscribe(String),
+}
+
+/// Does `p` name an HTTP(S) URL (the networked `open`/`read` source scheme,
+/// §33)? A cheap, std-only prefix test usable from the IR (no runtime `Scheme`
+/// dependency) so `PlanGraph::uses_net` can gate the `net` feature before run.
+pub fn is_http_url(p: &str) -> bool {
+    let l = p.trim_start();
+    l.len() >= 7 && l[..7].eq_ignore_ascii_case("http://")
+        || l.len() >= 8 && l[..8].eq_ignore_ascii_case("https://")
 }
 
 impl Discovery {
-    /// The discovery's path/pattern string: the fixed path (`Fixed`) or the glob
-    /// pattern (`Glob`/`Watch`). Used for `to_source` and the parallel-read size
-    /// gate (`Glob`/`Watch` never plan a byte-range read — their codec is
-    /// `Discover`).
+    /// The discovery's path/pattern string: the fixed path (`Fixed`), the glob
+    /// pattern (`Glob`/`Watch`) or the endpoint (`Subscribe`). Used for
+    /// `to_source` and the parallel-read size gate.
     pub fn path(&self) -> &str {
         match self {
-            Discovery::Fixed(p) | Discovery::Glob(p) | Discovery::Watch(p) => p,
+            Discovery::Fixed(p)
+            | Discovery::Glob(p)
+            | Discovery::Watch(p)
+            | Discovery::Subscribe(p) => p,
+        }
+    }
+
+    /// Is this the unbounded **file-`watch`** discovery (needs the `unbounded` /
+    /// `notify` feature), as opposed to the network `subscribe` (needs `net`)?
+    pub fn is_watch(&self) -> bool {
+        matches!(self, Discovery::Watch(_))
+    }
+
+    /// Is this a **networked** discovery — `subscribe` (always), or a `Fixed` /
+    /// `Glob` whose path is an `http://` / `https://` URL? Networked sources need
+    /// the `net` feature; the runtime refuses a feature-less plan pre-run.
+    pub fn is_net(&self) -> bool {
+        match self {
+            Discovery::Subscribe(_) => true,
+            Discovery::Fixed(p) | Discovery::Glob(p) | Discovery::Watch(p) => is_http_url(p),
         }
     }
 
@@ -398,7 +433,7 @@ impl Discovery {
     /// contract and must not be re-ordered or re-combined by the optimizer or
     /// the parallel executor.
     pub fn is_unbounded(&self) -> bool {
-        matches!(self, Discovery::Watch(_))
+        matches!(self, Discovery::Watch(_) | Discovery::Subscribe(_))
     }
 }
 
@@ -956,6 +991,13 @@ impl Op {
                 Codec::Binary { .. } => "readbin",
                 Codec::Discover { .. } if discovery.is_unbounded() => "watch",
                 Codec::Discover { .. } => "ls",
+                // A data codec over the unbounded network `subscribe` source
+                // (§33) is `subscribe`; otherwise a fixed/HTTP `open`.
+                Codec::Csv { .. } | Codec::Jsonl
+                    if matches!(discovery, Discovery::Subscribe(_)) =>
+                {
+                    "subscribe"
+                }
                 Codec::Csv { .. } | Codec::Jsonl => "open",
             },
             Op::Read { .. } => "read",
@@ -1032,7 +1074,15 @@ impl Op {
                         prefilter,
                         str_prefilter,
                     } => {
-                        let mut s = format!("open {path}");
+                        // `subscribe "tcp://…"` (§33) renders with the quoted
+                        // endpoint and the `subscribe` verb; an `http://` URL is
+                        // quoted so it re-lexes as one string token (reversible);
+                        // a plain path stays bare. All share the modifiers below.
+                        let mut s = match discovery {
+                            Discovery::Subscribe(_) => format!("subscribe {path:?}"),
+                            _ if is_http_url(path) => format!("open {path:?}"),
+                            _ => format!("open {path}"),
+                        };
                         if !header {
                             s.push_str(" noheader");
                         }
@@ -1098,7 +1148,19 @@ impl Op {
                             provenance.modifier()
                         )
                     }
-                    Codec::Jsonl => format!("open {path}{}", provenance.modifier()),
+                    // JSONL `subscribe` renders `subscribe "tcp://…" as json`; an
+                    // `http://` `open` quotes the URL + `as json` (an endpoint /
+                    // URL has no extension to infer the codec from); a file `open`
+                    // keeps the bare path (extension picks the codec).
+                    Codec::Jsonl => match discovery {
+                        Discovery::Subscribe(_) => {
+                            format!("subscribe {path:?} as json{}", provenance.modifier())
+                        }
+                        _ if is_http_url(path) => {
+                            format!("open {path:?} as json{}", provenance.modifier())
+                        }
+                        _ => format!("open {path}{}", provenance.modifier()),
+                    },
                     // `ls "glob"` / `watch "glob"` — the path is the glob
                     // pattern; quote it so it re-lexes as one string token
                     // (reversible). Provenance is not applicable to a discovery
@@ -1533,6 +1595,27 @@ impl PlanGraph {
     pub fn uses_unbounded(&self) -> bool {
         self.nodes.iter().any(|n| match &n.op {
             Op::Source { discovery, .. } => discovery.is_unbounded(),
+            _ => false,
+        })
+    }
+
+    /// Does the plan contain the unbounded **file-`watch`** source specifically
+    /// (gated by `unbounded` / `notify`), as opposed to the network `subscribe`
+    /// (gated by `net`)? The two unbounded sources are feature-gated apart, so
+    /// the runtime's pre-run feature check consults each separately.
+    pub fn uses_watch(&self) -> bool {
+        self.nodes.iter().any(|n| match &n.op {
+            Op::Source { discovery, .. } => discovery.is_watch(),
+            _ => false,
+        })
+    }
+
+    /// Does the plan contain a **networked** source — `subscribe "tcp://…"`, or an
+    /// `open`/`read` of an `http://` URL (§33)? A build without the `net` feature
+    /// refuses such a plan pre-run (never-silent, the `regex`/`unbounded` shape).
+    pub fn uses_net(&self) -> bool {
+        self.nodes.iter().any(|n| match &n.op {
+            Op::Source { discovery, .. } => discovery.is_net(),
             _ => false,
         })
     }

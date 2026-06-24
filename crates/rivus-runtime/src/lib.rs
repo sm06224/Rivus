@@ -13,6 +13,12 @@ mod engine;
 mod eval;
 mod jsonl;
 mod kernel;
+// §33 networking transport (feature `net`): a std-only HTTP/1.1 GET client and a
+// TCP subscribe dial — `open "http://…"` (bounded GET) and `subscribe "tcp://…"`
+// (unbounded feed). The default build does not compile it (zero-dep invariant).
+// Distributed execution (`serve` / `run --on`) is a later slice on this feature.
+#[cfg(feature = "net")]
+mod net;
 mod operators;
 mod route;
 mod telemetry;
