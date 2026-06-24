@@ -1149,6 +1149,42 @@ impl Parser {
                     provenance: Provenance::Off,
                 }))
             }
+            // `subscribe "tcp://host:port" [as csv|tsv|json]` — the unbounded
+            // network feed (§33, feature `net`): dial a TCP endpoint and stream
+            // newline-delimited records. Parsing is always-std (IR reversible);
+            // *evaluation* needs `net` (a feature-less run refuses pre-run). The
+            // endpoint has no extension, so the codec is CSV unless `as` says.
+            Tok::Word(w) if w == "subscribe" => {
+                self.bump();
+                let addr = match self.bump() {
+                    Tok::Str(s) => s,
+                    other => {
+                        return Err(self.err(format!(
+                            "subscribe expects a quoted tcp:// URL, found {other:?}"
+                        )))
+                    }
+                };
+                let explicit = if self.peek_is_word("as") {
+                    self.bump();
+                    Some(self.word()?)
+                } else {
+                    None
+                };
+                let codec = match explicit.as_deref() {
+                    None | Some("csv") => Codec::csv(b','),
+                    Some("tsv") | Some("tab") => Codec::csv(b'\t'),
+                    Some("json") | Some("jsonl") | Some("ndjson") => Codec::Jsonl,
+                    Some(other) => {
+                        return Err(self.err(format!("subscribe: unknown format '{other}'")))
+                    }
+                };
+                Ok(self.g.add_node(Op::Source {
+                    discovery: Discovery::Subscribe(addr),
+                    transport: Transport::Local,
+                    codec,
+                    provenance: Provenance::Off,
+                }))
+            }
             // `readbin path [le|be] [packed|aligned] (name:type ...)`.
             Tok::Word(w) if w == "readbin" => {
                 self.bump();
@@ -2193,6 +2229,7 @@ fn is_keyword(w: &str) -> bool {
             | "stop"
             | "monitor"
             | "watch"
+            | "subscribe"
             | "visualize"
             | "transition"
             | "log"
@@ -4288,6 +4325,26 @@ Import:
             canonical.to_source(),
             ".riv.md sugar must lower to the canonical graph (§31 stage-1 zero-semantic-change)"
         );
+    }
+
+    #[test]
+    fn subscribe_parses_and_round_trips() {
+        // §33 `net`: `subscribe "tcp://…"` is an unbounded source; `to_source`
+        // re-quotes the endpoint with the `subscribe` verb (reversible), `as json`
+        // round-trips. Parsing is always-std (no `net` feature); the plan is
+        // flagged networked (gated `net`) and unbounded (no parallel/reorder).
+        for src in [
+            "F:\n subscribe \"tcp://127.0.0.1:9000\"\n |> name\n;",
+            "J:\n subscribe \"tcp://host:9000\" as json\n |> name\n;",
+        ] {
+            let g = parse(src).unwrap();
+            let s = g.to_source();
+            assert!(s.contains("subscribe \"tcp://"), "subscribe quoted: {s}");
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not idempotent: {s}");
+            assert!(g.uses_net(), "subscribe must set uses_net");
+            assert!(g.uses_unbounded(), "subscribe is unbounded");
+            assert!(!g.uses_watch(), "subscribe is not watch (gated apart)");
+        }
     }
 
     #[test]

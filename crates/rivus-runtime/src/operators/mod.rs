@@ -14,8 +14,8 @@ use rivus_core::{
     Schema, Severity, StrColumn, TimeUnit, Validity, Value,
 };
 use rivus_ir::{
-    AggFunc, BinType, CmpOp, Codec, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
-    PathExpr, SinkCodec,
+    AggFunc, BinType, CmpOp, Codec, Discovery, Disposition, Endian, Expr, FillMethod, JoinKind,
+    NodeId, Op, PathExpr, SinkCodec,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -252,6 +252,21 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             ..
         } => {
             let path = discovery.path();
+            // `subscribe "tcp://…"` (§33): the unbounded network feed, dispatched
+            // apart from the file/HTTP readers. Its evaluator is `net`-gated;
+            // `run_with_progress` refuses a `net`-less plan pre-run, so the stub is
+            // defense-in-depth (a caller that skips the engine still gets a loud
+            // Fatal, never a silent one-shot).
+            if matches!(discovery, Discovery::Subscribe(_)) {
+                #[cfg(feature = "net")]
+                return Box::new(subscribe::SourceSubscribe::new(
+                    path.to_string(),
+                    codec,
+                    chunk_size,
+                ));
+                #[cfg(not(feature = "net"))]
+                return Box::new(SourceNetStub);
+            }
             match codec {
                 Codec::Csv {
                     header,
@@ -439,6 +454,9 @@ mod join;
 mod read;
 mod sink;
 mod source;
+// §33 unbounded network `subscribe` source (feature `net`).
+#[cfg(feature = "net")]
+mod subscribe;
 mod transform;
 // The unbounded `watch` evaluator (§28.12) — the only feature-gated operator
 // module; the default build does not compile it (zero-dep invariant).
