@@ -176,3 +176,89 @@ fn http_get_jsonl() {
         ]
     );
 }
+/// Feed `lines` over a single accepted loopback TCP connection, then close it —
+/// `subscribe` ends on peer close (the unbounded source's natural EOF).
+fn feed_once(lines: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Some(Ok(mut s)) = listener.incoming().next() {
+            let _ = s.write_all(lines.as_bytes());
+            let _ = s.flush();
+            // Dropping `s` closes the connection → EOF on the reader.
+        }
+    });
+    port
+}
+
+#[test]
+fn subscribe_tcp_stream_until_peer_close() {
+    let port = feed_once("name,age\nalice,30\nbob,17\ncarol,42\ndave,55\n");
+    // Give the listener a moment to be ready (bind is sync, but the accept loop
+    // races the client connect on a cold thread).
+    thread::sleep(std::time::Duration::from_millis(50));
+    let src = format!("Feed:\n subscribe \"tcp://127.0.0.1:{port}\"\n |? age >= 18\n |> name\n;");
+    let res = run_src(&src, 2);
+    assert!(
+        res.errors.iter().all(|e| !e.is_fatal()),
+        "no fatal errors: {:?}",
+        res.errors
+    );
+    let got = rows(&res, "Feed", &["name"]);
+    assert_eq!(
+        got,
+        vec![
+            vec!["alice".to_string()],
+            vec!["carol".to_string()],
+            vec!["dave".to_string()],
+        ]
+    );
+}
+
+#[test]
+fn subscribe_jsonl_stream() {
+    let port = feed_once(JSONL);
+    thread::sleep(std::time::Duration::from_millis(50));
+    let src =
+        format!("Feed:\n subscribe \"tcp://127.0.0.1:{port}\" as json\n |? age >= 18\n |> name\n;");
+    let res = run_src(&src, 2);
+    assert!(
+        res.errors.iter().all(|e| !e.is_fatal()),
+        "no fatal errors: {:?}",
+        res.errors
+    );
+    let got = rows(&res, "Feed", &["name"]);
+    assert_eq!(
+        got,
+        vec![vec!["alice".to_string()], vec!["carol".to_string()]]
+    );
+}
+
+#[test]
+fn subscribe_blocking_op_refused() {
+    // An aggregate downstream of the unbounded subscribe source needs the whole
+    // stream → refused pre-run (never-silent, §28.12.0). Parse/build is std.
+    let graph = rivus_parser::parse("G:\n subscribe \"tcp://127.0.0.1:9\"\n |# name count:name\n;")
+        .expect("parse");
+    let (graph, _r) = rivus_optimizer::optimize(graph);
+    let err = run(&graph, RunOptions::default()).expect_err("blocking-op refusal");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("unbounded"),
+        "refusal mentions unbounded: {msg}"
+    );
+}
+
+#[test]
+fn subscribe_connect_failure_is_fatal_not_panic() {
+    // Dialing a closed port surfaces a fatal (continue-first), never a panic.
+    let src = "D:\n subscribe \"tcp://127.0.0.1:1\"\n |> name\n;";
+    let graph = rivus_parser::parse(src).expect("parse");
+    let (graph, _r) = rivus_optimizer::optimize(graph);
+    let res = run(&graph, RunOptions::default()).expect("run returns");
+    assert!(
+        res.errors.iter().any(|e| e.is_fatal()),
+        "connect failure is fatal: {:?}",
+        res.errors
+    );
+}

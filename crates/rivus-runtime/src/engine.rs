@@ -153,7 +153,10 @@ pub fn run_with_progress(
     // feature cannot evaluate an unbounded source (`watch`). Refuse the plan
     // explicitly before running — the same shape as `regex`/`gzip`. Parsing and
     // `rivus explain` stay always-std.
-    if cfg!(not(feature = "unbounded")) && graph.uses_unbounded() {
+    // Only the file-`watch` source rides the `unbounded`/`notify` feature; the
+    // network `subscribe` is unbounded too but rides `net` (checked below). So
+    // this consults `uses_watch`, not `uses_unbounded`.
+    if cfg!(not(feature = "unbounded")) && graph.uses_watch() {
         return Err(RivusError::Build(
             "this flow uses an unbounded source (`watch`), but this build has the \
              `unbounded` feature disabled — rebuild with `--features unbounded` (the \

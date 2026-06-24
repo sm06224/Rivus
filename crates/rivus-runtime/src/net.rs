@@ -1,14 +1,16 @@
 //! Networking transport (design §33, feature `net`) — a **std-only** HTTP/1.1
-//! GET client, **client-side only** (no listener is ever bound, per §28.12.5-1:
-//! "protected channel or none; loopback is the only exception"). Zero
-//! third-party dependencies: the whole thing rides `std::net`.
+//! GET client and a TCP subscribe dial, both **client-side only** (no listener
+//! is ever bound, per §28.12.5-1: "protected channel or none; loopback is the
+//! only exception"). Zero third-party dependencies: the whole thing rides
+//! `std::net`.
 //!
-//! [`http_get`] produces a `Box<dyn BufRead + Send>` the existing codecs decode
-//! unchanged (the orthogonality of §28.2 — only the transport layer changes):
-//! `open "http://host[:port]/path.csv"` is one bounded GET, following up to
-//! [`MAX_REDIRECTS`] `3xx` redirects, body framed by `Content-Length` /
-//! `Transfer-Encoding: chunked` / connection-close. (The unbounded `subscribe
-//! "tcp://…"` feed is a later slice on this feature.)
+//! Both produce a `Box<dyn BufRead + Send>` the existing codecs decode unchanged
+//! (the orthogonality of §28.2 — only the transport layer changes):
+//! - [`http_get`] — `open "http://host[:port]/path.csv"`: one bounded GET,
+//!   following up to [`MAX_REDIRECTS`] `3xx` redirects, body framed by
+//!   `Content-Length` / `Transfer-Encoding: chunked` / connection-close.
+//! - [`tcp_connect`] — `subscribe "tcp://host:port"`: dial a feed and stream
+//!   newline-delimited records (an **unbounded** source, §33).
 //!
 //! ## Capability (§28.12.4 / §28.12.5)
 //! A reachable endpoint must be **loopback** (`127.0.0.0/8` / `::1` /
@@ -153,6 +155,43 @@ fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
         .set_read_timeout(Some(read_timeout()))
         .map_err(|e| format!("cannot set read timeout: {e}"))?;
     Ok(stream)
+}
+
+/// Parse `tcp://host:port` for `subscribe` (an explicit port is required — a
+/// feed has no default port).
+fn parse_tcp_url(url: &str) -> Result<Url, String> {
+    let rest = url
+        .strip_prefix("tcp://")
+        .or_else(|| {
+            url.get(..6)
+                .filter(|s| s.eq_ignore_ascii_case("tcp://"))
+                .map(|_| &url[6..])
+        })
+        .ok_or_else(|| {
+            format!("'{url}': subscribe needs a tcp:// URL (e.g. tcp://127.0.0.1:9000)")
+        })?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = split_host_port(authority, 0)?;
+    if port == 0 {
+        return Err(format!(
+            "'{url}': subscribe needs an explicit port (tcp://host:port)"
+        ));
+    }
+    Ok(Url {
+        host,
+        port,
+        path: String::new(),
+    })
+}
+
+/// `subscribe "tcp://host:port"` (§33): dial the feed (loopback-or-allowlist
+/// capability, §28.12.4) and return its byte stream as a `BufRead` the codec
+/// line-streams. **Unbounded** — the stream ends when the peer closes (or a
+/// `take N` downstream saturates).
+pub(crate) fn tcp_connect(url: &str) -> Result<Box<dyn BufRead + Send>, String> {
+    let u = parse_tcp_url(url)?;
+    let stream = dial(&u.host, u.port)?;
+    Ok(Box::new(BufReader::new(stream)))
 }
 
 /// `open "http://…"` (§33): one bounded HTTP/1.1 GET, following up to
@@ -376,6 +415,14 @@ mod tests {
     #[test]
     fn rejects_https() {
         assert!(parse_http_url("https://x/y").is_err());
+    }
+
+    #[test]
+    fn parses_tcp_urls() {
+        let u = parse_tcp_url("tcp://127.0.0.1:9000").unwrap();
+        assert_eq!(u.host, "127.0.0.1");
+        assert_eq!(u.port, 9000);
+        assert!(parse_tcp_url("tcp://127.0.0.1").is_err()); // no port required
     }
 
     #[test]
