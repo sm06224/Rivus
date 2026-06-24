@@ -172,6 +172,17 @@ impl Parser {
         matches!(self.tok(), Tok::Word(x) if x == w)
     }
 
+    /// Is the token *after* the current one a stage keyword other than `map`?
+    /// Used for the optional-leading-pipe sugar (§25, #171): a bare `|` directly
+    /// before a keyword stage (`| where`, `| sort`, `| group`, …) is consumed so
+    /// the stage parses as usual, while `| name` stays named-flow reuse (§25.4)
+    /// and `| map …`/`|> …` stay the projection forms. `map` is excluded so a
+    /// `| map` after a named-flow apply is never mis-read as a leading pipe.
+    fn peek_is_keyword_except_map(&self) -> bool {
+        matches!(self.toks.get(self.pos + 1).map(|t| &t.0),
+            Some(Tok::Word(w)) if is_keyword(w) && w != "map")
+    }
+
     /// Take all pending comment trivia that precede the current token position,
     /// in source order (§25.7). Called at each statement boundary so the run of
     /// comments leading a step is attached to that step's node.
@@ -290,6 +301,17 @@ impl Parser {
             // whatever node the matched transform creates first carries them.
             let lead = self.take_leading_comments();
             let mark = self.g.nodes.len();
+            // Optional-leading-pipe sugar (§25, #171): a bare `|` immediately
+            // before a keyword stage is consumed so `| where` / `| sort` and
+            // single-line chains (`open … | where … | save …`) read naturally.
+            // It is pure input sugar — the consumed `|` is not stored, so
+            // `to_source` re-emits the canonical typed-pipe form (no second
+            // canonical form). `| name` (named-flow §25.4) and `|> …` are
+            // unaffected; a body-leading `|` (no `current` stage yet) is handled
+            // by `parse_body_head` and still errors.
+            if self.at(&Tok::Pipe) && self.peek_is_keyword_except_map() {
+                self.bump();
+            }
             match self.tok().clone() {
                 // `|? pred` / `|? a, b` (comma = AND). `where` is a readable alias.
                 Tok::PipeFilter => {
@@ -350,42 +372,16 @@ impl Parser {
                 }
                 Tok::PipeGroup => {
                     self.bump();
-                    // One or more group keys, then optional aggregates. A word is
-                    // an aggregate (not a key) when it's a known func immediately
-                    // followed by `:` (e.g. `sum:score`); every other leading
-                    // word is a key. At least one key is required.
-                    let is_agg = |p: &Self| {
-                        matches!(p.tok(), Tok::Word(w)
-                            if AggFunc::parse(w).is_some()
-                                && p.toks[p.pos + 1].0 == Tok::Colon)
-                    };
-                    let mut keys = Vec::new();
-                    while let Tok::Word(_) = self.tok() {
-                        if is_agg(self) {
-                            break;
-                        }
-                        keys.push(self.word()?);
-                    }
-                    if keys.is_empty() {
-                        return Err(self.err("group `|#` requires at least one key"));
-                    }
-                    // Aggregates: `func:col` repeated.
-                    let mut aggs = Vec::new();
-                    while let Tok::Word(w) = self.tok().clone() {
-                        match AggFunc::parse(&w) {
-                            Some(func) if self.toks[self.pos + 1].0 == Tok::Colon => {
-                                self.bump(); // func
-                                self.bump(); // ':'
-                                let col = self.word()?;
-                                aggs.push((func, col));
-                            }
-                            _ => break,
-                        }
-                    }
-                    let keys = keys.into_iter().map(key_path).collect();
-                    let n = self.g.add_node(Op::GroupBy { keys, aggs });
-                    self.g.add_edge(current, n, EdgeKind::Stream);
-                    current = n;
+                    current = self.parse_group_tail(current)?;
+                }
+                // `group KEY… [func:col …]` — readable bare-word alias for `|#`
+                // (§25, #171). Same tail as `|#`; `to_source` re-emits `|#` (the
+                // canonical form — `group` is input-only sugar). A real column
+                // named `group` is reached with `item("group")` (it is reserved
+                // as a stage keyword here, like `sort`/`distinct`).
+                Tok::Word(w) if w == "group" => {
+                    self.bump();
+                    current = self.parse_group_tail(current)?;
                 }
                 Tok::Pipe => {
                     self.bump(); // `|`
@@ -979,6 +975,46 @@ impl Parser {
                 "`with` expects `source` or `filename`, found {other:?}"
             ))),
         }
+    }
+
+    /// Parse the tail of a group-by stage (the `|#` token or the `group` keyword
+    /// is already consumed): one or more keys, then optional `func:col`
+    /// aggregates. A leading word is an aggregate (not a key) only when it is a
+    /// known agg func immediately followed by `:` (e.g. `sum:score`); every other
+    /// leading word is a key, and at least one key is required. Shared by `|#`
+    /// and the `group` alias so the two stay identical (§25, #171).
+    fn parse_group_tail(&mut self, current: NodeId) -> Result<NodeId, RivusError> {
+        let is_agg = |p: &Self| {
+            matches!(p.tok(), Tok::Word(w)
+                if AggFunc::parse(w).is_some()
+                    && p.toks[p.pos + 1].0 == Tok::Colon)
+        };
+        let mut keys = Vec::new();
+        while let Tok::Word(_) = self.tok() {
+            if is_agg(self) {
+                break;
+            }
+            keys.push(self.word()?);
+        }
+        if keys.is_empty() {
+            return Err(self.err("group requires at least one key"));
+        }
+        let mut aggs = Vec::new();
+        while let Tok::Word(w) = self.tok().clone() {
+            match AggFunc::parse(&w) {
+                Some(func) if self.toks[self.pos + 1].0 == Tok::Colon => {
+                    self.bump(); // func
+                    self.bump(); // ':'
+                    let col = self.word()?;
+                    aggs.push((func, col));
+                }
+                _ => break,
+            }
+        }
+        let keys = keys.into_iter().map(key_path).collect();
+        let n = self.g.add_node(Op::GroupBy { keys, aggs });
+        self.g.add_edge(current, n, EdgeKind::Stream);
+        Ok(n)
     }
 
     /// upstream node.
@@ -2147,6 +2183,7 @@ fn is_keyword(w: &str) -> bool {
             | "reorder"
             | "rename"
             | "where"
+            | "group"
             | "on"
             | "map"
             | "mode"
@@ -4186,6 +4223,86 @@ Import:
             qsrc,
             parse(&qsrc).unwrap().to_source(),
             "not idempotent: {qsrc}"
+        );
+    }
+
+    #[test]
+    fn optional_leading_pipe_and_single_line_chaining() {
+        // §25 / #171: a bare `|` before a keyword stage is optional input sugar.
+        // It is NOT stored — `to_source` re-emits the canonical typed-pipe form
+        // (no second canonical form), so a leading-pipe flow and its bare
+        // equivalent produce byte-identical source.
+        let with_pipes =
+            parse("F:\n open a.csv\n | where age >= 30\n | sort score desc\n | save out.csv\n;")
+                .unwrap();
+        let plain =
+            parse("F:\n open a.csv\n |? age >= 30\n sort score desc\n save out.csv\n;").unwrap();
+        assert_eq!(
+            with_pipes.to_source(),
+            plain.to_source(),
+            "leading-pipe sugar must normalize to the canonical form"
+        );
+        // The canonical form is the typed pipe `|?` (a bare field renders as
+        // `$_.age`), with no leading bare `|` before the stage.
+        let src = with_pipes.to_source();
+        assert!(src.contains("|? $_.age >= 30"), "where→|? canonical: {src}");
+        assert!(
+            !src.lines().any(|l| l.trim_start().starts_with("| ")),
+            "no leading bare pipe in canonical source: {src}"
+        );
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent: {src}");
+
+        // Single-line chaining: stages separated by `|` on one line parse to the
+        // same graph as the multi-line form.
+        let one_line =
+            parse("F:\n open a.csv | where age >= 30 | sort score desc | save out.csv\n;").unwrap();
+        assert_eq!(
+            one_line.to_source(),
+            with_pipes.to_source(),
+            "single-line == multi-line"
+        );
+
+        // A body-leading `|` (before any source) is still a parse error.
+        assert!(parse("F:\n | open a.csv\n;").is_err());
+        // `| name` stays named-flow reuse (§25.4), not leading-pipe sugar.
+        assert!(
+            parse("A:\n open a.csv\n |> x\n;\nB:\n open b.csv\n | A\n;").is_ok(),
+            "named-flow apply must still parse"
+        );
+    }
+
+    #[test]
+    fn sugar_works_inside_literate_flow_fence_no_31_conflict() {
+        // #171 sugar must not conflict with the §31 literate form (#162/#163): a
+        // ```flow fence body is ordinary flow syntax, so leading pipes / single
+        // line / `group` parse there too, and lower to the same graph as the
+        // canonical `.riv`.
+        let md = "# demo\n\nprose\n\n```flow\nG:\n open a.csv | where age >= 30 | group country sum:score\n;\n```\n";
+        let from_md = parse_md(md).unwrap();
+        let canonical = parse("G:\n open a.csv\n |? age >= 30\n |# country sum:score\n;").unwrap();
+        assert_eq!(
+            from_md.to_source(),
+            canonical.to_source(),
+            ".riv.md sugar must lower to the canonical graph (§31 stage-1 zero-semantic-change)"
+        );
+    }
+
+    #[test]
+    fn group_keyword_is_sugar_for_pipe_hash() {
+        // §25 / #171: `group KEY… func:col…` is a readable alias for `|#`, and
+        // `to_source` re-emits `|#` (the canonical form — `group` is input sugar).
+        let kw = parse("G:\n open a.csv\n group country sum:score max:score\n;").unwrap();
+        let sym = parse("G:\n open a.csv\n |# country sum:score max:score\n;").unwrap();
+        assert_eq!(kw.to_source(), sym.to_source(), "group ≡ |#");
+        assert!(kw.to_source().contains("|# country"), "canonical is |#");
+        assert_eq!(kw.to_source(), parse(&kw.to_source()).unwrap().to_source());
+        // The `group` alias and `| group` (with the optional leading pipe) agree.
+        let piped = parse("G:\n open a.csv\n | group country sum:score max:score\n;").unwrap();
+        assert_eq!(piped.to_source(), sym.to_source(), "| group ≡ |#");
+        // A real column literally named `group` is still reachable via item("…").
+        assert!(
+            parse("G:\n open a.csv\n |> (item(\"group\")) as g\n;").is_ok(),
+            "item(\"group\") escape must work"
         );
     }
 
