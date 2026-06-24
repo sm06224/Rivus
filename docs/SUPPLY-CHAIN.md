@@ -23,6 +23,25 @@ third-party crate as untrusted-until-vetted and minimizes the trusted surface.
   - a user opts in explicitly, pulling a *vetted* crate and its reviewed tree;
   - the core engine never depends on them.
 
+- **Some opt-in features add *no* dependency at all.** The `net` feature
+  (networking execution, §33 — `open "http://…"` / `subscribe "tcp://…"`) is
+  implemented entirely on `std::net` (a minimal HTTP/1.1 client), so it pulls
+  **zero** third-party crates: `cargo tree -p rivus-runtime --features net
+  --edges normal` shows only `rivus-*`. It is gated off-by-default purely so the
+  *lean* build's surface is mechanically minimal; the transport itself is as
+  dependency-free as the core. (Per §28.12.1a, deps are taken only when a
+  capability can't be done in std — HTTP can.)
+
+- **The `quic` feature (§28.12.5-3, distributed-execution alternative) pulls a
+  vetted async/TLS stack — off by default, isolated.** `quinn` (pure-Rust QUIC,
+  the de-facto standard), `rustls` + `ring` (the pure-Rust TLS + crypto provider,
+  no OpenSSL), `rcgen` (self-signed identity certs), `tokio` (async runtime,
+  bridged to the sync engine). All gated behind `quic`; the default, `net` and
+  `full` builds do **not** compile or link them (`quic` is intentionally excluded
+  from `full` while its result-stream round-trip is WIP). The *primary*
+  distributed transport rides **kernel WireGuard** and embeds **no** crypto
+  (§28.12.5-2). Vet `--all-features` with `cargo deny` before adopting into `full`.
+
 - **Dev-only dependencies are isolated.** `criterion` (benchmarks) and its tree
   are `[dev-dependencies]`; they never ship in a release build.
 
@@ -79,6 +98,7 @@ a committed `Cargo.lock` + `cargo deny check --all-features`):
 | **file-change notification (`watch`)** ✅ *integrated (slice 5)* | [`notify`](https://crates.io/crates/notify) (notify-rs) | `unbounded` | **#149 ② amended ruling**: std polling rejected (needless OS load) → subscribe to the OS mechanism (inotify / kqueue / FSEvents / ReadDirectoryChangesW); 統括明言「依存ゼロは原則であって、依存なしで実装可能になるまでは依存ありで可」. `notify` is the de-facto standard watcher (notify-rs org, used across the ecosystem: cargo-watch / watchexec / rust-analyzer lineage), multi-year history, pinned to the **latest stable line 8.x (8.2.0 in `Cargo.lock`)** — the 9.x release candidates are *not* stable and are not taken. License **CC0-1.0** (already on the `deny.toml` allow-list). **Adopted**: `default-features = false, features = ["macos_fsevent"]` (its only default feature, kept explicitly so macOS uses FSEvents rather than one-fd-per-file kqueue), behind the `unbounded` feature (#149 ⑤) and the Discovery boundary — the core engine never references it. Linux transitive tree (all pure-Rust / FFI-decl only, no C build step; permissive): `inotify`→`inotify-sys`+`bitflags`, `libc`, `log`, `mio`, `notify-types`→`bitflags`, `walkdir`→`same-file`; platform-conditional: `fsevent-sys` (macOS), `kqueue`/`kqueue-sys` (BSD), `windows-sys` (Windows). Default `cargo tree -p rivus-cli` stays rivus-only; `cargo deny check --all-features` verified in CI. |
 | **Parquet / Arrow** | [`parquet`](https://crates.io/crates/parquet) + [`arrow`](https://crates.io/crates/arrow) (apache/arrow-rs) | `parquet` | official Apache project, the standard, actively released; heavy transitive tree → strictly feature-gated and isolated |
 | **Python pickle** | [`serde-pickle`](https://crates.io/crates/serde-pickle) | `pickle` | the established pickle crate, maintained, MIT/Apache-2.0 |
+| **transport core affinity (§34.3 / #174)** ✅ *pre-implemented* | [`libc`](https://crates.io/crates/libc) | `cpubudget` | **the canonical FFI crate**, rust-lang-maintained, ~ubiquitous (already in the tree transitively via `tokio`/`notify`), MIT/Apache-2.0, pinned `0.2.x`. Used **only** for the Linux `sched_setaffinity` syscall (CPU pinning), **only** under the off-by-default `cpubudget` feature, **only** on `target_os = "linux"` — the default / `net` / `quic` builds never compile or link it. No transitive deps. The `cpu_budget` API is always compiled but is a no-op `Unsupported` without the feature, so this adds **zero** to the default tree. Verify with `cargo deny check --all-features`. |
 
 **Streaming note for compressed inputs:** a compressed stream can't be
 arbitrarily seeked, so the byte-range *parallel* reader and the two-pass

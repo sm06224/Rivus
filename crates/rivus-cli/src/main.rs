@@ -40,6 +40,14 @@ fn main() -> ExitCode {
         return run_gen(&args[2..]);
     }
 
+    // `rivus serve [--bind ADDR]` — a protected-channel distributed worker
+    // (§33 / §17): accept allowlisted peers, run the IR they ship, stream the
+    // result back. Needs `--features net`; the bind/peer capability comes from
+    // the environment (RIVUS_CAP_NET_IFACE / RIVUS_CAP_NET_PEERS).
+    if cmd == "serve" {
+        return run_serve(&args[2..]);
+    }
+
     // Bare Unix-filter form: `rivus '|? age >= 20 |> name age'` (no subcommand).
     // If arg 1 is a transform-only program rather than a known subcommand, run
     // it as a stdin→stdout filter. Flags still parse from arg 2.
@@ -69,11 +77,25 @@ fn main() -> ExitCode {
     let mut tui = false;
     // `--memory low|auto|fast|unbounded` (Pillar C): reader memory/speed strategy.
     let mut memory = MemoryPref::default();
+    // `--on rivus://host:port` (or `host:port`): run this flow on a remote
+    // protected-channel worker (§33 / §17) — ship the IR, print the streamed
+    // result. Needs `--features net`.
+    let mut on_peer: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--no-opt" => optimize = false,
             "--write" | "-w" => fmt_write = true,
+            "--on" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => on_peer = Some(a.clone()),
+                    None => {
+                        eprintln!("error: --on requires a peer address (rivus://host:port)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             // Emit machine-readable JSONL telemetry to stderr (Observability
             // spec §19: base for editor/GUI). `--telemetry json` or `--json`.
             "--json" => telemetry_json = true,
@@ -350,6 +372,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "run" => {
+            // `--on PEER`: distributed execution (§33 / §17). Ship the IR (the
+            // deployment artifact) to a remote protected-channel worker and print
+            // the streamed result. The flow was already parsed above (so we ship a
+            // validated artifact); we transmit the canonical source.
+            if let Some(peer) = &on_peer {
+                return run_on_peer(peer, &parsed.to_source());
+            }
             // Human-facing visualization goes to STDERR so that a `save stdout`
             // sink leaves STDOUT as clean data for shell pipes (`… | rivus run
             // flow.riv | …`). Interactive terminals still show stderr. With
@@ -561,6 +590,217 @@ fn run_tui(graph: &rivus_ir::PlanGraph, chunk_size: usize, memory: MemoryPref) -
             ExitCode::FAILURE
         }
     }
+}
+
+/// `rivus serve [--bind ADDR]` — a protected-channel distributed worker
+/// (§33 / §17). Binds to a capability-gated address (loopback, or the trusted
+/// WireGuard interface via `RIVUS_CAP_NET_IFACE`), accepts allowlisted peers
+/// (`RIVUS_CAP_NET_PEERS`), and runs each shipped IR, streaming the rendered
+/// result back under the client's credit (bounded pull). Needs `--features net`.
+#[cfg(feature = "net")]
+fn run_serve(args: &[String]) -> ExitCode {
+    use rivus_runtime::distributed::{self, Handler, LinkConfig};
+    let mut bind = "127.0.0.1:9001".to_string();
+    let mut quic = false;
+    let mut uds: Option<String> = None;
+    let mut upstream: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => bind = a.clone(),
+                    None => {
+                        eprintln!("error: --bind requires an address (host:port)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            // §28.12.5-3: serve over the QUIC transport instead of the kernel-
+            // WireGuard-bound std channel.
+            "--quic" => quic = true,
+            // §34.4: serve over a Unix-domain socket (the host Transport Service
+            // front for co-located Rivus processes) — same channel protocol.
+            "--uds" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => uds = Some(a.clone()),
+                    None => {
+                        eprintln!("error: --uds requires a socket path");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            // §34.4 s2: forwarding gateway — relay each job to this upstream peer
+            // (PMCN consolidation: co-located Rivus share one network egress).
+            "--upstream" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => upstream = Some(a.clone()),
+                    None => {
+                        eprintln!("error: --upstream requires a peer (rivus://host:port)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("error: serve: unknown argument '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    // The worker handler: either execute the IR locally (parse → optimize → run →
+    // render), or — with `--upstream` — **forward** it to a remote worker (the
+    // host Transport Service gateway, §34.4 s2). The IR is the artifact either way.
+    let handler: Handler = match &upstream {
+        Some(up) => {
+            // Reuse one persistent upstream connection across all downstream jobs
+            // (§34.4 s2' session sharing — the consolidation payoff).
+            let addr = up.strip_prefix("rivus://").unwrap_or(up).to_string();
+            distributed::forwarding_session_handler(addr, LinkConfig::from_env())
+        }
+        None => std::sync::Arc::new(|src: &str| {
+            let graph = rivus_parser::parse(src).map_err(|e| format!("parse: {e:?}"))?;
+            let (graph, _report) = rivus_optimizer::optimize(graph);
+            let res = run(&graph, RunOptions::default()).map_err(|e| format!("run: {e:?}"))?;
+            Ok(viz::render_outputs(&res.outputs).into_bytes())
+        }),
+    };
+    #[cfg(unix)]
+    if let Some(path) = uds {
+        let cfg = LinkConfig::from_env();
+        return match distributed::serve_uds(&path, &cfg.identity, handler, |ev| {
+            eprintln!("[rivus serve] {ev}")
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("serve error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(not(unix))]
+    let _ = &uds;
+    if quic {
+        #[cfg(feature = "quic")]
+        {
+            use rivus_runtime::distributed_quic::{quic_worker, QuicConfig};
+            let worker = match quic_worker(&bind, QuicConfig::from_env()) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("serve error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprintln!("[rivus serve] QUIC identity key {}", worker.identity());
+            return match worker.serve(handler, |ev| eprintln!("[rivus serve] {ev}")) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("serve error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        #[cfg(not(feature = "quic"))]
+        {
+            eprintln!("`serve --quic` needs `--features quic`");
+            return ExitCode::from(2);
+        }
+    }
+    let cfg = LinkConfig::from_env();
+    match distributed::serve(&bind, &cfg, handler, |ev| eprintln!("[rivus serve] {ev}")) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("serve error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "net"))]
+fn run_serve(_args: &[String]) -> ExitCode {
+    eprintln!(
+        "`rivus serve` is a network feature — rebuild with `--features net` \
+         (the default build stays zero-dependency)"
+    );
+    ExitCode::from(2)
+}
+
+/// `rivus run flow.riv --on PEER` — ship the IR to a remote worker and print the
+/// streamed result. `PEER` is `rivus://host:port` or `host:port`. Needs `net`.
+#[cfg(feature = "net")]
+fn run_on_peer(peer: &str, ir_source: &str) -> ExitCode {
+    use rivus_runtime::distributed::{run_remote_observed, LinkConfig};
+    // `uds://path` selects the host Transport Service over a Unix-domain socket
+    // (§34.4); `quic://…` the QUIC transport; `rivus://` / bare `host:port` the
+    // kernel-WireGuard-bound std channel.
+    #[cfg(unix)]
+    if let Some(p) = peer.strip_prefix("uds://") {
+        use rivus_runtime::distributed::run_remote_uds;
+        return match run_remote_uds(p, &LinkConfig::from_env().identity, ir_source, 64, |ev| {
+            eprintln!("[rivus @uds://{p}] {ev}")
+        }) {
+            Ok(bytes) => {
+                let _ = std::io::stdout().write_all(&bytes);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("remote run error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(q) = peer.strip_prefix("quic://") {
+        #[cfg(feature = "quic")]
+        {
+            use rivus_runtime::distributed_quic::{quic_run_observed, QuicConfig};
+            return match quic_run_observed(q, &QuicConfig::from_env(), ir_source, |ev| {
+                eprintln!("[rivus @quic://{q}] {ev}");
+            }) {
+                Ok(bytes) => {
+                    let _ = std::io::stdout().write_all(&bytes);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("remote run error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        #[cfg(not(feature = "quic"))]
+        {
+            let _ = q;
+            eprintln!("`--on quic://…` needs `--features quic`");
+            return ExitCode::from(2);
+        }
+    }
+    let addr = peer.strip_prefix("rivus://").unwrap_or(peer);
+    // The worker narrates structured telemetry events on the telemetry channel
+    // (§34, event-centric observability); surface them on stderr while the data
+    // channel's result goes to stdout (clean for pipes).
+    match run_remote_observed(addr, &LinkConfig::from_env(), ir_source, |ev| {
+        eprintln!("[rivus @{addr}] {ev}");
+    }) {
+        Ok(bytes) => {
+            let _ = std::io::stdout().write_all(&bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("remote run error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "net"))]
+fn run_on_peer(_peer: &str, _ir_source: &str) -> ExitCode {
+    eprintln!(
+        "`--on` (distributed execution) is a network feature — rebuild with \
+         `--features net` (the default build stays zero-dependency)"
+    );
+    ExitCode::from(2)
 }
 
 /// `rivus gen <shape> [--rows N] [--seed S] [--ratio R]` — write deterministic,

@@ -1363,3 +1363,84 @@ continue-first holds.
 Remaining engineering (HANDOVER): the merge path still *holds* the collected
 worker outputs themselves; spilling those to disk (or per-worker part files for
 routes) is the next, separate step.
+
+---
+
+## Networking transport — distributed execution (§33 / §17, loopback, 4 vCPU)
+
+The transport for "execute a flow on a remote worker" — measured end-to-end
+(ship the IR → the worker parses/optimizes/runs it → the result is streamed back
+under credit), all on `127.0.0.1`. Harness: `tests/transport_bench.rs` (opt-in,
+`#[ignore]`d): `cargo test -p rivus-runtime --features net|quic --test
+transport_bench -- --ignored --nocapture`.
+
+| metric | std (kernel-WG-bound) | QUIC (feature `quic`) | note |
+|---|---:|---:|---|
+| round-trip **latency** (small result, 560 B) | **0.97 ms/iter** | 8.6 ms/iter¹ | per request/response |
+| pure-transport **throughput** (64 MiB payload) | **430 MB/s** | — | credit-streamed channel only |
+| distributed **end-to-end** (200 k-row CSV → 3 MB result) | **689 ms/iter** | — | dominated by the worker's flow exec + render, *not* transport |
+
+¹ The QUIC per-call figure includes a **fresh connection + full TLS 1.3
+handshake + a freshly-minted self-signed cert** every iteration. Connection reuse
+collapses this dramatically — **now measured at 4.3× via `QuicSession`** (per-call
+7.9 ms/job → reused 1.8 ms/job, see Findings below) — confirming the #176
+hypothesis. The per-call figure is the honest cost of the protected-channel
+alternative when there is no kernel WireGuard to ride *and* the connection is not
+amortised.
+
+### Findings (insights for the transport memo, §34)
+
+- **TCP_NODELAY is decisive for the std path.** The protocol is a small-frame
+  request/response ping-pong; with Nagle + delayed-ACK on, latency was **88 ms**
+  and throughput **5 MB/s**. Setting `TCP_NODELAY` dropped latency to **0.97 ms**
+  (≈ 90×) and lifted throughput to **430 MB/s** (≈ 86×). This is *the* lesson for
+  a CPU-budgeted transport: the stall was protocol/OS interaction, not CPU.
+- **The credit window must be ≥ 1 and reasonably sized.** A `#[derive(Default)]`
+  on `QuicConfig` gave `window = 0` → the client granted no credit → the worker
+  blocked forever (this masqueraded for a while as an "async lifecycle" bug; a
+  minimal two-runtime QUIC echo proved the runtime model innocent). Window 8 → 64
+  (≈ 2 MiB in flight) keeps the pipe full without unbounding memory.
+- **The distributed end-to-end cost is flow execution, not the wire.** At 689 ms
+  for a 200 k-row job the transport is < 1 % of the time (transport alone moves
+  3 MB in ~7 ms at 430 MB/s). This validates the §34 thesis: the lever is
+  *controlling* the transport's CPU/SIMD footprint (so it does not steal cycles
+  from the SIMD data plane), not making the wire faster.
+- **Logical channel separation (§34) is free here.** Tagging frames with a
+  channel byte (Control/Data/Telemetry) and narrating `flow.*` / `transfer.done`
+  events on the telemetry channel did not move any number — the data channel is
+  unaffected — while giving the coordinator event-centric observability.
+- **Connection reuse (§34.4 s2', a `Session` of many jobs over one connection):**
+  per-call **0.633 ms/job** vs reused session **0.441 ms/job** = **1.4× on the
+  std path** (300 jobs). The std win is modest because a TCP connect is already
+  cheap; the payoff is for **QUIC**, whose per-call cost is dominated by the
+  TLS 1.3 handshake + cert mint. **Now measured (§34.4 s2' applied to QUIC, the
+  lever in #176): per-call 7.891 ms/job (new conn + TLS + cert) vs reused session
+  1.815 ms/job (one handshake, a fresh bidi stream per job) = 4.3× faster reused**
+  (20 jobs). This confirms the #176 hypothesis: QUIC's handshake-dominated per-call
+  cost collapses toward the std figure once the connection is amortised — the
+  protected channel is cheap *per job* once established, so the cost to budget is
+  the *handshake*, paid once. The host Transport Service's forwarding gateway uses
+  `forwarding_session_handler` to share one persistent upstream connection across
+  all co-located Rivus (the PMCN consolidation), so even per-call downstream jobs
+  ride one amortised upstream handshake.
+
+  The `QuicSession` mirrors the std `Session`: `connect` performs the handshake +
+  static-key pin once, then each `run` opens a new QUIC bidi stream — QUIC's native
+  stream multiplexing is exactly the right primitive for "many jobs, one secured
+  connection" (no head-of-line blocking between concurrent jobs, unlike a single
+  TCP byte-stream).
+- **CPU-budget core affinity protects the data plane (§34.3, feature `cpubudget`,
+  #174).** This is the §34.0 thesis made measurable. On a 4-core box, run the SIMD
+  *data lane* (a CPU-bound integer reduction, one worker per data core) for a fixed
+  1.5 s wall **while transport-crypto noise contends for the cores**, and count the
+  data work units completed: **unpinned 332–339 vs pinned 553–559 → 1.6–1.7× more
+  data-plane throughput** when the transport is *confined to core 0* (`sched_set‐
+  affinity`) and the data lane is pinned to cores 1–3. Letting the OS freely
+  co-schedule crypto onto the data cores costs ~40 % of the data plane. The lesson
+  for a distributed node: **budget the transport's CPU placement, don't chase wire
+  speed** — the wire was already < 1 % (689 ms job, ~7 ms transfer). The knob is
+  `RIVUS_NET_TRANSPORT_CORES=0[,1…]`; affinity is placement, not data — the byte-
+  identity test `cpu_budget::tests::affinity_does_not_change_output` pins it.
+  (Linux-only syscall path behind `cpubudget`; a no-op `Unsupported` elsewhere.
+  The finer Telemetry/Control core split and pinning the QUIC tokio worker threads
+  are design-gated, §34.3.)

@@ -13,6 +13,25 @@ mod engine;
 mod eval;
 mod jsonl;
 mod kernel;
+// §33 / §17 protected-channel distributed execution (feature `net`): ship the IR
+// as the deployment artifact to a remote worker over a capability-gated channel.
+// std-only (kernel-WireGuard-bound posture; QUIC is the feature-gated alt).
+#[cfg(feature = "net")]
+pub mod distributed;
+// §28.12.5-3: the QUIC transport — the feature-gated alternative to kernel
+// WireGuard (heavy deps: quinn/tokio/rustls/ring). Off by default.
+#[cfg(feature = "quic")]
+pub mod distributed_quic;
+// §34.3 CPU budget / core affinity for the transport (feature `cpubudget`,
+// Linux-first). A pre-implementation: pin the transport/crypto threads to a
+// bounded core set so they cannot steal SIMD cycles from the data plane. The
+// API is always present (no-op without the feature / off-Linux) so callers stay
+// cfg-free; only the syscall path is feature-gated.
+pub mod cpu_budget;
+// §33 networking transport (feature `net`): a std-only HTTP/1.1 GET client and a
+// TCP subscribe dial. The default build does not compile it (zero-dep invariant).
+#[cfg(feature = "net")]
+mod net;
 mod operators;
 mod route;
 mod telemetry;

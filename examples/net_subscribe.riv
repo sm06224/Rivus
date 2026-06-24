@@ -1,0 +1,19 @@
+# Networking execution (design §33) — subscribe to an unbounded TCP feed.
+#
+# `subscribe "tcp://host:port"` dials a feed as a client (no listener is bound —
+# §28.12.5) and streams newline-delimited records. It is an UNBOUNDED source
+# (§0.14): the optimizer and the parallel executor leave it alone, and a
+# whole-stream aggregate (`|#`, `sort`, …) downstream is refused (needs a window,
+# a later slice) — pass-through (filter / project / take) flows on. The stream
+# ends on peer close or when a downstream `take N` saturates.
+#
+#   rivus run --features net examples/net_subscribe.riv   # (with a feed running)
+#
+# See examples/networking-demo.sh for a self-contained, runnable end-to-end demo.
+Feed:
+  subscribe "tcp://127.0.0.1:9000"
+  |? age >= 18
+  |> name age
+  take 100
+  print
+;

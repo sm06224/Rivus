@@ -39,7 +39,7 @@ formats until reaching for DuckDB/pandas is unnecessary.
 | ✅ | **Datetime / date / time lanes at the reader** (design doc 23) | **done** — `open f.csv (ts:datetime["fmt"])` (and `date` / `time` / `duration`) parse into the exact integer-tick lanes; **auto-inferred** without a declaration too (`#92`: an undeclared ISO column rides the datetime lane), incl. fractional-second / `Z` / `±offset` (`#93`). Exercised end-to-end by the real-ETL parity case (`yyMMddHHmmss`). Remaining: a `--dates` global auto-inference flag, sub-second `unit`, `tz`. |
 | 📋 | **Parquet / Arrow** | feature `parquet` via apache **`arrow`/`parquet`** (isolated behind the source/sink trait) |
 | 📋 | **Python pickle**, YAML/TOML/INI/XML/HTML | `pickle` via `serde-pickle`; text formats likely std-only or a small vetted dep |
-| 📋 | Transports: socket / HTTP / subscribe / scheduled-get | `docs/design/18` |
+| 🚧 | Transports: socket / HTTP / subscribe / scheduled-get | `docs/design/18`, `33`. **`http://` ✅ + `tcp://` subscribe ✅** (feature `net`, std-only / zero-dep): `open "http://host/x.csv"` is a bounded GET (CSV+JSON, content-length / chunked / close framing, redirects), `subscribe "tcp://host:port"` is an unbounded client feed (CSV+JSON, loopback-only by default, `RIVUS_CAP_NET_HOSTS` allowlist). Client-side only — no listener is bound (§28.12.5). Next: HTTP POST sink (output mirror, §28.7), `read` over `http://`, scheduled-get; future: WireGuard/QUIC protected channel. |
 
 ## B. Pipe / CLI ergonomics
 

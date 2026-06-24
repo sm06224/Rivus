@@ -251,6 +251,20 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             provenance,
             ..
         } => {
+            // The unbounded network `subscribe` source (§33) is dispatched apart:
+            // its evaluator is `net`-gated, and `run_with_progress` refuses a
+            // `net`-less plan pre-run — so the feature-less stub is defense-in-depth
+            // (a caller that skips the engine still gets a loud Fatal).
+            if matches!(discovery, rivus_ir::Discovery::Subscribe(_)) {
+                let addr = discovery.path().to_string();
+                #[cfg(feature = "net")]
+                return Box::new(SourceSubscribe::new(addr, codec, chunk_size));
+                #[cfg(not(feature = "net"))]
+                {
+                    let _ = (addr, codec);
+                    return Box::new(SourceNetStub);
+                }
+            }
             let path = discovery.path();
             match codec {
                 Codec::Csv {
@@ -440,10 +454,13 @@ mod read;
 mod sink;
 mod source;
 mod transform;
-// The unbounded `watch` evaluator (§28.12) — the only feature-gated operator
-// module; the default build does not compile it (zero-dep invariant).
+// The unbounded `watch` evaluator (§28.12) — feature-gated; the default build
+// does not compile it (zero-dep invariant).
 #[cfg(feature = "unbounded")]
 mod watch;
+// The unbounded network `subscribe` evaluator (§33) — feature-gated on `net`.
+#[cfg(feature = "net")]
+mod subscribe;
 
 // Flat shared namespace: each submodule pulls these via `use super::*`, and the
 // dispatch/tests below see the submodules' items via these globs.
@@ -452,6 +469,8 @@ use join::*;
 use read::*;
 use sink::*;
 use source::*;
+#[cfg(feature = "net")]
+use subscribe::SourceSubscribe;
 use transform::*;
 #[cfg(feature = "unbounded")]
 use watch::SourceWatch;

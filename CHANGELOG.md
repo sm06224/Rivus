@@ -6,6 +6,128 @@ All notable changes to Rivus. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+- **Protected-channel distributed execution (design §33 / §17, Pillar 3).** Run a
+  flow across the network by shipping its **IR as the deployment artifact**
+  (§28.12.5-4) to a remote worker that executes it on the same chunk engine and
+  streams the result back — **byte-identical to a local run** (interpret==
+  distribute, §0.5). `rivus serve [--bind ADDR]` is the worker; `rivus run
+  flow.riv --on rivus://host:port` is the coordinator. The channel is **never a
+  raw listener** (§28.12.5-1):
+  - **Primary = ride kernel WireGuard, embed no crypto (§28.12.5-2).** std-only,
+    **zero new dependencies**; Rivus only *enforces* binding to the trusted
+    interface (`RIVUS_CAP_NET_IFACE`) and an **allowlist of peer identities**
+    (`RIVUS_CAP_NET_PEERS`, the static-public-key ↔ wg-IP boundary). Loopback is
+    the one exception. Control+data are multiplexed with **credit-based bounded
+    pull** (§28.12.2 ④). Fully working and tested (`tests/net.rs::distributed_*`).
+  - **Alternative = QUIC (feature `quic`, §28.12.5-3), now complete:** `quinn` +
+    `rustls`/`ring` + `rcgen`, identity = the cert's public-key **fingerprint**,
+    allowlist pins peer fingerprints (`RIVUS_CAP_NET_PEER_KEYS`). Mutual-auth
+    handshake, static-key pinning, **and the byte-identical credit-streamed result
+    round-trip** all work and are tested (`tests/quic.rs`); `rivus serve --quic` /
+    `rivus run --on quic://…` demo it end-to-end. (Off by default; not yet in
+    `full` pending a `cargo deny` pass on its tree.) The streaming stall during
+    development was a `QuicConfig` `#[derive(Default)]` giving `window = 0` (the
+    client granted zero credit → the worker blocked forever) — fixed with a manual
+    `Default` (window 8) and a defensive `window.max(1)`.
+  - Capability denials name only the target, never the allowlist (§28.12.4);
+    credentials never ride the IR / telemetry / error stream.
+- **Transport architecture: logical channel separation + event-centric
+  observability (design §34, the maintainer's transport memo).** The distributed
+  wire protocol now tags every frame with a logical **channel** — Control
+  (lifecycle/credit), Data (result chunks), Telemetry (events) — multiplexed on
+  one connection (the QUIC stream-separation lesson, without N sockets). The
+  worker narrates structured events on the telemetry channel (`flow.started` /
+  `flow.completed result_bytes=… ms=…` / `transfer.done frames=… bytes=…`)
+  instead of the client packet-sniffing; `run_remote_observed` / `rivus run --on`
+  surface them on stderr while the result flows on the data channel (clean
+  stdout). **The QUIC backend now has event parity** — its worker narrates the
+  same `flow.started` / `flow.completed` / `transfer.done` over the stream
+  (`EVENT` frames), demuxed by `quic_run_observed` / `QuicSession::run_observed`
+  (`rivus run --on quic://` surfaces them on stderr); a non-observing client
+  ignores them (backward-compatible). **§34.1 channel→real-QUIC-stream mapping
+  (spike, opt-in `QuicConfig::telemetry_stream` / `RIVUS_NET_QUIC_TELEMETRY_STREAM=1`,
+  default off):** carry the Telemetry channel on a **dedicated unidirectional QUIC
+  stream** instead of multiplexing `EVENT` frames onto the result's bidi stream —
+  realizing the design's 1:1 channel→stream mapping with independent flow control
+  (a backed-up data stream can't head-of-line-block telemetry). The worker opens a
+  uni stream per job; the client reads result + telemetry concurrently. Both peers
+  must enable it (no negotiation yet — a spike limitation); the proven single-
+  stream path stays the default. Tested (`tests/quic.rs` case (e), byte-identical
+  result + events on the separate stream). Staged next (design only): the finer
+  Telemetry/Control affinity split and DPU/SmartNIC offload.
+- **Host Transport Service over a Unix-domain socket — §34.4 slices 1+2
+  (pre-implementation, `feature net`, unix-only).** A worker fronts a UDS that
+  co-located Rivus processes use instead of each owning a network stack (the PMCN
+  "consolidate comms responsibility" idea). `rivus serve --uds PATH
+  [--upstream rivus://host:port]` / `rivus run --on uds://PATH`;
+  `distributed::{serve_uds, run_remote_uds, forwarding_handler}`.
+  - **s1 (UDS front):** the worker/client protocol cores were extracted
+    **transport-agnostic** (`serve_protocol` / `client_protocol`), so the **same
+    channel-tagged frames** (Control/Data/Telemetry + credit + `flow.*` events)
+    run over UDS and yield a byte-identical round-trip — proving §34.1's transport
+    orthogonality. UDS is local + filesystem-permission-gated (no IP allowlist).
+  - **s2 (forwarding gateway):** with `--upstream`, the service's handler is
+    `forwarding_handler` (relay the IR to a remote worker and return its bytes),
+    so co-located Rivus reach the upstream through **one** local service that owns
+    the network egress — the PMCN consolidation, demonstrated end-to-end
+    (UDS client → UDS service → TCP worker → back, byte-identical).
+  - **s2' (persistent sessions):** the protocol now carries **many jobs per
+    connection** (the worker's `serve_protocol` is a job loop; stray credit between
+    jobs is skipped). A client `Session` (`connect` HELLOs once, `run` ships each
+    job) amortizes connect/handshake, and the gateway's
+    `forwarding_session_handler` shares **one** persistent upstream connection
+    across all co-located Rivus (`Mutex<Session>`) — true session sharing. Reuse
+    is **1.4× on std** (per-call 0.633 → session 0.441 ms/job) and is the lever
+    for QUIC's 8.6 ms per-call cost (#176). A bonus: the job loop's read-until-EOF
+    structurally subsumes the old single-job graceful drain (no large-result RST).
+  - **s2' for QUIC (`QuicSession`, feature `quic`):** the same reuse applied to the
+    protected channel — `connect` performs the TLS handshake + static-key pin
+    **once**, then each `run` opens a fresh QUIC **bidi stream** (native stream
+    multiplexing, no cross-job head-of-line blocking); the worker handshakes/pins
+    once and loops `accept_bi`. Measured **4.3× faster** (per-call 7.891 → reused
+    1.815 ms/job, 20 jobs), confirming #176's hypothesis that reuse collapses
+    QUIC's handshake-dominated per-call cost toward the std figure. Tested
+    (`tests/quic.rs` case (c)) and benched (`bench_quic_distributed_latency`).
+  Remaining (routing, session pooling/aggregation) stay design-gated.
+- **Transport CPU-budget core affinity — §34.3 (pre-implementation, feature
+  `cpubudget`, Linux-first).** The §34.0 thesis made operable: pin the transport/
+  crypto+I/O threads to a bounded core set (`RIVUS_NET_TRANSPORT_CORES=0[,1…]`,
+  ranges like `0,1,4-6`) so they cannot steal SIMD cycles from the data plane.
+  New `cpu_budget` module: `Role{Transport,Telemetry,Control}`, `CpuBudget::
+  from_env`, `pin_current_thread[_to]` returning a narratable `PinOutcome`
+  (best-effort — a failed pin degrades to "scheduler decides", never fatal). The
+  **API is always compiled** (a no-op `Unsupported` off-Linux / without the
+  feature, so callers stay `cfg`-free); only the `sched_setaffinity` syscall path
+  is feature-gated behind a feature-gated `libc` (the default / `net` builds stay
+  dep-free). The std worker's accept loop pins to the `Transport` set. **Measured:
+  1.6–1.7× more data-plane throughput** under transport-crypto contention on a
+  4-core box when the transport is confined off the data cores (`bench_cpubudget_
+  affinity_protects_data_plane`). **Byte-identity preserved** — affinity is
+  placement, not data (§0.14); pinned by `cpu_budget::tests::affinity_does_not_
+  change_output`. The finer Telemetry/Control split, fractional (cgroup) budgets,
+  and pinning the QUIC tokio worker threads stay design-gated (§34.3).
+- **Networking transport (design §33, feature `net`, std-only / zero new deps).**
+  Two client-side network transports behind the off-by-default `net` feature —
+  the default build stays zero-dependency, parsing / `rivus explain` are always
+  std, and *running* a network flow without the feature is refused up front with
+  rebuild guidance (never silent):
+  - **`open "http://host[:port]/path"`** — a bounded HTTP/1.1 GET (a minimal
+    client over `std::net`): fetch a remote **CSV or JSON** and wrangle it like a
+    local file (filter pushdown and all). Body framing handles `Content-Length`,
+    `Transfer-Encoding: chunked` and connection-close; up to 5 redirects are
+    followed; the body decodes single-pass in bounded memory and is chunk-size
+    independent. `https://` is rejected with guidance (TLS is out of scope).
+  - **`subscribe "tcp://host:port"`** — an unbounded TCP client feed (CSV or
+    `as json`): newline-delimited records streamed with lossless backpressure.
+    Like `watch` it is outside the determinism contract (§0.14) — the optimizer
+    and the parallel executor leave it alone and a whole-stream aggregate
+    downstream is refused (needs a window); it ends on peer close or `take N`.
+  - **Capability boundary** (§28.12.4/5): loopback is always reachable; any other
+    host must be in `RIVUS_CAP_NET_HOSTS` (else rejected, naming only the target).
+    Read timeout via `RIVUS_NET_TIMEOUT_MS` (default 30 s). No listener is ever
+    bound (§28.12.5). Runnable demo: `examples/networking-demo.sh`.
+
 ### Changed
 - **Expression `cast` to a temporal lane now parses a string source (BUG-D) —
   behavior change.** `cast ts:datetime` / `(ts:datetime) as t` (and `date`/`time`)

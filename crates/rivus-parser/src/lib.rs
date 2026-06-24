@@ -163,6 +163,9 @@ impl Parser {
     fn path_word(&mut self) -> Result<String, RivusError> {
         match self.bump() {
             Tok::Word(w) => Ok(w),
+            // A quoted path — needed for an `http://…` URL (§33), and useful for
+            // any path with characters the bare-word lexer would split.
+            Tok::Str(s) => Ok(s),
             Tok::Minus => Ok("-".to_string()),
             other => Err(self.err(format!("expected a path, found {other:?}"))),
         }
@@ -1107,6 +1110,43 @@ impl Parser {
                     discovery: Discovery::Watch(pattern),
                     transport: Transport::Local,
                     codec: Codec::discover(),
+                    provenance: Provenance::Off,
+                }))
+            }
+            // `subscribe "tcp://host:port" [as csv|tsv|json]` — the **unbounded**
+            // network source (§33): dial a TCP feed (client-side; no listener is
+            // bound) and stream newline-delimited records. Parsing is always-std
+            // (IR reversible); *evaluation* requires the off-by-default `net`
+            // feature — a feature-less run refuses pre-run (never-silent). Default
+            // codec is CSV (an endpoint has no extension to infer from).
+            Tok::Word(w) if w == "subscribe" => {
+                self.bump();
+                let addr = match self.bump() {
+                    Tok::Str(s) => s,
+                    other => {
+                        return Err(self.err(format!(
+                            "subscribe expects a quoted tcp:// URL, found {other:?}"
+                        )))
+                    }
+                };
+                let explicit = if self.peek_is_word("as") {
+                    self.bump();
+                    Some(self.word()?)
+                } else {
+                    None
+                };
+                let codec = match explicit.as_deref() {
+                    None | Some("csv") => Codec::csv(b','),
+                    Some("tsv") | Some("tab") => Codec::csv(b'\t'),
+                    Some("json") | Some("jsonl") | Some("ndjson") => Codec::Jsonl,
+                    Some(other) => {
+                        return Err(self.err(format!("subscribe: unknown format '{other}'")))
+                    }
+                };
+                Ok(self.g.add_node(Op::Source {
+                    discovery: Discovery::Subscribe(addr),
+                    transport: Transport::Local,
+                    codec,
                     provenance: Provenance::Off,
                 }))
             }
@@ -2153,6 +2193,7 @@ fn is_keyword(w: &str) -> bool {
             | "stop"
             | "monitor"
             | "watch"
+            | "subscribe"
             | "visualize"
             | "transition"
             | "log"
@@ -2836,6 +2877,79 @@ mod tests {
 
         // A non-string pattern is an explicit parse error (never-silent).
         assert!(parse("W:\n watch in.csv\n;").is_err());
+    }
+
+    #[test]
+    fn http_open_parses_and_round_trips() {
+        // `open "http://…"` (§33) → a Fixed source whose path is the URL; the
+        // network transport is scheme-derived at runtime. Parse/to_source are
+        // always-std; the URL is quoted so it re-lexes as one token (reversible).
+        let src = "R:\n open \"http://127.0.0.1:8080/data.csv\"\n |> name\n;";
+        let g = parse(src).unwrap();
+        assert!(matches!(
+            &g.nodes[0].op,
+            Op::Source {
+                discovery: Discovery::Fixed(p),
+                codec: Codec::Csv { .. },
+                ..
+            } if p == "http://127.0.0.1:8080/data.csv"
+        ));
+        assert!(g.uses_net(), "http source is networked");
+        assert!(!g.uses_unbounded(), "http GET is bounded");
+        let s = g.to_source();
+        assert!(
+            s.contains("open \"http://127.0.0.1:8080/data.csv\""),
+            "url lost in {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        // https is parsed (always-std) but `is_net` flags it for the gate.
+        assert!(parse("R:\n open \"https://h/x.csv\"\n;")
+            .unwrap()
+            .uses_net());
+    }
+
+    #[test]
+    fn subscribe_parses_and_round_trips() {
+        // `subscribe "tcp://…"` (§33) → the unbounded network source (Subscribe
+        // + a data codec). Parse/to_source always-std; evaluation needs `net`.
+        let src = "F:\n subscribe \"tcp://127.0.0.1:9000\"\n |? age >= 18\n |> name\n;";
+        let g = parse(src).unwrap();
+        assert!(matches!(
+            &g.nodes[0].op,
+            Op::Source {
+                discovery: Discovery::Subscribe(p),
+                codec: Codec::Csv { .. },
+                ..
+            } if p == "tcp://127.0.0.1:9000"
+        ));
+        assert!(g.uses_net() && g.uses_unbounded() && !g.uses_watch());
+        let s = g.to_source();
+        assert!(
+            s.contains("subscribe \"tcp://127.0.0.1:9000\""),
+            "addr lost in {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+
+        // `as json` round-trips through the JSONL codec.
+        let gj = parse("F:\n subscribe \"tcp://h:1\" as json\n;").unwrap();
+        assert!(matches!(
+            &gj.nodes[0].op,
+            Op::Source {
+                discovery: Discovery::Subscribe(_),
+                codec: Codec::Jsonl,
+                ..
+            }
+        ));
+        let sj = gj.to_source();
+        assert!(
+            sj.contains("subscribe \"tcp://h:1\" as json"),
+            "json subscribe: {sj}"
+        );
+        assert_eq!(sj, parse(&sj).unwrap().to_source());
+
+        // A non-string endpoint and an unknown format are explicit errors.
+        assert!(parse("F:\n subscribe tcp://h:1\n;").is_err());
+        assert!(parse("F:\n subscribe \"tcp://h:1\" as parquet\n;").is_err());
     }
 
     #[test]

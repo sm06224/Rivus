@@ -746,6 +746,166 @@ impl crate::codec::Decoder for JsonlChunker {
     }
 }
 
+/// A **single-pass** JSON-Lines reader over a non-seekable byte stream (an HTTP
+/// body / TCP feed, design §33, feature `net`) — the JSONL analogue of
+/// [`crate::csv::CompressedCsvReader`]. A network stream can't be re-read for the
+/// two-pass [`infer_global`], so the schema is inferred from a buffered sample of
+/// the first `chunk_size` objects (column order + lanes), then the rest is
+/// streamed. Same trade-off as the compressed CSV path: a key/type that only
+/// appears (or widens) past the sample is missed — documented in §33.
+#[cfg(feature = "net")]
+pub struct StreamJsonlReader {
+    reader: Box<dyn BufRead + Send>,
+    names: Vec<String>,
+    dtypes: Vec<DataType>,
+    chunk_size: usize,
+    /// Sample objects buffered during inference, emitted before streaming the rest.
+    pending: Vec<String>,
+    pending_pos: usize,
+    line: String,
+    eof: bool,
+    pub bad_rows: usize,
+}
+
+#[cfg(feature = "net")]
+impl StreamJsonlReader {
+    /// Sample-infer the schema from an already-opened stream, then yield rows.
+    pub fn from_reader(
+        mut reader: Box<dyn BufRead + Send>,
+        chunk_size: usize,
+    ) -> Result<(Schema, StreamJsonlReader), String> {
+        let cs = chunk_size.max(1);
+        let mut pending: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut flags: Vec<Flags> = Vec::new();
+        let mut started = false;
+        let mut bad_rows = 0usize;
+        while pending.len() < cs {
+            let mut l = String::new();
+            if reader.read_line(&mut l).map_err(|e| e.to_string())? == 0 {
+                break;
+            }
+            let t = l.trim_end_matches(['\n', '\r']);
+            if t.trim().is_empty() {
+                continue;
+            }
+            match parse_object(t) {
+                Some(obj) => {
+                    if !started {
+                        names = obj.iter().map(|(k, _)| k.clone()).collect();
+                        flags = names.iter().map(|_| Flags::new()).collect();
+                        started = true;
+                    }
+                    for (k, v) in &obj {
+                        if let Some(i) = names.iter().position(|n| n == k) {
+                            flags[i].observe(v);
+                        }
+                    }
+                    pending.push(t.to_string());
+                }
+                None => bad_rows += 1,
+            }
+        }
+        if !started {
+            return Err("JSON stream has no valid objects".to_string());
+        }
+        let dtypes: Vec<DataType> = flags.iter().map(|f| f.resolve()).collect();
+        let schema = Schema::new(
+            names
+                .iter()
+                .zip(&dtypes)
+                .map(|(n, d)| Field::new(n.clone(), *d))
+                .collect(),
+        );
+        Ok((
+            schema,
+            StreamJsonlReader {
+                reader,
+                names,
+                dtypes,
+                chunk_size: cs,
+                pending,
+                pending_pos: 0,
+                line: String::new(),
+                eof: false,
+                bad_rows,
+            },
+        ))
+    }
+
+    /// Project one parsed object onto the schema's column order (missing → null).
+    fn push_obj(&self, per_col: &mut [Vec<JVal>], obj: &[(String, JVal)]) {
+        for (i, name) in self.names.iter().enumerate() {
+            let v = obj
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(JVal::Null);
+            per_col[i].push(v);
+        }
+    }
+
+    pub fn next_columns(&mut self) -> Option<Vec<Column>> {
+        if self.eof && self.pending_pos >= self.pending.len() {
+            return None;
+        }
+        let mut per_col: Vec<Vec<JVal>> = self.names.iter().map(|_| Vec::new()).collect();
+        let mut got = 0usize;
+        // Drain the buffered sample first.
+        while got < self.chunk_size && self.pending_pos < self.pending.len() {
+            let line = std::mem::take(&mut self.pending[self.pending_pos]);
+            self.pending_pos += 1;
+            if let Some(obj) = parse_object(&line) {
+                self.push_obj(&mut per_col, &obj);
+                got += 1;
+            }
+        }
+        // Then stream the rest.
+        while got < self.chunk_size && !self.eof {
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.eof = true;
+                    break;
+                }
+            }
+            let l = self.line.trim_end_matches(['\n', '\r']);
+            if l.trim().is_empty() {
+                continue;
+            }
+            match parse_object(l) {
+                Some(obj) => {
+                    self.push_obj(&mut per_col, &obj);
+                    got += 1;
+                }
+                None => self.bad_rows += 1,
+            }
+        }
+        if got == 0 {
+            return None;
+        }
+        Some(
+            self.dtypes
+                .iter()
+                .zip(&per_col)
+                .map(|(d, vals)| build_column(*d, vals))
+                .collect(),
+        )
+    }
+}
+
+#[cfg(feature = "net")]
+impl crate::codec::Decoder for StreamJsonlReader {
+    fn decode_chunk(&mut self) -> Option<Vec<Column>> {
+        self.next_columns()
+    }
+}
+
 /// Plan a byte-range parallel read of a JSON-Lines file: the global schema and
 /// `nparts` newline-aligned ranges covering the file exactly once. Returns
 /// `None` for a top-level array (not splittable) — the caller stays serial.
