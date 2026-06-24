@@ -706,6 +706,15 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `explode COL` / `unnest COL` — multiply rows over a List column
+                // (§32 s4c).
+                Tok::Word(w) if w == "explode" || w == "unnest" => {
+                    self.bump();
+                    let col = self.word()?;
+                    let n = self.g.add_node(Op::Explode { col });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
                 // `fill col VALUE|ffill|bfill` — fill empty cells of a text
                 // column with a constant, or carry the last/next value over.
                 Tok::Word(w) if w == "fill" => {
@@ -2130,6 +2139,8 @@ fn is_keyword(w: &str) -> bool {
             | "distinct"
             | "describe"
             | "dropna"
+            | "explode"
+            | "unnest"
             | "fill"
             | "drop"
             | "cast"
@@ -4175,6 +4186,34 @@ Import:
             qsrc,
             parse(&qsrc).unwrap().to_source(),
             "not idempotent: {qsrc}"
+        );
+    }
+
+    #[test]
+    fn explode_parses_and_round_trips() {
+        // §32 s4c: `explode COL` (and the `unnest` alias) lower to `Op::Explode`
+        // and round-trip as `explode COL` (idempotent through to_source).
+        let g = parse("E:\n open d.jsonl\n explode tags\n |> id tags\n;").unwrap();
+        match nth_op("E:\n open d.jsonl\n explode tags\n;", 1) {
+            Op::Explode { col } => assert_eq!(col, "tags"),
+            other => panic!("expected Explode, got {other:?}"),
+        }
+        let src = g.to_source();
+        assert!(src.contains("explode tags"), "explode lost: {src}");
+        assert_eq!(
+            src,
+            parse(&src).unwrap().to_source(),
+            "not idempotent: {src}"
+        );
+
+        // `unnest` is an alias and normalizes to `explode` in the source form.
+        let u = parse("U:\n open d.jsonl\n unnest items\n;").unwrap();
+        let usrc = u.to_source();
+        assert!(usrc.contains("explode items"), "unnest alias: {usrc}");
+        assert_eq!(
+            usrc,
+            parse(&usrc).unwrap().to_source(),
+            "alias not idempotent"
         );
     }
 

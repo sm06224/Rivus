@@ -32,6 +32,96 @@ fn mk(files: &[(&str, &str)]) -> (TempTree, String) {
 }
 
 #[test]
+fn deep_descent_resolves_shallowest_and_counts_ambiguity() {
+    // §32 s4c: `$_..city` finds the shallowest nested field named `city`,
+    // breadth-first. A deeply-nested match resolves; multiple matches at the
+    // shallowest depth are ambiguous → counted (never-silent) and resolved to the
+    // first in field order (deterministic).
+    let (_t, base) = mk(&[(
+        "d.jsonl",
+        "{\"id\":1,\"user\":{\"addr\":{\"city\":\"NYC\"}}}\n\
+         {\"id\":2,\"user\":{\"addr\":{\"city\":\"LA\"}}}\n",
+    )]);
+    let res = run_src(
+        &format!("D:\n open {base}/d.jsonl\n |> id ($_..city) as c\n;"),
+        4,
+    );
+    assert_eq!(
+        collect_strings(&res, "D", "c"),
+        vec!["NYC", "LA"],
+        "deep descent resolves the nested `city`"
+    );
+
+    // Ambiguous: `city` appears in two structs at the same (shallowest) depth.
+    let (_t2, base2) = mk(&[(
+        "a.jsonl",
+        "{\"id\":1,\"home\":{\"city\":\"H\"},\"work\":{\"city\":\"W\"}}\n",
+    )]);
+    let amb = run_src(
+        &format!("A:\n open {base2}/a.jsonl\n |> id ($_..city) as c\n;"),
+        4,
+    );
+    // Resolved deterministically to the first match (field order: `home`).
+    assert_eq!(
+        collect_strings(&amb, "A", "c"),
+        vec!["H"],
+        "first match wins"
+    );
+    // The ambiguity is surfaced on the error stream (never-silent), not fatal.
+    assert!(
+        !amb.errors.is_empty(),
+        "an ambiguous deep match must be surfaced (counted)"
+    );
+    assert!(
+        !amb.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+        "ambiguity is recoverable, not fatal"
+    );
+}
+
+#[test]
+fn explode_multiplies_rows_over_a_list_empty_and_null_are_zero_rows() {
+    // §32 s4c: `explode tags` yields one row per list element, repeating the
+    // other columns; an empty list (`[]`) and a null list (missing key) both
+    // contribute zero rows (Arrow UNNEST / SQL). Expansion order = physical
+    // order. The `tags` lane becomes the element type (i64 here).
+    let (_t, base) = mk(&[(
+        "d.jsonl",
+        "{\"id\":1,\"tags\":[10,20]}\n\
+         {\"id\":2,\"tags\":[]}\n\
+         {\"id\":3,\"tags\":[30]}\n\
+         {\"id\":4}\n",
+    )]);
+    for cs in [1usize, 2, 1000] {
+        let res = run_src(
+            &format!("E:\n open {base}/d.jsonl\n explode tags\n |> id tags\n;"),
+            cs,
+        );
+        assert_eq!(
+            collect_strings(&res, "E", "id"),
+            vec!["1", "1", "3"],
+            "explode repeats the parent row per element @cs={cs}"
+        );
+        assert_eq!(
+            collect_strings(&res, "E", "tags"),
+            vec!["10", "20", "30"],
+            "explode emits elements in physical order @cs={cs}"
+        );
+        // The exploded `tags` column is the element lane (i64), not a list.
+        let out = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("E"))
+            .unwrap();
+        let ti = out.chunks[0].schema.index_of("tags").unwrap();
+        assert_eq!(
+            out.chunks[0].schema.fields[ti].dtype,
+            rivus_core::DataType::I64,
+            "exploded column takes the element type"
+        );
+    }
+}
+
+#[test]
 fn sort_and_distinct_by_nested_key_resolve_the_path() {
     // §32 s4b: `sort` / `distinct` keys resolve a nested path to the underlying
     // value (numeric `user.age`), not the bare struct's text form. Sort orders

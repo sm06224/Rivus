@@ -10,8 +10,8 @@ use crate::eval;
 use crate::jsonl;
 use crate::kernel;
 use rivus_core::{
-    Chunk, Column, ColumnData, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field, Schema,
-    Severity, StrColumn, TimeUnit, Validity, Value,
+    Chunk, Column, ColumnData, DataType, DateTime, DtColumn, ErrorEvent, ErrorScope, Field, Nested,
+    Schema, Severity, StrColumn, TimeUnit, Validity, Value,
 };
 use rivus_ir::{
     AggFunc, BinType, CmpOp, Codec, Disposition, Endian, Expr, FillMethod, JoinKind, NodeId, Op,
@@ -337,6 +337,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
         Op::Describe => Box::new(Describe::default()),
         Op::DropNa { cols } => Box::new(DropNa { cols: cols.clone() }),
+        Op::Explode { col } => Box::new(Explode { col: col.clone() }),
         Op::Fill { col, method } => match method {
             FillMethod::Value(value) => Box::new(Fill {
                 col: col.clone(),

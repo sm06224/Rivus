@@ -12,7 +12,10 @@
 //! doesn't fit the fast paths falls back to the owned-`Value` interpreter, so
 //! results are identical.
 
-use rivus_core::{Chunk, Column, ColumnData, DataType, Resource, StrColumn, Validity, Value};
+use rivus_core::{
+    Chunk, Column, ColumnData, DataType, Field, Nested, Resource, Schema, StrColumn, Validity,
+    Value,
+};
 use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func, PathExpr, PathSeg};
 use std::cmp::Ordering;
 
@@ -794,6 +797,18 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
             name,
             access: Access::Source,
         } => source_column(name, chunk),
+        // `$_..name` deep descent (§32 s4c): resolved row-wise against the
+        // shallowest nested field named `name`; the narrowest fitting lane is
+        // chosen (a miss / null stays null).
+        Expr::Field {
+            name: _,
+            access: Access::Deep,
+        } => {
+            let vals: Vec<Value> = (0..chunk.len)
+                .map(|r| eval_acc(expr, chunk, r, fails))
+                .collect();
+            column_from_values(vals)
+        }
         Expr::Field { name, .. } => match chunk.column(name) {
             Some(c) => c.clone(),
             // Missing field → a NaN numeric lane (continue-first).
@@ -1295,6 +1310,12 @@ pub fn eval_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> Valu
         // An unbound `$x` hole should have been bound before execution; if one
         // reaches eval it yields Null (continue-first, never a panic).
         Expr::Hole(_) => Value::Null,
+        // `$_..name` deep descent (§32 s4c) is resolved against the nested
+        // structure; the other access strategies stay on the flat path.
+        Expr::Field {
+            name,
+            access: Access::Deep,
+        } => eval_deep(name, chunk, row, fails),
         Expr::Field { name, access } => eval_field(name, *access, chunk, row),
         // `$_[i]` — positional reference (§29.5-6 s4). Out of range → null +
         // counted (continue-first, never silent).
@@ -1474,6 +1495,68 @@ pub(crate) fn resolve_key_indices(
             }
         })
         .collect()
+}
+
+/// `$_..name` deep descent (§32 s4c): resolve `name` against the **shallowest**
+/// nested field with that name, breadth-first over the struct nesting (a list's
+/// element field is not name-addressable — pick an element with `[i]`/`explode`).
+/// Multiple matches at the shallowest depth are **ambiguous**: counted (warn,
+/// never-silent) and resolved to the first in column/child order (deterministic).
+/// No field named `name` anywhere → counted null (continue-first).
+fn eval_deep(name: &str, chunk: &Chunk, row: usize, fails: &mut u64) -> Value {
+    match find_deep_path(&chunk.schema, name) {
+        Some((root, segs, ambiguous)) => {
+            if ambiguous {
+                *fails += 1; // multiple shallowest matches — never-silent
+            }
+            match chunk.column(&root) {
+                Some(col) => resolve_in_column(col, row, &segs, fails),
+                None => {
+                    *fails += 1;
+                    Value::Null
+                }
+            }
+        }
+        None => {
+            *fails += 1; // no field named `name` in the (nested) schema
+            Value::Null
+        }
+    }
+}
+
+/// Breadth-first search for the shallowest field named `name` in `schema`'s
+/// struct nesting. Returns `(root_column, segments, ambiguous)` where the path is
+/// `root` then `segments`, and `ambiguous` is set when more than one field
+/// matches at that shallowest depth. Descends only `Struct` children (a `List`
+/// has no single element to address by name).
+fn find_deep_path(schema: &Schema, name: &str) -> Option<(String, Vec<PathSeg>, bool)> {
+    // Each frontier entry: (root column, segments leading to `field`, field).
+    let mut level: Vec<(String, Vec<PathSeg>, &Field)> = schema
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), Vec::new(), f))
+        .collect();
+    while !level.is_empty() {
+        // Matches at this (shallowest reached) depth, in deterministic order.
+        let matches: Vec<&(String, Vec<PathSeg>, &Field)> =
+            level.iter().filter(|(_, _, f)| f.name == name).collect();
+        if let Some((root, segs, _)) = matches.first() {
+            return Some((root.clone(), segs.clone(), matches.len() > 1));
+        }
+        // Descend into struct children for the next depth.
+        let mut next: Vec<(String, Vec<PathSeg>, &Field)> = Vec::new();
+        for (root, segs, field) in &level {
+            if let Some(Nested::Struct(children)) = &field.nested {
+                for child in children {
+                    let mut s = segs.clone();
+                    s.push(PathSeg::Field(child.name.clone()));
+                    next.push((root.clone(), s, child));
+                }
+            }
+        }
+        level = next;
+    }
+    None
 }
 
 /// Resolve a nested path `user.age` / `tags[0]` (§32 s4) at `row`. Walks the

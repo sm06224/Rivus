@@ -746,6 +746,112 @@ impl Operator for DropNa {
     }
 }
 
+/// `explode COL` / `unnest COL` (§32 s4c) — multiply rows over a `List` column.
+/// Stateless per chunk: each input row yields one output row per list element,
+/// with the other columns repeated and `COL` replaced by the element (lane =
+/// the list's element type). An empty or null list contributes **zero** rows
+/// (Arrow `UNNEST` / SQL); expansion order is the list's physical order, so the
+/// result is byte-identical across serial / parallel / chunk-size. A non-list
+/// (or unknown) column is a never-silent warning + pass-through (continue-first).
+pub(crate) struct Explode {
+    pub(crate) col: String,
+}
+
+impl Operator for Explode {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let Some(ci) = chunk.schema.index_of(&self.col) else {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Warn,
+                    ErrorScope::Chunk,
+                    format!("explode: unknown column '{}' (passed through)", self.col),
+                )
+                .at_node(ctx.label.clone()),
+            );
+            return vec![chunk];
+        };
+        let ColumnData::List(list) = chunk.columns[ci].data() else {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Warn,
+                    ErrorScope::Chunk,
+                    format!(
+                        "explode: column '{}' is not a list lane (passed through)",
+                        self.col
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+            return vec![chunk];
+        };
+        // Parent-row map + element-index map, in the list's physical order. A
+        // null list (validity 0) contributes nothing — its offsets span is empty.
+        let mut row_map: Vec<usize> = Vec::new();
+        let mut elem_idx: Vec<usize> = Vec::new();
+        for r in 0..chunk.len {
+            if chunk.columns[ci].is_null(r) {
+                continue; // null list → zero rows
+            }
+            let (a, b) = (list.offsets[r] as usize, list.offsets[r + 1] as usize);
+            for e in a..b {
+                row_map.push(r);
+                elem_idx.push(e);
+            }
+        }
+        // The exploded column is the list's child, selected (and reordered to)
+        // the element map — already the element lane.
+        let exploded = Column::new(
+            list.child.data().gather(&elem_idx),
+            list.child.validity().gather(&elem_idx),
+        );
+        // Output field for the exploded column: the element field, renamed to the
+        // column (carrying its nested detail); fall back to the child's lane.
+        let exploded_field = match &chunk.schema.fields[ci].nested {
+            Some(Nested::List(elem)) => {
+                let mut e = (**elem).clone();
+                e.name = self.col.clone();
+                e
+            }
+            _ => Field::new(self.col.clone(), exploded.data().dtype()),
+        };
+
+        let fields: Vec<Field> = chunk
+            .schema
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if i == ci {
+                    exploded_field.clone()
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        let cols: Vec<Column> = chunk
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == ci {
+                    exploded.clone()
+                } else {
+                    c.gather(&row_map)
+                }
+            })
+            .collect();
+
+        if row_map.is_empty() {
+            return Vec::new(); // every list empty/null → no output rows
+        }
+        vec![Chunk::new(
+            ctx.fresh_id(),
+            Arc::new(Schema::new(fields)),
+            cols,
+        )]
+    }
+}
+
 /// `fill col VALUE` — replace **null** (missing) cells of a column with `VALUE`,
 /// on **any** lane (null model §26; numeric blanks are now null, no longer `0`,
 /// so `fill price 0` works). Streaming, stateless. `VALUE` is coerced to the

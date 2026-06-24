@@ -81,6 +81,25 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
                     .collect(),
             )
         }),
+        // `explode COL` keeps every column but replaces the `List` lane with its
+        // element field (§32 s4c); other columns are unchanged. A non-list (or
+        // unknown) `COL` leaves the schema untouched (runtime warns).
+        Op::Explode { col } => input.map(|s| {
+            Schema::new(
+                s.fields
+                    .into_iter()
+                    .map(|f| match &f.nested {
+                        Some(Nested::List(elem)) if &f.name == col => {
+                            // The element field, renamed to the exploded column.
+                            let mut e = (**elem).clone();
+                            e.name = f.name.clone();
+                            e
+                        }
+                        _ => f,
+                    })
+                    .collect(),
+            )
+        }),
         Op::Reorder { cols } => input.map(|s| {
             let mut front: Vec<Field> = Vec::new();
             for c in cols {
