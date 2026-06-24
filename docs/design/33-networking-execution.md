@@ -1,11 +1,14 @@
 # 33. Networking execution — protected-channel distributed execution (Pillar 3)
 
 > **実装状況（main）**：本設計は **#173 で批准済**。段階着地中 —
-> ✅ `open "http://…"`（有界 GET・#208 着地）／✅ `subscribe "tcp://…"`（無界 feed・本スライス）＝
-> **`net` クライアント・std/依存ゼロ**。残り — 分散実行（`serve` / `run --on`・WireGuard primary）
-> → **B2 `quic`**（quinn/rustls/rcgen/ring・**ring 0.17 ライセンス裁定後**）
-> → **B3 `cpubudget`**（§34・ベンチで効果実証後）。本文中の「landed/完動/実装済」のうち
-> **`serve`/`run --on`/QUIC は元 #173 ブランチの状態**を指す（main へは順次着地）。
+> ✅ `open "http://…"`（有界 GET・#208）／✅ `subscribe "tcp://…"`（無界 feed・#209）＝
+> **`net` クライアント**。✅ **分散実行ランタイム**（`distributed::serve`/`run_remote`・§34.1 論理
+> チャネル＋イベント観測・credit bounded pull・WireGuard posture）＋ **`interpret==distribute`
+> byte-identity を生ワーカで実機 pin 済**（本スライス）。すべて **std/依存ゼロ**。残り —
+> **CLI `serve`/`run --on`**（次スライス）→ **B2 `quic`**（quinn/rustls/rcgen/ring・**ring 0.17
+> ライセンス裁定後**）→ **B3 `cpubudget`**（§34・ベンチ実証後・現状は no-op shim）／
+> **UDS host-shared Transport Service（§34.2/34.4）＝批准待ち**。本文中の「landed/完動」のうち
+> **CLI `serve`/`run --on`・UDS・QUIC は元 #173 ブランチの状態**を指す（main へは順次着地）。
 >
 > 状態：実装（feature `net` ＝ std-only・依存ゼロの本命／feature `quic` ＝ 重い
 > 依存の代替）。§00 ピラー3（分散＝ネットワーク transport）と §28.12.5（socket/http

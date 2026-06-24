@@ -141,9 +141,9 @@ pub fn run_with_progress(
             if tag[node.id] && node.op.is_blocking() {
                 return Err(RivusError::Build(format!(
                     "`{}` needs the whole stream, but it is downstream of an unbounded \
-                     source (`watch`) that never ends — aggregating an unbounded source \
-                     needs a window (a later slice); remove `watch`, or wait for the \
-                     windowing slice",
+                     source (`watch` / `subscribe`) that never ends — aggregating an \
+                     unbounded source needs a window (a later slice); remove the unbounded \
+                     source, or wait for the windowing slice",
                     node.op.kind_str()
                 )));
             }
