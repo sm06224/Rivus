@@ -163,6 +163,9 @@ impl Parser {
     fn path_word(&mut self) -> Result<String, RivusError> {
         match self.bump() {
             Tok::Word(w) => Ok(w),
+            // A quoted path — needed for an `http://…` URL (§33), and useful for
+            // any path with characters the bare-word lexer would split.
+            Tok::Str(s) => Ok(s),
             Tok::Minus => Ok("-".to_string()),
             other => Err(self.err(format!("expected a path, found {other:?}"))),
         }
@@ -4284,6 +4287,27 @@ Import:
             from_md.to_source(),
             canonical.to_source(),
             ".riv.md sugar must lower to the canonical graph (§31 stage-1 zero-semantic-change)"
+        );
+    }
+
+    #[test]
+    fn http_open_parses_and_round_trips() {
+        // §33 `net`: `open "http://…"` reads the URL as one quoted string token;
+        // `to_source` re-quotes it (reversible), and `as json` selects the codec
+        // for a URL with no extension. Parsing is always-std (no `net` feature).
+        for src in [
+            "A:\n open \"http://127.0.0.1:8080/data.csv\"\n |> name\n;",
+            "J:\n open \"http://host/feed\" as json\n |> name\n;",
+        ] {
+            let g = parse(src).unwrap();
+            let s = g.to_source();
+            assert!(s.contains("open \"http://"), "URL quoted in to_source: {s}");
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not idempotent: {s}");
+        }
+        // The plan is flagged as networked (the runtime gates `net` pre-run).
+        assert!(
+            parse("A:\n open \"http://h/a.csv\"\n;").unwrap().uses_net(),
+            "http source must set uses_net"
         );
     }
 

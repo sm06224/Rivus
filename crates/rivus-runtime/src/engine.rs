@@ -161,6 +161,18 @@ pub fn run_with_progress(
                 .into(),
         ));
     }
+    // §33 (never-silent): a build without the `net` feature cannot evaluate a
+    // networked source (`open "http://…"`). Refuse the plan explicitly before
+    // running — the same shape as `regex`/`unbounded`. Parsing and `rivus
+    // explain` stay always-std (the URL round-trips in any build).
+    if cfg!(not(feature = "net")) && graph.uses_net() {
+        return Err(RivusError::Build(
+            "this flow uses a network source (`open \"http://…\"`), but this build has the \
+             `net` feature disabled — rebuild with `--features net` (the default build \
+             stays zero-dependency)"
+                .into(),
+        ));
+    }
     let mut res = run_dispatch(graph, opts, hook)?;
     // Never-silent: a `$x` value hole that reaches execution with no binding
     // would evaluate to null in silence (e.g. running a template scope on its
