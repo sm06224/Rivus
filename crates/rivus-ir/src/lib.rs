@@ -10,16 +10,29 @@ pub mod schema_prop;
 
 pub use expr::{is_type_word, Access, ArithOp, CmpOp, Expr, Func, PathExpr, PathSeg};
 pub use graph::{
-    delim_for_path, delim_modifier_for, parse_route_template, AggFunc, BinType, Codec, Discovery,
-    Disposition, Edge, EdgeKind, Endian, FillMethod, Hook, HookAction, HookEvent, JoinKind, Node,
-    NodeId, Op, PlanGraph, Provenance, ReadFmt, Route, RouteSeg, SinkCodec, SubView, Transport,
-    ViewDef, COMMA,
+    delim_for_path, delim_modifier_for, is_http_url, parse_route_template, AggFunc, BinType, Codec,
+    Discovery, Disposition, Edge, EdgeKind, Endian, FillMethod, Hook, HookAction, HookEvent,
+    JoinKind, Node, NodeId, Op, PlanGraph, Provenance, ReadFmt, Route, RouteSeg, SinkCodec,
+    SubView, Transport, ViewDef, COMMA,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rivus_core::Value;
+
+    #[test]
+    fn is_http_url_recognizes_scheme_and_is_byte_safe() {
+        assert!(is_http_url("http://x/a.csv"));
+        assert!(is_http_url("HTTPS://x/a.csv"));
+        assert!(is_http_url("  http://x")); // leading space trimmed
+        assert!(!is_http_url("ftp://x"));
+        assert!(!is_http_url("/local/a.csv"));
+        // A non-ASCII path must never panic on the fixed-length prefix slice
+        // (a byte index could fall mid-multibyte-char; #178 regression).
+        assert!(!is_http_url("テスト/データ.csv"));
+        assert!(!is_http_url("日"));
+    }
 
     #[test]
     fn topo_order_of_linear_chain() {

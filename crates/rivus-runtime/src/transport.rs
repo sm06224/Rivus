@@ -42,14 +42,22 @@ pub(crate) enum Scheme {
     File,
     Stdin,
     Compressed,
+    /// An `http://` URL fetched over the network (design §33, feature `net`): a
+    /// bounded GET whose body is a non-seekable byte stream, so it reads on the
+    /// single-pass streaming path (like `Compressed`).
+    Http,
 }
 
 impl Scheme {
-    /// Classify a source path: `-` is stdin; a `.gz` / `.zst` / `.zstd` suffix
+    /// Classify a source path: `-` is stdin; an `http://` / `https://` URL is the
+    /// network transport (§33); a `.gz` / `.zst` / `.zstd` suffix
     /// (case-insensitive) is compressed; everything else is a plain local file.
     pub(crate) fn of(path: &str) -> Scheme {
         if path == "-" {
             return Scheme::Stdin;
+        }
+        if rivus_ir::is_http_url(path) {
+            return Scheme::Http;
         }
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".gz") || lower.ends_with(".zst") || lower.ends_with(".zstd") {
