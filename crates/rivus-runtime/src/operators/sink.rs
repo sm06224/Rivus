@@ -108,7 +108,8 @@ pub fn write_csv_file(path: &str, chunks: &[Chunk], delim: u8) -> std::io::Resul
     let sink: Box<dyn Write> = if path == "-" {
         Box::new(std::io::stdout())
     } else {
-        Box::new(std::fs::File::create(path)?)
+        let p = crate::transport::adjust_path(path);
+        Box::new(std::fs::File::create(p)?)
     };
     let mut w = BufWriter::with_capacity(256 * 1024, sink);
     let sep = delim as char;
@@ -299,7 +300,8 @@ pub fn write_jsonl_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
     let sink: Box<dyn Write> = if path == "-" {
         Box::new(std::io::stdout())
     } else {
-        Box::new(std::fs::File::create(path)?)
+        let p = crate::transport::adjust_path(path);
+        Box::new(std::fs::File::create(p)?)
     };
     let mut w = BufWriter::with_capacity(256 * 1024, sink);
     let mut out = String::new();

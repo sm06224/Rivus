@@ -484,7 +484,7 @@ impl<'a> Lexer<'a> {
     /// outside parens it stays path-friendly (`users.csv`, `data/out`, `a-b`).
     fn word_part(&self, c: u8) -> bool {
         if self.depth > 0 {
-            c.is_ascii_alphanumeric() || c == b'_'
+            c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
         } else {
             is_word_part(c)
         }
@@ -494,12 +494,12 @@ impl<'a> Lexer<'a> {
 fn is_word_start(c: u8) -> bool {
     // `/` is allowed so absolute/relative file paths (`/tmp/x.csv`, `./out`)
     // lex as a single word in source/sink positions.
-    c.is_ascii_alphabetic() || c == b'_' || c == b'/'
+    c.is_ascii_alphabetic() || c == b'_' || c == b'/' || c >= 0x80
 }
 
 /// Words may contain dots, slashes and dashes so that file paths
 /// (`users.csv`, `data/out.parquet`) lex as a single token. A leading `.` is
 /// never absorbed because `lex_word` only starts on an alphabetic/underscore.
 fn is_word_part(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'/' || c == b'-'
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'/' || c == b'-' || c >= 0x80
 }

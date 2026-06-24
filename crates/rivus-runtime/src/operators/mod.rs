@@ -65,7 +65,8 @@ impl StreamWriter {
             let w: Box<dyn Write> = if self.path == "-" {
                 Box::new(std::io::stdout())
             } else {
-                Box::new(File::create(&self.path)?)
+                let p = crate::transport::adjust_path(&self.path);
+                Box::new(File::create(p)?)
             };
             self.inner = Some(BufWriter::with_capacity(256 * 1024, w));
         }
@@ -78,7 +79,8 @@ impl StreamWriter {
         if let Some(w) = self.inner.as_mut() {
             w.flush()?;
         } else if self.path != "-" {
-            File::create(&self.path)?;
+            let p = crate::transport::adjust_path(&self.path);
+            File::create(p)?;
         }
         Ok(())
     }
@@ -139,7 +141,8 @@ fn write_output(path: &str, data: &str) -> std::io::Result<()> {
         use std::io::Write;
         std::io::stdout().write_all(data.as_bytes())
     } else {
-        std::fs::write(path, data)
+        let p = crate::transport::adjust_path(path);
+        std::fs::write(p, data)
     }
 }
 

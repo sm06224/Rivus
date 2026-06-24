@@ -99,3 +99,4 @@ mod real_etl;
 mod syntax;
 mod temporal;
 mod transforms;
+mod unicode_longpath;
