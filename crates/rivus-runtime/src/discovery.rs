@@ -67,7 +67,13 @@ pub(crate) fn glob_paths(pattern: &str, name_prefilter: &[String]) -> Vec<String
     let seg_refs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
     let root_path_adjusted = crate::transport::adjust_path_buf(root_path);
 
-    walk(&root_path_adjusted, &uri_prefix, &seg_refs, name_prefilter, &mut out);
+    walk(
+        &root_path_adjusted,
+        &uri_prefix,
+        &seg_refs,
+        name_prefilter,
+        &mut out,
+    );
 
     out.sort();
     out.dedup();

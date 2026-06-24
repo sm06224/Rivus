@@ -13,18 +13,20 @@ fn test_japanese_column_names_and_identifiers() {
 
     // Query using Japanese column names in project and filter
     let res = run_src(
-        &format!("
+        &format!(
+            "
             O:
               open {p}
               |? 年齢 >= 30
               |> 氏名 年齢 部署
             ;
-        "),
+        "
+        ),
         10,
     );
 
     assert!(res.errors.is_empty());
-    
+
     // Check that we filtered correctly
     let ages = collect_i64(&res, "O", "年齢");
     for age in ages {
@@ -42,13 +44,15 @@ fn test_japanese_file_paths() {
 
     let p = file_path.to_string_lossy().replace('\\', "/");
     let res = run_src(
-        &format!("
+        &format!(
+            "
             O:
               open {p}
               |? id == 1
               |> 値
             ;
-        "),
+        "
+        ),
         5,
     );
 
@@ -56,8 +60,8 @@ fn test_japanese_file_paths() {
     let vals = collect_strings(&res, "O", "値");
     assert_eq!(vals, vec!["あいう"]);
 
-    let _ = fs::remove_file(&file_path).unwrap();
-    let _ = fs::remove_dir(&dir).unwrap();
+    let _ = fs::remove_file(&file_path);
+    let _ = fs::remove_dir(&dir);
 }
 
 #[test]
@@ -67,7 +71,7 @@ fn test_windows_long_path_support() {
     for i in 0..15 {
         dir = dir.join(format!("long_path_directory_segment_number_{i}"));
     }
-    
+
     // Create the deep directory using standard fs::create_dir_all
     fs::create_dir_all(&dir).unwrap();
 
@@ -79,12 +83,14 @@ fn test_windows_long_path_support() {
     // Read the file using standard open which uses adjust_path internally
     let p = file_path.to_string_lossy().replace('\\', "/");
     let res = run_src(
-        &format!("
+        &format!(
+            "
             O:
               open {p}
               |> col_a col_b
             ;
-        "),
+        "
+        ),
         5,
     );
 
@@ -93,7 +99,7 @@ fn test_windows_long_path_support() {
     assert_eq!(a_vals, vec![100]);
 
     // Clean up
-    let _ = fs::remove_file(&file_path).unwrap();
+    let _ = fs::remove_file(&file_path);
     // Recursively delete the nested directories
     let mut current = dir;
     while current != std::env::temp_dir() {

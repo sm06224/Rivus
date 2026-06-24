@@ -158,7 +158,7 @@ pub(crate) fn adjust_path(path: &str) -> std::path::PathBuf {
 /// On other platforms, it is a no-op that returns the path unmodified.
 #[cfg(windows)]
 pub(crate) fn adjust_path_buf(path: &std::path::Path) -> std::path::PathBuf {
-    use std::path::{Path, PathBuf, Component};
+    use std::path::{Component, Path, PathBuf};
 
     let path_str = path.to_string_lossy();
     if path_str == "-" {
@@ -227,4 +227,3 @@ pub(crate) fn adjust_path(path: &str) -> std::path::PathBuf {
 pub(crate) fn adjust_path_buf(path: &std::path::Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
-
