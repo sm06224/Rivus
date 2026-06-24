@@ -208,7 +208,13 @@ fn group_schema(keys: &[PathExpr], aggs: &[(AggFunc, String)], input: &Schema) -
             .index_of(col)
             .map(|i| input.fields[i].dtype)
             .unwrap_or(DataType::Str);
-        fields.push(Field::new(name, agg_type(func, col_ty)));
+        // `array_agg` outputs a `List` lane whose element is the aggregated
+        // column's type (§32 / #172); other aggregates are flat scalar lanes.
+        if matches!(func, AggFunc::ArrayAgg) {
+            fields.push(Field::list(name, Field::new("item", col_ty)));
+        } else {
+            fields.push(Field::new(name, agg_type(func, col_ty)));
+        }
     }
     Schema::new(fields)
 }
@@ -227,6 +233,9 @@ fn agg_type(func: &AggFunc, col_ty: DataType) -> DataType {
         },
         // Mean / spread / percentile are nominally float.
         AggFunc::Avg | AggFunc::Std | AggFunc::Pct(_) => DataType::F64,
+        // `array_agg` is a List lane (the nested detail is set by `group_schema`
+        // via `Field::list`; this is the bare lane marker).
+        AggFunc::ArrayAgg => DataType::List,
     }
 }
 

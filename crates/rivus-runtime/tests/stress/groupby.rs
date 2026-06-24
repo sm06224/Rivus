@@ -6,6 +6,66 @@
 use super::*;
 
 #[test]
+fn array_agg_collects_list_in_source_order_and_is_explode_dual() {
+    // §32 / #172: `array_agg:v` collects each group's non-null values into a
+    // `List` lane, in source order. `array_agg` is the dual of `explode`:
+    // grouping then exploding the list reconstructs the original (g, v) rows.
+    let text = "g,v\na,1\nb,2\na,3\nb,4\na,5\n";
+    let f = TempCsv(gendata::write_temp_bytes("stress_arragg", text.as_bytes()));
+    let p = f.0.display();
+
+    let res = run_src(&format!("G:\n open {p}\n |# g array_agg:v\n;"), 4096);
+    let o = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("G"))
+        .unwrap();
+    let c = &o.chunks[0];
+    let (gi, ai) = (
+        c.schema.index_of("g").unwrap(),
+        c.schema.index_of("array_agg_v").unwrap(),
+    );
+    // The aggregate column is a List lane.
+    assert_eq!(c.schema.fields[ai].dtype, rivus_core::DataType::List);
+    let mut got: Vec<(String, String)> = (0..c.len)
+        .map(|r| (c.value(r, gi).to_string(), c.value(r, ai).to_string()))
+        .collect();
+    got.sort();
+    // Source order preserved within each group.
+    assert_eq!(
+        got,
+        vec![
+            ("a".to_string(), "[1, 3, 5]".to_string()),
+            ("b".to_string(), "[2, 4]".to_string()),
+        ],
+        "array_agg keeps source order per group"
+    );
+
+    // Dual: group → array_agg → explode reconstructs the original (g, v) rows.
+    let back = run_src(
+        &format!("G:\n open {p}\n |# g array_agg:v\n explode array_agg_v\n |> g array_agg_v\n;"),
+        4096,
+    );
+    let mut rows: Vec<(String, String)> = {
+        let g = collect_strings(&back, "G", "g");
+        let v = collect_strings(&back, "G", "array_agg_v");
+        g.into_iter().zip(v).collect()
+    };
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("a".into(), "1".into()),
+            ("a".into(), "3".into()),
+            ("a".into(), "5".into()),
+            ("b".into(), "2".into()),
+            ("b".into(), "4".into()),
+        ],
+        "explode(array_agg) reconstructs the rows (the dual)"
+    );
+}
+
+#[test]
 fn describe_matches_oracle() {
     // One numeric column `v`; `describe` must report count/min/max/mean that
     // match an independent computation, for every chunk size.

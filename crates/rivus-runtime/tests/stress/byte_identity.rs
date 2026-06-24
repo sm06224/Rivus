@@ -6,6 +6,73 @@
 use super::*;
 
 #[test]
+fn parallel_array_agg_list_byte_identical() {
+    // §32 / #172 GO condition: `array_agg` collects a group's values into a List
+    // in SOURCE order, and the parallel partition→merge concatenates partitions
+    // in source order — so the list (element order included) is byte-identical
+    // serial == parallel == chunk-size. Same discipline as `explode` (order-based,
+    // not the f64 #41 trap). `v = row index` makes the element order checkable.
+    // >1 MiB + MemoryPref::Fast forces the bounded parallel group path.
+    let rows = 150_000usize;
+    let groups = ["a", "b", "c", "d"];
+    let mut text = String::from("g,v\n");
+    for i in 0..rows {
+        text.push_str(&format!("{},{}\n", groups[i % groups.len()], i));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_arragg_par",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("G:\n open {p}\n |# g array_agg:v\n;");
+    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 4096,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("G"))
+            .unwrap();
+        // (group, full list text) — the list text encodes the exact element order.
+        let mut lines: Vec<String> = o
+            .chunks
+            .iter()
+            .flat_map(|c| {
+                let (gi, ai) = (
+                    c.schema.index_of("g").unwrap(),
+                    c.schema.index_of("array_agg_v").unwrap(),
+                );
+                (0..c.len).map(move |r| format!("{}\t{}", c.value(r, gi), c.value(r, ai)))
+            })
+            .collect();
+        lines.sort();
+        (lines, !res.workers.is_empty())
+    };
+    let (serial, serial_par) = collect(rivus_runtime::MemoryPref::Low);
+    let (parallel, par) = collect(rivus_runtime::MemoryPref::Fast);
+    assert!(!serial_par, "low must be serial");
+    assert!(par, "fast should engage the bounded parallel group path");
+    assert_eq!(
+        parallel, serial,
+        "array_agg list (element order included) must be byte-identical serial vs parallel"
+    );
+    // Sanity: the element order is the source order (group a = 0,4,8,…).
+    let a = serial.iter().find(|l| l.starts_with("a\t")).unwrap();
+    assert!(
+        a.starts_with("a\t[0, 4, 8, "),
+        "source order in the list: {a}"
+    );
+}
+
+#[test]
 fn parallel_decimal_chunk_size_independent() {
     // The streaming-parallel byte-range reader builds decimal columns via the
     // same ColBuilder as the serial path. This gates that the parallel path is
