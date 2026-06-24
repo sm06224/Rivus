@@ -4288,6 +4288,28 @@ Import:
     }
 
     #[test]
+    fn array_agg_aliases_parse_and_canonicalize() {
+        use rivus_ir::AggFunc;
+        // §32 / #172: `array_agg`, `list_agg`, `arr` all lower to `ArrayAgg`; the
+        // canonical `to_source` name is `array_agg` (one-way alias normalization).
+        let op = nth_op(
+            "G:\n open a.csv\n |# team array_agg:score list_agg:p arr:name\n;",
+            1,
+        );
+        let Op::GroupBy { aggs, .. } = op else {
+            panic!("expected GroupBy, got {op:?}");
+        };
+        assert!(
+            aggs.iter().all(|(f, _)| *f == AggFunc::ArrayAgg),
+            "all three aliases → ArrayAgg"
+        );
+        let g = parse("G:\n open a.csv\n |# t arr:score\n;").unwrap();
+        let s = g.to_source();
+        assert!(s.contains("array_agg:score"), "canonical array_agg: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source(), "idempotent: {s}");
+    }
+
+    #[test]
     fn group_keyword_is_sugar_for_pipe_hash() {
         // §25 / #171: `group KEY… func:col…` is a readable alias for `|#`, and
         // `to_source` re-emits `|#` (the canonical form — `group` is input sugar).

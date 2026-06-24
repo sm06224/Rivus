@@ -64,6 +64,11 @@ pub(crate) struct AggAcc {
     has_time: bool,
     time_min: i64,
     time_max: i64,
+    /// `array_agg` buffer (§32 / #172): the group's **non-null** values in
+    /// observe (source) order. The parallel merge appends a later partition's
+    /// buffer after this one (source order), so the list — element order included
+    /// — is byte-identical serial vs parallel. Bounded by group size.
+    arr: Vec<Value>,
 }
 
 /// Extra fractional digits an exact decimal `avg` carries beyond the input scale
@@ -122,6 +127,7 @@ impl AggAcc {
             has_time: false,
             time_min: i64::MAX,
             time_max: i64::MIN,
+            arr: Vec::new(),
         }
     }
 
@@ -223,6 +229,12 @@ impl AggAcc {
                     self.values.push(x);
                 }
             }
+            // array_agg: the group's non-null values, in source order (§32 / #172).
+            AggFunc::ArrayAgg => {
+                if !v.is_null() {
+                    self.arr.push(v.clone());
+                }
+            }
         }
     }
 
@@ -298,6 +310,9 @@ impl AggAcc {
             self.last = other.last.clone();
         }
         self.values.extend_from_slice(&other.values);
+        // array_agg: `self` precedes `other` in source order, so appending keeps
+        // the list — and its element order — deterministic across partitions.
+        self.arr.extend(other.arr.iter().cloned());
     }
 
     /// Numeric aggregate value (sum/avg/min/max/std). `0.0` for an empty group.
@@ -471,6 +486,10 @@ impl AggAcc {
     pub(crate) fn last_opt(&self) -> Option<&str> {
         self.last.as_deref()
     }
+    /// The `array_agg` buffer: the group's non-null values in source order.
+    pub(crate) fn arr_values(&self) -> &[Value] {
+        &self.arr
+    }
     #[cfg(test)]
     pub(crate) fn first_str(&self) -> &str {
         self.first.as_deref().unwrap_or("")
@@ -555,6 +574,10 @@ pub(crate) fn group_parallel_safe(
         | AggFunc::CountDistinct
         | AggFunc::First
         | AggFunc::Last
+        // array_agg concatenates in source order on merge (like first/last), so
+        // the partition→merge result — element order included — is byte-identical
+        // to serial. Integer/order-based, never the f64 #41 trap.
+        | AggFunc::ArrayAgg
         | AggFunc::Pct(_) => true,
         // Exact integer lanes (decimal i128, duration i64) make sum/avg
         // associative → parallel byte-identical; f64 sum/avg are not. #57.
@@ -720,6 +743,36 @@ impl Operator for GroupBy {
                         DataType::Str,
                         Column::new(ColumnData::Str(sc), Validity::from_bits(&valid)),
                     )
+                }
+                // array_agg → a List lane (§32 / #172): one child column over all
+                // groups' flattened non-null values (group order), with per-group
+                // offsets. Source-ordered (observe + merge), so the list and its
+                // element order are byte-identical serial vs parallel. The list is
+                // always a real value — an empty group is `[]` (validity 1), never
+                // null (the inverse of `explode`, whose empty list yields 0 rows).
+                AggFunc::ArrayAgg => {
+                    let mut offsets: Vec<i32> = Vec::with_capacity(self.groups.len() + 1);
+                    offsets.push(0);
+                    let mut flat: Vec<Value> = Vec::new();
+                    let mut acc = 0i32;
+                    for s in self.groups.values() {
+                        let items = s.accs[j].arr_values();
+                        acc += items.len() as i32;
+                        flat.extend(items.iter().cloned());
+                        offsets.push(acc);
+                    }
+                    let child = eval::column_from_values(flat);
+                    let elem = Field::new("item", child.data().dtype());
+                    let list = Column::new(
+                        ColumnData::List(rivus_core::ListColumn {
+                            offsets,
+                            child: Box::new(child),
+                        }),
+                        Validity::all_valid(),
+                    );
+                    fields.push(Field::list(name, elem));
+                    columns.push(list);
+                    continue;
                 }
                 // sum/avg/min/max/std/pct. On a decimal column these stay exact
                 // (i128) when every group produced an exact result; if any group

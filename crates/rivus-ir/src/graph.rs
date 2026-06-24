@@ -151,6 +151,14 @@ pub enum AggFunc {
     /// `median` is p50. These buffer every numeric value per group, so — like
     /// `sort`/`join` — they are pipeline-breakers bounded by group cardinality.
     Pct(u8),
+    /// `array_agg:col` (aliases `list_agg`, `arr`) — collect the group's
+    /// **non-null** values into a `List` lane (§32 / #172), in source order. The
+    /// dual of `explode`: `explode` flattens a list to rows, `array_agg` folds
+    /// rows back into a list. Like `first`/`last` it is order-dependent but
+    /// deterministic — the parallel partition→merge concatenates in source order,
+    /// so serial == parallel == chunk-size (element order included). Buffers each
+    /// group's values, so it is a pipeline-breaker bounded by group size.
+    ArrayAgg,
 }
 
 impl AggFunc {
@@ -165,6 +173,8 @@ impl AggFunc {
             "count_distinct" | "nunique" => AggFunc::CountDistinct,
             "first" => AggFunc::First,
             "last" => AggFunc::Last,
+            // `list_agg` / `arr` are aliases; the canonical name is `array_agg`.
+            "array_agg" | "list_agg" | "arr" => AggFunc::ArrayAgg,
             "median" => AggFunc::Pct(50),
             // `pN` / `pNN` percentile, N in 0..=100 (e.g. `p50`, `p90`, `p99`).
             other => {
@@ -201,6 +211,7 @@ impl AggFunc {
             AggFunc::CountDistinct => "count_distinct",
             AggFunc::First => "first",
             AggFunc::Last => "last",
+            AggFunc::ArrayAgg => "array_agg",
             AggFunc::Pct(_) => "pct",
         }
     }
