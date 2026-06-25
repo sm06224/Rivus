@@ -19,6 +19,18 @@ mod kernel;
 // Distributed execution (`serve` / `run --on`) is a later slice on this feature.
 #[cfg(feature = "net")]
 mod net;
+// §33 / §17 protected-channel distributed execution (feature `net`): ship the IR
+// to a remote worker over a trusted channel (kernel-WireGuard-bound posture) and
+// run it on the same chunk engine — byte-identical to a local run
+// (`interpret == distribute`, §0.5). `serve` / `run --on rivus://…`.
+#[cfg(feature = "net")]
+pub mod distributed;
+// §34.3 transport CPU-budget / core affinity (feature `net`). A no-op shim today
+// (the API is always present so callers stay cfg-free); the actual
+// `sched_setaffinity` syscall is gated behind a later `cpubudget` feature (+libc,
+// Linux) and proven by a benchmark first. Dep-zero — pulls no `libc`.
+#[cfg(feature = "net")]
+pub mod cpu_budget;
 mod operators;
 mod route;
 mod telemetry;
