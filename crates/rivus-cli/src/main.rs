@@ -40,6 +40,15 @@ fn main() -> ExitCode {
         return run_gen(&args[2..]);
     }
 
+    // `rivus serve [--bind ADDR]` — a protected-channel distributed worker (§33 /
+    // §17): accept allowlisted peers over the trusted transport and run each
+    // shipped IR on the same chunk engine, streaming the result back. Needs
+    // `--features net`; bind/peer capability comes from the environment
+    // (`RIVUS_CAP_NET_IFACE` / `RIVUS_CAP_NET_PEERS`).
+    if cmd == "serve" {
+        return run_serve(&args[2..]);
+    }
+
     // Bare Unix-filter form: `rivus '|? age >= 20 |> name age'` (no subcommand).
     // If arg 1 is a transform-only program rather than a known subcommand, run
     // it as a stdin→stdout filter. Flags still parse from arg 2.
@@ -69,6 +78,9 @@ fn main() -> ExitCode {
     let mut tui = false;
     // `--memory low|auto|fast|unbounded` (Pillar C): reader memory/speed strategy.
     let mut memory = MemoryPref::default();
+    // `run --on rivus://host:port`: ship this flow's IR to a remote worker and
+    // print its (byte-identical) rendered result instead of running locally (§33).
+    let mut run_on: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -126,6 +138,18 @@ fn main() -> ExitCode {
                     _ => "127.0.0.1:0".to_string(),
                 };
                 serve_addr = Some(addr);
+            }
+            // `--on rivus://host:port` (or `host:port`): run this flow on a remote
+            // worker (§33) and print its byte-identical result.
+            "--on" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => run_on = Some(a.clone()),
+                    None => {
+                        eprintln!("error: --on requires a peer address (rivus://host:port)");
+                        return ExitCode::from(2);
+                    }
+                }
             }
             "--open" => open_browser = true,
             "--chunk-size" => {
@@ -367,6 +391,13 @@ fn main() -> ExitCode {
                 eprint!("{}", viz::render_opt_report(&report));
                 eprintln!();
             }
+            // `run --on rivus://host:port` (§33 / §17): ship this flow (its IR,
+            // the deployment artifact) to a remote worker and print its rendered
+            // result — byte-identical to a local run (`interpret == distribute`).
+            // The local run path below is untouched when `--on` is absent.
+            if let Some(peer) = &run_on {
+                return run_on_peer(&graph, peer);
+            }
             // Live dashboard: run the flow on a worker thread that publishes
             // snapshots to a Hub, and serve the embedded HTML/SSE UI here.
             if let Some(addr) = &serve_addr {
@@ -525,6 +556,97 @@ fn run_served(
         Ok(_) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
+}
+
+/// `rivus serve [--bind ADDR]` — a protected-channel distributed worker (§33 /
+/// §17): bind only the trusted WireGuard interface (`RIVUS_CAP_NET_IFACE`) or
+/// loopback, accept allowlisted peers (`RIVUS_CAP_NET_PEERS`), and run each
+/// shipped IR on the same chunk engine — streaming the rendered result back under
+/// the client's credit (bounded pull). The worker handler executes the IR
+/// locally (parse → optimize → run → render): the IR is the deployment artifact.
+#[cfg(feature = "net")]
+fn run_serve(args: &[String]) -> ExitCode {
+    use rivus_runtime::distributed::{self, Handler, LinkConfig};
+    let mut bind = "127.0.0.1:9001".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => bind = a.clone(),
+                    None => {
+                        eprintln!("error: --bind requires an address (host:port)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("error: serve: unknown argument '{other}'");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    // Execute each shipped IR locally and render its result bytes — the same
+    // render a local run produces, so `run --on` is byte-identical (§0.5).
+    let handler: Handler = std::sync::Arc::new(|src: &str| {
+        let graph = rivus_parser::parse(src).map_err(|e| format!("parse: {e:?}"))?;
+        let (graph, _report) = rivus_optimizer::optimize(graph);
+        let res = run(&graph, RunOptions::default()).map_err(|e| format!("run: {e:?}"))?;
+        Ok(viz::render_outputs(&res.outputs).into_bytes())
+    });
+    let cfg = LinkConfig::from_env();
+    match distributed::serve(&bind, &cfg, handler, |ev| eprintln!("[rivus serve] {ev}")) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("serve error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Defense-in-depth: a `net`-less build cannot serve.
+#[cfg(not(feature = "net"))]
+fn run_serve(_args: &[String]) -> ExitCode {
+    eprintln!(
+        "`rivus serve` needs the network feature — rebuild with `--features net` \
+         (the default build stays zero-dependency)"
+    );
+    ExitCode::from(2)
+}
+
+/// `rivus run --on rivus://host:port` — ship the parsed flow's IR to a remote
+/// worker (§33) and print its byte-identical rendered result. The peer must be
+/// loopback or allowlisted; a capability denial names only the target.
+#[cfg(feature = "net")]
+fn run_on_peer(graph: &rivus_ir::PlanGraph, peer: &str) -> ExitCode {
+    use rivus_runtime::distributed::{self, LinkConfig};
+    let addr = peer.strip_prefix("rivus://").unwrap_or(peer);
+    let ir_source = graph.to_source();
+    match distributed::run_remote(addr, &LinkConfig::from_env(), &ir_source) {
+        Ok(bytes) => {
+            // The worker's rendered result, written verbatim (byte-identical to
+            // a local run's `render_outputs`).
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("remote run error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Defense-in-depth: a `net`-less build cannot run `--on`.
+#[cfg(not(feature = "net"))]
+fn run_on_peer(_graph: &rivus_ir::PlanGraph, _peer: &str) -> ExitCode {
+    eprintln!(
+        "`rivus run --on` needs the network feature — rebuild with `--features net` \
+         (the default build stays zero-dependency)"
+    );
+    ExitCode::from(2)
 }
 
 /// `rivus run … --tui`: repaint a live ANSI dashboard frame on stderr each tick

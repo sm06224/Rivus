@@ -729,3 +729,59 @@ fn riv_md_explain_write_is_idempotent_and_inert() {
         "mermaid leaked into execution: {nodes}"
     );
 }
+
+/// §33 / §17 (feature `net`): `rivus serve` + `rivus run --on rivus://…` round
+/// trips a flow through a remote worker. The worker runs the shipped IR on the
+/// same chunk engine and streams back its rendered result (byte-identity proven
+/// at the runtime level in `tests/net.rs`; here we pin the CLI wiring end to end).
+#[cfg(feature = "net")]
+#[test]
+fn serve_and_run_on_round_trips() {
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    // A free loopback port for the worker.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let bind = format!("127.0.0.1:{port}");
+    let dir = std::env::temp_dir();
+    let csv = dir.join(format!("rivus_cli_on_{}.csv", std::process::id()));
+    std::fs::write(&csv, "name,age\nalice,30\nbob,17\ncarol,42\n").unwrap();
+    let p = csv.to_string_lossy().replace('\\', "/");
+
+    let mut worker = Command::new(BIN)
+        .args(["serve", "--bind", &bind])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+    thread::sleep(Duration::from_millis(400)); // let the worker bind + listen
+
+    let flow = format!("R:\n open {p}\n |? age >= 18\n |> name age\n;");
+    let out = Command::new(BIN)
+        .args(["run", "--on", &format!("rivus://{bind}"), "-c", &flow])
+        .output()
+        .expect("spawn run --on");
+    let _ = worker.kill();
+    let _ = worker.wait();
+    let _ = std::fs::remove_file(&csv);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "run --on failed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The remote worker filtered + projected: adults survive, the minor is gone.
+    assert!(
+        stdout.contains("alice") && stdout.contains("carol"),
+        "adults present in remote result: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("bob"),
+        "minor filtered remotely: {stdout:?}"
+    );
+}
