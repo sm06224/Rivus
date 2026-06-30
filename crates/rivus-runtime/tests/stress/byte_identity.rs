@@ -73,6 +73,76 @@ fn parallel_array_agg_list_byte_identical() {
 }
 
 #[test]
+fn parallel_bucket_window_chunk_size_byte_identical() {
+    // #179: `bucket(ts, dur)` is a row-wise floor — a pure scalar projection — so
+    // the byte-range parallel reader concatenates partitions in source order and
+    // the output is byte-identical serial == parallel == chunk-size. Same
+    // order-based discipline as `explode` / `array_agg` (not the f64 #41 trap).
+    // `temporal::test_bucket_tumbling_window_evaluation` pins the bucket *values*;
+    // this pins *strategy / chunk-size invariance* under load. A projection's
+    // byte-range path only engages with a file sink (cf. `parallel_decimal_*`), so
+    // each run `save`s and we compare the output files byte-for-byte.
+    let rows = 150_000usize; // >1 MiB of "id,ts\n" → crosses the Fast parallel floor
+    let mut text = String::from("id,ts\n");
+    for i in 0..rows {
+        // Deterministic spread over many 15m / 1h buckets, incl. a pre-epoch
+        // negative tick every 7th row (floor toward -inf must agree too).
+        let ts = if i % 7 == 0 {
+            format!("1969-12-31T23:{:02}:{:02}", i % 60, (i * 3) % 60)
+        } else {
+            format!(
+                "2026-06-23T{:02}:{:02}:{:02}",
+                (i / 60) % 24,
+                i % 60,
+                (i * 7) % 60
+            )
+        };
+        text.push_str(&format!("{i},{ts}\n"));
+    }
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_bucket_par",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+
+    let run_to_file = |cs: usize, pref: rivus_runtime::MemoryPref, out: &std::path::Path| {
+        let src = format!(
+            "D:\n open {p}\n |> id (bucket(ts, \"15m\":duration)) as b15m (bucket(ts, \"1h\")) as b1h\n save {}\n;",
+            out.display()
+        );
+        let g = rivus_parser::parse(&src).expect("parse");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: cs,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run")
+    };
+
+    // Serial oracle (single-threaded reader).
+    let ser_out = TempCsv(gendata::write_temp_bytes("bucket_par_serial", b""));
+    run_to_file(1024, rivus_runtime::MemoryPref::Low, &ser_out.0);
+    let oracle = std::fs::read_to_string(&ser_out.0).expect("read serial out");
+    assert!(oracle.lines().count() > rows, "oracle unexpectedly small");
+
+    for cs in [1usize, 1000, rows] {
+        let par_out = TempCsv(gendata::write_temp_bytes("bucket_par_parallel", b""));
+        let res = run_to_file(cs, rivus_runtime::MemoryPref::Fast, &par_out.0);
+        assert!(
+            !res.workers.is_empty(),
+            "expected the byte-range parallel reader to engage @cs={cs}"
+        );
+        let got = std::fs::read_to_string(&par_out.0).expect("read parallel out");
+        // Parts are concatenated in source order, so the parallel projection is
+        // byte-identical to serial (not merely set-equal) at every chunk size.
+        assert_eq!(got, oracle, "parallel bucket projection != serial @cs={cs}");
+    }
+}
+
+#[test]
 fn parallel_decimal_chunk_size_independent() {
     // The streaming-parallel byte-range reader builds decimal columns via the
     // same ColBuilder as the serial path. This gates that the parallel path is
