@@ -25,12 +25,12 @@ fn parallel_array_agg_list_byte_identical() {
     ));
     let p = f.0.display();
     let flow = format!("G:\n open {p}\n |# g array_agg:v\n;");
-    let collect = |pref: rivus_runtime::MemoryPref| -> (Vec<String>, bool) {
+    let collect = |pref: rivus_runtime::MemoryPref, cs: usize| -> (Vec<String>, bool) {
         let g = rivus_parser::parse(&flow).expect("parse");
         let res = run(
             &g,
             RunOptions {
-                chunk_size: 4096,
+                chunk_size: cs,
                 memory: pref,
                 ..Default::default()
             },
@@ -56,20 +56,39 @@ fn parallel_array_agg_list_byte_identical() {
         lines.sort();
         (lines, !res.workers.is_empty())
     };
-    let (serial, serial_par) = collect(rivus_runtime::MemoryPref::Low);
-    let (parallel, par) = collect(rivus_runtime::MemoryPref::Fast);
-    assert!(!serial_par, "low must be serial");
-    assert!(par, "fast should engage the bounded parallel group path");
-    assert_eq!(
-        parallel, serial,
-        "array_agg list (element order included) must be byte-identical serial vs parallel"
-    );
+    // Chunk-size-independence oracle: one serial run. The element order inside
+    // each list is the source order and must not move with chunk size *or*
+    // strategy — so every run below is compared against this single oracle.
+    let (oracle, oracle_par) = collect(rivus_runtime::MemoryPref::Low, 4096);
+    assert!(!oracle_par, "low must be serial");
     // Sanity: the element order is the source order (group a = 0,4,8,…).
-    let a = serial.iter().find(|l| l.starts_with("a\t")).unwrap();
+    let a = oracle.iter().find(|l| l.starts_with("a\t")).unwrap();
     assert!(
         a.starts_with("a\t[0, 4, 8, "),
         "source order in the list: {a}"
     );
+    // serial == parallel == chunk-size: at every chunk size, both the serial
+    // reader and the bounded parallel group path reproduce the oracle exactly
+    // (lists element-order-identical, not merely set-equal). #193: previously
+    // only the memory pref varied (fixed chunk_size); the chunk-size loop pins
+    // that the source-ordered merge is independent of chunk boundaries too.
+    for cs in [1usize, 1000, rows] {
+        let (serial, serial_par) = collect(rivus_runtime::MemoryPref::Low, cs);
+        let (parallel, par) = collect(rivus_runtime::MemoryPref::Fast, cs);
+        assert!(!serial_par, "low must be serial @cs={cs}");
+        assert!(
+            par,
+            "fast should engage the bounded parallel group path @cs={cs}"
+        );
+        assert_eq!(
+            serial, oracle,
+            "array_agg list must be chunk-size independent (serial) @cs={cs}"
+        );
+        assert_eq!(
+            parallel, oracle,
+            "array_agg list (element order included) must be byte-identical serial == parallel == chunk-size @cs={cs}"
+        );
+    }
 }
 
 #[test]
