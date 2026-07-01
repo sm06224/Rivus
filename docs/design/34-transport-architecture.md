@@ -38,7 +38,8 @@ Transport (one connection)
 
 消費側はチャネルで demux し、**Data を止めずに Telemetry を surface**できる（`run_remote_observed`）。
 QUIC のストリーム分離を、物理 N 接続でなく**フレームのチャネルタグ**で実現（QUIC backend では
-本物のストリームに 1:1 で載る）。
+本物のストリームに 1:1 で載る——ただし **QUIC は opt-in feature・非出荷・`full` 非搭載**が前提
+〔§35 批准・#211〕）。
 
 ## 34.2 イベント中心の可観測性（**landed**）
 
@@ -56,7 +57,8 @@ transfer.done  frames=<n> bytes=<n>
 （§17.7 coordinator 集約・既存 `RuntimeSnapshot`/`--json` と同系）。CLI `--on` は
 イベントを stderr に出し（`[rivus @addr] …`）、結果（Data）は stdout に流す。
 
-**QUIC バックエンドも同一イベントを narrate（parity・landed）**：worker が同じ
+**QUIC バックエンドも同一イベントを narrate（parity・landed）**（本段以降の QUIC 記述は
+すべて **opt-in `quic`・非出荷・`full` 非搭載** が前提〔§35 批准〕）：worker が同じ
 `flow.started`/`flow.completed`/`transfer.done` を `EVENT` フレームでストリームに流し、
 `quic_run_observed` / `QuicSession::run_observed`（CLI `--on quic://`）が結果から demux する
 （非観測クライアントは無視＝後方互換）。test `tests/quic.rs` case (d)。既定は同一 bidi
@@ -101,6 +103,12 @@ OS 任せでなく **CPU 利用率自体を設計対象**にする。例：
   affinity 適用・`0.5 core` のような分数予算（cgroup quota）。
 
 ## 34.4 ホスト共有 Transport Service（s1 UDS フロント＝**プレ実装 landed**／以降 設計）
+
+> **§35 批准追補（#211）**：sidecar Transport Service は「**トランスポート境界をプラガブルに
+> し Rivus を dep-zero に保つ正準機構**」と位置づける——非 WireGuard 環境の安全境界
+> （TLS/QUIC/mTLS/service mesh）はすべて sidecar が終端し、Rivus は平文 UDS のまま無改造・
+> 依存ゼロ。**この批准は設計上の位置づけであり、UDS 実装は従来どおり staged（批准制・
+> 順次着地）のまま**——実装スケジュールは変わらない。
 
 1 台に Rivus A/B/C が同居すると、各々が QUIC/TLS/WG を持つと**通信だけで複数コア消費**＋
 SIMD 競合。PMCN の集約思想で、**ホスト単位の通信専用サービス**へ責務を集約：
