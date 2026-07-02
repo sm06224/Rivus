@@ -99,6 +99,12 @@ fn discovery_prefilter(mut graph: PlanGraph, report: &mut OptReport) -> PlanGrap
         }
         let preds = match &graph.nodes[consumers[0]].op {
             Op::FilterProject { preds, .. } => preds.clone(),
+            // A bare `Filter` (not fused into a FilterProject because its
+            // neighbor is a computed projection / rename / …, #189) is just as
+            // safe a pushdown seed: every source prefilter is additive — the
+            // filter node re-checks each surviving row — so results are
+            // unchanged whatever follows the filter.
+            Op::Filter { pred } => vec![pred.clone()],
             _ => continue,
         };
         let mut conjuncts: Vec<&Expr> = Vec::new();
@@ -198,6 +204,12 @@ fn string_prefilter(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
         }
         let preds = match &graph.nodes[consumers[0]].op {
             Op::FilterProject { preds, .. } => preds.clone(),
+            // A bare `Filter` (not fused into a FilterProject because its
+            // neighbor is a computed projection / rename / …, #189) is just as
+            // safe a pushdown seed: every source prefilter is additive — the
+            // filter node re-checks each surviving row — so results are
+            // unchanged whatever follows the filter.
+            Op::Filter { pred } => vec![pred.clone()],
             _ => continue,
         };
         let mut conjuncts: Vec<&Expr> = Vec::new();
@@ -313,6 +325,12 @@ fn filter_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
         }
         let preds = match &graph.nodes[consumers[0]].op {
             Op::FilterProject { preds, .. } => preds.clone(),
+            // A bare `Filter` (not fused into a FilterProject because its
+            // neighbor is a computed projection / rename / …, #189) is just as
+            // safe a pushdown seed: every source prefilter is additive — the
+            // filter node re-checks each surviving row — so results are
+            // unchanged whatever follows the filter.
+            Op::Filter { pred } => vec![pred.clone()],
             _ => continue,
         };
         // Flatten top-level `and` chains; an atom under `or` is *not* a
@@ -442,6 +460,39 @@ fn project_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
                         push_unique(&mut needed, f);
                     }
                 }
+                // A computed projection (#189): `ProjectExpr` emits ONLY its
+                // items, so nothing downstream can reference another source
+                // column — the live set is exactly the columns its expressions
+                // (and sub-view bases) read. Optionally reached through one
+                // bare `Filter` (the unfused shape a computed projection
+                // leaves behind): then the filter's predicate columns are live
+                // too, and the filter must feed the ProjectExpr alone.
+                Op::Filter { pred } => {
+                    let downstream = graph.outputs_of(*c);
+                    let pe = match downstream.as_slice() {
+                        [one] => match &graph.nodes[*one].op {
+                            Op::ProjectExpr { items, views } => Some((items, views)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let Some((items, views)) = pe else {
+                        safe = false;
+                        break;
+                    };
+                    if !collect_project_expr_live(pred, items, views, &mut needed) {
+                        safe = false;
+                        break;
+                    }
+                }
+                Op::ProjectExpr { items, views } => {
+                    // Direct computed projection: live = referenced columns only.
+                    let no_pred = Expr::Literal(rivus_core::Value::Bool(true));
+                    if !collect_project_expr_live(&no_pred, items, views, &mut needed) {
+                        safe = false;
+                        break;
+                    }
+                }
                 _ => {
                     safe = false;
                     break;
@@ -466,6 +517,32 @@ fn project_pushdown(mut graph: PlanGraph, report: &mut OptReport) -> PlanGraph {
         ));
     }
     graph
+}
+
+/// Collect the live columns of a `ProjectExpr` consumer (#189): the columns its
+/// item expressions read, its sub-view base columns, plus a guarding filter's
+/// predicate columns. Returns `false` (pruning unsafe) when any expression uses
+/// a positional `$_[i]` reference — pruning shifts schema order.
+fn collect_project_expr_live(
+    pred: &Expr,
+    items: &[(Expr, String)],
+    views: &[rivus_ir::ViewDef],
+    needed: &mut Vec<String>,
+) -> bool {
+    let positional = |e: &Expr| e.any(&|x| matches!(x, Expr::FieldAt(_)));
+    if positional(pred) || items.iter().any(|(e, _)| positional(e)) {
+        return false;
+    }
+    collect_fields(pred, needed);
+    for (e, _) in items {
+        collect_fields(e, needed);
+    }
+    // A `:{ … }` sub-view block slices its base column at eval time, so the
+    // base must stay live even when no item references it directly.
+    for v in views {
+        push_unique(needed, &v.col);
+    }
+    true
 }
 
 /// Collect referenced field names from a predicate expression.
@@ -824,6 +901,92 @@ B:\n open data.csv\n |# country\n;";
             .iter()
             .filter(|n| matches!(n.op, Op::FilterProject { .. }))
             .count()
+    }
+
+    #[test]
+    fn pushdowns_fire_for_computed_projections() {
+        // #189: a single computed column (`(b*2) as d` → ProjectExpr) used to
+        // disable EVERY optimization — fuse_linear has no ProjectExpr arm, so
+        // no FilterProject appears, and both pushdowns only recognized
+        // FilterProject consumers. The pushdowns are semantically independent
+        // of the projection's shape: the prefilter is additive (the Filter
+        // re-checks) and ProjectExpr emits only its items (live set = columns
+        // its expressions read + the filter's predicate columns).
+        let src = "F:\n open d.csv\n |? a > 1\n |> a (b * 2) as d\n;";
+        let g = rivus_parser::parse(src).unwrap();
+        let (opt, report) = optimize(g);
+        let s = opt
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Source { .. }))
+            .unwrap();
+        match &s.op {
+            Op::Source {
+                codec:
+                    Codec::Csv {
+                        prefilter,
+                        projection,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(prefilter.len(), 1, "numeric atom lifted to the reader");
+                assert_eq!(prefilter[0].0, "a");
+                let proj = projection.as_ref().expect("projection restricted");
+                let mut proj = proj.clone();
+                proj.sort();
+                assert_eq!(proj, vec!["a".to_string(), "b".to_string()], "c pruned");
+            }
+            other => panic!("expected a CSV source, got {other:?}"),
+        }
+        assert!(report.applied.iter().any(|l| l.contains("filter_pushdown")));
+        assert!(report
+            .applied
+            .iter()
+            .any(|l| l.contains("project_pushdown")));
+
+        // A direct computed projection (no filter): live = referenced columns.
+        let src = "F:\n open d.csv\n |> (b * 2) as d\n;";
+        let (opt, _) = optimize(rivus_parser::parse(src).unwrap());
+        match &opt
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Source { .. }))
+            .unwrap()
+            .op
+        {
+            Op::Source {
+                codec: Codec::Csv { projection, .. },
+                ..
+            } => assert_eq!(projection.as_deref(), Some(&["b".to_string()][..])),
+            other => panic!("expected a CSV source, got {other:?}"),
+        }
+
+        // Positional `$_[i]` in a computed item: pruning must stay off (it
+        // would shift schema order), but the additive prefilter still fires.
+        let src = "F:\n open d.csv\n |? a > 1\n |> ($_[1]) as x\n;";
+        let (opt, _) = optimize(rivus_parser::parse(src).unwrap());
+        match &opt
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Source { .. }))
+            .unwrap()
+            .op
+        {
+            Op::Source {
+                codec:
+                    Codec::Csv {
+                        projection,
+                        prefilter,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(projection.is_none(), "positional ref disables pruning");
+                assert_eq!(prefilter.len(), 1, "additive prefilter is still safe");
+            }
+            other => panic!("expected a CSV source, got {other:?}"),
+        }
     }
 
     #[test]

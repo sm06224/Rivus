@@ -1363,3 +1363,33 @@ continue-first holds.
 Remaining engineering (HANDOVER): the merge path still *holds* the collected
 worker outputs themselves; spilling those to disk (or per-worker part files for
 routes) is the next, separate step.
+
+## computed-projection pushdown — bare Filter / ProjectExpr consumers (#189, landed)
+
+Before #220, a single computed column in the projection (`|> a (b*2) as d` →
+`ProjectExpr`) disabled **every** pushdown: no `FilterProject` fusion arm →
+all three source pushdowns (numeric/string prefilter, discovery-name
+projection) recognized only the `FilterProject` consumer → `rivus explain`
+showed `(no transformations applied)` on virtually every real ETL flow. #220
+generalizes the consumers (bare `Filter` is additive so always safe;
+`ProjectExpr` emits only its items so its referenced-column set is the live
+set; `$_[i]` positional references keep pruning off as before).
+
+Measured (research session, #220; release build, Linux container — relative
+comparison, not cross-machine absolute): 1 M rows × 6 columns,
+`|? age>=58 |> name (age*2) as d` with a file `save`, min of 5 runs:
+
+| scenario | wall |
+|---|---:|
+| before (computed projection = no optimization; verified ≡ `--no-opt`) | 0.148 s |
+| **after (prefilter + projection pushdown both fire)** | **0.094 s = 1.57×** |
+| reference: pure projection (already optimized before #220) | 0.092 s |
+
+The computed-column penalty is gone (within noise of the pure-projection
+form). Correctness gate: `opt == --no-opt` output is **byte-identical**
+(355,570-row diff match), pinned by
+`optimizer_equiv::computed_projection_pushdown_is_equivalent` across three
+shapes plus the `$_[i]` guard test.
+
+Remaining (recorded in #189): pushdown through `rename`/`drop` (needs a
+column-name reverse map) and a `(Filter, ProjectExpr)` fusion arm.
