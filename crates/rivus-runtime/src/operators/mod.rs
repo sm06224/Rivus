@@ -354,7 +354,10 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::Sort { keys } => Box::new(Sort::new(keys.clone())),
         Op::Distinct { keys } => Box::new(Distinct::new(keys.clone())),
         Op::Describe => Box::new(Describe::default()),
-        Op::DropNa { cols } => Box::new(DropNa { cols: cols.clone() }),
+        Op::DropNa { cols } => Box::new(DropNa {
+            cols: cols.clone(),
+            dropped: 0,
+        }),
         Op::Explode { col } => Box::new(Explode { col: col.clone() }),
         Op::Fill { col, method } => match method {
             FillMethod::Value(value) => Box::new(Fill {

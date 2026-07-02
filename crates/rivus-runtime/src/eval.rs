@@ -591,6 +591,50 @@ fn cast_value(v: Value, ty: DataType, fails: &mut u64) -> Value {
             _ => {} // numeric source → ticks reinterpret below
         }
     }
+    // Numeric lanes from a STRING source parse checked (#190): a non-empty
+    // string that won't parse becomes `null` + counted (never a silent 0/NaN),
+    // an empty/whitespace cell is "missing" → null, NOT a failure (reader
+    // parity), and a null propagates (§26.2c). Non-string sources keep the
+    // deliberate reinterpretations below (bool→0/1, temporal→ticks, …).
+    if matches!(ty, DataType::I64 | DataType::F64 | DataType::Decimal { .. }) {
+        match &v {
+            Value::Null => return Value::Null,
+            Value::Str(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    return Value::Null;
+                }
+                return match ty {
+                    DataType::I64 => match t
+                        .parse::<i64>()
+                        .or_else(|_| t.parse::<f64>().map(|f| f as i64))
+                    {
+                        Ok(x) => Value::I64(x),
+                        Err(_) => {
+                            *fails += 1;
+                            Value::Null
+                        }
+                    },
+                    DataType::F64 => match t.parse::<f64>() {
+                        Ok(x) => Value::F64(x),
+                        Err(_) => {
+                            *fails += 1;
+                            Value::Null
+                        }
+                    },
+                    DataType::Decimal { scale } => match t.parse::<f64>() {
+                        Ok(x) => Value::Dec(f64_to_decimal(x, scale)),
+                        Err(_) => {
+                            *fails += 1;
+                            Value::Null
+                        }
+                    },
+                    _ => unreachable!("guarded by the matches! above"),
+                };
+            }
+            _ => {}
+        }
+    }
     match ty {
         DataType::I64 => Value::I64(to_i64(v)),
         DataType::F64 => Value::F64(to_f64(v)),
@@ -733,6 +777,70 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
     if is_temporal(ty) {
         if let ColumnData::Str(s) = col.data() {
             return cast_str_column_temporal(s, &col, n, ty, fails);
+        }
+    }
+    // Numeric lanes from a STRING column parse checked per cell (#190): an
+    // unparseable non-empty cell → null + counted (never a silent 0/NaN); an
+    // empty cell and a null cell stay null uncounted (reader parity / §26.2c).
+    if matches!(ty, DataType::I64 | DataType::F64 | DataType::Decimal { .. })
+        && matches!(col.data(), ColumnData::Str(_))
+    {
+        {
+            let mut valid = Vec::with_capacity(n);
+            return match ty {
+                DataType::I64 => {
+                    let mut out = Vec::with_capacity(n);
+                    for i in 0..n {
+                        match cast_value(col.value_at(i), ty, fails) {
+                            Value::I64(x) => {
+                                out.push(x);
+                                valid.push(true);
+                            }
+                            _ => {
+                                out.push(0);
+                                valid.push(false);
+                            }
+                        }
+                    }
+                    Column::new(ColumnData::I64(out), Validity::from_bits(&valid))
+                }
+                DataType::F64 => {
+                    let mut out = Vec::with_capacity(n);
+                    for i in 0..n {
+                        match cast_value(col.value_at(i), ty, fails) {
+                            Value::F64(x) => {
+                                out.push(x);
+                                valid.push(true);
+                            }
+                            _ => {
+                                out.push(0.0);
+                                valid.push(false);
+                            }
+                        }
+                    }
+                    Column::new(ColumnData::F64(out), Validity::from_bits(&valid))
+                }
+                DataType::Decimal { scale } => {
+                    let mut unscaled = Vec::with_capacity(n);
+                    for i in 0..n {
+                        match cast_value(col.value_at(i), ty, fails) {
+                            Value::Dec(d) => {
+                                unscaled.push(d.unscaled);
+                                valid.push(true);
+                            }
+                            _ => {
+                                unscaled.push(0);
+                                valid.push(false);
+                            }
+                        }
+                    }
+                    Column::new(
+                        ColumnData::Dec(rivus_core::DecColumn { unscaled, scale }),
+                        Validity::from_bits(&valid),
+                    )
+                }
+                _ => unreachable!("guarded by the matches! above"),
+            };
         }
     }
     // Null in → null out (design 26 §26.2c): a null row stays null after a cast
@@ -1238,6 +1346,10 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, fails: &mut
     };
     let (lf, li) = col_num_lane(lc);
     let (rf, ri) = col_num_lane(rc);
+    // A zero divisor (#190): the result cell becomes NULL and is counted —
+    // never a silent `inf`/`NaN` (float `/`) or a silent `0` (int `%`). The
+    // extra validity pass is paid only by Div/Mod.
+    let mut div0: Vec<usize> = Vec::new();
     // Integer lane only when both sides are integers and the op preserves it
     // (division always yields a float, matching pandas/SQL `/` semantics).
     let data = if li && ri && op != ArithOp::Div {
@@ -1253,7 +1365,8 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, fails: &mut
                         if b != 0 {
                             a % b
                         } else {
-                            0
+                            div0.push(i);
+                            0 // backing only; the cell is nulled below
                         }
                     }
                     ArithOp::Div => unreachable!(),
@@ -1270,14 +1383,40 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, fails: &mut
                     ArithOp::Add => a + b,
                     ArithOp::Sub => a - b,
                     ArithOp::Mul => a * b,
-                    ArithOp::Div => a / b,
-                    ArithOp::Mod => a % b,
+                    ArithOp::Div => {
+                        if b != 0.0 {
+                            a / b
+                        } else {
+                            div0.push(i);
+                            0.0
+                        }
+                    }
+                    ArithOp::Mod => {
+                        if b != 0.0 {
+                            a % b
+                        } else {
+                            div0.push(i);
+                            0.0
+                        }
+                    }
                 }
             })
             .collect();
         ColumnData::F64(out)
     };
-    Column::new(data, out_validity)
+    if div0.is_empty() {
+        return Column::new(data, out_validity);
+    }
+    // Count only rows that were otherwise valid (a null operand already made
+    // the row null and is not a division failure), then null the div0 cells.
+    let mut bits: Vec<bool> = (0..n).map(|i| !out_validity.is_null(i)).collect();
+    for &i in &div0 {
+        if bits[i] {
+            *fails += 1;
+            bits[i] = false;
+        }
+    }
+    Column::new(data, Validity::from_bits(&bits))
 }
 
 /// Evaluate a predicate expression for a single row.

@@ -161,7 +161,7 @@ fn scalar_cast_failures_surface_bug_d_a2() {
         assert!(
             pred.errors
                 .iter()
-                .any(|e| e.message.contains("could not be cast")),
+                .any(|e| e.message.contains("failed to evaluate")),
             "predicate cast failure must surface @cs={cs}: {:?}",
             pred.errors
         );
@@ -194,4 +194,164 @@ fn datetime_parses_fractional_and_timezone_bug_c() {
         "fractional-second / timezone ISO datetimes should parse, not fail: {:?}",
         res.errors
     );
+}
+
+#[test]
+fn numeric_expr_cast_failure_is_null_and_surfaced_not_silent_zero() {
+    // #190: `(v:int)` on an unparseable string yielded a SILENT 0 (the
+    // classic silent-0), and `(v:float)` a silent NaN. Now: null + counted +
+    // surfaced, per lane. An empty cell is "missing" (null, NOT counted —
+    // reader parity), and a parseable cell is unchanged.
+    for cs in [1usize, 3, 4096] {
+        let f = TempCsv(gendata::write_temp_bytes(
+            "b190_cast",
+            b"id,v\n1,100\n2,notanumber\n3,42\n4,\n5,12.5\n",
+        ));
+        let p = f.0.display();
+        let res = run_src(
+            &format!("C:\n open {p} (id:int v:str)\n |> id (v:int) as n\n;"),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("C"))
+            .unwrap();
+        // Collect (id, n-as-string) across chunks; null renders distinctly.
+        let mut vals: Vec<(i64, bool, i64)> = Vec::new(); // (id, n_is_null, n_backing)
+        for c in &o.chunks {
+            let (ii, ni) = (
+                c.schema.index_of("id").unwrap(),
+                c.schema.index_of("n").unwrap(),
+            );
+            for r in 0..c.len {
+                let id = match c.value(r, ii) {
+                    rivus_core::Value::I64(x) => x,
+                    other => panic!("id lane: {other:?}"),
+                };
+                let is_null = c.columns[ni].is_null(r);
+                let backing = match c.value(r, ni) {
+                    rivus_core::Value::I64(x) => x,
+                    rivus_core::Value::Null => 0,
+                    other => panic!("n lane: {other:?}"),
+                };
+                vals.push((id, is_null, backing));
+            }
+        }
+        vals.sort();
+        assert_eq!(vals[0], (1, false, 100), "@cs={cs}");
+        assert!(vals[1].1, "'notanumber' must be NULL, not 0 @cs={cs}");
+        assert_eq!(vals[2], (3, false, 42), "@cs={cs}");
+        assert!(vals[3].1, "empty cell is null @cs={cs}");
+        assert_eq!(
+            vals[4],
+            (5, false, 12),
+            "float-looking text truncates @cs={cs}"
+        );
+        // Exactly ONE failure surfaced ('notanumber'); the empty cell is not
+        // a failure (reader parity — no false positives on missing data).
+        let msg = res
+            .errors
+            .iter()
+            .find(|e| e.message.contains("could not be cast to i64"))
+            .unwrap_or_else(|| panic!("cast failure must surface @cs={cs}: {:?}", res.errors));
+        assert!(
+            msg.message.starts_with("1 value(s)"),
+            "count must be exactly 1 (empty is missing, not a failure) @cs={cs}: {}",
+            msg.message
+        );
+    }
+}
+
+#[test]
+fn division_by_zero_is_null_and_surfaced_not_silent_inf() {
+    // #190: `a / 0` yielded a SILENT IEEE `inf` (and `a % 0` a silent 0 on the
+    // int lane) with an empty error stream. Now: null + counted + surfaced.
+    for cs in [1usize, 2, 4096] {
+        let f = TempCsv(gendata::write_temp_bytes(
+            "b190_div0",
+            b"id,a,b\n1,10,2\n2,5,0\n3,8,4\n",
+        ));
+        let p = f.0.display();
+        let res = run_src(
+            &format!("D:\n open {p} (id:int a:int b:int)\n |> id (a / b) as q (a % b) as m\n;"),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        let mut rows: Vec<(i64, bool, bool)> = Vec::new(); // (id, q_null, m_null)
+        for c in &o.chunks {
+            let (ii, qi, mi) = (
+                c.schema.index_of("id").unwrap(),
+                c.schema.index_of("q").unwrap(),
+                c.schema.index_of("m").unwrap(),
+            );
+            for r in 0..c.len {
+                let id = match c.value(r, ii) {
+                    rivus_core::Value::I64(x) => x,
+                    other => panic!("id lane: {other:?}"),
+                };
+                rows.push((id, c.columns[qi].is_null(r), c.columns[mi].is_null(r)));
+            }
+        }
+        rows.sort();
+        assert_eq!(rows[0], (1, false, false), "@cs={cs}");
+        assert_eq!(
+            rows[1],
+            (2, true, true),
+            "5/0 and 5%0 must be NULL @cs={cs}"
+        );
+        assert_eq!(rows[2], (3, false, false), "@cs={cs}");
+        // No inf anywhere in the rendered output.
+        for c in &o.chunks {
+            for r in 0..c.len {
+                for col in 0..c.schema.fields.len() {
+                    let s = c.value(r, col).to_string();
+                    assert!(!s.contains("inf"), "no silent inf @cs={cs}: {s}");
+                }
+            }
+        }
+        // Surfaced (division by zero counts ride the evaluate-failure surface).
+        assert!(
+            res.errors
+                .iter()
+                .any(|e| e.message.contains("division by zero")),
+            "division by zero must surface @cs={cs}: {:?}",
+            res.errors
+        );
+    }
+}
+
+#[test]
+fn dropna_reports_dropped_row_count() {
+    // #204: dropna silently vanished rows (validate…reject reports its count;
+    // dropna is the same never-silent debt). Now one Recoverable on finish.
+    for cs in [1usize, 2, 4096] {
+        let f = TempCsv(gendata::write_temp_bytes(
+            "b204_dropna",
+            b"id,name,age\n1,alice,30\n2,,25\n3,carol,\n4,dave,40\n",
+        ));
+        let p = f.0.display();
+        let res = run_src(
+            &format!("C:\n open {p} (id:int name:str age:int)\n dropna\n |> id\n;"),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("C"))
+            .unwrap();
+        let total: usize = o.chunks.iter().map(|c| c.len).sum();
+        assert_eq!(total, 2, "rows 2 and 3 dropped @cs={cs}");
+        assert!(
+            res.errors
+                .iter()
+                .any(|e| e.message.contains("dropna: dropped 2 row(s)")),
+            "dropna must report its dropped count @cs={cs}: {:?}",
+            res.errors
+        );
+    }
 }

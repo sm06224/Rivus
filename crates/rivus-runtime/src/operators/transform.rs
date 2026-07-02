@@ -28,7 +28,10 @@ fn surface_pred_cast_fails(n: u64, preds: &[&Expr], ctx: &mut OpCtx) {
             ErrorEvent::new(
                 Severity::Recoverable,
                 ErrorScope::Item,
-                format!("{n} value(s) could not be cast in `|? {txt}`; set to null"),
+                format!(
+                    "{n} value(s) failed to evaluate in `|? {txt}` (unparseable cast or \
+                     division by zero); set to null"
+                ),
             )
             .at_node(ctx.label.clone()),
         );
@@ -721,6 +724,10 @@ impl Operator for Describe {
 /// `0` and dropna was blind to it; that is BUG-A, now fixed.)
 pub(crate) struct DropNa {
     pub(crate) cols: Vec<String>,
+    /// Rows dropped for a null (#204) — surfaced once on finish, like
+    /// `validate … reject` reports its count: silently vanishing rows are the
+    /// same never-silent debt whether a contract or a null dropped them.
+    pub(crate) dropped: u64,
 }
 
 impl Operator for DropNa {
@@ -736,6 +743,7 @@ impl Operator for DropNa {
         let keep: Vec<usize> = (0..chunk.len)
             .filter(|&r| !idxs.iter().any(|&ci| chunk.columns[ci].is_null(r)))
             .collect();
+        self.dropped += (chunk.len - keep.len()) as u64;
         if keep.is_empty() {
             return Vec::new();
         }
@@ -743,6 +751,28 @@ impl Operator for DropNa {
             return vec![chunk];
         }
         vec![chunk.gather(&keep)]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.dropped > 0 {
+            let cols = if self.cols.is_empty() {
+                "any column".to_string()
+            } else {
+                format!("{:?}", self.cols)
+            };
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Recoverable,
+                    ErrorScope::Chunk,
+                    format!(
+                        "dropna: dropped {} row(s) with null(s) in {cols}",
+                        self.dropped
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        Vec::new()
     }
 }
 
@@ -1285,7 +1315,10 @@ fn surface_cast_failures(
                 ErrorEvent::new(
                     Severity::Recoverable,
                     ErrorScope::Item,
-                    format!("{n} value(s) in '{col}' could not be cast to {ty}; set to null"),
+                    format!(
+                        "{n} value(s) in '{col}' could not be cast to {ty} (or hit a \
+                     division by zero); set to null"
+                    ),
                 )
                 .at_node(ctx.label.clone()),
             );
