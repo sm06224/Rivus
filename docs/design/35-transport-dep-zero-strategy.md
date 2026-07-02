@@ -1,7 +1,8 @@
 # 35. 分散トランスポートの dep-zero 戦略 — QUIC 要否と B2 進退
 
-> **状態：研究メモ（§33/§34 追補候補・批准待ち）。** 統括の研究ブリーフ（2026-06-24・
-> #210）への回答。**出荷物 dep-zero は不変条件**、暗号は内蔵せず委譲（§28.12.5-2）、
+> **状態：批准済（2026-07-01・#211 GO）。** §35.5 の §33/§34 追補は反映済（§33.4・§34.1/34.4
+> 追補・SUPPLY-CHAIN.md）。B2 ＝ won't-do（委譲）で close、`quic` は opt-in 温存・非出荷。
+> 統括の研究ブリーフ（2026-06-24・#210）への回答。**出荷物 dep-zero は不変条件**、暗号は内蔵せず委譲（§28.12.5-2）、
 > roll-your-own-crypto は禁止。本メモは B2（`quic` を `full` 搭載＝`cargo deny
 > --all-features` 通過）の進退を立証するための先行研究。コードは追加しない（docs-only）。
 
@@ -38,6 +39,9 @@
 できない**」場合——未信頼網を跨ぐ ad-hoc 接続、WireGuard を構成できない制限ホスト、WASM 等。
 これは問い (2) の sidecar で **Rivus に暗号を内蔵せず** 解ける。
 
+**監視トリガ**：§17.3 の stage 分割 shuffle が**接続数をスケール**させる段（ワーカ数×中間
+成果物ストリームで多重化の価値が変わる）に入ったら、本表の「多重ストリーム」要否を再評価する。
+
 ---
 
 ## 35.2 問い (2)：暗号非内蔵の安全トランスポート境界の比較
@@ -65,8 +69,9 @@ OS-QUIC は将来監視。
 B2 のブロッカーは **ring 0.17**（quinn が使う rustls の crypto provider）：**非 pure-Rust（C/asm）
 ＋非 SPDX ライセンス（OpenSSL 派生・帰属義務）**。pure-Rust 経路は **rustls + RustCrypto provider**：
 
-- rustls 0.23+ は **crypto provider がプラガブル**（既定 ring・他に `aws-lc-rs`〔C〕・
-  `rustls-rustcrypto`〔pure-Rust〕）。pure-Rust QUIC ＝ quinn + rustls + RustCrypto provider。
+- rustls 0.23+ は **crypto provider がプラガブル**（upstream 既定は `aws-lc-rs`〔C/asm〕・
+  **本ツリーは quinn 経由で `ring`**・他に `rustls-rustcrypto`〔pure-Rust〕——どの既定でも
+  C/asm 依存である点は同じで**結論不変**）。pure-Rust QUIC ＝ quinn + rustls + RustCrypto provider。
 - **現状の未成熟点**：(a) RustCrypto は asm 無しで **ring/aws-lc より遅い**（§34.0 の暗号 CPU 競合が
   悪化＝Rivus には一般 Web より痛い）、(b) 全 AEAD/hash が FIPS/形式監査済みではない、
   (c) `rustls-rustcrypto` はコミュニティ provider で quinn 公式一級対応ではない。

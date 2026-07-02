@@ -30,8 +30,16 @@ third-party crate as untrusted-until-vetted and minimizes the trusted surface.
   --edges normal` shows only `rivus-*`. It is gated off-by-default purely so the
   *lean* build's surface is mechanically minimal; the transport itself is as
   dependency-free as the core. (Per §28.12.1a, deps are taken only when a
-  capability can't be done in std — HTTP and a TCP feed can. The QUIC
-  alternative — quinn/rustls/ring — is a later slice.)
+  capability can't be done in std — HTTP and a TCP feed can.)
+
+- **The `quic` feature is opt-in only and never ships** (§35 ruling, #211). The
+  QUIC alternative (quinn/rustls/ring/rcgen/tokio) is **not promoted into
+  `full`** and is **not part of any distributed/release build** — it stays an
+  off-by-default spike for users who cannot use WireGuard or a sidecar and
+  explicitly accept the `ring` dependency tree. The dep-zero primary path for
+  the protected channel is **kernel WireGuard**; any other secure transport
+  (TLS/QUIC/mTLS/mesh) is terminated by a **sidecar** (§34.4), keeping Rivus
+  itself dependency-free.
 
 - **Dev-only dependencies are isolated.** `criterion` (benchmarks) and its tree
   are `[dev-dependencies]`; they never ship in a release build.
