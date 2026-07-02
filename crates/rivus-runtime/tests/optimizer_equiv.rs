@@ -440,3 +440,46 @@ fn discovery_prefilter_preserves_results() {
         report.applied
     );
 }
+
+#[test]
+fn computed_projection_pushdown_is_equivalent() {
+    // #189: the pushdowns now fire for computed projections (bare Filter ->
+    // ProjectExpr, or a direct ProjectExpr). The prefilter is additive and the
+    // live-column set must cover every referenced column - equivalence is the
+    // proof. (Before the fix these plans were simply not optimized, so this
+    // also pins that enabling the optimization does not change results.)
+    let rows = 50_000;
+    let data = gendata::clean(rows, 7);
+    let f = TempCsv(gendata::write_temp("opt_projexpr", &data));
+    let p = f.0.display();
+    for src in [
+        // filter + computed column (the #189 headline shape)
+        format!("F:\n open {p}\n |? age >= 58\n |> name (age * 2) as d\n;"),
+        // direct computed projection, no filter
+        format!("F:\n open {p}\n |> (score + 1.5) as s name\n;"),
+        // computed column over a case expression + a filter on another column
+        format!(
+            "F:\n open {p}\n |? score >= 50.0\n |> country (case when age >= 40 then \"o\" else \"y\" end) as band\n;"
+        ),
+    ] {
+        let (raw, opt) = fingerprints_both(&src);
+        assert_eq!(raw, opt, "opt != no-opt for {src:?}");
+    }
+    // And the headline shape actually engages both pushdowns now.
+    let src = format!("F:\n open {p}\n |? age >= 58\n |> name (age * 2) as d\n;");
+    let g = rivus_parser::parse(&src).unwrap();
+    let (_, report) = rivus_optimizer::optimize(g);
+    assert!(
+        report.applied.iter().any(|l| l.contains("filter_pushdown")),
+        "filter_pushdown should fire: {:?}",
+        report.applied
+    );
+    assert!(
+        report
+            .applied
+            .iter()
+            .any(|l| l.contains("project_pushdown")),
+        "project_pushdown should fire: {:?}",
+        report.applied
+    );
+}
