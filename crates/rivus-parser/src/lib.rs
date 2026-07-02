@@ -3581,6 +3581,39 @@ Merged:
     }
 
     #[test]
+    fn to_source_round_trips_merge_and_join_scopes_with_downstream_stages() {
+        // #186: a merge/join scope with downstream stages (`M: A + B |# c ;`)
+        // used to render as an inline `-> M: + merge` branch — headless syntax
+        // that does not re-parse, with the second input orphaned. It must render
+        // as an independent scope with the binary head (`M:\n A + B\n |# c ;`)
+        // and round-trip to the same DAG.
+        for src in [
+            "A: open a.csv (c:str) ;\nB: open b.csv (c:str) ;\nM: A + B |# c ;",
+            "A: open a.csv (c:str) ;\nB: open b.csv (c:str) ;\nM: A + B |? c == \"x\" ;",
+            "U: open u.csv (id:i64 a:i64) ;\nO: open o.csv (id:i64) ;\nJ: U & O on id |? a >= 1 ;",
+            "U: open u.csv (id:i64 a:i64) ;\nO: open o.csv (id:i64) ;\nJ: U &left O on uid:oid sort a desc take 5 ;",
+            // The tail-position special case must keep working unchanged.
+            "A: open a.csv ;\nB: open b.csv ;\nM: A + B ;",
+            "U: open u.csv ;\nO: open o.csv ;\nJ: U & O on id ;",
+            // Three-way merge with a downstream stage.
+            "A: open a.csv ;\nB: open b.csv ;\nC: open c.csv ;\nM: A + B + C take 3 ;",
+        ] {
+            let g1 = parse(src).unwrap();
+            let s = g1.to_source();
+            let g2 = parse(&s).unwrap_or_else(|e| {
+                panic!("regenerated source does not re-parse for {src:?}:\n{s}\nerror: {e:?}")
+            });
+            assert_eq!(
+                fingerprint(&g1),
+                fingerprint(&g2),
+                "round-trip changed the DAG for {src:?}; regenerated:\n{s}"
+            );
+            // Idempotence: rendering the re-parsed graph gives the same text.
+            assert_eq!(s, g2.to_source(), "to_source not idempotent for {src:?}");
+        }
+    }
+
+    #[test]
     fn to_source_round_trips_a_branch_dag() {
         // `->` fan-out must round-trip: parse → to_source → parse is the same
         // DAG (faithful branch rendering, not the old `... ;` placeholder), and
