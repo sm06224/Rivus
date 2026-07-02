@@ -1139,6 +1139,109 @@ impl FillStat {
             format!("{x}")
         }
     }
+
+    /// Fill the null cells of a NUMERIC column with the mean/median of its
+    /// valid cells (#204). Lane rules: an F64 column fills in place; a Decimal
+    /// column fills at its scale (half-even, like the reader); an I64 column
+    /// fills in place when the statistic is integral, else the whole column
+    /// widens to F64 (pandas `fillna(mean)` semantics — a fractional mean can't
+    /// live in an integer lane). Deterministic and chunk-size independent (the
+    /// statistic is computed over ALL buffered chunks before any fill).
+    fn fill_numeric(&mut self, mut chunks: Vec<Chunk>, ci: usize, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let mut nums: Vec<f64> = Vec::new();
+        let mut count = 0f64;
+        let mut sum = 0f64;
+        let mut holes = false;
+        for c in &chunks {
+            let col = &c.columns[ci];
+            for r in 0..c.len {
+                if col.is_null(r) {
+                    holes = true;
+                    continue;
+                }
+                if let Some(x) = col.value_at(r).as_f64() {
+                    sum += x;
+                    count += 1.0;
+                    if self.median {
+                        nums.push(x);
+                    }
+                }
+            }
+        }
+        if !holes {
+            return chunks; // nothing to fill — zero-cost pass-through
+        }
+        if count == 0.0 {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Warn,
+                    ErrorScope::Chunk,
+                    format!(
+                        "fill {}: no numeric values to compute {}",
+                        self.col,
+                        if self.median { "median" } else { "mean" }
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+            return chunks;
+        }
+        let stat = if self.median {
+            Self::median_of(nums)
+        } else {
+            sum / count
+        };
+        let int_ok = stat.fract() == 0.0 && stat.abs() < 9.2e18;
+        for c in chunks.iter_mut() {
+            let n = c.len;
+            let col = &c.columns[ci];
+            let new_col = match col.data() {
+                ColumnData::F64(v) => {
+                    let out: Vec<f64> = (0..n)
+                        .map(|r| if col.is_null(r) { stat } else { v[r] })
+                        .collect();
+                    Column::f64(out)
+                }
+                ColumnData::Dec(d) => {
+                    let filled = eval::f64_to_decimal_pub(stat, d.scale);
+                    let unscaled: Vec<i128> = (0..n)
+                        .map(|r| {
+                            if col.is_null(r) {
+                                filled.unscaled
+                            } else {
+                                d.unscaled[r]
+                            }
+                        })
+                        .collect();
+                    Column::dec(rivus_core::DecColumn {
+                        unscaled,
+                        scale: d.scale,
+                    })
+                }
+                ColumnData::I64(v) if int_ok => {
+                    let s = stat as i64;
+                    let out: Vec<i64> = (0..n)
+                        .map(|r| if col.is_null(r) { s } else { v[r] })
+                        .collect();
+                    Column::i64(out)
+                }
+                // Fractional statistic into an integer lane: widen to F64.
+                ColumnData::I64(v) => {
+                    let out: Vec<f64> = (0..n)
+                        .map(|r| if col.is_null(r) { stat } else { v[r] as f64 })
+                        .collect();
+                    Column::f64(out)
+                }
+                _ => unreachable!("guarded by the lane match in finish"),
+            };
+            let dtype = new_col.data().dtype();
+            c.columns[ci] = new_col;
+            let mut fields = c.schema.fields.clone();
+            fields[ci] = Field::new(self.col.clone(), dtype);
+            c.schema = Arc::new(Schema::new(fields));
+        }
+        chunks
+    }
 }
 
 impl Operator for FillStat {
@@ -1166,9 +1269,35 @@ impl Operator for FillStat {
             }
             return chunks;
         };
-        // Numeric column → no blanks to fill (parsed to 0 already); pass through.
-        if !matches!(chunks[0].columns[ci].data(), ColumnData::Str(_)) {
-            return chunks;
+        // Numeric lane (#204): with the null model a blank numeric cell is
+        // NULL (not the pre-null-model 0), so a numeric column CAN carry holes
+        // — compute the statistic over the valid cells and fill the null ones.
+        // (The old pass-through assumed blanks had parsed to 0; that premise
+        // died with BUG-A, which made `fill … mean` a silent no-op here.)
+        match chunks[0].columns[ci].data() {
+            ColumnData::Str(_) => {}
+            ColumnData::I64(_) | ColumnData::F64(_) | ColumnData::Dec(_) => {
+                return self.fill_numeric(chunks, ci, ctx);
+            }
+            _ => {
+                if !self.warned {
+                    self.warned = true;
+                    ctx.raise(
+                        ErrorEvent::new(
+                            Severity::Warn,
+                            ErrorScope::Chunk,
+                            format!(
+                                "fill {} {}: unsupported column lane (numeric or string \
+                                 expected); rows left as-is",
+                                self.col,
+                                if self.median { "median" } else { "mean" }
+                            ),
+                        )
+                        .at_node(ctx.label.clone()),
+                    );
+                }
+                return chunks;
+            }
         }
 
         // Pass 1: collect every non-empty cell that parses as a number.
