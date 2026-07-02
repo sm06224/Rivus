@@ -312,3 +312,97 @@ fn group_percentiles_are_correct_and_chunk_independent() {
         }
     }
 }
+
+#[test]
+fn decimal_sum_overflow_is_surfaced_and_null_not_silent_f64() {
+    // #202: an i128 overflow in a decimal aggregate must NOT silently degrade
+    // the column to f64 — that is a wrong money total with no warning, on the
+    // lane whose whole contract is exactness. The column stays Decimal, the
+    // overflowed group's cell is null (continue-first), and one Recoverable
+    // event names the column (never-silent). A sum that fits stays exact and
+    // raises nothing (no false positives on clean data).
+    let big = "9999999999999999999999999999999999.99"; // ~1e34, scale 2
+
+    // (a) 50 rows fit in i128 (~5e35 * 100 < i128::MAX ~ 1.7e38): exact, quiet.
+    let mut fits = String::from("g,v\n");
+    for _ in 0..50 {
+        fits.push_str(&format!("x,{big}\n"));
+    }
+    let f1 = TempCsv(gendata::write_temp_bytes(
+        "stress_dec_fits",
+        fits.as_bytes(),
+    ));
+    let res = run_src(
+        &format!(
+            "G:\n open {} (g:str v:decimal(2))\n |# g sum:v\n;",
+            f1.0.display()
+        ),
+        4096,
+    );
+    let o = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("G"))
+        .unwrap();
+    let c = &o.chunks[0];
+    let si = c.schema.index_of("sum_v").unwrap();
+    assert!(matches!(
+        c.schema.fields[si].dtype,
+        rivus_core::DataType::Decimal { .. }
+    ));
+    assert_eq!(
+        c.value(0, si).to_string(),
+        "499999999999999999999999999999999999.50",
+        "in-range decimal sum stays exact"
+    );
+    assert!(
+        !res.errors.iter().any(|e| e.message.contains("overflow")),
+        "no false-positive overflow on clean data"
+    );
+
+    // (b) 200 rows overflow i128 (~2e36 * 100 > i128::MAX): Decimal + null + surfaced.
+    let mut ovf = String::from("g,v\n");
+    for _ in 0..200 {
+        ovf.push_str(&format!("x,{big}\n"));
+    }
+    let f2 = TempCsv(gendata::write_temp_bytes("stress_dec_ovf", ovf.as_bytes()));
+    let res = run_src(
+        &format!(
+            "G:\n open {} (g:str v:decimal(2))\n |# g sum:v\n;",
+            f2.0.display()
+        ),
+        4096,
+    );
+    let o = res
+        .outputs
+        .iter()
+        .find(|o| o.label.as_deref() == Some("G"))
+        .unwrap();
+    let c = &o.chunks[0];
+    let si = c.schema.index_of("sum_v").unwrap();
+    assert!(
+        matches!(
+            c.schema.fields[si].dtype,
+            rivus_core::DataType::Decimal { .. }
+        ),
+        "an overflowed decimal column must stay Decimal, never degrade to f64"
+    );
+    assert!(
+        matches!(c.value(0, si), rivus_core::Value::Null),
+        "the overflowed cell is null, not a drifted f64: got {}",
+        c.value(0, si)
+    );
+    let ci = c.schema.index_of("count").unwrap();
+    assert_eq!(
+        c.value(0, ci).to_string(),
+        "200",
+        "count survives (continue-first)"
+    );
+    assert!(
+        res.errors
+            .iter()
+            .any(|e| e.message.contains("overflow") && e.message.contains("'v'")),
+        "the overflow must be surfaced naming the column; got: {:?}",
+        res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
