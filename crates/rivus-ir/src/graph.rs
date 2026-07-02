@@ -1794,6 +1794,34 @@ impl PlanGraph {
             for c in &self.nodes[nid].leading_comments {
                 let _ = writeln!(out, "{pad}{c}");
             }
+            // A chain whose ROOT is a fan-in node (a merge/join scope with
+            // downstream stages, #186) renders the binary head `A + B` /
+            // `A &kind B on k` referencing both inputs by label — the generic
+            // `to_src_line` would emit a headless `+ merge` / `& on k`, which
+            // does not re-parse and orphans the second input.
+            if i == 0 {
+                let head = match &self.nodes[nid].op {
+                    Op::Merge => Some(self.input_labels(&self.inputs_of(nid)).join(" + ")),
+                    Op::Join {
+                        left_keys,
+                        right_keys,
+                        kind,
+                    } => {
+                        let sep = format!(" {} ", kind.amp());
+                        let names = self.input_labels(&self.inputs_of(nid)).join(&sep);
+                        Some(format!("{names} {}", join_on_clause(left_keys, right_keys)))
+                    }
+                    _ => None,
+                };
+                if let Some(head) = head {
+                    let _ = writeln!(out, "{pad}{head}");
+                    for h in &self.nodes[nid].hooks {
+                        self.write_hook(out, h);
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
             // A contiguous run spliced from one `| name` apply collapses back to
             // that single form (§25.4 round-trip), instead of the desugared ops.
             if let Some((site, name, bindings)) = &self.nodes[nid].applied_from {
@@ -1879,9 +1907,17 @@ impl PlanGraph {
         }
         let chain = self.linear_chain_to(scope_tail);
         let root = *chain.first()?;
-        // A source-rooted chain has no input → independent scope; otherwise the
-        // single input is the parent's fan-out point.
-        self.inputs_of(root).first().copied()
+        // A source-rooted chain has no input → independent scope. A fan-in root
+        // (Merge/Join, ≥2 inputs) is NOT a branch child either — a scope whose
+        // chain *starts* at a merge/join is an independent `M: A + B …` scope;
+        // classifying it under its first input rendered it as an inline
+        // `-> M: + merge` branch, which drops the second input and does not
+        // re-parse (#186). Only a single-input root continues a parent fan-out.
+        let inputs = self.inputs_of(root);
+        if inputs.len() != 1 {
+            return None;
+        }
+        Some(inputs[0])
     }
 
     /// Labeled branch-child scopes that fan out directly from `node`, id-sorted.
