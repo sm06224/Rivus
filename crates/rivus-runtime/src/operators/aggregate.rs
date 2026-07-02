@@ -372,6 +372,16 @@ impl AggAcc {
         v[lo] + (v[hi] - v[lo]) * frac
     }
 
+    /// The decimal scale this accumulator saw, i.e. **lane membership** for the
+    /// exact-decimal lane — `Some` even after an i128 overflow. `dec_value()`
+    /// conflates "not a decimal lane" with "overflowed" (both `None`); the
+    /// overflow surfacing in `GroupBy::finish` (#202) needs them apart so an
+    /// overflowed decimal column can stay Decimal (null cells) instead of
+    /// silently degrading to f64.
+    pub(crate) fn dec_scale(&self) -> Option<u8> {
+        self.dec_scale
+    }
+
     /// Exact decimal result for `sum`/`min`/`max`/`avg` on a decimal column, or
     /// `None` when this aggregate isn't an exact-decimal one (then the caller uses
     /// the f64 `num_value`). `avg` rounds the exact `sum/count` quotient half-even
@@ -854,29 +864,71 @@ impl Operator for GroupBy {
                         columns.push(Column::duration(rivus_core::DurColumn { ticks, unit }));
                         continue;
                     }
-                    let dec_ok = matches!(
+                    // Exact decimal lane (sum/avg/min/max). Exactness is the
+                    // lane's whole contract (#202): a group whose i128
+                    // accumulator overflowed must NOT silently degrade the
+                    // column to f64 — that is a wrong money total with no
+                    // warning. Instead the column stays Decimal, the overflowed
+                    // cells become null (validity 0, continue-first), and the
+                    // loss is surfaced once on the error stream (never-silent).
+                    let is_dec_lane = matches!(
                         func,
                         AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
                     ) && !self.groups.is_empty()
                         && self
                             .groups
                             .values()
-                            .all(|s| s.accs[j].dec_value().is_some());
-                    if dec_ok {
-                        let decs: Vec<rivus_core::Decimal> = self
+                            .all(|s| s.accs[j].dec_scale().is_some());
+                    if is_dec_lane {
+                        let vals: Vec<Option<rivus_core::Decimal>> = self
                             .groups
                             .values()
-                            .map(|s| s.accs[j].dec_value().unwrap())
+                            .map(|s| s.accs[j].dec_value())
                             .collect();
+                        let overflowed = vals.iter().filter(|v| v.is_none()).count();
+                        if overflowed > 0 {
+                            ctx.raise(
+                                ErrorEvent::new(
+                                    Severity::Recoverable,
+                                    ErrorScope::Chunk,
+                                    format!(
+                                        "decimal {} of column '{col}' overflowed i128 in \
+                                         {overflowed} group(s); those cells are null — the \
+                                         exact lane cannot represent the value",
+                                        func.label()
+                                    ),
+                                )
+                                .at_node(ctx.label.clone()),
+                            );
+                        }
                         // All groups share the column's scale (sum/min/max) or
-                        // scale+extra (avg), so the output scale is uniform.
-                        let scale = decs[0].scale;
-                        let unscaled = decs.iter().map(|d| d.unscaled).collect();
-                        (
-                            DataType::Decimal { scale },
-                            Column::dec(rivus_core::DecColumn { unscaled, scale }),
-                        )
-                    } else {
+                        // scale+extra (avg), so the output scale is uniform;
+                        // take it from any exact cell, else (all overflowed)
+                        // from the accumulator's base scale — display-only then,
+                        // since every cell is null.
+                        let scale = vals
+                            .iter()
+                            .flatten()
+                            .next()
+                            .map(|d| d.scale)
+                            .or_else(|| {
+                                self.groups
+                                    .values()
+                                    .next()
+                                    .and_then(|s| s.accs[j].dec_scale())
+                            })
+                            .unwrap_or(0);
+                        let unscaled: Vec<i128> =
+                            vals.iter().map(|v| v.map_or(0, |d| d.unscaled)).collect();
+                        let valid: Vec<bool> = vals.iter().map(|v| v.is_some()).collect();
+                        fields.push(Field::new(name, DataType::Decimal { scale }));
+                        columns.push(Column::new(
+                            ColumnData::Dec(rivus_core::DecColumn { unscaled, scale }),
+                            Validity::from_bits(&valid),
+                        ));
+                        continue;
+                    }
+                    {
                         (
                             DataType::F64,
                             Column::f64(
