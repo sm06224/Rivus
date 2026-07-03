@@ -14,7 +14,7 @@
 use crate::operators::{self, OpCtx, Operator};
 use crate::telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
 use rivus_core::{Chunk, DataType, ErrorEvent, ErrorScope, Mode, RivusError, Severity};
-use rivus_ir::{Codec, HookAction, HookEvent, NodeId, Op, PlanGraph, SinkCodec};
+use rivus_ir::{Codec, Expr, HookAction, HookEvent, NodeId, Op, PathExpr, PlanGraph, SinkCodec};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -176,6 +176,9 @@ pub fn run_with_progress(
                 .into(),
         ));
     }
+    // Plan Validation Gate (#191/#195/#200): refuse-with-guidance for mistakes
+    // the runtime would otherwise swallow. Same pass as the CLI's `check`.
+    plan_validate(graph)?;
     let mut res = run_dispatch(graph, opts, hook)?;
     // Never-silent: a `$x` value hole that reaches execution with no binding
     // would evaluate to null in silence (e.g. running a template scope on its
@@ -558,7 +561,8 @@ fn drive(
                 }
                 // The error stream is graph-level: an `on error` hook declared
                 // in any scope can respond to a new event (continue-first).
-                apply_error_hooks(graph, &errors[before..], &mut mode);
+                let extra = apply_error_hooks(graph, &errors[before..], &mut mode);
+                errors.extend(extra);
                 telemetry[nid].mode = mode;
             }
 
@@ -2411,7 +2415,181 @@ fn distribute(
     }
 }
 
-fn apply_error_hooks(graph: &PlanGraph, new_errors: &[ErrorEvent], mode: &mut Mode) {
+/// **Plan Validation Gate** (#191/#195/#200 — the "errors that teach" pass).
+/// Plan-time, pre-run, read-only over the IR: catch mistakes the engine would
+/// otherwise swallow at runtime, and refuse with guidance (never-silent).
+///
+/// 1. **Empty program** (#195): zero nodes is a mistake, not a success.
+/// 2. **Silent-no-op hooks** (#200): `on error: route X` parses but is not
+///    wired — refuse up front instead of ignoring it at runtime.
+/// 3. **Unknown bare-column references** (#191) when the input schema is
+///    **declared** (static, via `node_schemas` §32.1): a typo like
+///    `|? aeg >= 60` becomes a plan error with a "did you mean 'age'?" hint
+///    and the available columns — instead of silently filtering every row
+///    out. Inferred schemas stay `None` → skipped (honesty rule §32.1); the
+///    runtime warns handle those. Nested paths (`user.age`) keep the ratified
+///    §32.8③ runtime policy (typed null + counted) and are not checked here.
+///
+/// Called by [`run`]/[`run_with_progress`] before dispatch, and by the CLI's
+/// `check` so a validation-only pass gives the same guidance.
+pub fn plan_validate(graph: &PlanGraph) -> Result<(), RivusError> {
+    if graph.nodes.is_empty() {
+        return Err(RivusError::Build(
+            "no flow found (the program is empty) — write at least one scope, e.g. \
+             `Name:\n    open file.csv\n;`"
+                .into(),
+        ));
+    }
+    for node in &graph.nodes {
+        for h in &node.hooks {
+            if let HookAction::Route(target) = &h.action {
+                return Err(RivusError::Build(format!(
+                    "`on {}: route {target}` is not yet implemented (only `transition <mode>` \
+                     and `log \"…\"` are wired) — routing error items to a flow is a later \
+                     slice; remove the hook or use `log`/`transition`",
+                    h.event.as_str()
+                )));
+            }
+        }
+    }
+
+    let schemas = graph.node_schemas();
+    for node in &graph.nodes {
+        let inputs = graph.inputs_of(node.id);
+        let schema_of = |k: usize| -> Option<&rivus_core::Schema> {
+            inputs.get(k).and_then(|&i| schemas[i].as_ref())
+        };
+        // (col, input-slot) references this op makes against its input schema(s).
+        let mut refs: Vec<(String, usize)> = Vec::new();
+        match &node.op {
+            Op::Filter { pred } | Op::Validate { pred, .. } => {
+                collect_bare_fields(pred, 0, &mut refs)
+            }
+            Op::FilterProject { preds, fields } => {
+                for p in preds {
+                    collect_bare_fields(p, 0, &mut refs);
+                }
+                if let Some(fs) = fields {
+                    refs.extend(fs.iter().map(|f| (f.clone(), 0)));
+                }
+            }
+            Op::Project { fields } => refs.extend(fields.iter().map(|f| (f.clone(), 0))),
+            Op::ProjectExpr { items, views } => {
+                for (e, _) in items {
+                    collect_bare_fields(e, 0, &mut refs);
+                }
+                refs.extend(views.iter().map(|v| (v.col.clone(), 0)));
+            }
+            Op::GroupBy { keys, aggs } => {
+                refs.extend(bare_keys(keys));
+                refs.extend(aggs.iter().map(|(_, c)| (c.clone(), 0)));
+            }
+            Op::Sort { keys } => {
+                refs.extend(bare_keys(keys.iter().map(|(k, _)| k)));
+            }
+            Op::Distinct { keys } => refs.extend(bare_keys(keys)),
+            Op::Join {
+                left_keys,
+                right_keys,
+                ..
+            } => {
+                refs.extend(bare_keys(left_keys));
+                refs.extend(bare_keys(right_keys).into_iter().map(|(c, _)| (c, 1)));
+            }
+            Op::DropNa { cols } | Op::Drop { cols } | Op::Reorder { cols } => {
+                refs.extend(cols.iter().map(|c| (c.clone(), 0)))
+            }
+            Op::Fill { col, .. } => refs.push((col.clone(), 0)),
+            Op::Cast { casts } => refs.extend(casts.iter().map(|(c, _)| (c.clone(), 0))),
+            Op::Rename { pairs } => refs.extend(pairs.iter().map(|(f, _)| (f.clone(), 0))),
+            _ => {}
+        }
+        for (col, slot) in refs {
+            let Some(schema) = schema_of(slot) else {
+                continue; // inferred/unknown schema: runtime policy applies
+            };
+            if schema.index_of(&col).is_some() {
+                continue;
+            }
+            let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+            // A bare aggregate name (`|# d count`) parses as a group *key*, so
+            // it lands here as an unknown column — teach the `func:col` form
+            // instead of suggesting a lookalike (#191 family).
+            let bare_agg_key = rivus_ir::AggFunc::parse(&col).is_some()
+                && matches!(&node.op, Op::GroupBy { keys, .. }
+                    if keys.iter().any(|k| k.is_bare() && k.root == col));
+            let hint = if bare_agg_key {
+                format!(
+                    " — a bare word in `|#` is a group key; aggregates take the `func:col` \
+                     form (e.g. `{col}:price`), and `count` is always emitted"
+                )
+            } else {
+                rivus_core::suggest::suggest_similar(&col, names.iter().copied())
+                    .map(|sug| format!(" — did you mean '{sug}'?"))
+                    .unwrap_or_default()
+            };
+            let mut line = node.op.to_src_line();
+            if line.chars().count() > 48 {
+                line = format!("{}…", line.chars().take(47).collect::<String>());
+            }
+            return Err(RivusError::Build(format!(
+                "unknown column '{col}' in `{line}`{hint} (available: {})",
+                names.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Bare-field references of an expression (columns only): `Field` with a
+/// column access. Positional refs, holes, provenance accessors, sub-views and
+/// nested paths are skipped — each has its own resolution policy.
+fn collect_bare_fields(e: &Expr, slot: usize, out: &mut Vec<(String, usize)>) {
+    match e {
+        Expr::Field { name, access } if access.is_column() => out.push((name.clone(), slot)),
+        Expr::Field { .. }
+        | Expr::FieldAt(_)
+        | Expr::SubView { .. }
+        | Expr::Path(_)
+        | Expr::Literal(_)
+        | Expr::Hole(_) => {}
+        Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
+            collect_bare_fields(left, slot, out);
+            collect_bare_fields(right, slot, out);
+        }
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            collect_bare_fields(a, slot, out);
+            collect_bare_fields(b, slot, out);
+        }
+        Expr::Cast { expr, .. } => collect_bare_fields(expr, slot, out),
+        Expr::Func { args, .. } => args.iter().for_each(|a| collect_bare_fields(a, slot, out)),
+        Expr::Case { branches, default } => {
+            for (c, v) in branches {
+                collect_bare_fields(c, slot, out);
+                collect_bare_fields(v, slot, out);
+            }
+            if let Some(d) = default {
+                collect_bare_fields(d, slot, out);
+            }
+        }
+    }
+}
+
+/// The bare (single-segment) keys of a key list, as slot-0 references. A
+/// nested key (`user.age`) keeps the §32.8③ runtime policy and is skipped.
+fn bare_keys<'a>(keys: impl IntoIterator<Item = &'a PathExpr>) -> Vec<(String, usize)> {
+    keys.into_iter()
+        .filter(|k| k.is_bare())
+        .map(|k| (k.root.clone(), 0))
+        .collect()
+}
+
+fn apply_error_hooks(
+    graph: &PlanGraph,
+    new_errors: &[ErrorEvent],
+    mode: &mut Mode,
+) -> Vec<ErrorEvent> {
+    let mut extra = Vec::new();
     for node in &graph.nodes {
         for hook in &node.hooks {
             if hook.event != HookEvent::Error {
@@ -2422,12 +2600,23 @@ fn apply_error_hooks(graph: &PlanGraph, new_errors: &[ErrorEvent], mode: &mut Mo
                 None => true,
             });
             if triggered {
-                if let HookAction::Transition(m) = &hook.action {
-                    *mode = *m;
+                match &hook.action {
+                    HookAction::Transition(m) => *mode = *m,
+                    // `on error: log "…"` (#200): narrate the user's message on
+                    // the error stream, once per triggering batch. Info-level —
+                    // the log is commentary, not a new failure.
+                    HookAction::Log(msg) => extra.push(
+                        ErrorEvent::new(Severity::Info, ErrorScope::Chunk, format!("log: {msg}"))
+                            .at_node(label_of(graph, node.id)),
+                    ),
+                    // Route is rejected up front by `plan_validate` (#200);
+                    // unreachable here, and deliberately NOT a silent no-op.
+                    HookAction::Route(_) => {}
                 }
             }
         }
     }
+    extra
 }
 
 fn label_of(graph: &PlanGraph, id: NodeId) -> String {

@@ -842,7 +842,9 @@ fn parallel_group_all_null_column_byte_identical() {
         text.as_bytes(),
     ));
     let p = f.0.display();
-    let flow = format!("G:\n open {p} (g:str v:int)\n |# g count count:v min:v max:v\n;");
+    // NB: no bare `count` word — `count` is always emitted by `|#`, and a bare
+    // agg name would parse as a phantom group key (now a plan_validate error).
+    let flow = format!("G:\n open {p} (g:str v:int)\n |# g count:v min:v max:v\n;");
     let (serial, parallel, engaged) = serial_vs_parallel(&flow, "G");
     assert!(engaged, "parallel group-by did not engage");
     assert_eq!(

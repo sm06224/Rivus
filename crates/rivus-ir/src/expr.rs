@@ -128,6 +128,46 @@ pub enum Func {
 }
 
 impl Func {
+    /// Every canonical function spelling (aliases like `regex`/`matches`
+    /// excluded) — the candidate list for "did you mean …?" hints and the
+    /// "available:" enumeration in the unknown-function error (#192).
+    pub fn names() -> &'static [&'static str] {
+        &[
+            "upper",
+            "lower",
+            "len",
+            "trim",
+            "substr",
+            "contains",
+            "starts_with",
+            "ends_with",
+            "like",
+            "glob",
+            "regexp",
+            "replace",
+            "split_part",
+            "concat",
+            "abs",
+            "round",
+            "floor",
+            "ceil",
+            "coalesce",
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "trunc",
+            "format",
+            "weekday",
+            "is_weekend",
+            "date",
+            "time",
+            "bucket",
+        ]
+    }
+
     pub fn parse(s: &str) -> Option<Func> {
         Some(match s {
             "upper" => Func::Upper,

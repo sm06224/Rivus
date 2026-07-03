@@ -1906,6 +1906,26 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 Ok(Expr::Func { func, args })
             }
+            // An UNKNOWN word followed by `(` is a function-call attempt with a
+            // name we don't have (#192) — say so, with the nearest valid name,
+            // instead of drifting into an unrelated "expected RParen" error.
+            // Type-words are excluded (`datetime("fmt")` is a schema form
+            // handled by the type parser), as are the keyword forms below.
+            Tok::Word(ref w)
+                if self.toks[self.pos + 1].0 == Tok::LParen
+                    && Func::parse(w).is_none()
+                    && !is_type_word(w)
+                    && w != "case"
+                    && w != "resource" =>
+            {
+                let hint = rivus_core::suggest::suggest_similar(w, Func::names().iter().copied())
+                    .map(|s| format!(" — did you mean '{s}'?"))
+                    .unwrap_or_default();
+                Err(self.err(format!(
+                    "unknown function '{w}'{hint} (available: {})",
+                    Func::names().join(", ")
+                )))
+            }
             // `case when COND then VAL [when …] [else VAL] end` conditional.
             Tok::Word(ref w) if w == "case" => {
                 self.bump(); // case
@@ -4556,6 +4576,25 @@ Import:
         assert!(parse("F:\n open a.csv\n |> (case end) as b\n;").is_err());
         assert!(parse("F:\n open a.csv\n |> (case when age >= 1 \"x\" end) as b\n;").is_err());
         assert!(parse("F:\n open a.csv\n |> (case when age >= 1 then \"x\") as b\n;").is_err());
+    }
+
+    #[test]
+    fn unknown_function_errors_with_suggestion_and_list() {
+        // #192: `squareroot(x)` used to parse as a bare field named `squareroot`
+        // and evaluate to null in silence. Now it refuses at parse, teaches the
+        // available list, and a near-miss gets a did-you-mean.
+        let e = parse("F:\n open a.csv\n |? squareroot(age) > 2\n;")
+            .expect_err("unknown function must not parse")
+            .to_string();
+        assert!(e.contains("unknown function 'squareroot'"), "named: {e}");
+        assert!(e.contains("available:"), "lists the catalog: {e}");
+        let e = parse("F:\n open a.csv\n |> (uper(name)) as u\n;")
+            .expect_err("typo'd function must not parse")
+            .to_string();
+        assert!(e.contains("did you mean 'upper'"), "did-you-mean: {e}");
+        // Known calls, type-word casts, and `case`/`resource` stay untouched.
+        assert!(parse("F:\n open a.csv\n |> (upper(name)) as u\n;").is_ok());
+        assert!(parse("F:\n open a.csv\n |? (age:int) >= 2\n;").is_ok());
     }
 
     #[test]
