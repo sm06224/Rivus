@@ -1109,3 +1109,122 @@ fn like_and_glob_chunk_size_independent() {
         assert!(l.errors.is_empty() && g.errors.is_empty());
     }
 }
+
+#[test]
+fn fill_mean_median_fill_numeric_null_cells() {
+    // #204 (the fill half): `fill <col> mean|median` was a SILENT no-op on a
+    // numeric column — FillStat passed every non-Str lane through, on the
+    // pre-null-model premise that numeric blanks "parsed to 0". With the null
+    // model a blank numeric cell is NULL, so the statistic must be computed
+    // over the valid cells and the nulls filled.
+    for cs in [1usize, 2, 4096] {
+        // (a) integral mean on an int lane stays an int lane.
+        let f = TempCsv(gendata::write_temp_bytes(
+            "b204_fill_int",
+            b"id,age\n1,30\n2,\n3,40\n",
+        ));
+        let res = run_src(
+            &format!(
+                "C:\n open {} (id:int age:int)\n fill age mean\n |> id age\n;",
+                f.0.display()
+            ),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("C"))
+            .unwrap();
+        let mut vals: Vec<(i64, String)> = Vec::new();
+        for c in &o.chunks {
+            let (ii, ai) = (
+                c.schema.index_of("id").unwrap(),
+                c.schema.index_of("age").unwrap(),
+            );
+            assert_eq!(
+                c.schema.fields[ai].dtype,
+                rivus_core::DataType::I64,
+                "integral mean keeps the int lane @cs={cs}"
+            );
+            for r in 0..c.len {
+                vals.push((
+                    match c.value(r, ii) {
+                        rivus_core::Value::I64(x) => x,
+                        other => panic!("{other:?}"),
+                    },
+                    c.value(r, ai).to_string(),
+                ));
+            }
+        }
+        vals.sort();
+        assert_eq!(
+            vals,
+            vec![
+                (1, "30".to_string()),
+                (2, "35".to_string()),
+                (3, "40".to_string())
+            ],
+            "mean(30,40)=35 fills the null @cs={cs}"
+        );
+
+        // (b) fractional mean on an int lane widens the column to f64.
+        let f = TempCsv(gendata::write_temp_bytes(
+            "b204_fill_frac",
+            b"id,v\n1,1\n2,\n3,2\n",
+        ));
+        let res = run_src(
+            &format!(
+                "C:\n open {} (id:int v:int)\n fill v mean\n |> id v\n;",
+                f.0.display()
+            ),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("C"))
+            .unwrap();
+        for c in &o.chunks {
+            let vi = c.schema.index_of("v").unwrap();
+            assert_eq!(
+                c.schema.fields[vi].dtype,
+                rivus_core::DataType::F64,
+                "fractional mean widens int→f64 @cs={cs}"
+            );
+            for r in 0..c.len {
+                assert!(!c.columns[vi].is_null(r), "all filled @cs={cs}");
+            }
+        }
+
+        // (c) median on an f64 lane fills in place.
+        let f = TempCsv(gendata::write_temp_bytes(
+            "b204_fill_f64",
+            b"id,s\n1,10.5\n2,\n3,20.5\n4,30.5\n",
+        ));
+        let res = run_src(
+            &format!(
+                "C:\n open {} (id:int s:float)\n fill s median\n |> id s\n;",
+                f.0.display()
+            ),
+            cs,
+        );
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("C"))
+            .unwrap();
+        let mut got: Vec<String> = Vec::new();
+        for c in &o.chunks {
+            let si = c.schema.index_of("s").unwrap();
+            for r in 0..c.len {
+                got.push(c.value(r, si).to_string());
+            }
+        }
+        got.sort();
+        assert!(
+            got.contains(&"20.5".to_string()),
+            "median(10.5,20.5,30.5)=20.5 fills the null @cs={cs}: {got:?}"
+        );
+        assert_eq!(got.iter().filter(|s| *s == "20.5").count(), 2, "@cs={cs}");
+    }
+}

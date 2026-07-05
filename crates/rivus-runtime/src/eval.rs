@@ -667,6 +667,12 @@ fn cast_value(v: Value, ty: DataType, fails: &mut u64) -> Value {
 }
 
 /// Build a `Decimal` at `scale` from an f64 (round-half-even on the last digit).
+/// `pub(crate)` alias for operators (fill mean/median on a decimal lane, #204).
+pub(crate) fn f64_to_decimal_pub(x: f64, scale: u8) -> rivus_core::Decimal {
+    f64_to_decimal(x, scale)
+}
+
+/// Build a `Decimal` at `scale` from an f64 (round-half-even on the last digit).
 fn f64_to_decimal(x: f64, scale: u8) -> rivus_core::Decimal {
     if !x.is_finite() {
         return rivus_core::Decimal::new(0, scale);
