@@ -51,7 +51,22 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
     let input = inputs.first().and_then(|s| s.clone());
     match op {
         // ── Sources: known only when the codec carries explicit columns. ──
-        Op::Source { codec, .. } => source_schema(codec),
+        // `with filename` (§28.6, slice 2-②b) materializes a trailing text
+        // column — `filename`, or `filename_r` when the data already has one
+        // (§27.1 collision rule) — so the static schema must carry it too.
+        Op::Source {
+            codec, provenance, ..
+        } => source_schema(codec).map(|mut s| {
+            if provenance.materializes_filename() {
+                let name = if s.index_of("filename").is_some() {
+                    "filename_r"
+                } else {
+                    "filename"
+                };
+                s.fields.push(Field::new(name, DataType::Str));
+            }
+            s
+        }),
         // Reader union / named replay / discovery decode aren't statically known.
         Op::Read { .. } | Op::StreamRef { .. } => None,
 

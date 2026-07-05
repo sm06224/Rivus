@@ -325,6 +325,12 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "check" => {
+            // Same Plan Validation Gate as `run` (#191/#195/#200): a check-only
+            // pass gives the same guidance a run would, without executing.
+            if let Err(e) = rivus_runtime::plan_validate(&parsed) {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
             println!(
                 "ok: {} node(s), {} edge(s)",
                 parsed.nodes.len(),

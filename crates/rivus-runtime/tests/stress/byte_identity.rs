@@ -1205,7 +1205,9 @@ fn date_groupby_parallel_matches_serial() {
         text.as_bytes(),
     ));
     let p = f.0.display();
-    let flow = format!("D:\n open {p} (d:date v:int)\n |# d count max:v\n;");
+    // NB: no bare `count` word — `count` is always emitted by `|#`, and a bare
+    // agg name would parse as a phantom group key (now a plan_validate error).
+    let flow = format!("D:\n open {p} (d:date v:int)\n |# d max:v\n;");
 
     let snapshot = |pref: rivus_runtime::MemoryPref| {
         let g = rivus_parser::parse(&flow).expect("parse");

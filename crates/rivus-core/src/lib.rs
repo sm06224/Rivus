@@ -13,6 +13,7 @@ pub mod chunk;
 pub mod error;
 pub mod numparse;
 pub mod schema;
+pub mod suggest;
 pub mod value;
 
 pub use chunk::{
