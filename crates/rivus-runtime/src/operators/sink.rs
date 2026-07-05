@@ -52,7 +52,10 @@ impl SinkCsv {
                     }
                     write_cell(&mut line, &chunk.columns[c], row, delim);
                 }
-                writeln!(w, "{line}")?;
+                // write_all skips the `fmt` machinery a `writeln!` would re-enter
+                // per row — the bytes are already formatted.
+                line.push('\n');
+                w.write_all(line.as_bytes())?;
             }
         }
         self.w.wrote_header = true;
@@ -124,7 +127,10 @@ pub fn write_csv_file(path: &str, chunks: &[Chunk], delim: u8) -> std::io::Resul
                 }
                 write_cell(&mut line, &chunk.columns[c], row, delim);
             }
-            writeln!(w, "{line}")?;
+            // write_all skips the `fmt` machinery a `writeln!` would re-enter
+            // per row — the bytes are already formatted.
+            line.push('\n');
+            w.write_all(line.as_bytes())?;
         }
     }
     w.flush()
@@ -146,11 +152,15 @@ pub(crate) fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8)
         return;
     }
     match col.data() {
-        ColumnData::I64(v) => {
-            let _ = write!(line, "{}", v[row]);
-        }
+        // Numeric lanes ride the LUT/short-decimal fast paths — byte-identical
+        // to `format!("{}")` by construction (rivus_core::numfmt), with std as
+        // the refusal fallback. `save` is the second cost on the 1 GB profile
+        // and f64 `Display` was its hottest lane (docs/BENCHMARKS.md).
+        ColumnData::I64(v) => rivus_core::numfmt::push_i64(line, v[row]),
         ColumnData::F64(v) => {
-            let _ = write!(line, "{}", v[row]);
+            if !rivus_core::numfmt::push_f64(line, v[row]) {
+                let _ = write!(line, "{}", v[row]);
+            }
         }
         ColumnData::Bool(v) => line.push_str(if v[row] { "true" } else { "false" }),
         ColumnData::Dec(d) => {
@@ -448,15 +458,15 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
         return;
     }
     match col.data() {
-        ColumnData::I64(v) => {
-            let _ = write!(out, "{}", v[row]);
-        }
+        // Same numeric fast paths as the CSV cell writer (rivus_core::numfmt),
+        // byte-identical to `format!("{}")` with std as the refusal fallback.
+        ColumnData::I64(v) => rivus_core::numfmt::push_i64(out, v[row]),
         // JSON has no NaN/Infinity → emit null (continue-first), matching json_value.
         ColumnData::F64(v) => {
-            if v[row].is_finite() {
-                let _ = write!(out, "{}", v[row]);
-            } else {
+            if !v[row].is_finite() {
                 out.push_str("null");
+            } else if !rivus_core::numfmt::push_f64(out, v[row]) {
+                let _ = write!(out, "{}", v[row]);
             }
         }
         ColumnData::Bool(v) => out.push_str(if v[row] { "true" } else { "false" }),
