@@ -1579,7 +1579,7 @@ fn pred_cast_failures_sum_serial_eq_parallel() {
     let sum_fails = |res: &rivus_runtime::RunResult| -> u64 {
         res.errors
             .iter()
-            .filter(|e| e.message.contains("could not be cast"))
+            .filter(|e| e.message.contains("failed to evaluate"))
             .filter_map(|e| e.message.split_whitespace().next()?.parse::<u64>().ok())
             .sum()
     };
