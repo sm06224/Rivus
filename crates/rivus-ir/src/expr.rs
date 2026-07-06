@@ -112,6 +112,12 @@ pub enum Func {
     Trunc,
     /// `bucket(ts, dur)` — bucket a datetime into arbitrary dur boundaries (closed-open).
     Bucket,
+    /// `hops(ts, size, hop)` — the **list** of sliding-window start datetimes
+    /// (epoch-aligned, closed-open, ascending) containing `ts`. The sliding
+    /// generalization of `bucket` under §30's "a window is a derived grouping
+    /// key": `hops` derives the *keys* (plural) and the existing `explode` +
+    /// `|#` do the rest. `hop == size` degenerates to `bucket`. §30.4 / #60.
+    Hops,
     /// `format(ts, "yyyy-MM-dd")` — render a datetime as text. Design 23.
     Format,
     /// `weekday(x)` — ISO day-of-week of a date/datetime: `0 = Mon … 6 = Sun`
@@ -165,6 +171,7 @@ impl Func {
             "date",
             "time",
             "bucket",
+            "hops",
         ]
     }
 
@@ -197,6 +204,7 @@ impl Func {
             "second" => Func::Second,
             "trunc" => Func::Trunc,
             "bucket" => Func::Bucket,
+            "hops" => Func::Hops,
             "format" => Func::Format,
             "weekday" => Func::Weekday,
             "is_weekend" => Func::IsWeekend,
@@ -234,6 +242,7 @@ impl Func {
             Func::Second => "second",
             Func::Trunc => "trunc",
             Func::Bucket => "bucket",
+            Func::Hops => "hops",
             Func::Format => "format",
             Func::Weekday => "weekday",
             Func::IsWeekend => "is_weekend",

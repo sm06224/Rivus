@@ -547,6 +547,48 @@ impl DateTime {
         Some(DateTime::new(q * dur_ticks, self.unit))
     }
 
+    /// The start ticks (at `self.unit`, **ascending**) of every sliding window
+    /// of width `size`, hopping by `hop`, that contains this instant: each
+    /// start `w` with `w ≡ 0 (mod hop)` (epoch-aligned, like [`bucketed`]) and
+    /// `w ≤ t < w + size` (closed-open). `hop == size` degenerates to the
+    /// tumbling `bucketed` start; `hop > size` leaves gaps (an instant between
+    /// windows yields an **empty** list — a real answer, not an error).
+    /// Negative ticks (pre-epoch) floor correctly. `None` when either duration
+    /// is non-positive or not exactly representable at `self.unit` (same
+    /// contract as [`bucketed`], never-silent at the call site).
+    ///
+    /// [`bucketed`]: DateTime::bucketed
+    pub fn hop_starts(&self, size: Duration, hop: Duration) -> Option<Vec<i64>> {
+        let to_self_ticks = |d: Duration| -> Option<i64> {
+            if d.ticks <= 0 {
+                return None;
+            }
+            let n = d.ticks as i128 * self.unit.per_sec() as i128;
+            let per = d.unit.per_sec() as i128;
+            if n % per != 0 {
+                return None;
+            }
+            i64::try_from(n / per).ok()
+        };
+        let size = to_self_ticks(size)?;
+        let hop = to_self_ticks(hop)?;
+        let t = self.ticks;
+        // Last start ≤ t, first start > t - size — both hop-aligned (floor
+        // division handles negatives; i128 guards `t - size` overflow).
+        let floor_div = |a: i128, b: i128| a.div_euclid(b);
+        let last = floor_div(t as i128, hop as i128) * hop as i128;
+        let first = floor_div(t as i128 - size as i128, hop as i128) * hop as i128 + hop as i128;
+        let mut out = Vec::new();
+        let mut w = first;
+        while w <= last {
+            if let Ok(ticks) = i64::try_from(w) {
+                out.push(ticks);
+            }
+            w += hop as i128;
+        }
+        Some(out)
+    }
+
     /// Parse `s` with a `strptime`-style `fmt` (tokens `yyyy`/`yy`/`MM`/`dd`/
     /// `ddd`/`HH` or `hh`/`mm`/`ss`/`n…n`; any other char is a literal that must
     /// match) into a `DateTime` at `unit`. A leading `[ja-jp]`/`[en-us]` tag
@@ -1132,6 +1174,52 @@ impl fmt::Display for Date {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (y, m, d) = self.ymd();
         write!(f, "{y:04}-{m:02}-{d:02}")
+    }
+}
+
+#[cfg(test)]
+mod hop_starts_tests {
+    use super::{DateTime, Duration, TimeUnit};
+
+    fn dt(secs: i64) -> DateTime {
+        DateTime::new(secs, TimeUnit::Sec)
+    }
+    fn dur(secs: i64) -> Duration {
+        Duration::new(secs, TimeUnit::Sec)
+    }
+
+    #[test]
+    fn hop_starts_covers_containing_windows_ascending() {
+        // t=130, size=120 hop=60: windows [60,180) and [120,240) contain it.
+        assert_eq!(dt(130).hop_starts(dur(120), dur(60)), Some(vec![60, 120]));
+        // Boundary: t exactly on a start belongs to it (closed-open) and to
+        // the previous overlapping window.
+        assert_eq!(dt(120).hop_starts(dur(120), dur(60)), Some(vec![60, 120]));
+        // hop == size degenerates to the tumbling bucket start.
+        assert_eq!(dt(130).hop_starts(dur(60), dur(60)), Some(vec![120]));
+        assert_eq!(
+            dt(130).bucketed(dur(60)).map(|b| b.ticks),
+            Some(120),
+            "degenerate hops start == bucket start"
+        );
+        // hop > size leaves gaps: t=90 with size=60 hop=180 is in no window.
+        assert_eq!(dt(90).hop_starts(dur(60), dur(180)), Some(vec![]));
+        assert_eq!(dt(30).hop_starts(dur(60), dur(180)), Some(vec![0]));
+    }
+
+    #[test]
+    fn hop_starts_negative_ticks_floor_correctly() {
+        // Pre-epoch: t=-10, size=120 hop=60 → starts -120 and -60.
+        assert_eq!(dt(-10).hop_starts(dur(120), dur(60)), Some(vec![-120, -60]));
+    }
+
+    #[test]
+    fn hop_starts_refuses_bad_durations_like_bucketed() {
+        assert_eq!(dt(10).hop_starts(dur(0), dur(60)), None, "size ≤ 0");
+        assert_eq!(dt(10).hop_starts(dur(60), dur(0)), None, "hop ≤ 0");
+        // A sub-second duration is not representable at the Sec unit.
+        let half_ms = Duration::new(500, TimeUnit::Milli);
+        assert_eq!(dt(10).hop_starts(half_ms, dur(60)), None);
     }
 }
 

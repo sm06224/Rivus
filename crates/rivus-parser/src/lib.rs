@@ -4598,6 +4598,18 @@ Import:
     }
 
     #[test]
+    fn hops_parses_and_round_trips() {
+        // §36: sliding-window derived keys — hops + explode + group.
+        let g = parse(
+            "W:\n open t.csv (ts:datetime v:int)\n |> (hops(ts, \"2m\", \"1m\")) as w v\n explode w\n |# w avg:v\n;",
+        )
+        .unwrap();
+        let src = g.to_source();
+        assert!(src.contains("hops($_.ts, \"2m\", \"1m\")"), "{src}");
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+    }
+
+    #[test]
     fn bare_dash_is_stdin_stdout_sentinel() {
         // `open -` / `save -` map to the "-" sentinel, like `open stdin` /
         // `save stdout` (the bare dash lexes as Minus; path_word accepts it).

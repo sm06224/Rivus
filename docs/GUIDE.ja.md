@@ -754,6 +754,10 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   （continue-first。そのリテラルに対しては `!=` のみ真）。
 - **関数**：`year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)` `second(ts)`
   （整数）、`trunc(ts, "day"|"hour"|"minute"|"month"|"year")`（日時バケットキー）、
+  `bucket(ts, "15m")`（任意幅の tumbling 窓キー、左閉右開・epoch 整列）、
+  `hops(ts, size, hop)`（`ts` を含む **sliding 窓**開始キーの *List* —
+  explode して group する：`|> (hops(ts, "5m", "1m")) as w price` →
+  `explode w` → `|# w avg:price`。`hops(x, s, s)` は `bucket` に退化、§36）、
   `format(ts, "fmt")`（文字列。`ddd`/`[ja-jp]`/`n…n` も同じトークンで使えます —
   `format(ts, "[ja-jp]ddd")` は `水` を返す）。既定の整形は ISO-8601
   `yyyy-MM-ddTHH:mm:ss`（サブ秒レーンは全幅の小数付き）。

@@ -398,6 +398,8 @@ fn func_type(func: Func, args: &[Expr], schema: &Schema) -> DataType {
             .first()
             .map(|a| expr_type(a, schema))
             .unwrap_or(DataType::F64),
+        // The sliding-window derived keys: a list of datetime starts (§30.4).
+        Hops => DataType::List,
         Date => DataType::Date,
         // Text-producing / null-coalescing / everything else is nominal text.
         _ => DataType::Str,
