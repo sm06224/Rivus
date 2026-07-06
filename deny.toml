@@ -13,7 +13,15 @@ version = 2
 # Fail on any RUSTSEC advisory or yanked crate. No exceptions are carried; if
 # one becomes necessary it must be added here with a justifying comment.
 yanked = "deny"
-ignore = []
+ignore = [
+    # `paste` (proc-macro pulled by the official apache `parquet` crate, opt-in
+    # `parquet` feature only — never in the default build or any runtime code
+    # path) is archived-but-complete: RUSTSEC-2024-0436 is an *unmaintained*
+    # notice, not a vulnerability, and it executes at compile time only.
+    # Upstream tracking: arrow-rs migrating off `paste` (e.g. to `pastey`);
+    # revisit on every `parquet` version bump and drop this when it lands.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
