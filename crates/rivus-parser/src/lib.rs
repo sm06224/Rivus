@@ -417,18 +417,31 @@ impl Parser {
                                 current = nid;
                             }
                         }
-                        // `| map { ... }` — MVP: skip the block (no-op).
+                        // `| map { ... }` — reserved but not implemented. It used
+                        // to parse and silently drop the block (a no-op the user
+                        // reads as a working transform, #203) — refuse with the
+                        // working alternative instead (never-silent).
                         Tok::Word(w) if w == "map" => {
-                            self.bump();
-                            self.skip_block()?;
+                            return Err(self.err(
+                                "`| map { … }` is not yet implemented — write computed \
+                                 columns as `|> (expr) as col` (e.g. `|> name (age * 2) \
+                                 as doubled`)",
+                            ));
                         }
                         // A bare word that names no defined flow is a clear error
                         // (not a silent skip), matching the merge/join diagnostic.
                         Tok::Word(n) => {
                             return Err(self.err(format!("`| {n}`: unknown flow '{n}'")));
                         }
-                        // `| { ... }` — MVP: skip the block (no-op).
-                        _ => self.skip_block()?,
+                        // `| { ... }` — reserved but not implemented; same #203
+                        // family as `map` (a block that parsed and vanished).
+                        _ => {
+                            return Err(self.err(
+                                "a bare `| { … }` block is not yet implemented — write \
+                                 computed columns as `|> (expr) as col`, filters as \
+                                 `|? pred`",
+                            ));
+                        }
                     }
                 }
                 Tok::Arrow => {
@@ -1560,20 +1573,6 @@ impl Parser {
         }
     }
 
-    fn skip_block(&mut self) -> Result<(), RivusError> {
-        self.expect(&Tok::LBrace)?;
-        let mut depth = 1;
-        while depth > 0 {
-            match self.bump() {
-                Tok::LBrace => depth += 1,
-                Tok::RBrace => depth -= 1,
-                Tok::Eof => return Err(self.err("unterminated `{ ... }` block")),
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
     // ------------------------------------------------------------------- hooks
 
     fn parse_hook(&mut self) -> Result<Hook, RivusError> {
@@ -1810,6 +1809,29 @@ impl Parser {
                 // f64 lane via `Decimal::to_f64()` everywhere else.
                 self.bump();
                 Ok(Expr::Literal(Value::Dec(d)))
+            }
+            // Unary minus on a numeric literal — `split_part(s, "/", -1)`,
+            // `(x * -1)` (#199). Restricted to literals: general negation has
+            // no IR node yet, and `0 - expr` spells it explicitly.
+            Tok::Minus => {
+                self.bump();
+                match self.tok().clone() {
+                    Tok::Int(n) => {
+                        self.bump();
+                        Ok(Expr::Literal(Value::I64(-n)))
+                    }
+                    Tok::Float(_, d) => {
+                        self.bump();
+                        Ok(Expr::Literal(Value::Dec(rivus_core::Decimal::new(
+                            -d.unscaled,
+                            d.scale,
+                        ))))
+                    }
+                    other => Err(self.err(format!(
+                        "unary `-` needs a numeric literal, found {other:?} — write \
+                         `0 - expr` for a general negation"
+                    ))),
+                }
             }
             Tok::Str(s) => {
                 self.bump();
@@ -4595,6 +4617,51 @@ Import:
         // Known calls, type-word casts, and `case`/`resource` stay untouched.
         assert!(parse("F:\n open a.csv\n |> (upper(name)) as u\n;").is_ok());
         assert!(parse("F:\n open a.csv\n |? (age:int) >= 2\n;").is_ok());
+    }
+
+    #[test]
+    fn map_and_bare_blocks_refuse_with_guidance() {
+        // #203: `| map { … }` / `| { … }` used to parse and silently drop the
+        // block (a no-op the user reads as a working transform).
+        let e = parse("M:\n open a.csv\n | map { x }\n |> name\n;")
+            .expect_err("map must not parse")
+            .to_string();
+        assert!(e.contains("`| map { … }` is not yet implemented"), "{e}");
+        assert!(
+            e.contains("|> (expr) as col"),
+            "teaches the alternative: {e}"
+        );
+        let e = parse("M:\n open a.csv\n | { anything }\n;")
+            .expect_err("bare block must not parse")
+            .to_string();
+        assert!(e.contains("bare `| { … }` block"), "{e}");
+    }
+
+    #[test]
+    fn unary_minus_literals_parse_and_round_trip() {
+        // #199: `split_part(p, "/", -1)` and `(x * -1)` forms.
+        let g = parse("N:\n open a.csv\n |> ((age * -1)) as neg\n;").unwrap();
+        assert_eq!(g.to_source(), parse(&g.to_source()).unwrap().to_source());
+        let g = parse("N:\n open a.csv\n |> ((price * -2.5)) as neg\n;").unwrap();
+        assert!(g.to_source().contains("-2.5"), "{}", g.to_source());
+        // General negation of a column stays a clear error, with the spelled fix.
+        let e = parse("N:\n open a.csv\n |> ((-age)) as neg\n;")
+            .expect_err("unary minus on a column must not parse")
+            .to_string();
+        assert!(e.contains("0 - expr"), "teaches the general form: {e}");
+    }
+
+    #[test]
+    fn path_funcs_parse_and_round_trip() {
+        // #199: basename / stem / dirname.
+        let g =
+            parse("P:\n open a.csv\n |> (basename(p)) as b (stem(p)) as s (dirname(p)) as d\n;")
+                .unwrap();
+        let src = g.to_source();
+        for f in ["basename(", "stem(", "dirname("] {
+            assert!(src.contains(f), "{f} lost in round-trip: {src}");
+        }
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
     }
 
     #[test]

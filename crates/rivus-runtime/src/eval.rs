@@ -93,15 +93,49 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut u
         Func::SplitPart => {
             let s = arg(0).to_string();
             let sep = arg(1).to_string();
-            // 1-based field index (DuckDB/awk convention); 0 or out-of-range → "".
+            // 1-based field index (DuckDB/awk convention); a negative index
+            // counts from the end (`-1` = last, #199); 0 or out-of-range → "".
             let n = arg(2).as_f64().unwrap_or(0.0) as i64;
-            let out = if sep.is_empty() || n < 1 {
+            let out = if sep.is_empty() || n == 0 {
                 String::new()
-            } else {
+            } else if n > 0 {
                 s.split(sep.as_str())
                     .nth((n - 1) as usize)
                     .unwrap_or("")
                     .to_string()
+            } else {
+                let parts: Vec<&str> = s.split(sep.as_str()).collect();
+                let idx = parts.len() as i64 + n; // n < 0
+                if idx >= 0 {
+                    parts[idx as usize].to_string()
+                } else {
+                    String::new()
+                }
+            };
+            Value::Str(out)
+        }
+        // Path helpers (#199): provenance columns carry full paths; a report
+        // wants `jp.csv`. Splitting is on `/` AND `\` so the result does not
+        // depend on the host platform (byte-identity across environments).
+        Func::Basename => Value::Str(path_basename(&arg(0).to_string()).to_string()),
+        Func::Stem => {
+            let s = arg(0).to_string();
+            let base = path_basename(&s);
+            // Strip the final extension; a leading dot (`.env`) is a hidden
+            // file's name, not an extension, so it stays.
+            let out = match base.rfind('.') {
+                Some(i) if i > 0 => &base[..i],
+                _ => base,
+            };
+            Value::Str(out.to_string())
+        }
+        Func::Dirname => {
+            let s = arg(0).to_string();
+            // POSIX dirname: no separator → ".", a root-only path → "/".
+            let out = match s.rfind(['/', '\\']) {
+                None => ".".to_string(),
+                Some(0) => s[..1].to_string(),
+                Some(i) => s[..i].to_string(),
             };
             Value::Str(out)
         }
@@ -363,6 +397,11 @@ fn regexp_column(_args: &[Expr], chunk: &Chunk, _fails: &mut u64) -> Column {
 /// `start == 1` is the first char and `start <= 1` clamps to the beginning
 /// (lenient, so the old 0-based call `substr(s, 0, n)` still returns the prefix).
 /// `#bugreport ③`. `take == usize::MAX` means "to the end" (no length given).
+/// The final path segment (after the last `/` or `\`) — `basename` (#199).
+fn path_basename(s: &str) -> &str {
+    s.rsplit(['/', '\\']).next().unwrap_or(s)
+}
+
 fn substr_1based(s: &str, start: f64, take: usize) -> String {
     let start1 = start as i64;
     let skip = if start1 <= 1 {
