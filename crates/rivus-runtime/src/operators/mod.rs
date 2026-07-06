@@ -377,6 +377,14 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             casts: casts.clone(),
             fails: Default::default(),
         }),
+        Op::Sessionize { ts, gap, by } => Box::new(Sessionize {
+            ts: ts.clone(),
+            gap: gap.clone(),
+            by: by.clone(),
+            state: std::collections::BTreeMap::new(),
+            regressions: 0,
+            warned: false,
+        }),
         Op::Reorder { cols } => Box::new(Reorder { cols: cols.clone() }),
         // `views` are metadata only (§29.3, s2): sub-view references are lowered
         // to `Expr::SubView` at parse time, so the operator needs just `items`.

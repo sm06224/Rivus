@@ -1706,3 +1706,175 @@ impl Operator for FilterProject {
         Vec::new()
     }
 }
+
+// ------------------------------------------------------------- sessionize (§36.5)
+
+/// Session windows (§36.5 / #60): append a `session` column carrying each
+/// row's **session start** (the ts column's datetime lane — the same "window
+/// start as key" shape as `bucket`/`hops`). A new session starts when the gap
+/// from the previous row's ts (per `by` group) exceeds `gap`.
+///
+/// Stateful per group (`last ts` + `current start` only — bounded by group
+/// cardinality, input-size independent), per-chunk emit (streaming), and
+/// **order-dependent**: the engine keeps it on the serial path (like `ffill`).
+/// Input is assumed time-ascending (#60 contract); a time regression still
+/// sessionizes by the same rule (its gap is negative ⇒ same session) but is
+/// **counted and surfaced once** on finish (never-silent).
+pub(crate) struct Sessionize {
+    pub(crate) ts: String,
+    pub(crate) gap: String,
+    pub(crate) by: Vec<String>,
+    /// Composite `by` key (0x1F-joined, like GroupBy) → (last ts, session start).
+    pub(crate) state: std::collections::BTreeMap<String, (i64, i64)>,
+    pub(crate) regressions: u64,
+    pub(crate) warned: bool,
+}
+
+impl Sessionize {
+    fn warn_once(&mut self, ctx: &mut OpCtx, msg: String) {
+        if !self.warned {
+            self.warned = true;
+            ctx.raise(
+                ErrorEvent::new(Severity::Warn, ErrorScope::Chunk, msg).at_node(ctx.label.clone()),
+            );
+        }
+    }
+}
+
+impl Operator for Sessionize {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let Some(ci) = chunk.schema.index_of(&self.ts) else {
+            self.warn_once(
+                ctx,
+                format!("sessionize: unknown column '{}' (passed through)", self.ts),
+            );
+            return vec![chunk];
+        };
+        let ColumnData::DateTime(d) = chunk.columns[ci].data() else {
+            self.warn_once(
+                ctx,
+                format!(
+                    "sessionize: column '{}' is not a datetime lane (passed through) — \
+                     declare it, e.g. `({}:datetime)`",
+                    self.ts, self.ts
+                ),
+            );
+            return vec![chunk];
+        };
+        let unit = d.unit;
+        let Some(gap) = rivus_core::Duration::parse_interval(&self.gap, unit).and_then(|g| {
+            // Exact gap ticks at the ts unit (same contract as bucket/hops).
+            let n = g.ticks as i128 * unit.per_sec() as i128;
+            let per = g.unit.per_sec() as i128;
+            if g.ticks <= 0 || n % per != 0 {
+                None
+            } else {
+                i64::try_from(n / per).ok()
+            }
+        }) else {
+            self.warn_once(
+                ctx,
+                format!(
+                    "sessionize: gap \"{}\" is not a positive duration representable at the \
+                     ts unit (passed through)",
+                    self.gap
+                ),
+            );
+            return vec![chunk];
+        };
+        // Resolve the `by` columns (missing ones warn once and group as "").
+        let by_cols: Vec<String> = self.by.clone();
+        let mut by_idx: Vec<Option<usize>> = Vec::with_capacity(by_cols.len());
+        for c in &by_cols {
+            let i = chunk.schema.index_of(c);
+            if i.is_none() {
+                self.warn_once(
+                    ctx,
+                    format!("sessionize: unknown `by` column '{c}' (grouped as empty)"),
+                );
+            }
+            by_idx.push(i);
+        }
+
+        let ticks = &d.ticks;
+        let mut starts: Vec<i64> = Vec::with_capacity(chunk.len);
+        let mut valid: Vec<bool> = Vec::with_capacity(chunk.len);
+        let mut key = String::new();
+        for (r, &t) in ticks.iter().enumerate().take(chunk.len) {
+            if chunk.columns[ci].is_null(r) {
+                // A null ts can't be sessionized → null session cell (the row
+                // itself flows on; continue-first, blank-cell convention).
+                starts.push(0);
+                valid.push(false);
+                continue;
+            }
+            key.clear();
+            for (k, idx) in by_idx.iter().enumerate() {
+                if k > 0 {
+                    key.push('\u{1f}');
+                }
+                if let Some(i) = idx {
+                    if !chunk.columns[*i].is_null(r) {
+                        key.push_str(&chunk.value(r, *i).to_string());
+                    }
+                }
+            }
+            let start = match self.state.get(key.as_str()) {
+                Some(&(last, cur_start)) => {
+                    if t < last {
+                        self.regressions += 1;
+                    }
+                    // Strictly-greater-than-gap starts a new session; a gap of
+                    // exactly `gap` continues it (closed threshold).
+                    if t.saturating_sub(last) > gap {
+                        t
+                    } else {
+                        cur_start
+                    }
+                }
+                None => t,
+            };
+            self.state.insert(key.clone(), (t, start));
+            starts.push(start);
+            valid.push(true);
+        }
+
+        // Append the `session` column (suffix `_r` on collision, §27.1 rule).
+        let name = if chunk.schema.index_of("session").is_some() {
+            "session_r"
+        } else {
+            "session"
+        };
+        let mut fields = chunk.schema.fields.clone();
+        fields.push(rivus_core::Field::new(name, chunk.schema.fields[ci].dtype));
+        let mut columns = chunk.columns.clone();
+        columns.push(Column::new(
+            ColumnData::DateTime(rivus_core::DtColumn {
+                ticks: starts,
+                unit,
+            }),
+            rivus_core::Validity::from_bits(&valid),
+        ));
+        let mut out = Chunk::new(chunk.meta.id, Arc::new(Schema::new(fields)), columns);
+        out.meta = chunk.meta.clone();
+        vec![out]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        if self.regressions > 0 {
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Recoverable,
+                    ErrorScope::Chunk,
+                    format!(
+                        "sessionize: {} row(s) arrived out of time order (ts went backwards) — \
+                         sessions assume an ascending '{}'; sort upstream for exact boundaries",
+                        self.regressions, self.ts
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+        Vec::new()
+    }
+}

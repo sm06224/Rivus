@@ -790,3 +790,118 @@ fn sliding_window_serial_parallel_chunk_size_byte_identical() {
         );
     }
 }
+
+// --- session windows via `sessionize ts gap "30m" by user` (§36.5 / #60,
+// research prototype: session start as the derived key). ---
+
+#[test]
+fn sessionize_assigns_session_starts_per_group() {
+    // Two interleaved users; gap=30m. aki: 09:00+09:05 share a session,
+    // 09:50 and 10:31 each start new ones. ben: 09:02+09:03 share, 10:30 new.
+    // Interleaving exercises per-group state (ts regressions ACROSS groups are
+    // fine — only within-group order matters).
+    let text = "ts,user\n\
+                2024-06-03T09:00:00,aki\n\
+                2024-06-03T09:05:00,aki\n\
+                2024-06-03T09:50:00,aki\n\
+                2024-06-03T09:02:00,ben\n\
+                2024-06-03T09:03:00,ben\n\
+                2024-06-03T10:30:00,ben\n\
+                2024-06-03T10:31:00,aki\n";
+    let f = TempCsv(gendata::write_temp_bytes("sess_oracle", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "S:\n open {p} (ts:datetime user:str)\n sessionize ts gap \"30m\" by user\n \
+         |# user session count:ts\n sort user session\n;"
+    );
+    // Chunk-size sweep pins the cross-chunk state carry (cz=1 = every row its
+    // own chunk) — the session assignment must not depend on chunking.
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "S", "session"),
+            vec![
+                "2024-06-03T09:00:00",
+                "2024-06-03T09:50:00",
+                "2024-06-03T10:31:00",
+                "2024-06-03T09:02:00",
+                "2024-06-03T10:30:00",
+            ],
+            "session starts @cz={cz}"
+        );
+        assert_eq!(
+            collect_i64(&res, "S", "count"),
+            vec![2, 1, 1, 2, 1],
+            "rows per session @cz={cz}"
+        );
+        assert!(
+            !res.errors
+                .iter()
+                .any(|e| e.message.contains("out of time order")),
+            "ascending per-group input must not surface a regression @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn sessionize_gap_boundary_is_closed() {
+    // A gap of exactly `gap` continues the session; strictly greater starts a
+    // new one (closed threshold, pinned).
+    let text = "ts,v\n\
+                2024-01-01T00:00:00,1\n\
+                2024-01-01T00:30:00,2\n\
+                2024-01-01T01:00:01,3\n";
+    let f = TempCsv(gendata::write_temp_bytes("sess_edge", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "S:\n open {p} (ts:datetime v:int)\n sessionize ts gap \"30m\"\n \
+         |# session count:v\n sort session\n;"
+    );
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "S", "session"),
+        vec!["2024-01-01T00:00:00", "2024-01-01T01:00:01"],
+        "== gap continues; > gap (by 1s) starts a new session"
+    );
+    assert_eq!(collect_i64(&res, "S", "count"), vec![2, 1]);
+}
+
+#[test]
+fn sessionize_surfaces_time_regressions_and_null_ts() {
+    // Out-of-order rows (within the single implicit group) are counted and
+    // surfaced once (never-silent); a null ts yields a null session cell.
+    let text = "ts,v\n\
+                2024-01-01T10:00:00,1\n\
+                2024-01-01T09:00:00,2\n\
+                ,3\n\
+                2024-01-01T11:00:00,4\n";
+    let f = TempCsv(gendata::write_temp_bytes("sess_reg", text.as_bytes()));
+    let p = f.0.display();
+    let flow =
+        format!("S:\n open {p} (ts:datetime v:int)\n sessionize ts gap \"10m\"\n |> v session\n;");
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "S", "session"),
+        vec![
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00", // regression: negative gap ≤ gap → same session
+            "",                    // null ts → null session
+            "2024-01-01T11:00:00",
+        ],
+    );
+    let reg = res
+        .errors
+        .iter()
+        .filter(|e| e.message.contains("out of time order"))
+        .count();
+    assert_eq!(
+        reg, 1,
+        "exactly one aggregate regression event: {:?}",
+        res.errors
+    );
+    assert!(
+        res.errors.iter().any(|e| e.message.contains("1 row(s)")),
+        "the event carries the count: {:?}",
+        res.errors
+    );
+}
