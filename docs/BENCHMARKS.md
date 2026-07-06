@@ -1435,3 +1435,33 @@ the data-file shape, not silently degrade to the fallback).
 Remaining recorded ideas: a full shortest-repr formatter (Ryū/Dragonbox port)
 for the long-mantissa tail (random doubles fall back to std today), and the
 same LUT for `Decimal`/date/time digit emission.
+
+### Phase 2 — temporal/decimal lanes (the post-f64 heaviest cells)
+
+Lane isolation after phase 1 showed the **datetime lane as the new heaviest
+cell by far** — the default `Display` went through the `format("yyyy-MM-ddTHH:
+mm:ss")` *template interpreter* (a String alloc + pattern scan per cell):
+
+| 5 M-row `save`, one column (release, min of 3) | before | after | speedup |
+|---|---:|---:|---:|
+| datetime (`yyyy-MM-ddTHH:mm:ss`) | 1,045 ms | **292 ms** | **3.58×** |
+| date (`yyyy-MM-dd`) | 435 ms | **152 ms** | **2.86×** |
+| decimal(2) | 328 ms | **190 ms** | **1.73×** |
+| i64 (phase-1 reference) | 113 ms | 131 ms | (noise) |
+
+What landed: `numfmt` gained pair-LUT component writers (`push_date_ymd`,
+`push_hms`, `push_frac`, `push_decimal`, `push_u128`); `DateTime`/`Date`/
+`TimeOfDay`/`Decimal` **`Display` now delegates to them** (one implementation —
+group keys and `to_string()` callers get the same speedup), and the CSV/JSONL
+cell writers push digits directly, skipping `fmt` entirely on the hot path.
+Out-of-common-era years (outside `0..=9999`) and oversized components refuse
+and fall back to the canonical `{y:04}`-style rendering. The JSONL datetime/
+date/time fast path quotes directly (the rendering is digits + `-T:.`, none of
+which JSON escapes); the fallback keeps the escaping `json_string`.
+
+**Byte-identity, measured directly**: phase-1 binary (old `Display` forms) vs
+this one — 5 M-row datetime/date/decimal CSV (228,338,905 B) `cmp`-identical;
+a 200 k-row torture file (years 1600–9999 incl. pre-1970 negative ticks,
+negative decimals, `-0.001`) identical as CSV **and** JSONL. Property tests
+re-implement the pre-LUT `write!` forms as oracles (200 k random
+`i128×scale` decimals, boundary dates/times) and pin the refusal cases.

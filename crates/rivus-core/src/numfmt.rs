@@ -143,6 +143,105 @@ pub fn push_f64(buf: &mut String, v: f64) -> bool {
     false
 }
 
+/// Append `v` (a two-digit component, `0..100`) zero-padded — `{:02}`.
+#[inline]
+fn push_pair(buf: &mut String, v: usize) {
+    debug_assert!(v < 100);
+    let pair = v * 2;
+    // One two-byte LUT entry; always exactly two ASCII digits.
+    buf.push(DIGIT_PAIRS[pair] as char);
+    buf.push(DIGIT_PAIRS[pair + 1] as char);
+}
+
+/// Append `v`'s decimal digits — byte-identical to `format!("{v}")` (u128).
+/// The common small magnitude rides the u64 writer.
+pub fn push_u128(buf: &mut String, v: u128) {
+    if let Ok(small) = u64::try_from(v) {
+        return push_u64(buf, small);
+    }
+    // Peel the low 19 digits into the u64 writer's range, recurse on the rest.
+    const POW19: u128 = 10u128.pow(19);
+    let (hi, lo) = (v / POW19, (v % POW19) as u64);
+    push_u128(buf, hi);
+    // Zero-pad `lo` to exactly 19 digits (it is a suffix, not a leading group).
+    let mut tmp = [0u8; 20];
+    let n = write_u64_digits(lo, &mut tmp);
+    for _ in n..19 {
+        buf.push('0');
+    }
+    buf.push_str(std::str::from_utf8(&tmp[20 - n..]).expect("ascii digits"));
+}
+
+/// Append a scaled decimal — byte-identical to [`crate::Decimal`]'s rendering
+/// (`Display` delegates here): sign, integer part, `.`, fraction zero-padded
+/// to exactly `scale` digits; `scale == 0` is a plain integer.
+pub fn push_decimal(buf: &mut String, unscaled: i128, scale: u8) {
+    if unscaled < 0 {
+        buf.push('-');
+    }
+    let abs = unscaled.unsigned_abs();
+    if scale == 0 {
+        return push_u128(buf, abs);
+    }
+    let div = 10u128.pow(scale as u32);
+    push_u128(buf, abs / div);
+    buf.push('.');
+    // Zero-pad the fraction to exactly `scale` digits.
+    let frac = abs % div;
+    if let Ok(small) = u64::try_from(frac) {
+        let mut tmp = [0u8; 20];
+        let n = write_u64_digits(small, &mut tmp);
+        for _ in n..scale as usize {
+            buf.push('0');
+        }
+        buf.push_str(std::str::from_utf8(&tmp[20 - n..]).expect("ascii digits"));
+    } else {
+        let mut s = String::new();
+        push_u128(&mut s, frac);
+        for _ in s.len()..scale as usize {
+            buf.push('0');
+        }
+        buf.push_str(&s);
+    }
+}
+
+/// Append an ISO `yyyy-MM-dd` for `epoch_day` and return `true`, or `false`
+/// (buffer untouched) when the year falls outside `0..=9999` — the caller
+/// falls back to the canonical `Display` (which handles sign/width there).
+pub fn push_date_ymd(buf: &mut String, y: i64, m: i64, d: i64) -> bool {
+    if !(0..=9999).contains(&y) {
+        return false;
+    }
+    push_pair(buf, (y / 100) as usize);
+    push_pair(buf, (y % 100) as usize);
+    buf.push('-');
+    push_pair(buf, m as usize);
+    buf.push('-');
+    push_pair(buf, d as usize);
+    true
+}
+
+/// Append `HH:mm:ss` (each component `0..100`, zero-padded).
+#[inline]
+pub fn push_hms(buf: &mut String, h: i64, m: i64, s: i64) {
+    push_pair(buf, h as usize);
+    buf.push(':');
+    push_pair(buf, m as usize);
+    buf.push(':');
+    push_pair(buf, s as usize);
+}
+
+/// Append `sub` zero-padded to exactly `width` digits (a sub-second fraction,
+/// without the leading `.`). `{:0width$}` for values known < 10^width.
+pub fn push_frac(buf: &mut String, sub: i64, width: usize) {
+    let mut tmp = [0u8; 20];
+    let n = write_u64_digits(sub as u64, &mut tmp);
+    for _ in n..width {
+        buf.push('0');
+    }
+    buf.push_str(std::str::from_utf8(&tmp[20 - n..]).expect("ascii digits"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +344,104 @@ mod tests {
             5e-324,
         ] {
             assert!(fast_f64(v).is_none(), "must fall back to std for {v}");
+        }
+    }
+
+    #[test]
+    fn decimal_matches_the_pre_lut_oracle() {
+        // The exact `write!` form `Decimal::Display` used before delegating
+        // here, re-implemented as the test oracle: any divergence is a
+        // byte-identity break.
+        fn oracle(unscaled: i128, scale: u8) -> String {
+            if scale == 0 {
+                return format!("{unscaled}");
+            }
+            let div = 10u128.pow(scale as u32);
+            let sign = if unscaled < 0 { "-" } else { "" };
+            let abs = unscaled.unsigned_abs();
+            format!(
+                "{sign}{}.{:0>width$}",
+                abs / div,
+                abs % div,
+                width = scale as usize
+            )
+        }
+        let mut x = 0x243F6A8885A308D3u64; // SplitMix64 stream
+        let mut next = || {
+            x = x.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        for scale in 0..=12u8 {
+            for v in [0i128, 1, -1, 9, 10, -10, 100, i128::MAX, i128::MIN + 1] {
+                let mut s = String::new();
+                push_decimal(&mut s, v, scale);
+                assert_eq!(s, oracle(v, scale), "v={v} scale={scale}");
+            }
+        }
+        for _ in 0..200_000 {
+            let v = ((next() as i128) << 64 | next() as i128) >> (next() % 90);
+            let scale = (next() % 13) as u8;
+            let mut s = String::new();
+            push_decimal(&mut s, v, scale);
+            assert_eq!(s, oracle(v, scale), "v={v} scale={scale}");
+        }
+    }
+
+    #[test]
+    fn date_ymd_matches_the_write_macro_form() {
+        for (y, m, d) in [
+            (1970i64, 1i64, 1i64),
+            (2024, 6, 3),
+            (2000, 2, 29),
+            (9999, 12, 31),
+            (0, 1, 1),
+            (1, 12, 31),
+        ] {
+            let mut s = String::new();
+            assert!(push_date_ymd(&mut s, y, m, d));
+            assert_eq!(s, format!("{y:04}-{m:02}-{d:02}"));
+        }
+        // Out of the common era → refuse (Display's `{y:04}` handles those).
+        for y in [-1i64, 10_000, -9999] {
+            let mut s = String::new();
+            assert!(!push_date_ymd(&mut s, y, 1, 1), "y={y}");
+            assert!(s.is_empty(), "buffer must be untouched on refusal");
+        }
+    }
+
+    #[test]
+    fn hms_and_frac_match_the_write_macro_form() {
+        for (h, m, s) in [(0i64, 0i64, 0i64), (9, 5, 7), (23, 59, 59)] {
+            let mut out = String::new();
+            push_hms(&mut out, h, m, s);
+            assert_eq!(out, format!("{h:02}:{m:02}:{s:02}"));
+        }
+        for (sub, w) in [(0i64, 3usize), (7, 3), (999, 3), (1, 6), (999_999_999, 9)] {
+            let mut out = String::new();
+            push_frac(&mut out, sub, w);
+            assert_eq!(out, format!("{sub:0w$}"), "sub={sub} w={w}");
+        }
+    }
+
+    #[test]
+    fn u128_matches_std_everywhere() {
+        for v in [
+            0u128,
+            9,
+            10,
+            u64::MAX as u128,
+            u64::MAX as u128 + 1,
+            10u128.pow(19),
+            10u128.pow(19) - 1,
+            10u128.pow(38),
+            u128::MAX,
+        ] {
+            let mut s = String::new();
+            push_u128(&mut s, v);
+            assert_eq!(s, format!("{v}"), "u128 {v}");
         }
     }
 
