@@ -309,6 +309,19 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                     SourceJsonl::new(path.to_string(), chunk_size)
                         .with_provenance(*provenance, path),
                 ),
+                // Parquet (feature-gated adapter): the engine refuses a
+                // feature-less plan pre-run (`uses_parquet`); the stub is
+                // defense-in-depth for callers that skip the engine.
+                Codec::Parquet => {
+                    #[cfg(feature = "parquet")]
+                    let src: Box<dyn Operator> = Box::new(
+                        crate::parquet_read::SourceParquet::new(path.to_string(), chunk_size)
+                            .with_provenance(*provenance, path),
+                    );
+                    #[cfg(not(feature = "parquet"))]
+                    let src: Box<dyn Operator> = Box::new(SourceParquetStub);
+                    src
+                }
                 // `ls` discovery: enumerate the glob (`path` is the pattern) into a
                 // Resource stream; no codec decode, no provenance. The unbounded
                 // `watch` discovery (§28.12) is dispatched apart: its evaluator is
@@ -482,6 +495,10 @@ pub(crate) use aggregate::{group_parallel_safe, new_group, GroupBy};
 pub(crate) use sink::{
     json_object_row, write_cell, write_csv_file, write_json_file, write_jsonl_file,
 };
+#[cfg(feature = "parquet")]
+pub(crate) use source::attach_provenance;
+#[cfg(not(feature = "parquet"))]
+pub(crate) use source::SourceParquetStub;
 pub(crate) use source::{bin_layout, bin_range_source, bin_schema};
 
 #[cfg(test)]

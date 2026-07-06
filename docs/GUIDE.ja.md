@@ -87,10 +87,11 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 
 | 構文 | 読み込むもの |
 |---|---|
-| `open PATH` | 拡張子で形式判定（`.csv`→CSV、`.jsonl`/`.ndjson`/`.json`→JSON） |
-| `open PATH as FMT` | 形式を強制（`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`） |
+| `open PATH` | 拡張子で形式判定（`.csv`→CSV、`.jsonl`/`.ndjson`/`.json`→JSON、`.parquet`→Parquet） |
+| `open PATH as FMT` | 形式を強制（`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson` \| `parquet`） |
 | `open PATH`（`.tsv`/`.tab`） | **TSV** — タブ区切り、拡張子で判定（std のみ）。`as tsv` で任意パスに強制、`as csv` でカンマに戻す |
 | `open PATH.gz` / `PATH.zst` | **圧縮** CSV/TSV — gzip（`.gz`、`--features gzip`）または zstd（`.zst`/`.zstd`、`--features zstd`）。直列・単一パス・有界メモリ。既定（依存ゼロ）ビルドは `rebuild with --features gzip`/`zstd` を促すエラー |
+| `open PATH.parquet` | **Apache Parquet**（`--features parquet`・読み取りのみ）：ファイル埋め込みスキーマから型付きレーンへ直行 — int64→int・double→float・utf8→str・DATE→date・TIMESTAMP millis/micros→datetime・DECIMAL→decimal、null も本物。非圧縮/snappy/gzip、row-group ストリーミング（有界メモリ）、ネスト列は誘導付きエラー。既定（依存ゼロ）ビルドは `--features parquet` を促すエラー |
 | `open PATH noheader` | ヘッダ行なし CSV — 全行がデータ、列名は `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定 — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点）, `datetime[("fmt")]`（厳密な時刻）, `duration`（符号付き時間量）, `date`（ISO `yyyy-MM-dd` の暦日）, `time`（`HH:mm:ss` の時刻、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む。`open log.csv (ts:datetime("yyMMddHHmmss"))` は `ts` を時刻として読む |
 | `readcsv PATH` | CSV を明示 |

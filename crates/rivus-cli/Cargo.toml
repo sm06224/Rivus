@@ -23,6 +23,9 @@ default = []
 regex = ["rivus-runtime/regex"]
 gzip = ["rivus-runtime/gzip"]
 zstd = ["rivus-runtime/zstd"]
+# Apache Parquet read (SUPPLY-CHAIN selected adapter). NOT in `full` yet —
+# whether the release build ships it is the maintainer's distribution call.
+parquet = ["rivus-runtime/parquet"]
 # §28.12 (#149): the unbounded transport skeleton (`watch`). Off by default —
 # parse/explain always work; running an unbounded flow needs this feature.
 unbounded = ["rivus-runtime/unbounded"]

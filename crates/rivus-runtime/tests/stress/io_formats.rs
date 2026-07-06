@@ -680,3 +680,219 @@ fn route_save_parallel_merge_streams_byte_identically() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// --- Apache Parquet reader (feature `parquet`, SUPPLY-CHAIN selected adapter,
+// read-only slice). The fixture is written with the same vetted crate. ---
+
+#[cfg(feature = "parquet")]
+#[test]
+fn parquet_typed_lanes_and_nulls_match_oracle() {
+    use parquet::basic::{
+        Compression, ConvertedType, LogicalType, Repetition, Type as PhysicalType,
+    };
+    use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::types::Type as PqType;
+    use std::sync::Arc;
+
+    // Write a snappy-compressed fixture: i64, nullable utf8, nullable f64,
+    // timestamp-millis.
+    let mut path = std::env::temp_dir();
+    path.push(format!("rivus_pq_lanes_{}.parquet", std::process::id()));
+    let schema = Arc::new(
+        PqType::group_type_builder("schema")
+            .with_fields(vec![
+                Arc::new(
+                    PqType::primitive_type_builder("id", PhysicalType::INT64)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                ),
+                Arc::new(
+                    PqType::primitive_type_builder("name", PhysicalType::BYTE_ARRAY)
+                        .with_converted_type(ConvertedType::UTF8)
+                        .with_repetition(Repetition::OPTIONAL)
+                        .build()
+                        .unwrap(),
+                ),
+                Arc::new(
+                    PqType::primitive_type_builder("score", PhysicalType::DOUBLE)
+                        .with_repetition(Repetition::OPTIONAL)
+                        .build()
+                        .unwrap(),
+                ),
+                Arc::new(
+                    PqType::primitive_type_builder("ts", PhysicalType::INT64)
+                        .with_logical_type(Some(LogicalType::timestamp(
+                            true,
+                            parquet::basic::TimeUnit::MILLIS,
+                        )))
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                ),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let props = Arc::new(
+        WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build(),
+    );
+    let file = std::fs::File::create(&path).unwrap();
+    let mut w = SerializedFileWriter::new(file, schema, props).unwrap();
+    {
+        let mut rg = w.next_row_group().unwrap();
+        let mut c = rg.next_column().unwrap().unwrap();
+        c.typed::<Int64Type>()
+            .write_batch(&[1, 2, 3], None, None)
+            .unwrap();
+        c.close().unwrap();
+        let mut c = rg.next_column().unwrap().unwrap();
+        c.typed::<ByteArrayType>()
+            .write_batch(
+                &[ByteArray::from("aki"), ByteArray::from("cho")],
+                Some(&[1, 0, 1]),
+                None,
+            )
+            .unwrap();
+        c.close().unwrap();
+        let mut c = rg.next_column().unwrap().unwrap();
+        c.typed::<DoubleType>()
+            .write_batch(&[93.46, 50.0], Some(&[1, 1, 0]), None)
+            .unwrap();
+        c.close().unwrap();
+        let mut c = rg.next_column().unwrap().unwrap();
+        c.typed::<Int64Type>()
+            .write_batch(
+                &[1717406400123i64, 1717406401000, 1717406402500],
+                None,
+                None,
+            )
+            .unwrap();
+        c.close().unwrap();
+        rg.close().unwrap();
+    }
+    w.close().unwrap();
+    let f = TempCsv(path.clone());
+    let p = f.0.display();
+
+    // Chunk-size sweep: the row-group → chunk slicing must not change results.
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&format!("P:\n open {p}\n;"), cz);
+        assert!(
+            res.errors.is_empty(),
+            "clean read @cz={cz}: {:?}",
+            res.errors
+        );
+        assert_eq!(collect_i64(&res, "P", "id"), vec![1, 2, 3], "@cz={cz}");
+        assert_eq!(
+            collect_strings(&res, "P", "name"),
+            vec!["aki", "", "cho"],
+            "null name renders empty @cz={cz}"
+        );
+        assert_eq!(
+            collect_strings(&res, "P", "score"),
+            vec!["93.46", "50", ""],
+            "f64 lane + null @cz={cz}"
+        );
+        // The timestamp column rides the DateTime lane at milli resolution.
+        assert_eq!(
+            collect_strings(&res, "P", "ts"),
+            vec![
+                "2024-06-03T09:20:00.123",
+                "2024-06-03T09:20:01.000",
+                "2024-06-03T09:20:02.500",
+            ],
+            "timestamp-millis → datetime lane @cz={cz}"
+        );
+        // Typed lanes flow into the engine: a numeric filter works end-to-end.
+        let res = run_src(&format!("P:\n open {p}\n |? id >= 2\n |> id name\n;"), cz);
+        assert_eq!(collect_i64(&res, "P", "id"), vec![2, 3], "@cz={cz}");
+    }
+}
+
+#[cfg(feature = "parquet")]
+#[test]
+fn parquet_nested_schema_is_refused_with_guidance() {
+    use parquet::basic::{Repetition, Type as PhysicalType};
+    use parquet::data_type::Int64Type;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::types::Type as PqType;
+    use std::sync::Arc;
+
+    // A file whose root has a nested group column → Fatal naming the column.
+    let mut path = std::env::temp_dir();
+    path.push(format!("rivus_pq_nested_{}.parquet", std::process::id()));
+    let schema = Arc::new(
+        PqType::group_type_builder("schema")
+            .with_fields(vec![
+                Arc::new(
+                    PqType::primitive_type_builder("id", PhysicalType::INT64)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                ),
+                Arc::new(
+                    PqType::group_type_builder("user")
+                        .with_repetition(Repetition::OPTIONAL)
+                        .with_fields(vec![Arc::new(
+                            PqType::primitive_type_builder("age", PhysicalType::INT64)
+                                .with_repetition(Repetition::OPTIONAL)
+                                .build()
+                                .unwrap(),
+                        )])
+                        .build()
+                        .unwrap(),
+                ),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let file = std::fs::File::create(&path).unwrap();
+    let mut w =
+        SerializedFileWriter::new(file, schema, Arc::new(WriterProperties::builder().build()))
+            .unwrap();
+    {
+        let mut rg = w.next_row_group().unwrap();
+        let mut c = rg.next_column().unwrap().unwrap();
+        c.typed::<Int64Type>()
+            .write_batch(&[1], None, None)
+            .unwrap();
+        c.close().unwrap();
+        let mut c = rg.next_column().unwrap().unwrap();
+        c.typed::<Int64Type>()
+            .write_batch(&[7], Some(&[2]), None)
+            .unwrap();
+        c.close().unwrap();
+        rg.close().unwrap();
+    }
+    w.close().unwrap();
+    let f = TempCsv(path.clone());
+    let p = f.0.display();
+    let res = run_src(&format!("P:\n open {p}\n;"), 4096);
+    assert!(
+        res.errors.iter().any(|e| {
+            e.is_fatal() && e.message.contains("'user'") && e.message.contains("nested")
+        }),
+        "nested column must be a Fatal naming the column: {:?}",
+        res.errors
+    );
+}
+
+#[cfg(not(feature = "parquet"))]
+#[test]
+fn parquet_without_the_feature_refuses_the_plan_pre_run() {
+    // The default (zero-dependency) build must refuse a Parquet plan before
+    // running — never a silent empty read (same shape as regex/gzip).
+    let g = rivus_parser::parse("P:\n open data.parquet\n;").expect("parse is always std-only");
+    let err = run(&g, RunOptions::default()).expect_err("must refuse pre-run");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`parquet` feature") && msg.contains("--features parquet"),
+        "teaches the rebuild: {msg}"
+    );
+}

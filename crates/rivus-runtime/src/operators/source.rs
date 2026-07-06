@@ -17,7 +17,11 @@ use rivus_core::Resource;
 /// byte-range parallel worker — each derives the same handle from the same path
 /// — so the origin (and the materialized column) is partition-independent and
 /// byte-identity holds (serial == parallel == chunk-size).
-fn attach_provenance(mut chunk: Chunk, source: &Option<Resource>, filename: bool) -> Chunk {
+pub(crate) fn attach_provenance(
+    mut chunk: Chunk,
+    source: &Option<Resource>,
+    filename: bool,
+) -> Chunk {
     let Some(handle) = source else {
         return chunk;
     };
@@ -1208,6 +1212,31 @@ impl Operator for SourceUnboundedStub {
             ErrorScope::Graph,
             "unbounded `watch` source cannot run in this build — rebuild with \
              `--features unbounded` (the default build stays zero-dependency)"
+                .to_string(),
+        ));
+        None
+    }
+    fn process(&mut self, _from: NodeId, _chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        Vec::new()
+    }
+}
+
+/// Feature-off Parquet stub (defense-in-depth — the engine refuses the plan
+/// pre-run via `uses_parquet`, so this is only reachable by callers that skip
+/// the engine): a loud Fatal, never a silent empty source.
+#[cfg(not(feature = "parquet"))]
+pub(crate) struct SourceParquetStub;
+
+#[cfg(not(feature = "parquet"))]
+impl Operator for SourceParquetStub {
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn pull(&mut self, ctx: &mut OpCtx) -> Option<Chunk> {
+        ctx.raise(ErrorEvent::new(
+            Severity::Fatal,
+            ErrorScope::Graph,
+            "this build has the `parquet` feature disabled — rebuild with              `--features parquet`"
                 .to_string(),
         ));
         None

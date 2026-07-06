@@ -168,6 +168,18 @@ pub fn run_with_progress(
     // networked source (`open "http://…"`). Refuse the plan explicitly before
     // running — the same shape as `regex`/`unbounded`. Parsing and `rivus
     // explain` stay always-std (the URL round-trips in any build).
+    // SUPPLY-CHAIN adapter gate (never-silent): a build without the `parquet`
+    // feature cannot decode a Parquet source. Refuse the plan explicitly before
+    // running — the same shape as `regex`/`gzip`. Parsing and `rivus explain`
+    // stay always-std (the codec round-trips in any build).
+    if cfg!(not(feature = "parquet")) && graph.uses_parquet() {
+        return Err(RivusError::Build(
+            "this flow reads a Parquet source, but this build has the `parquet` feature \
+             disabled — rebuild with `--features parquet` (the default build stays \
+             zero-dependency)"
+                .into(),
+        ));
+    }
     if cfg!(not(feature = "net")) && graph.uses_net() {
         return Err(RivusError::Build(
             "this flow uses a network source (`open \"http://…\"`), but this build has the \
@@ -1752,6 +1764,10 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
     };
     let provenance = *provenance;
     match codec {
+        // A columnar container has no byte-range line split — the Parquet
+        // source streams row groups serially (downstream transforms still
+        // parallelize on the chunk-partition path).
+        Codec::Parquet => None,
         Codec::Csv {
             projection,
             prefilter,
