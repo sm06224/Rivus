@@ -1,155 +1,99 @@
-# セッション・ハンドオーバー（次セッションの実装担当へ）
+# セッション・ハンドオーバー（次セッションの担当者へ）
 
-最終更新: 2026-06-13 ／ ブランチ運用：**テーマ毎に main 基底の `claude/design-…` を
-1本切り、常に唯一の開いた PR**（統括承認 2026-06-10。旧指定 `claude/eager-bohr-HsrXO`
-の remote は §28 squash 済みの非祖先 tip で放置・使わない）。版数 **`1.3.0-dev`**
-（提案タグ v1.3.0-dev.15〜18 はカット待ち：…15=s2 系・…16=#141・…17=#142・…18=#144）。squash 後は
-`git fetch origin main && git reset --hard origin/main` して継続。
-
-> **§28 slice 4（route 出力）完結・§29 は s1-s4 全 landed（#136-#142）。**
-> s4a（#144）／s4b（#145）／s4c（#146）／serial streaming writer（#147）／
-> **parallel マージ streaming（#151・#143 ③ part 2：`write_sink` Template 腕が merged
-> chunks を chunk 単位で同じ `RouteWriter` に流す・在荷 `write_routed` は `#[cfg(test)]`
-> オラクル・RSS ≈1/31 実測・JSON は budget≪基数 worst case で wall ×3 → budget≥基数で
-> +12% 回復・BENCHMARKS 参照）** まで landed。残工学：collected worker outputs 自体の
-> spill（または route の per-worker part file 化）。
-> **§28 slice 5（非有界 transport 骨組み）＝裁定済（issue #149・全6分岐・②は修正裁定＝
-> std polling 却下→OS 通知購読・⑤⑥明確化つき。§28.12 確定版は #148）→ 実装＝本PR**：
-> `watch "glob"`（`Discovery::Watch` slot・決定性タグ＝`unbounded_nodes` 導出式・
-> `notify` 8.2 を `unbounded` feature 裏に隔離・bounded-block キュー
-> `RIVUS_WATCH_QUEUE`・capability 拒否イベント `RIVUS_CAP_WATCH_PATHS`・`take` 飽和での
-> 停止・feature-off は実行前 Build 拒否・窓無しブロッキング op も実行前拒否・有界直列
-> ループ不変を test pin・英日ガイド更新）。配布 fat 是正は #150 で landed
-> （`full` feature・release.yml・RELEASE.md）。**`unbounded` を `full` に入れるかは
-> 統括判断待ち**。後続スライス：socket/http（方向性は §28.12.5 裁可済）・窓・watermark。
+最終更新: **2026-07-06**（先行研究セッションによる全面刷新 — 旧版は §28 時代の文脈で
+陳腐化していた。過去の詳細は git 履歴の本ファイル参照）。
 
 ---
 
 ## 0. まず読むもの
-1. `CLAUDE.md`（運用契約・規律）— **拘束力あり**。特に「Tool & edit discipline」
-   （依存編集を並列発行しない／小バッチ＋都度ゲート／ディスク信頼）。
-2. `docs/design/00-north-star.md`・`docs/design/28-io-substrate.md`（§28.6/§28.8/§28.10）。
-3. 本ファイル（直近の文脈・次タスクの実装契約）。
 
----
+1. `CLAUDE.md`（運用契約・ゲート・ツール規律）— **拘束力あり**。特に「依存する tool 呼び出しを
+   並列発行しない／小バッチ＋都度ゲート／ディスク信頼」。
+2. 本ファイル（現在地・運用体制・開いている判断）。
+3. `docs/BENCHMARKS.md`（計測済み事実の台帳 — 「速い」はここに数字がある時だけ）・
+   `docs/SUPPLY-CHAIN.md`（依存の審査台帳）。
+4. issue **#180**（着地トラッカー）— 裁可・マージ判断のスレッド。**#217**（棚卸し）。
 
-## 1. §28 進捗（landed＝main マージ済み／本PR＝レビュー待ち）
+## 1. 運用体制（2026-07 現在）
 
-| slice | 内容 | 主な成果物 |
+- **役割分担**：統括（人間・最終決定）／**レビュー兼統括指揮担当**（マージ裁可、#180 で
+  GO を出す）／実装主担当（着地）／**先行研究員**（本セッション群・Antigravity セッション
+  も同格の研究員）。**自己マージは誰もしない。**
+- **ブランチ運用（研究員）**：PR ごとに `claude/<topic>` を **origin/main 基点**で切る。
+  マージ後は `git fetch origin main` して次ブランチを新 main から。force-push 不可
+  （recover forward）。CLAUDE.md の「単一 dev ブランチ」節は実装主担当向けの旧運用で、
+  研究員は branch-per-PR が現行の合意。
+- **裁可フロー**：PR 作成 → #180 に裁可依頼コメント（実測・破壊的変更・ゲート数値を明記）
+  → 指揮が squash-merge → **マージ毎にタグ提案**（`v1.4.0-dev.N`、カットは統括専権）。
+- **ゲート（push 前・毎回・数値で確認）**：fmt --check clean／clippy default **と**
+  `--all-features -D warnings` = 0／test 両 feature セット 0 failed／
+  `cargo tree -p rivus-cli --edges normal` = rivus-* のみ。gitleaks / cargo-deny は
+  コンテナに無ければ CI に委ねる（CI は `cargo deny check --all-features`）。
+- **GitHub API は希少資源**：CI をポーリングしない（webhook 購読）、コメントは束ねて1回。
+
+## 2. main の現在地（v1.4.0-dev.7 = #220 以降）
+
+- **Wave-1 正しさ債（#188 官能テスト起票分）ほぼ完済**：#218 decimal overflow surface・
+  #219 to_source 可逆性・#220 pushdown 一般化（1.57×）・#221 式レーン never-silent
+  （checked cast・div/0→null 破壊的）・#222 fill mean/median 実装・#223 **Plan
+  Validation Gate**（未知列 did-you-mean・空プログラム・route 拒否・log フック実装・
+  未知関数）— すべてマージ済み。
+- 分散実行（§33/§34）・null model・decimal レーン・SWAR/AVX2 CSV scan・部分 route 出力は
+  以前から landed（詳細は BENCHMARKS / design docs）。
+
+## 3. 裁可待ち PR（2026-07-06 時点・5本）
+
+| PR | 中身 | 特記 |
 |---|---|---|
-| **1a** | Codec/Transport トレイト抽出（純移設・挙動ゼロ） | `crates/rivus-runtime/src/transport.rs`（`Scheme`/`FileTransport`/`read_whole`/`open_compressed`）・`codec.rs`（`trait Decoder`）。全 reader を裏へ移設、重複分類を `Scheme` に集約 |
-| **1b** | `Resource` 値型 ＋ `resource("uri")` リテラル | core `Resource{uri,size?,mtime?}`（**同一性は uri のみ**＝§0.14）・`Value/DataType/ColumnData::Resource`・`Column::resource`。parser `resource("uri")`→`Expr::Literal`、to_source 往復（uri のみ） |
-| **2-①** | provenance 配線（挙動ゼロ） | IR `Provenance{Off,Source,Filename}` を `Op::OpenCsv/OpenBinary/OpenJsonl` に追加。parser `with source`/`with filename`（全形式・`with`未知=Err）、to_source 可逆。**runtime は `..` で無視＝byte-identity 完全不変** |
-| **2-②a** | provenance 活性化（アクセサ＋付与） | core `ChunkMeta.source: Option<Resource>`（加算的）。ir `Access::Source`（field 名を焼き込まない汎用）・`Access::is_column()`・`Provenance::source(path)`・to_source `source.<field>`。parser `source.<field>`（`.field` が続く時だけ予約）。runtime eval `source.uri`/`source.scheme`＝`resource_field`（slice 3 の Resource 列と共有）・provenance 無し→null。source op が serial＋全並列ワーカで同一ハンドルを stamp＝**byte-identity（serial==parallel==chunk-size）**。optimizer の prefilter/projection pushdown は Access::Source を非列として除外 |
-| **2-②b** | `with filename` 材化 ＋ ガイド | `with filename`＝`(source.uri) as filename`：source op が行末に `filename` 列（=path・Str）を材化。衝突時 `filename_r`（join 規則）。`with source` は handle のみ（列ゼロ）。英日ガイド（§3 Sources＋§6 アクセサ）。stress: 材化・衝突・並列 byte-identity |
-| **Op::Source 統一** | 形式別3変種統一（move-only・#122 マージ済） | `Op::Source{discovery:Discovery::Fixed, transport:Transport::Local, codec:Csv/Jsonl/Binary, provenance}`。`OpenCsv/OpenJsonl/OpenBinary` を撤去。parser は `open`/`readcsv`/`readjson`/`readbin` を desugar、`to_source` は同一文字列を復元。**挙動ゼロ・byte-identity 不変**（注意1＝再石化回避） |
-| **3a** | discovery-as-flow（`ls`・#123 マージ済） | `ls "glob"`(+alias `gci`/`dir`)＝`Op::Source{Discovery::Glob, Codec::Discover}`。std 自前 glob（`**`/`*`/`?`/`[…]`・symlink 非追従・uri 昇順・0件→warn）。**bare-columns** `{path:Resource, name:str, size:int, mtime:datetime}`（accessor 不採用＝可逆性確保）。述語の dotted `word.field`（`source.uri` 含む）は明示エラー（never-silent＋可逆性ガード）。size/mtime は §0.14 契約外 |
-| **3b** | discovery 述語プッシュダウン（#124 マージ済） | optimizer `discovery_prefilter`：`ls` の単一 FilterProject 消費者から `name` の必須サブ文字列（`==`/`contains`/`starts_with`/`ends_with`/`like` 先頭）を抽出し `Codec::Discover{name_prefilter}` へ。enumeration walk が **stat 前**に basename で枝刈り（大ディレクトリで syscall 節約）。superset prune＋filter 権威＝結果不変（optimizer_equiv 固定）。size/mtime は stat 必須で利得なしのため非対象。決定性文言を精緻化 |
-| **3c-①** | `resource(式)`（#125 マージ済） | `resource(EXPR)`：文字列リテラルは Resource リテラル（1b 維持）、それ以外は **cast `EXPR:resource`** へ desugar（マニフェスト列・計算パス）。parser `decl_type` に `resource` 追加（1b の `:resource` cast の parser 欠落も解消）。＋ canon メモ（§0.7/§28.3/ROADMAP） |
-| **3c-②** | `read` 多ファイル union-by-name（**本PR**） | `read [as fmt] [with source/filename]`＝`Op::Read{fmt, provenance}`。Resource 列（既定 `path`、無ければ最初の Resource 型列、無ければ Fatal）を消費し全ファイルを open+decode。**union-by-name**（first-seen 列順・欠損→null）・**数値 widening**（int⊆float⊆decimal⊆str＝無切捨て）。開けない/壊れ→**quarantine**（Recoverable surface・スキップ・継続）。bad_rows も surface。provenance で各ファイル handle を行に（`source.uri`/`filename` 行ごと）。uri 昇順・chunk-size 非依存・**MVP=serial**・CSV+JSONL。`operators/read.rs` |
+| **#224** | sink 書式高速化 2 弾：数値 LUT＋f64 exact fast path（save 1.80×）／temporal・decimal LUT＋**Display 委譲**（datetime 3.58×） | byte-identity は旧バイナリ A/B cmp＋オラクル 20万件で実証 |
+| **#226** | UX 債バッチ：#203 map/裸ブロック明示拒否・#194 explain node サマリ・#199 basename/stem/dirname＋split_part 負 index＋**式の単項マイナス** | — |
+| **#227** | **sliding window** = `hops(ts,size,hop)`（窓開始 List）＋既存 explode＋group | §36 メモの批准込み。column_from_values に List アーム新設 |
+| **#228** | **session window** = `sessionize ts gap "30m" by user`（session 開始 datetime を付与） | **#227 の上にスタック** — #227 squash 後にリベース要 |
+| **#229** | **Parquet リーダ**（feature `parquet`・arrow 抜き 22 crate・C ビルド皆無） | **RUSTSEC-2024-0436（paste unmaintained）の文書化例外を1件持ち込み** — 裁可時に明示確認。`full` 搭載は統括の配布判断 |
 
-ゲートは各 commit で全緑（fmt / clippy `--all-features -D warnings` 0 / 全テスト /
-stress serial==parallel==chunk-size / optimizer_equiv / 依存ゼロ）。各 slice は CLI で
-e2e 確認済（`open`/`ls`/`gci`/`resource(式)`/`read`/`with source`/`with filename`/`explain` 往復）。
+マージされたら：#227→#60 リスコープコメント（tumbling=済・sliding/session=着地・
+watermark 系=§30.5 で永続対象外）、#228→リベース、タグ提案を忘れずに。
 
-**Verb 命名ポリシー（恒久・§25.2a）**：Verb のみ・`Verb-Noun` 不採用・PowerShell 動詞/別名
-語彙・短縮は alias（正名へ解決、to_source は正名）。
+## 4. 計測済みの知見（BENCHMARKS.md に台帳あり）
 
-**リリース**：提案タグは 2-② → **`v1.3.0-dev.7`**、Op::Source → **`v1.3.0-dev.8`**、
-3a → **`v1.3.0-dev.9`**、3b → **`v1.3.0-dev.10`**、3c-① → **`v1.3.0-dev.11`**、
-3c-② → **`v1.3.0-dev.12`**（カットは統括判断）。
+- **1GB プロファイル**：open（parse）支配 → SWAR/AVX2 split 着地済み。**save が第2コスト
+  かつ並列時の Amdahl 支配項**だった → #224 で書式コストを解消（レーン別 5M 行 save：
+  datetime 1045→292ms・f64 625→296・date 435→152・decimal 328→190・int 113ms）。
+- **読み側の f64 は std が既に Eisel-Lemire**（rust-lang/rust#86761）— 置換不要。
+  `std::simd` は 2026 年も nightly — SIMD は `core::arch`＋実行時検出が正解のまま。
+- **否定結果（#225 に記録）**：collected 一括書き出しの並列レンダは**どのホット経路にも
+  乗らず無効果 → リバート済み**。sink 経路の地図：大ファイル streaming-parallel は
+  per-worker part file で既に並列／blocking op 後の merge ストリームだけが直列面
+  （sort→save で save≈760ms が残存標的）。
+- 裸 `|# d count` は**幻の第2キー**になる parser quirk があった（#223 の Gate が教育的
+  エラーで捕捉するようになった）。
 
----
+## 5. 開いている設計判断（勝手に決めない）
 
-## 2. 次タスク＝slice 4（route 出力）＋ 3c フォローアップ
+1. **§36（sliding/session）の批准** — #227/#228 のマージ＝批准の理解で依頼中。
+2. **Parquet の `full` 搭載可否**＋ **paste 例外の受容**（#229）。
+3. **#41 の残り半分＝#45 正準縮約木**：f64 並列 sum/avg/std の byte-identity 化。
+   pairwise/固定ブロック縮約は **serial の出力値も変える**（ULP レベル）ので、
+   「バージョン間の値変化を許すか」という**批准事項**。次の研究の本丸候補。
+4. §30.5 の裁定（watermark・unbounded 集計解除＝永続対象外）は**現行有効** — 窓 3 種が
+   揃った今も、これを覆すには再批准が要る。
+5. `unbounded` feature を `full` に入れるか（旧 issue の統括判断待ちのまま）。
 
-slice 3（discovery-as-flow）は **完了**：3a（`ls`）・3b（pushdown）・3c-①（`resource(式)`）・
-3c-②（`read` union-by-name・本PR）。§28.10 の次は **slice 4（動的/分割出力 route・§28.7/§27.3-4）**：
-`save` を encode→route→transport に分解、動的出力名・`by key` 分割、決定的・byte-identity。
+## 6. 次のレバー候補（優先順は裁可の流れ次第）
 
-**3c フォローアップ（モデルはこのまま乗る・rework なし）**：
-- sqlite/http/s3 の Transport プラグイン（§28.4／slice 5）。`read` は scheme dispatch 前提。
-- パス→パーティション列 materialize（Hive 部分読み・gap B）。
-- binary codec で `read`、並列多ファイル＋bounded-memory streaming（現 MVP は serial・全 buffer）。
-- `read` の per-column cast 失敗 surface（現状 widening で原則発生せず・reader の bad_rows は surface 済）。
+- **#45 正準縮約木**（上記 5-3。設計メモ→プロトタイプ→計測の王道パターン）。
+- **Parquet write 側**＋ row-group メタデータへの述語/射影 pushdown（#229 の残タスク）。
+- sort→save の直列 merge ストリーム並列レンダ（#225 の提案、期待 ~2.5×）。
+- Ryū/Dragonbox 移植（長仮数 f64 の std fallback テール）・Duration LUT。
+- Track C 残り：resample/gap-fill（#62）・rolling（#63）・as-of join（#64）・lead/lag（#65）。
+- Housekeeping：#188 サブの状態同期・GUIDE の窓 3 種チュートリアル節。
 
-実装の足場（本セッションで整えた共有機構）:
-- `Op::Source{Discovery::Glob, Codec::Discover}`＝`ls`、`Op::Read{fmt, provenance}`＝`read`。
-- discovery glob は `crates/rivus-runtime/src/discovery.rs`（std・`glob_paths`）。
-- `read` は `crates/rivus-runtime/src/operators/read.rs`（per-file decode は `csv::CsvChunker::open`/
-  `jsonl::JsonlChunker::open` を直接駆動＝Fatal-on-open を避け quarantine 化。widening は `widen()`）。
+## 7. 落とし穴（実際に踏んだもの）
 
----
-
-## 2b. §29 surface 収束（現テーマ・進捗 2026-06-10 時点）
-
-`docs/design/29-surface-convergence-and-union-views.md`（裁定反映済・lowering 節あり）。
-
-- **裁定**：§29.5 ②③⑤⑥＝**issue #137 で批准済**。TZ＝**issue #140 で (a) std-only 批准**
-  （「外部要因に晒さない」・(b) tzdata は将来 feature-gated スライス＝版 pin＋再批准前提）。
-- **s1 landed（#136）**：`:` 定義チェーン（`Op::ProjectExpr` へ lower・verb は desugar しない）。
-- **s2 landed（#138＋#139）**：共用体ビュー完結。text/char＝`col :string(W) :{ name@a..b }` ＋
-  式文脈 `base.name`（`Expr::SubView`・zero-copy char スライス・UTF-8 境界 never-silent）。
-  binary/byte＝`BinType::Char(N)`（`readbin (… name:char[16])`・全 N バイト値保持・align=1）。
-- **s3 landed（#141）**：検証つき `ddd` 曜日・`[ja-jp]` ロケール・`n…n` サブ秒（最長 run が
-  unit 導出 1-3→ms/4-6→µs/7-9→ns）＋ **TZ 略称テーブル**（#140 (a)：最終確定
-  `UTC`/`GMT`/`JST`/`MST`/`HST`。**EST は実装レビュー裁定で曖昧側**＝豪州 +10 衝突・
-  基準は「野生のセルで曖昧か」。CST/IST/BST/PST/EST は never-silent 棄却）。同梱：
-  マルチバイト既存バグ3件修正（lexer `lex_string`・`DateTime::format`・`parse_with_format`
-  の char 境界 panic）。AUTO_FORMATS 不変更。
-- **s4＝本PR**：`~`（regex 中置・比較同位）＋`'…'`（**raw** regex リテラル・パターン位置のみ・
-  `'` は不可→`"…"` で）＝既存 `Func::Regexp` へ lower（**IR 変更ゼロ**・to_source 正規形は
-  リテラルパターンなら `lhs ~ '…'` に収束、計算/`'` 入りは `regexp(…)` 維持）。
-  `$_[i]`（位置参照・0始まり・新 `Expr::FieldAt(u32)`・範囲外=null＋counted・
-  projection pushdown は FieldAt 込みで保守的 skip）。`|! { pred disp; … }`（複数検証束・
-  連鎖 `Op::Validate` へ lower＝IR ゼロ・to_source は連続 2+ Validate を `{}` に収束・
-  trivia/hook/分岐は束を切る）。**feature off の never-silent 化**：旧 `Func::Regexp` は
-  off で黙って false だった既存ギャップを修正 — `PlanGraph::uses_regexp` を実行前検査し
-  `RivusError::Build` で guidance 付き明示拒否（`rivus explain`/parse は常時 std で可能）。
-  汎用走査 `Expr::any` 追加（walker の重複増殖防止）。
-- **次**：s4 マージ後は **§28 slice 4（route 出力・§28.7/§27.3-4）** に戻る（§2 参照）。
-
----
-
-## 3. tracked
-- ✅ **`Op::Source` 統一（注意1）＝done**（#122）。
-- ✅ **3a の 🟡 列名問題は回避済**（discovery は bare 列）。
-- 🟡 **handle field accessor は parens 内（computed column）限定**：flow-mode lexer が `a.b` を
-  1 識別子に畳むため、述語の dotted `word.field` は明示エラー（never-silent）。
-- 🟡 `dedup_sources` は現状 **CSV のみ**（path キー）。全 `Op::Source` 一般化は follow-up。
-- 🟡 `read` MVP は **serial＋全ファイル buffer**。並列多ファイル＋bounded-memory は follow-up。
-
-## 4. 以降のスライス順（§28.10）
-2（provenance・**done**）→ \[Op::Source 統一・**done**\] → 3（discovery-as-flow・**done**：
-3a/3b/3c-①/3c-②）→ **4（route 出力・次）** → 5（非有界骨組み・feature-gate）。
-
----
-
-## 5. ローカルゲート（push 前に必須・数値で確認）
-```sh
-cargo fmt --all -- --check
-RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features   # =0
-cargo test --workspace            # 既存挙動ゼロ回帰
-cargo test --workspace --all-features   # gzip/zstd オラクル・stress 含む
-# byte-identity: tests/stress（serial==parallel==chunk-size・null・provenance 列）
-# 依存ゼロ: cargo tree -p rivus-cli --edges normal  → rivus-* のみ
-```
-- 新 enum variant（`Value`/`DataType`/`ColumnData`/`Op` フィールド/`Access`）は
-  **`cargo build --workspace --all-targets` の E0004/E0027/E0063 を潰し切る**（公開
-  re-export の variant は dead-code 警告は出ない＝構築経路なしでも先行可）。
-- **sink に新しい失敗系を足すときは serial（operator）と parallel（`write_sink` 呼出 3 箇所）の
-  surface を対で確認**（#145 fix3・#146 で同型 divergence が 2 連発した教訓）。
-- force-push 不可。`reset --hard origin/main` 後の push は merge commit 経由で FF。
-  上流 merge commit（committer `noreply@github.com`）は**amend しない**（公開済・乖離する）。
-
-## 6. 環境メモ
-- 4 vCPU。`gen` は6列固定（id,name,age,score,country,active）。
-- 並列強制/抑止: `RIVUS_PARALLEL_MIN_BYTES=0` / `RIVUS_NO_PARALLEL=1`。
-- ノード別 busy_ms: `rivus run f.riv --json 2>&1 | grep '"kind"'`。
-
----
-
-## 旧文脈（§28 以前・参考）
-SIMD-native parse（#71）・columnar（#40）・decimal/#41・日時レーン（doc23 §23.1）は
-landed 済み。doc23 §23.2 list 集計 / §23.3 pivot は未着手バックログ。詳細は
-`docs/BENCHMARKS.md` 末尾と git 履歴（〜#112）。
+- **依存する tool 呼び出しを並列発行しない**（CLAUDE.md 規律 — 破ると編集消失・過剰主張
+  commit が起きる。実績あり）。
+- ゲートスクリプトの多重起動に注意（同一ログ/一時ファイルを取り合って偽 FAIL を出す）。
+- `fill` は `fill <col> <method>`（列が先）。sub-second を含む duration リテラルは
+  文字列（`"30m"`・bare `15m` は未実装＝§30.7①未確定）。
+- fmt の canonical は `$_.col` 展開（#197 が pretty 化を提案中 — 未着手）。
+- stress の一時 CSV はプロセス毎の名前だが、**並行 cargo test 二重起動**では衝突しうる。
