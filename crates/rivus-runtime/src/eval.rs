@@ -195,6 +195,29 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut u
             },
             None => Value::Null,
         },
+        // `date_bin(ts, dur[, origin])` → datetime floored to `dur` boundaries
+        // aligned at `origin` (a datetime); a missing/absent origin aligns at
+        // the epoch and equals `bucket`. All-integer, exact (no f64).
+        Func::DateBin => match as_datetime(arg(0)) {
+            Some(dt) => match as_duration(arg(1), dt.unit) {
+                Some(dur) => {
+                    // 2-arg → epoch origin; 3-arg → parse the origin datetime
+                    // (a non-datetime origin is continue-first Null, not epoch).
+                    let origin = match args.get(2) {
+                        None => None,
+                        Some(_) => match as_datetime(arg(2)) {
+                            Some(o) => Some(o),
+                            None => return Value::Null,
+                        },
+                    };
+                    dt.date_binned(dur, origin)
+                        .map(Value::DateTime)
+                        .unwrap_or(Value::Null)
+                }
+                None => Value::Null,
+            },
+            None => Value::Null,
+        },
         // `hops(ts, size, hop)` → the LIST of sliding-window start datetimes
         // containing ts (§30.4 sliding = derived keys, plural; explode + `|#`
         // do the rest). A bad ts/duration → Null (continue-first, like bucket).
@@ -1019,7 +1042,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
                 // `hops` yields a List lane of datetime starts (column_from_values
                 // builds the ListColumn — the explode + `|#` downstream needs the
                 // real lane, not a text rendering).
-                Func::Trunc | Func::Bucket | Func::Hops => {
+                Func::Trunc | Func::Bucket | Func::DateBin | Func::Hops => {
                     let vals: Vec<Value> = (0..n)
                         .map(|r| call_func(*func, args, chunk, r, fails))
                         .collect();
