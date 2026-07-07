@@ -601,6 +601,22 @@ f64 aggregation that can't use the decimal lane — at which point the global-ro
 coordination above is the design. This mirrors the #39 discipline: a clever
 mechanism is not adopted until a measurement shows it earns its complexity.
 
+**Follow-up measurement (2026-07, → `docs/design/37`, awaiting ratification):** an
+isolated prototype of the canonical fixed-block tree (not wired into the engine)
+adds two findings that may move the recommendation. (1) *Parallel canonical is
+bit-identical to serial canonical across P=2/4/8* — achieved only when each worker
+returns its **vector of block-sums** (not a single scalar), so the folded tree is
+the exact same shape regardless of partition count. (2) *The canonical block-sum is
+markedly more accurate than the shipping naive left-fold*: against a Kahan-Babuška
+reference on n=1M over 40 seeds, canonical is strictly more accurate in **39/40**
+(mean `naive_err / canonical_err` = **70.5×**), because blocked summation grows
+error as O(log n) vs the naive fold's O(n). Parallel canonical is ~1.5–3× faster
+than the serial fold at n≥1M. So the ratification question sharpens to: *accept a
+one-time ~1-ULP shift of every f64 sum/avg/std (at the adopting version boundary),
+in exchange for parallel byte-identity **and** a standing accuracy improvement?*
+The value shift does not touch `--exact`/decimal users (i128 is unchanged). See
+`docs/design/37` §37.6 for the two questions posed to the maintainer.
+
 ### Columnar CSV write — format from the lane, stream the output (save ~2.2×)
 
 Output writing was the **second cost** in the 1 GB profile (save 6.9 s vs parse
