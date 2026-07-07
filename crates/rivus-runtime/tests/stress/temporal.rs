@@ -905,3 +905,86 @@ fn sessionize_surfaces_time_regressions_and_null_ts() {
         res.errors
     );
 }
+
+// --- time-series shift/difference via `shift col lag|diff|pct_change …` (#65,
+// Track C slice 1: backward-only, order-dependent, per-group serial). ---
+
+#[test]
+fn shift_lag_diff_pct_change_by_group_matches_oracle() {
+    // Two interleaved groups; the shift is per-group in source order and must
+    // not depend on chunking (cross-chunk state carry).
+    let text = "sym,price\n\
+                A,100\n\
+                A,110\n\
+                B,50\n\
+                A,105\n\
+                B,55\n";
+    let f = TempCsv(gendata::write_temp_bytes("shift_oracle", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "T:\n open {p} (sym:str price:int)\n \
+         shift price lag 1 by sym as prev\n \
+         shift price diff by sym as delta\n \
+         shift price pct_change by sym as ret\n;"
+    );
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        // lag: first row of each group is null.
+        assert_eq!(
+            collect_strings(&res, "T", "prev"),
+            vec!["", "100", "", "110", "50"],
+            "lag by group @cz={cz}"
+        );
+        assert_eq!(
+            collect_strings(&res, "T", "delta"),
+            vec!["", "10", "", "-5", "5"],
+            "diff by group @cz={cz}"
+        );
+        // pct_change: (110-100)/100 = 0.1, (105-110)/110, (55-50)/50 = 0.1.
+        let ret = collect_strings(&res, "T", "ret");
+        assert_eq!(ret[0], "", "@cz={cz}");
+        assert_eq!(ret[1], "0.1", "@cz={cz}");
+        assert!(ret[3].starts_with("-0.0454"), "{} @cz={cz}", ret[3]);
+        assert_eq!(ret[4], "0.1", "@cz={cz}");
+    }
+}
+
+#[test]
+fn shift_datetime_diff_is_exact_duration() {
+    // A datetime column's `diff` yields an exact `Duration` (i64 ticks, #57) —
+    // never routed through f64. Sub-second precision must survive.
+    let text = "ts\n\
+                2024-06-03T09:00:00.000\n\
+                2024-06-03T09:00:01.500\n\
+                2024-06-03T09:00:03.750\n";
+    let f = TempCsv(gendata::write_temp_bytes("shift_dtdiff", text.as_bytes()));
+    let p = f.0.display();
+    // Declare millisecond precision (the `nnn` fraction run → ms unit) so the
+    // sub-second gap is exact and rides the Duration's millisecond ticks.
+    let flow = format!(
+        "D:\n open {p} (ts:datetime(\"yyyy-MM-ddTHH:mm:ss.nnn\"))\n          shift ts diff as gap\n |> gap\n;"
+    );
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "D", "gap"),
+        vec!["", "00:00:01.500", "00:00:02.250"],
+        "datetime diff → exact Duration with sub-second ticks"
+    );
+}
+
+#[test]
+fn shift_lag_n_and_endpoints() {
+    // lag N > 1: the first N rows per group are null; the rest reference N back.
+    let text = "v\n1\n2\n3\n4\n5\n";
+    let f = TempCsv(gendata::write_temp_bytes("shift_lagn", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("N:\n open {p} (v:int)\n shift v lag 2 as p2\n;");
+    for cz in [1usize, 2, 5] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "N", "p2"),
+            vec!["", "", "1", "2", "3"],
+            "lag 2 endpoints @cz={cz}"
+        );
+    }
+}

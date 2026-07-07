@@ -398,6 +398,21 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             regressions: 0,
             warned: false,
         }),
+        Op::Shift {
+            col,
+            kind,
+            n,
+            by,
+            out,
+        } => Box::new(Shift {
+            col: col.clone(),
+            kind: *kind,
+            n: (*n).max(1) as usize,
+            by: by.clone(),
+            out: out.clone(),
+            state: std::collections::BTreeMap::new(),
+            warned: false,
+        }),
         Op::Reorder { cols } => Box::new(Reorder { cols: cols.clone() }),
         // `views` are metadata only (§29.3, s2): sub-view references are lowered
         // to `Expr::SubView` at parse time, so the operator needs just `items`.

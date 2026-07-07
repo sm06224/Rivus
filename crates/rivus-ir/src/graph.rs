@@ -96,6 +96,37 @@ pub enum FillMethod {
     Median,
 }
 
+/// The kind of time-series shift `shift col …` computes (#65). `n` (rows back)
+/// is carried on `Op::Shift`, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftKind {
+    /// `lag(col, n)` — the value `n` rows back (per group, source order).
+    Lag,
+    /// `diff(col, n)` — `col − lag(col, n)`; a datetime column yields an exact
+    /// `Duration` (#57), otherwise the column's own numeric lane.
+    Diff,
+    /// `pct_change(col, n)` — `(col − lag)/lag` as `f64`.
+    PctChange,
+}
+
+impl ShiftKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShiftKind::Lag => "lag",
+            ShiftKind::Diff => "diff",
+            ShiftKind::PctChange => "pct_change",
+        }
+    }
+    pub fn parse(s: &str) -> Option<ShiftKind> {
+        match s {
+            "lag" => Some(ShiftKind::Lag),
+            "diff" => Some(ShiftKind::Diff),
+            "pct_change" => Some(ShiftKind::PctChange),
+            _ => None,
+        }
+    }
+}
+
 /// What a `|!` validator does with a row that fails its contract (#83, §24.2).
 /// Every disposition surfaces the failure on the error stream (never silent);
 /// they differ only in what happens to the row.
@@ -779,6 +810,23 @@ pub enum Op {
         gap: String,
         by: Vec<String>,
     },
+    /// `shift COL lag|diff|pct_change [N] [by COL ...] as ALIAS` — time-series
+    /// shift/difference primitives (#65): append `out` carrying a value derived
+    /// from an earlier row **within the same `by` group, in source order**.
+    /// `Lag(n)` = the value `n` rows back (null for the first `n`); `Diff(n)` =
+    /// `col − lag(col, n)` (a datetime column yields an exact `Duration`, #57);
+    /// `PctChange(n)` = `(col − lag)/lag` as `f64`. Stateful per group (a ring
+    /// of the last `n` values), streaming per-chunk emit, order-dependent →
+    /// serial path (like `ffill`/`sessionize`); chunk-size independent because
+    /// the shift is defined in source order. Backward-only in this slice;
+    /// `lead` (look-ahead) and time-shift `lag(x, 5m)` (as-of) are follow-ups.
+    Shift {
+        col: String,
+        kind: ShiftKind,
+        n: u32,
+        by: Vec<String>,
+        out: String,
+    },
     /// `rename OLD NEW [OLD NEW ...]` — rename columns in place, preserving
     /// position, type and values. Unknown `OLD` names are skipped with a warning.
     /// Streaming, stateless.
@@ -1040,6 +1088,7 @@ impl Op {
             Op::Explode { .. } => "explode",
             Op::Fill { .. } => "fill",
             Op::Sessionize { .. } => "sessionize",
+            Op::Shift { .. } => "shift",
             Op::Rename { .. } => "rename",
             Op::Drop { .. } => "drop",
             Op::Cast { .. } => "cast",
@@ -1351,6 +1400,24 @@ impl Op {
                 if !by.is_empty() {
                     s.push_str(&format!(" by {}", by.join(" ")));
                 }
+                s
+            }
+            Op::Shift {
+                col,
+                kind,
+                n,
+                by,
+                out,
+            } => {
+                // `lag`/`pct_change` always print N; `diff` omits the default 1.
+                let mut s = format!("shift {col} {}", kind.as_str());
+                if *kind != ShiftKind::Diff || *n != 1 {
+                    s.push_str(&format!(" {n}"));
+                }
+                if !by.is_empty() {
+                    s.push_str(&format!(" by {}", by.join(" ")));
+                }
+                s.push_str(&format!(" as {out}"));
                 s
             }
             Op::Fill { col, method } => match method {
