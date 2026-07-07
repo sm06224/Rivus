@@ -815,7 +815,11 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   window key, closed-open, epoch-aligned); `hops(ts, size, hop)` (→ the *list*
   of **sliding-window** start keys containing `ts` — explode it and group:
   `|> (hops(ts, "5m", "1m")) as w price` → `explode w` → `|# w avg:price`;
-  `hops(x, s, s)` degenerates to `bucket`, §36); `format(ts, "fmt")` (→ text, same tokens incl.
+  `hops(x, s, s)` degenerates to `bucket`, §36); **session windows**:
+  `sessionize ts gap "30m" [by user]` appends a `session` column (the session's
+  start datetime — group on it: `|# user session …`; a new session starts when
+  the per-group gap exceeds the duration, out-of-order input is surfaced, §36.5);
+  `format(ts, "fmt")` (→ text, same tokens incl.
   `ddd`/`[ja-jp]`/`n…n` — `format(ts, "[ja-jp]ddd")` renders `水`). Default
   rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss` (+ full-width fraction on a
   sub-second lane).

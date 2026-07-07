@@ -759,6 +759,20 @@ pub enum Op {
     /// A constant fill is streaming/stateless; `ffill`/`bfill` are stateful
     /// (they carry state across rows and chunks) → serial path.
     Fill { col: String, method: FillMethod },
+    /// `sessionize TS gap "30m" [by COL ...]` — session windows (§36.5 / #60):
+    /// append a `session` column carrying each row's **session start** (a
+    /// datetime on `ts`'s lane — the same "window start as key" shape as
+    /// `bucket`/`hops`, so `|# session …` aggregates per session). A new
+    /// session starts when the gap to the previous row's ts (per `by` group)
+    /// exceeds `gap`. Stateful per group (last ts + current start), streaming
+    /// per-chunk emit, order-dependent → serial path (like `ffill`); input is
+    /// assumed time-ascending and a regression is counted + surfaced
+    /// (continue-first, never-silent).
+    Sessionize {
+        ts: String,
+        gap: String,
+        by: Vec<String>,
+    },
     /// `rename OLD NEW [OLD NEW ...]` — rename columns in place, preserving
     /// position, type and values. Unknown `OLD` names are skipped with a warning.
     /// Streaming, stateless.
@@ -1019,6 +1033,7 @@ impl Op {
             Op::DropNa { .. } => "dropna",
             Op::Explode { .. } => "explode",
             Op::Fill { .. } => "fill",
+            Op::Sessionize { .. } => "sessionize",
             Op::Rename { .. } => "rename",
             Op::Drop { .. } => "drop",
             Op::Cast { .. } => "cast",
@@ -1314,6 +1329,13 @@ impl Op {
                 }
             }
             Op::Explode { col } => format!("explode {col}"),
+            Op::Sessionize { ts, gap, by } => {
+                let mut s = format!("sessionize {ts} gap \"{gap}\"");
+                if !by.is_empty() {
+                    s.push_str(&format!(" by {}", by.join(" ")));
+                }
+                s
+            }
             Op::Fill { col, method } => match method {
                 FillMethod::Value(v) => format!("fill {col} \"{v}\""),
                 FillMethod::Ffill => format!("fill {col} ffill"),

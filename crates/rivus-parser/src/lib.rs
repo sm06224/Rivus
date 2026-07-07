@@ -749,6 +749,47 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `sessionize TS gap "30m" [by COL ...]` — session windows
+                // (§36.5 / #60): append a `session` column carrying the row's
+                // session start (same "window start as key" shape as bucket/
+                // hops, so `|# session …` aggregates per session).
+                Tok::Word(w) if w == "sessionize" => {
+                    self.bump();
+                    let ts = self.word()?;
+                    if !self.peek_is_word("gap") {
+                        return Err(self.err(
+                            "sessionize expects `gap \"DUR\"` after the timestamp column \
+                             (e.g. `sessionize ts gap \"30m\"`)",
+                        ));
+                    }
+                    self.bump(); // 'gap'
+                    let gap = match self.bump() {
+                        Tok::Str(s) => s,
+                        other => {
+                            return Err(self.err(format!(
+                                "sessionize gap expects a duration string like \"30m\", \
+                                 found {other:?}"
+                            )))
+                        }
+                    };
+                    let mut by = Vec::new();
+                    if self.peek_is_word("by") {
+                        self.bump();
+                        while let Tok::Word(name) = self.tok().clone() {
+                            if is_keyword(&name) {
+                                break;
+                            }
+                            self.bump();
+                            by.push(name);
+                        }
+                        if by.is_empty() {
+                            return Err(self.err("sessionize `by` expects at least one column"));
+                        }
+                    }
+                    let n = self.g.add_node(Op::Sessionize { ts, gap, by });
+                    self.g.add_edge(current, n, EdgeKind::Stream);
+                    current = n;
+                }
                 // `drop COL [COL ...]` — remove the named columns.
                 Tok::Word(w) if w == "drop" => {
                     self.bump();
@@ -2235,6 +2276,7 @@ fn is_keyword(w: &str) -> bool {
     matches!(
         w,
         "open"
+            | "sessionize"
             | "readbin"
             | "readcsv"
             | "readjson"
@@ -4674,6 +4716,33 @@ Import:
             assert!(src.contains(f), "{f} lost in round-trip: {src}");
         }
         assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+    }
+
+    #[test]
+    fn sessionize_parses_and_round_trips() {
+        // §36.5: session windows — ts, gap duration, optional by columns.
+        let g =
+            parse("S:\n open e.csv (ts:datetime user:str)\n sessionize ts gap \"30m\" by user\n;")
+                .unwrap();
+        let src = g.to_source();
+        assert!(src.contains("sessionize ts gap \"30m\" by user"), "{src}");
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // Without `by` (single implicit group).
+        let g = parse("S:\n open e.csv (ts:datetime)\n sessionize ts gap \"1h\"\n;").unwrap();
+        assert!(
+            g.to_source().contains("sessionize ts gap \"1h\"\n"),
+            "{}",
+            g.to_source()
+        );
+        // Malformed forms teach the shape.
+        let e = parse("S:\n open e.csv\n sessionize ts \"30m\"\n;")
+            .expect_err("gap keyword required")
+            .to_string();
+        assert!(e.contains("gap \"DUR\""), "{e}");
+        let e = parse("S:\n open e.csv\n sessionize ts gap 30\n;")
+            .expect_err("gap must be a duration string")
+            .to_string();
+        assert!(e.contains("duration string"), "{e}");
     }
 
     #[test]

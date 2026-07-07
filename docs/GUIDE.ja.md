@@ -763,6 +763,9 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   `hops(ts, size, hop)`（`ts` を含む **sliding 窓**開始キーの *List* —
   explode して group する：`|> (hops(ts, "5m", "1m")) as w price` →
   `explode w` → `|# w avg:price`。`hops(x, s, s)` は `bucket` に退化、§36）、
+  **session 窓**：`sessionize ts gap "30m" [by user]` が `session` 列
+  （セッション開始 datetime）を付与 — そのまま `|# user session …` で集計。
+  グループ内 gap 超過で新セッション、時刻逆行は surface（§36.5）、
   `format(ts, "fmt")`（文字列。`ddd`/`[ja-jp]`/`n…n` も同じトークンで使えます —
   `format(ts, "[ja-jp]ddd")` は `水` を返す）。既定の整形は ISO-8601
   `yyyy-MM-ddTHH:mm:ss`（サブ秒レーンは全幅の小数付き）。
