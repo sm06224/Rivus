@@ -217,7 +217,12 @@ fn source_schema(codec: &Codec) -> Option<Schema> {
         )),
         // Undeclared CSV, JSON Lines, and the discovery codec aren't statically
         // typed (columns come from the data / a runtime walk).
-        Codec::Csv { declared: None, .. } | Codec::Jsonl | Codec::Discover { .. } => None,
+        // Parquet carries an embedded schema, but it is only known at open
+        // (runtime), not statically from the IR — honesty rule: None.
+        Codec::Csv { declared: None, .. }
+        | Codec::Jsonl
+        | Codec::Parquet
+        | Codec::Discover { .. } => None,
     }
 }
 

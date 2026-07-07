@@ -85,10 +85,11 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 
 | syntax | reads |
 |---|---|
-| `open PATH` | format from the extension (`.csv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSON) |
-| `open PATH as FMT` | force the format (`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
+| `open PATH` | format from the extension (`.csv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSON, `.parquet` → Parquet) |
+| `open PATH as FMT` | force the format (`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson` \| `parquet`) |
 | `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
 | `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
+| `open PATH.parquet` | **Apache Parquet** (opt-in `--features parquet`, read-only): typed lanes come straight from the file's schema — int64→int, double→float, utf8→str, DATE→date, TIMESTAMP millis/micros→datetime, DECIMAL→decimal — with real nulls. Uncompressed/snappy/gzip codecs; row-group streaming (bounded memory); nested columns error with guidance. The default (zero-dependency) build errors with `rebuild with --features parquet` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), `duration` (signed time spans), `date` (ISO `yyyy-MM-dd` calendar dates), or `time` (`HH:mm:ss` time-of-day; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
 | `readcsv PATH` | CSV, explicitly |

@@ -32,6 +32,11 @@ pub mod distributed;
 #[cfg(feature = "net")]
 pub mod cpu_budget;
 mod operators;
+// SUPPLY-CHAIN selected adapter (read-only slice): Apache Parquet input behind
+// the off-by-default `parquet` feature. The default build does not compile it
+// (zero-dep invariant); a feature-less run refuses the plan pre-run.
+#[cfg(feature = "parquet")]
+mod parquet_read;
 mod route;
 mod telemetry;
 mod transport;

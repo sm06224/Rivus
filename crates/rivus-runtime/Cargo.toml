@@ -30,6 +30,17 @@ ruzstd = { version = "0.8", optional = true }
 notify = { version = "8.2", optional = true, default-features = false, features = [
     "macos_fsevent",
 ] }
+# Off-by-default: Apache Parquet input (read-only slice). The official
+# apache/arrow-rs `parquet` crate **without the arrow feature** — the row/
+# column API only, which keeps the transitive tree at 30 pure-Rust crates
+# (measured via `cargo tree`; no C build step anywhere). Codecs: uncompressed + snappy (`snap`, the
+# de-facto writer default) + gzip via the same pure-Rust `flate2` backend the
+# `gzip` feature already vets. See SUPPLY-CHAIN.md (selected adapter).
+parquet = { version = "59", optional = true, default-features = false, features = [
+    "snap",
+    "flate2",
+    "flate2-rust_backened",
+] }
 
 [features]
 default = []
@@ -39,6 +50,7 @@ zstd = ["dep:ruzstd"]
 # #149 ⑤: unbounded transport skeleton (watch). parse/to_source stay always-std;
 # only evaluation needs this feature; feature-off runs refuse pre-run (§28.12).
 unbounded = ["dep:notify"]
+parquet = ["dep:parquet"]
 # §33 networking execution: `open "http://…"` (bounded HTTP GET) and
 # `subscribe "tcp://…"` (unbounded TCP client feed). **std-only — zero
 # third-party deps** (a minimal HTTP/1.1 client over `std::net`). parse/

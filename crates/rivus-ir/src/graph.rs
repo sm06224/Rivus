@@ -475,6 +475,12 @@ pub enum Codec {
     },
     /// JSON Lines (one flat JSON object per line) or a top-level JSON array.
     Jsonl,
+    /// Apache Parquet (columnar, `.parquet`). Read-only in this slice, behind
+    /// the runtime's off-by-default `parquet` feature (SUPPLY-CHAIN selected
+    /// adapter): the IR/parser always know the codec (std-only, `explain`
+    /// works in any build) and a feature-less run refuses the plan pre-run
+    /// (never-silent, same shape as `regex`/`gzip`).
+    Parquet,
     /// Fixed-width binary records (a C-struct dump). `endian` selects byte order;
     /// `c_align` true uses C `repr(C)` natural-alignment padding, false packs.
     Binary {
@@ -1018,7 +1024,7 @@ impl Op {
                 {
                     "subscribe"
                 }
-                Codec::Csv { .. } | Codec::Jsonl => "open",
+                Codec::Csv { .. } | Codec::Jsonl | Codec::Parquet => "open",
             },
             Op::Read { .. } => "read",
             Op::StreamRef { .. } => "stream",
@@ -1168,6 +1174,17 @@ impl Op {
                             cols.join(" "),
                             provenance.modifier()
                         )
+                    }
+                    // Parquet: a file `open` keeps the bare path (the `.parquet`
+                    // extension picks the codec back up on re-parse); any other
+                    // path spells the codec explicitly.
+                    Codec::Parquet => {
+                        let lower = path.to_ascii_lowercase();
+                        if lower.ends_with(".parquet") {
+                            format!("open {path}{}", provenance.modifier())
+                        } else {
+                            format!("open {path} as parquet{}", provenance.modifier())
+                        }
                     }
                     // JSONL `subscribe` renders `subscribe "tcp://…" as json`; an
                     // `http://` `open` quotes the URL + `as json` (an endpoint /
@@ -1643,6 +1660,20 @@ impl PlanGraph {
         self.nodes.iter().any(|n| match &n.op {
             Op::Source { discovery, .. } => discovery.is_net(),
             _ => false,
+        })
+    }
+
+    /// Does any source read Parquet? Drives the runtime's `parquet` feature
+    /// gate: a feature-less build refuses the plan pre-run (never-silent).
+    pub fn uses_parquet(&self) -> bool {
+        self.nodes.iter().any(|n| {
+            matches!(
+                &n.op,
+                Op::Source {
+                    codec: Codec::Parquet,
+                    ..
+                }
+            )
         })
     }
 

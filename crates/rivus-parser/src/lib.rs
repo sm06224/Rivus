@@ -561,6 +561,14 @@ impl Parser {
                     }
                     let delim = resolve_delim(&path, explicit.as_deref());
                     let fmt = resolve_format(&path, explicit.as_deref());
+                    // Parquet is read-only in this slice — refuse the sink with
+                    // guidance instead of a silent wrong format (never-silent).
+                    if matches!(fmt, Some(Format::Parquet)) {
+                        return Err(self.err(
+                            "`save … .parquet` is not yet implemented (Parquet is read-only in this \
+                             slice) — save as csv / jsonl / json",
+                        ));
+                    }
                     let n = if templated || !by.is_empty() {
                         // Partitioned default format: CSV (a Hive base like
                         // `out/` has no extension to infer from).
@@ -568,6 +576,7 @@ impl Parser {
                             Format::Csv => SinkCodec::Csv { delim },
                             Format::Jsonl => SinkCodec::Jsonl,
                             Format::Json => SinkCodec::Json,
+                            Format::Parquet => unreachable!("refused above"),
                         };
                         self.g.add_node(Op::Sink {
                             route: Route::Template {
@@ -2212,6 +2221,8 @@ fn norm_path(p: String) -> String {
 enum Format {
     Csv,
     Jsonl,
+    /// Apache Parquet (read-only slice; runtime `parquet` feature).
+    Parquet,
     /// JSON array output (`[{…},{…}]`). On the *read* side it behaves like
     /// `Jsonl` (the JSON reader already accepts both an array and NDJSON).
     Json,
@@ -2224,6 +2235,7 @@ impl Format {
             // The JSON reader accepts both NDJSON and a top-level array, so both
             // surface forms open the same source.
             Format::Jsonl | Format::Json => Codec::Jsonl,
+            Format::Parquet => Codec::Parquet,
         };
         Op::source(path, codec)
     }
@@ -2233,6 +2245,8 @@ impl Format {
             Format::Csv => SinkCodec::Csv { delim },
             Format::Jsonl => SinkCodec::Jsonl,
             Format::Json => SinkCodec::Json,
+            // Refused at the `save` parse site before reaching here.
+            Format::Parquet => unreachable!("parquet sink refused at parse"),
         };
         Op::sink(path, codec)
     }
@@ -2259,11 +2273,14 @@ fn resolve_format(path: &str, explicit: Option<&str>) -> Option<Format> {
             // `json` = a single JSON array; `jsonl`/`ndjson` = one object per line.
             "json" => Some(Format::Json),
             "jsonl" | "ndjson" => Some(Format::Jsonl),
+            "parquet" => Some(Format::Parquet),
             _ => None,
         };
     }
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
+    if lower.ends_with(".parquet") {
+        Some(Format::Parquet)
+    } else if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
         Some(Format::Jsonl)
     } else if lower.ends_with(".json") {
         Some(Format::Json) // a `.json` file is conventionally a JSON array
@@ -4659,6 +4676,26 @@ Import:
         // Known calls, type-word casts, and `case`/`resource` stay untouched.
         assert!(parse("F:\n open a.csv\n |> (upper(name)) as u\n;").is_ok());
         assert!(parse("F:\n open a.csv\n |? (age:int) >= 2\n;").is_ok());
+    }
+
+    #[test]
+    fn parquet_source_parses_and_round_trips() {
+        // SUPPLY-CHAIN adapter slice: `.parquet` resolves the codec from the
+        // extension; a non-.parquet path spells `as parquet`. Parse/to_source
+        // are std-only (any build); only *running* needs the feature.
+        let g = parse("P:\n open data.parquet\n;").unwrap();
+        assert!(g.uses_parquet(), "codec must be Parquet");
+        let src = g.to_source();
+        assert!(src.contains("open data.parquet\n"), "{src}");
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        let g = parse("P:\n open blob.bin as parquet\n;").unwrap();
+        assert!(g.uses_parquet());
+        assert!(g.to_source().contains("as parquet"), "{}", g.to_source());
+        // The write side is a later slice — refused with guidance.
+        let e = parse("P:\n open a.csv\n save out.parquet\n;")
+            .expect_err("parquet sink must not parse")
+            .to_string();
+        assert!(e.contains("read-only in this slice"), "{e}");
     }
 
     #[test]
