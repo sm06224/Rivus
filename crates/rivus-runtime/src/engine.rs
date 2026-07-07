@@ -352,6 +352,7 @@ fn must_drain(graph: &PlanGraph) -> bool {
                 | Op::Distinct { .. }
                 | Op::Describe
                 | Op::Join { .. }
+                | Op::AsofJoin { .. }
                 | Op::StreamRef { .. }
                 // bfill/mean/median buffer the whole stream and emit on finish
                 // (they need a value from a later chunk, or a whole-column
@@ -1189,6 +1190,7 @@ fn try_parallel(
             // would be wrong for all three. Force the serial path.
             Op::GroupBy { .. }
             | Op::Join { .. }
+            | Op::AsofJoin { .. }
             | Op::StreamRef { .. }
             | Op::Take { .. }
             | Op::Sort { .. }
@@ -3942,6 +3944,13 @@ pub fn plan_validate(graph: &PlanGraph) -> Result<(), RivusError> {
             }
             Op::Shift { col, by, .. } => {
                 refs.push((col.clone(), 0));
+                refs.extend(by.iter().map(|c| (c.clone(), 0)));
+            }
+            Op::AsofJoin { by, ts, .. } => {
+                // ts + by must exist on the left (slot 0); the right side is a
+                // separate input stream whose schema the Gate checks at its own
+                // node, so only the left references are validated here.
+                refs.push((ts.clone(), 0));
                 refs.extend(by.iter().map(|c| (c.clone(), 0)));
             }
             Op::Cast { casts } => refs.extend(casts.iter().map(|(c, _)| (c.clone(), 0))),

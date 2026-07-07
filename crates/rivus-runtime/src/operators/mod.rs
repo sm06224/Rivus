@@ -441,6 +441,14 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             *kind,
             inputs.first().copied().unwrap_or(usize::MAX),
         )),
+        // As-of join (#64): the first input edge is the left side (parser adds
+        // it first), same convention as the equi-join above.
+        Op::AsofJoin { by, ts, tolerance } => Box::new(AsofJoin::new(
+            by.clone(),
+            ts.clone(),
+            tolerance.clone(),
+            inputs.first().copied().unwrap_or(usize::MAX),
+        )),
         Op::SinkPrint => Box::new(SinkPrint),
         // The unified sink (§28.7): Route::Fixed + Transport::Local today, so
         // the codec alone picks the writer (same operators as before the

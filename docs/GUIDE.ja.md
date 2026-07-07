@@ -567,6 +567,12 @@ Merged:
 - `A &right B on key` — **右外部結合**：右の全行を保持（左列をデフォルト埋め）。
   結合キー列は右キーを保持するので、孤立した右行もキーを失いません。
 - `A &full B on key` — **完全外部結合**：両側の全行。未マッチ側はデフォルト埋め。
+- `A & B [on key…] asof ts [within "5m"]` — **as-of / 時間結合**（#64）：各左行を、
+  datetime `ts` が**左以下で最も近い**右行で補完（`on` キー＝`by` グループで厳密一致、
+  例 `on sym`）。左外部結合なので未マッチ左行は右列 `null`。`within "DUR"` は許容差
+  超のマッチを落とす（閉閾値）。右の `ts`・`on` 列は出力から除外（左が保持）。両側は
+  時刻昇順前提、右をグループ毎にソートするので chunk-size 非依存（直列）。datetime の
+  `≤` は正確（i64 ticks）。例：`Trades & Quotes on sym asof ts within "1m"`。
 
 ```
 # 2 つの CSV を id で内部結合

@@ -604,6 +604,15 @@ Merged:
   orphan right row never loses its key.
 - `A &full B on key` — **full outer join**: every row from both sides; unmatched
   rows are padded on the missing side.
+- `A & B [on key…] asof ts [within "5m"]` — **as-of / temporal join** (#64):
+  enrich each left row with the right row whose datetime `ts` is the **nearest at
+  or before** the left's, matched exactly on the `on` keys (a `by` group, e.g.
+  `on sym`); left-outer, so an unmatched left row keeps `null` right columns. The
+  optional `within "DUR"` drops a match older than the bound (closed threshold).
+  The right `ts` and `on` columns are dropped from the output (the left carries
+  them). Both sides are assumed time-ascending; the right side is sorted per
+  group so the result is chunk-size independent (serial). Datetime `≤` is exact
+  (i64 ticks). Example: `Trades & Quotes on sym asof ts within "1m"`.
 
 ```
 # inner join two CSVs on `id`
