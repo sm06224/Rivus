@@ -622,7 +622,12 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 
 - *文字列* — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
   `substr(s, start, len)`（1 始まり、SQL 流儀）, `replace(s, from, to)`,
-  `split_part(s, sep, n)`（1 始まりのフィールド）, `concat(a, b, …)`。
+  `split_part(s, sep, n)`（1 始まりのフィールド、負は末尾から：`-1`＝最後）,
+  `concat(a, b, …)`。
+- *パス* — `basename(p)`（最終セグメント：`/x/y/jp.csv` → `jp.csv`）,
+  `stem(p)`（拡張子なしの basename：`jp`）, `dirname(p)`（最終セグメントを
+  除いたパス、POSIX 流儀：区切りなし → `.`）。`with filename` の来歴列を
+  レポート向けに短くする定番（#199）。
 - *述語*（→ bool）— `contains(s, sub)`, `starts_with(s, p)`, `ends_with(s, p)`,
   `like(s, pat)`, `glob(s, pat)`、および（`--features regex` 時）正規表現テスト：
   `s ~ 're'` — **`~` 中置**＋raw な `'…'` regex リテラルが正規形。

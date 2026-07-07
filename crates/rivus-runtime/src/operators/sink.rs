@@ -52,7 +52,10 @@ impl SinkCsv {
                     }
                     write_cell(&mut line, &chunk.columns[c], row, delim);
                 }
-                writeln!(w, "{line}")?;
+                // write_all skips the `fmt` machinery a `writeln!` would re-enter
+                // per row — the bytes are already formatted.
+                line.push('\n');
+                w.write_all(line.as_bytes())?;
             }
         }
         self.w.wrote_header = true;
@@ -124,7 +127,10 @@ pub fn write_csv_file(path: &str, chunks: &[Chunk], delim: u8) -> std::io::Resul
                 }
                 write_cell(&mut line, &chunk.columns[c], row, delim);
             }
-            writeln!(w, "{line}")?;
+            // write_all skips the `fmt` machinery a `writeln!` would re-enter
+            // per row — the bytes are already formatted.
+            line.push('\n');
+            w.write_all(line.as_bytes())?;
         }
     }
     w.flush()
@@ -146,35 +152,42 @@ pub(crate) fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8)
         return;
     }
     match col.data() {
-        ColumnData::I64(v) => {
-            let _ = write!(line, "{}", v[row]);
-        }
+        // Numeric lanes ride the LUT/short-decimal fast paths — byte-identical
+        // to `format!("{}")` by construction (rivus_core::numfmt), with std as
+        // the refusal fallback. `save` is the second cost on the 1 GB profile
+        // and f64 `Display` was its hottest lane (docs/BENCHMARKS.md).
+        ColumnData::I64(v) => rivus_core::numfmt::push_i64(line, v[row]),
         ColumnData::F64(v) => {
-            let _ = write!(line, "{}", v[row]);
+            if !rivus_core::numfmt::push_f64(line, v[row]) {
+                let _ = write!(line, "{}", v[row]);
+            }
         }
         ColumnData::Bool(v) => line.push_str(if v[row] { "true" } else { "false" }),
-        ColumnData::Dec(d) => {
-            let _ = write!(
-                line,
-                "{}",
-                rivus_core::Decimal::new(d.unscaled[row], d.scale)
-            );
-        }
+        // Temporal/decimal lanes push their digits directly (the same LUT
+        // implementation `Display` delegates to — measured as the heaviest
+        // cell costs after f64, docs/BENCHMARKS.md); the rare out-of-range
+        // rendering falls back to the canonical `Display`.
+        ColumnData::Dec(d) => rivus_core::numfmt::push_decimal(line, d.unscaled[row], d.scale),
         ColumnData::DateTime(d) => {
-            let _ = write!(line, "{}", rivus_core::DateTime::new(d.ticks[row], d.unit));
+            let dt = rivus_core::DateTime::new(d.ticks[row], d.unit);
+            if !dt.push_default(line) {
+                let _ = write!(line, "{dt}");
+            }
         }
         ColumnData::Duration(d) => {
             let _ = write!(line, "{}", rivus_core::Duration::new(d.ticks[row], d.unit));
         }
         ColumnData::Date(v) => {
-            let _ = write!(line, "{}", rivus_core::Date::new(v[row]));
+            let date = rivus_core::Date::new(v[row]);
+            if !date.push_iso(line) {
+                let _ = write!(line, "{date}");
+            }
         }
         ColumnData::Time(v) => {
-            let _ = write!(
-                line,
-                "{}",
-                rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec)
-            );
+            let t = rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec);
+            if !t.push_default(line) {
+                let _ = write!(line, "{t}");
+            }
         }
         // A resource handle renders its uri (text), with the same CSV quoting.
         ColumnData::Str(s) | ColumnData::Resource(s) => {
@@ -448,42 +461,60 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
         return;
     }
     match col.data() {
-        ColumnData::I64(v) => {
-            let _ = write!(out, "{}", v[row]);
-        }
+        // Same numeric fast paths as the CSV cell writer (rivus_core::numfmt),
+        // byte-identical to `format!("{}")` with std as the refusal fallback.
+        ColumnData::I64(v) => rivus_core::numfmt::push_i64(out, v[row]),
         // JSON has no NaN/Infinity → emit null (continue-first), matching json_value.
         ColumnData::F64(v) => {
-            if v[row].is_finite() {
-                let _ = write!(out, "{}", v[row]);
-            } else {
+            if !v[row].is_finite() {
                 out.push_str("null");
+            } else if !rivus_core::numfmt::push_f64(out, v[row]) {
+                let _ = write!(out, "{}", v[row]);
             }
         }
         ColumnData::Bool(v) => out.push_str(if v[row] { "true" } else { "false" }),
-        ColumnData::Dec(d) => {
-            let _ = write!(
-                out,
-                "{}",
-                rivus_core::Decimal::new(d.unscaled[row], d.scale)
-            );
-        }
+        ColumnData::Dec(d) => rivus_core::numfmt::push_decimal(out, d.unscaled[row], d.scale),
         // Datetime has no JSON literal form → emit a quoted ISO-8601 string.
-        ColumnData::DateTime(d) => json_string(
-            out,
-            &rivus_core::DateTime::new(d.ticks[row], d.unit).to_string(),
-        ),
+        // The default rendering is digits and `-T:.` only — none need JSON
+        // escaping — so the fast path quotes directly; the out-of-range
+        // fallback keeps the escaping `json_string` for safety.
+        ColumnData::DateTime(d) => {
+            let dt = rivus_core::DateTime::new(d.ticks[row], d.unit);
+            out.push('"');
+            if !dt.push_default(out) {
+                out.pop();
+                json_string(out, &dt.to_string());
+            } else {
+                out.push('"');
+            }
+        }
         // Duration likewise → quoted human-readable string (#57).
         ColumnData::Duration(d) => json_string(
             out,
             &rivus_core::Duration::new(d.ticks[row], d.unit).to_string(),
         ),
         // Date → quoted ISO yyyy-MM-dd string (#58).
-        ColumnData::Date(v) => json_string(out, &rivus_core::Date::new(v[row]).to_string()),
+        ColumnData::Date(v) => {
+            let date = rivus_core::Date::new(v[row]);
+            out.push('"');
+            if !date.push_iso(out) {
+                out.pop();
+                json_string(out, &date.to_string());
+            } else {
+                out.push('"');
+            }
+        }
         // Time → quoted HH:mm:ss string (#58).
-        ColumnData::Time(v) => json_string(
-            out,
-            &rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec).to_string(),
-        ),
+        ColumnData::Time(v) => {
+            let t = rivus_core::TimeOfDay::new(v[row], rivus_core::TimeUnit::Sec);
+            out.push('"');
+            if !t.push_default(out) {
+                out.pop();
+                json_string(out, &t.to_string());
+            } else {
+                out.push('"');
+            }
+        }
         // A resource handle → its uri as a quoted JSON string.
         ColumnData::Str(s) | ColumnData::Resource(s) => json_string(out, s.get(row)),
         // §32 s3a: a nested lane renders as a real JSON object/array, recursing

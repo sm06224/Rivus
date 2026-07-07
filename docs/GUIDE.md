@@ -661,8 +661,12 @@ Used in `|?` predicates and `(…)` computed columns.
 
 - *string* — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
   `substr(s, start, len)` (1-based start, SQL convention),
-  `replace(s, from, to)`, `split_part(s, sep, n)` (1-based field),
-  `concat(a, b, …)`.
+  `replace(s, from, to)`, `split_part(s, sep, n)` (1-based field; negative
+  counts from the end, `-1` = last), `concat(a, b, …)`.
+- *path* — `basename(p)` (final segment: `/x/y/jp.csv` → `jp.csv`),
+  `stem(p)` (basename without its extension: `jp`), `dirname(p)` (the path
+  up to the final segment, POSIX style: no separator → `.`). The idiomatic
+  way to shorten a `with filename` provenance column for reports (#199).
 - *predicates* (→ bool) — `contains(s, sub)`, `starts_with(s, p)`,
   `ends_with(s, p)`, `like(s, pat)`, `glob(s, pat)`, and (with `--features
   regex`) the regex test: `s ~ 're'` — the **`~` infix** with a raw `'…'`
