@@ -559,8 +559,16 @@ pub fn render_explain(graph: &PlanGraph) -> String {
     s.push_str("\u{2592} nodes\n");
     for n in &graph.nodes {
         let label = n.label.clone().unwrap_or_else(|| "-".into());
+        // One-line op summary (#194): the node list used to read as an
+        // uninformative `label=- hooks=0` ladder while the same predicate /
+        // key / field detail sat only in the Mermaid edge labels — surface it
+        // here too, truncated so one node stays one line.
+        let mut src = n.op.to_src_line();
+        if src.chars().count() > 60 {
+            src = format!("{}…", src.chars().take(59).collect::<String>());
+        }
         s.push_str(&format!(
-            "  #{:<2} {:<8} label={label:<10} hooks={}\n",
+            "  #{:<2} {:<8} label={label:<10} hooks={}  {src}\n",
             n.id,
             n.op.kind_str(),
             n.hooks.len()
