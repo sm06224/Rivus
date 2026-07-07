@@ -623,7 +623,12 @@ AllUsers: Users &left Orders on id  |> name amount  save out.csv ;
 
 - *文字列* — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
   `substr(s, start, len)`（1 始まり、SQL 流儀）, `replace(s, from, to)`,
-  `split_part(s, sep, n)`（1 始まりのフィールド）, `concat(a, b, …)`。
+  `split_part(s, sep, n)`（1 始まりのフィールド、負は末尾から：`-1`＝最後）,
+  `concat(a, b, …)`。
+- *パス* — `basename(p)`（最終セグメント：`/x/y/jp.csv` → `jp.csv`）,
+  `stem(p)`（拡張子なしの basename：`jp`）, `dirname(p)`（最終セグメントを
+  除いたパス、POSIX 流儀：区切りなし → `.`）。`with filename` の来歴列を
+  レポート向けに短くする定番（#199）。
 - *述語*（→ bool）— `contains(s, sub)`, `starts_with(s, p)`, `ends_with(s, p)`,
   `like(s, pat)`, `glob(s, pat)`、および（`--features regex` 時）正規表現テスト：
   `s ~ 're'` — **`~` 中置**＋raw な `'…'` regex リテラルが正規形。
@@ -755,6 +760,13 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   （continue-first。そのリテラルに対しては `!=` のみ真）。
 - **関数**：`year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)` `second(ts)`
   （整数）、`trunc(ts, "day"|"hour"|"minute"|"month"|"year")`（日時バケットキー）、
+  `bucket(ts, "15m")`（任意幅の tumbling 窓キー、左閉右開・epoch 整列）、
+  `hops(ts, size, hop)`（`ts` を含む **sliding 窓**開始キーの *List* —
+  explode して group する：`|> (hops(ts, "5m", "1m")) as w price` →
+  `explode w` → `|# w avg:price`。`hops(x, s, s)` は `bucket` に退化、§36）、
+  **session 窓**：`sessionize ts gap "30m" [by user]` が `session` 列
+  （セッション開始 datetime）を付与 — そのまま `|# user session …` で集計。
+  グループ内 gap 超過で新セッション、時刻逆行は surface（§36.5）、
   `format(ts, "fmt")`（文字列。`ddd`/`[ja-jp]`/`n…n` も同じトークンで使えます —
   `format(ts, "[ja-jp]ddd")` は `水` を返す）。既定の整形は ISO-8601
   `yyyy-MM-ddTHH:mm:ss`（サブ秒レーンは全幅の小数付き）。

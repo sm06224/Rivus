@@ -654,3 +654,254 @@ fn test_bucket_tumbling_window_evaluation() {
         ]
     );
 }
+
+// --- sliding windows via `hops(ts, size, hop)` + explode + `|#` (§30.4 / #60,
+// research prototype: sliding = derived grouping KEYS, plural). ---
+
+#[test]
+fn sliding_window_hops_explode_group_matches_oracle() {
+    // 5 ticks, size=2m hop=1m: each row lands in exactly two windows (the
+    // epoch-aligned starts covering it), and the per-window avg/count follow.
+    let text = "ts,price\n\
+                2024-06-03T09:00:10,100\n\
+                2024-06-03T09:00:50,110\n\
+                2024-06-03T09:01:30,120\n\
+                2024-06-03T09:02:10,130\n\
+                2024-06-03T09:04:30,200\n";
+    let f = TempCsv(gendata::write_temp_bytes("slide_oracle", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "W:\n open {p} (ts:datetime price:int)\n |> (hops(ts, \"2m\", \"1m\")) as w price\n \
+         explode w\n |# w avg:price\n sort w\n;"
+    );
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "W", "w"),
+            vec![
+                "2024-06-03T08:59:00",
+                "2024-06-03T09:00:00",
+                "2024-06-03T09:01:00",
+                "2024-06-03T09:02:00",
+                "2024-06-03T09:03:00",
+                "2024-06-03T09:04:00",
+            ],
+            "window starts @cz={cz}"
+        );
+        assert_eq!(
+            collect_i64(&res, "W", "count"),
+            vec![2, 3, 2, 1, 1, 1],
+            "per-window membership @cz={cz}"
+        );
+        assert_eq!(
+            collect_strings(&res, "W", "avg_price"),
+            vec!["105", "110", "125", "130", "200", "200"],
+            "per-window avg @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn hops_gap_and_degenerate_cases() {
+    // hop > size leaves gaps: a tick between windows yields an EMPTY list →
+    // explode drops the row (zero windows is a real answer, not an error).
+    // hop == size degenerates to tumbling (== bucket).
+    let text = "ts,v\n2024-01-01T00:00:30,1\n2024-01-01T00:03:30,2\n";
+    let f = TempCsv(gendata::write_temp_bytes("slide_gap", text.as_bytes()));
+    let p = f.0.display();
+    // size=1m hop=3m: only ticks in the first minute of each 3m hop belong.
+    let flow = format!(
+        "G:\n open {p} (ts:datetime v:int)\n |> (hops(ts, \"1m\", \"3m\")) as w v\n \
+         explode w\n |# w count:v\n sort w\n;"
+    );
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "G", "w"),
+        vec!["2024-01-01T00:00:00", "2024-01-01T00:03:00"],
+        "hop>size: each tick in ≤1 window, gap ticks in none"
+    );
+    // hop == size ≡ bucket: identical keys.
+    let tumbling = format!(
+        "T:\n open {p} (ts:datetime v:int)\n |> (hops(ts, \"3m\", \"3m\")) as w v\n \
+         explode w\n |# w count:v\n sort w\n;"
+    );
+    let bucketed = format!(
+        "T:\n open {p} (ts:datetime v:int)\n |> (bucket(ts, \"3m\")) as w v\n \
+         |# w count:v\n sort w\n;"
+    );
+    assert_eq!(
+        collect_strings(&run_src(&tumbling, 4096), "T", "w"),
+        collect_strings(&run_src(&bucketed, 4096), "T", "w"),
+        "hops(size==hop) must degenerate to bucket"
+    );
+}
+
+#[test]
+fn sliding_window_serial_parallel_chunk_size_byte_identical() {
+    // Exact aggregates (count/max) over sliding windows are byte-identical
+    // across the serial and parallel paths and chunk sizes (§30.6: windows add
+    // no new parallel hazard — the window key is just another group key).
+    let rows = 200_000usize;
+    let mut text = String::from("ts,v\n");
+    for i in 0..rows {
+        let (h, m, s) = ((i / 3600) % 24, (i / 60) % 60, i % 60);
+        text.push_str(&format!("2024-06-03T{h:02}:{m:02}:{s:02},{}\n", i % 1000));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("slide_bi", text.as_bytes()));
+    let p = f.0.display();
+    let run_one = |cz: usize, pref: rivus_runtime::MemoryPref| {
+        let flow = format!(
+            "B:\n open {p} (ts:datetime v:int)\n |> (hops(ts, \"10m\", \"5m\")) as w v\n \
+             explode w\n |# w count:v max:v\n sort w\n;"
+        );
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let mut lines = Vec::new();
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("B"))
+            .expect("output");
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join("\u{1f}"));
+            }
+        }
+        lines
+    };
+    let oracle = run_one(1024, rivus_runtime::MemoryPref::Low);
+    assert!(!oracle.is_empty());
+    for cz in [777usize, 4096] {
+        assert_eq!(
+            run_one(cz, rivus_runtime::MemoryPref::Fast),
+            oracle,
+            "sliding window must be serial==parallel==chunk-size @cz={cz}"
+        );
+    }
+}
+
+// --- session windows via `sessionize ts gap "30m" by user` (§36.5 / #60,
+// research prototype: session start as the derived key). ---
+
+#[test]
+fn sessionize_assigns_session_starts_per_group() {
+    // Two interleaved users; gap=30m. aki: 09:00+09:05 share a session,
+    // 09:50 and 10:31 each start new ones. ben: 09:02+09:03 share, 10:30 new.
+    // Interleaving exercises per-group state (ts regressions ACROSS groups are
+    // fine — only within-group order matters).
+    let text = "ts,user\n\
+                2024-06-03T09:00:00,aki\n\
+                2024-06-03T09:05:00,aki\n\
+                2024-06-03T09:50:00,aki\n\
+                2024-06-03T09:02:00,ben\n\
+                2024-06-03T09:03:00,ben\n\
+                2024-06-03T10:30:00,ben\n\
+                2024-06-03T10:31:00,aki\n";
+    let f = TempCsv(gendata::write_temp_bytes("sess_oracle", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "S:\n open {p} (ts:datetime user:str)\n sessionize ts gap \"30m\" by user\n \
+         |# user session count:ts\n sort user session\n;"
+    );
+    // Chunk-size sweep pins the cross-chunk state carry (cz=1 = every row its
+    // own chunk) — the session assignment must not depend on chunking.
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "S", "session"),
+            vec![
+                "2024-06-03T09:00:00",
+                "2024-06-03T09:50:00",
+                "2024-06-03T10:31:00",
+                "2024-06-03T09:02:00",
+                "2024-06-03T10:30:00",
+            ],
+            "session starts @cz={cz}"
+        );
+        assert_eq!(
+            collect_i64(&res, "S", "count"),
+            vec![2, 1, 1, 2, 1],
+            "rows per session @cz={cz}"
+        );
+        assert!(
+            !res.errors
+                .iter()
+                .any(|e| e.message.contains("out of time order")),
+            "ascending per-group input must not surface a regression @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn sessionize_gap_boundary_is_closed() {
+    // A gap of exactly `gap` continues the session; strictly greater starts a
+    // new one (closed threshold, pinned).
+    let text = "ts,v\n\
+                2024-01-01T00:00:00,1\n\
+                2024-01-01T00:30:00,2\n\
+                2024-01-01T01:00:01,3\n";
+    let f = TempCsv(gendata::write_temp_bytes("sess_edge", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "S:\n open {p} (ts:datetime v:int)\n sessionize ts gap \"30m\"\n \
+         |# session count:v\n sort session\n;"
+    );
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "S", "session"),
+        vec!["2024-01-01T00:00:00", "2024-01-01T01:00:01"],
+        "== gap continues; > gap (by 1s) starts a new session"
+    );
+    assert_eq!(collect_i64(&res, "S", "count"), vec![2, 1]);
+}
+
+#[test]
+fn sessionize_surfaces_time_regressions_and_null_ts() {
+    // Out-of-order rows (within the single implicit group) are counted and
+    // surfaced once (never-silent); a null ts yields a null session cell.
+    let text = "ts,v\n\
+                2024-01-01T10:00:00,1\n\
+                2024-01-01T09:00:00,2\n\
+                ,3\n\
+                2024-01-01T11:00:00,4\n";
+    let f = TempCsv(gendata::write_temp_bytes("sess_reg", text.as_bytes()));
+    let p = f.0.display();
+    let flow =
+        format!("S:\n open {p} (ts:datetime v:int)\n sessionize ts gap \"10m\"\n |> v session\n;");
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "S", "session"),
+        vec![
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00", // regression: negative gap ≤ gap → same session
+            "",                    // null ts → null session
+            "2024-01-01T11:00:00",
+        ],
+    );
+    let reg = res
+        .errors
+        .iter()
+        .filter(|e| e.message.contains("out of time order"))
+        .count();
+    assert_eq!(
+        reg, 1,
+        "exactly one aggregate regression event: {:?}",
+        res.errors
+    );
+    assert!(
+        res.errors.iter().any(|e| e.message.contains("1 row(s)")),
+        "the event carries the count: {:?}",
+        res.errors
+    );
+}

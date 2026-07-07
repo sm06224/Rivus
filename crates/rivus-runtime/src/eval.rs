@@ -93,15 +93,49 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut u
         Func::SplitPart => {
             let s = arg(0).to_string();
             let sep = arg(1).to_string();
-            // 1-based field index (DuckDB/awk convention); 0 or out-of-range → "".
+            // 1-based field index (DuckDB/awk convention); a negative index
+            // counts from the end (`-1` = last, #199); 0 or out-of-range → "".
             let n = arg(2).as_f64().unwrap_or(0.0) as i64;
-            let out = if sep.is_empty() || n < 1 {
+            let out = if sep.is_empty() || n == 0 {
                 String::new()
-            } else {
+            } else if n > 0 {
                 s.split(sep.as_str())
                     .nth((n - 1) as usize)
                     .unwrap_or("")
                     .to_string()
+            } else {
+                let parts: Vec<&str> = s.split(sep.as_str()).collect();
+                let idx = parts.len() as i64 + n; // n < 0
+                if idx >= 0 {
+                    parts[idx as usize].to_string()
+                } else {
+                    String::new()
+                }
+            };
+            Value::Str(out)
+        }
+        // Path helpers (#199): provenance columns carry full paths; a report
+        // wants `jp.csv`. Splitting is on `/` AND `\` so the result does not
+        // depend on the host platform (byte-identity across environments).
+        Func::Basename => Value::Str(path_basename(&arg(0).to_string()).to_string()),
+        Func::Stem => {
+            let s = arg(0).to_string();
+            let base = path_basename(&s);
+            // Strip the final extension; a leading dot (`.env`) is a hidden
+            // file's name, not an extension, so it stays.
+            let out = match base.rfind('.') {
+                Some(i) if i > 0 => &base[..i],
+                _ => base,
+            };
+            Value::Str(out.to_string())
+        }
+        Func::Dirname => {
+            let s = arg(0).to_string();
+            // POSIX dirname: no separator → ".", a root-only path → "/".
+            let out = match s.rfind(['/', '\\']) {
+                None => ".".to_string(),
+                Some(0) => s[..1].to_string(),
+                Some(i) => s[..i].to_string(),
             };
             Value::Str(out)
         }
@@ -158,6 +192,24 @@ fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut u
             Some(dt) => match as_duration(arg(1), dt.unit) {
                 Some(dur) => dt.bucketed(dur).map(Value::DateTime).unwrap_or(Value::Null),
                 None => Value::Null,
+            },
+            None => Value::Null,
+        },
+        // `hops(ts, size, hop)` → the LIST of sliding-window start datetimes
+        // containing ts (§30.4 sliding = derived keys, plural; explode + `|#`
+        // do the rest). A bad ts/duration → Null (continue-first, like bucket).
+        Func::Hops => match as_datetime(arg(0)) {
+            Some(dt) => match (as_duration(arg(1), dt.unit), as_duration(arg(2), dt.unit)) {
+                (Some(size), Some(hop)) => match dt.hop_starts(size, hop) {
+                    Some(starts) => Value::List(
+                        starts
+                            .into_iter()
+                            .map(|t| Value::DateTime(rivus_core::DateTime::new(t, dt.unit)))
+                            .collect(),
+                    ),
+                    None => Value::Null,
+                },
+                _ => Value::Null,
             },
             None => Value::Null,
         },
@@ -363,6 +415,11 @@ fn regexp_column(_args: &[Expr], chunk: &Chunk, _fails: &mut u64) -> Column {
 /// `start == 1` is the first char and `start <= 1` clamps to the beginning
 /// (lenient, so the old 0-based call `substr(s, 0, n)` still returns the prefix).
 /// `#bugreport ③`. `take == usize::MAX` means "to the end" (no length given).
+/// The final path segment (after the last `/` or `\`) — `basename` (#199).
+fn path_basename(s: &str) -> &str {
+    s.rsplit(['/', '\\']).next().unwrap_or(s)
+}
+
 fn substr_1based(s: &str, start: f64, take: usize) -> String {
     let start1 = start as i64;
     let skip = if start1 <= 1 {
@@ -958,8 +1015,11 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
                         .map(|r| to_i64(call_func(*func, args, chunk, r, fails)))
                         .collect(),
                 ),
-                // `trunc` and `bucket` stay on the datetime lane (truncated/bucketed ticks, same unit).
-                Func::Trunc | Func::Bucket => {
+                // `trunc` and `bucket` stay on the datetime lane (truncated/bucketed ticks, same unit);
+                // `hops` yields a List lane of datetime starts (column_from_values
+                // builds the ListColumn — the explode + `|#` downstream needs the
+                // real lane, not a text rendering).
+                Func::Trunc | Func::Bucket | Func::Hops => {
                     let vals: Vec<Value> = (0..n)
                         .map(|r| call_func(*func, args, chunk, r, fails))
                         .collect();
@@ -1060,6 +1120,26 @@ pub(crate) fn column_from_values(vals: Vec<Value>) -> Column {
         first_present.is_some() && vals.iter().filter(|v| !v.is_null()).all(pred)
     };
 
+    // All-list → a real List lane (e.g. `hops(ts, size, hop)`): flatten the
+    // elements into a recursively lane-typed child column with offsets, so the
+    // downstream `explode` sees a genuine list, not a text rendering. A null
+    // row spans zero elements (offsets stay flat across it).
+    if matches!(first_present, Some(Value::List(_))) && all(|v| matches!(v, Value::List(_))) {
+        let mut offsets: Vec<i32> = Vec::with_capacity(vals.len() + 1);
+        offsets.push(0);
+        let mut flat: Vec<Value> = Vec::new();
+        for v in &vals {
+            if let Value::List(items) = v {
+                flat.extend(items.iter().cloned());
+            }
+            offsets.push(flat.len() as i32);
+        }
+        let child = column_from_values(flat);
+        return with(ColumnData::List(rivus_core::ListColumn {
+            offsets,
+            child: Box::new(child),
+        }));
+    }
     // All-datetime → keep the datetime lane (e.g. `trunc(ts, "day")`), carrying
     // the first non-null cell's unit (every cell shares it). Design 23.
     if let Some(Value::DateTime(first)) = first_present {

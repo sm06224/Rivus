@@ -1183,6 +1183,10 @@ fn try_parallel(
                     | rivus_ir::FillMethod::Median,
                 ..
             } => return None,
+            // Session boundaries depend on the previous row's ts per group
+            // (order-dependent state across chunks) → not partitionable; the
+            // serial path keeps byte-identity (§36.5, same family as ffill).
+            Op::Sessionize { .. } => return None,
             _ => {}
         }
     }
@@ -2516,6 +2520,10 @@ pub fn plan_validate(graph: &PlanGraph) -> Result<(), RivusError> {
                 refs.extend(cols.iter().map(|c| (c.clone(), 0)))
             }
             Op::Fill { col, .. } => refs.push((col.clone(), 0)),
+            Op::Sessionize { ts, by, .. } => {
+                refs.push((ts.clone(), 0));
+                refs.extend(by.iter().map(|c| (c.clone(), 0)));
+            }
             Op::Cast { casts } => refs.extend(casts.iter().map(|(c, _)| (c.clone(), 0))),
             Op::Rename { pairs } => refs.extend(pairs.iter().map(|(f, _)| (f.clone(), 0))),
             _ => {}

@@ -187,21 +187,15 @@ impl PartialOrd for Decimal {
 }
 
 impl fmt::Display for Decimal {
+    /// Sign, integer part, `.`, fraction zero-padded to exactly `scale`
+    /// digits (`scale == 0` → plain integer). Delegates to the LUT writer so
+    /// the sink's direct-push path and `to_string()` are one implementation
+    /// (byte-identity by construction; the old `write!` form is kept as a
+    /// test oracle in `numfmt`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.scale == 0 {
-            return write!(f, "{}", self.unscaled);
-        }
-        let div = Self::pow10(self.scale);
-        let sign = if self.unscaled < 0 { "-" } else { "" };
-        let abs = self.unscaled.unsigned_abs();
-        let int = abs / div as u128;
-        let frac = abs % div as u128;
-        // Zero-pad the fraction to exactly `scale` digits.
-        write!(
-            f,
-            "{sign}{int}.{frac:0>width$}",
-            width = self.scale as usize
-        )
+        let mut s = String::with_capacity(24);
+        crate::numfmt::push_decimal(&mut s, self.unscaled, self.scale);
+        f.write_str(&s)
     }
 }
 
@@ -501,6 +495,37 @@ impl DateTime {
         (y, m, d, sod / 3600, (sod / 60) % 60, sod % 60)
     }
 
+    /// Fraction digits the default rendering appends for `unit` (`0` = none).
+    pub fn unit_width(unit: TimeUnit) -> usize {
+        match unit {
+            TimeUnit::Sec => 0,
+            TimeUnit::Milli => 3,
+            TimeUnit::Micro => 6,
+            TimeUnit::Nano => 9,
+        }
+    }
+
+    /// Append the default ISO rendering (`yyyy-MM-ddTHH:mm:ss[.frac]`)
+    /// directly (LUT digits, no `fmt` machinery) and return `true`; `false`
+    /// (buffer untouched) for a year outside `0..=9999` — the caller uses the
+    /// canonical `Display`/template path for those. One implementation shared
+    /// by `Display` and the sink's hot cell writers (byte-identity by
+    /// construction).
+    pub fn push_default(&self, out: &mut String) -> bool {
+        let (y, mo, d, h, mi, se) = self.fields();
+        if !crate::numfmt::push_date_ymd(out, y, mo, d) {
+            return false;
+        }
+        out.push('T');
+        crate::numfmt::push_hms(out, h, mi, se);
+        let ps = self.unit.per_sec();
+        if ps > 1 {
+            out.push('.');
+            crate::numfmt::push_frac(out, self.ticks.rem_euclid(ps), Self::unit_width(self.unit));
+        }
+        true
+    }
+
     /// Truncate to a calendar/clock boundary (`year`/`month`/`day`/`hour`/
     /// `minute`/`second`), returning a `DateTime` at the same `unit` — the
     /// time-series group-by key (design 23). Integer math, so byte-identical
@@ -545,6 +570,48 @@ impl DateTime {
             q -= 1;
         }
         Some(DateTime::new(q * dur_ticks, self.unit))
+    }
+
+    /// The start ticks (at `self.unit`, **ascending**) of every sliding window
+    /// of width `size`, hopping by `hop`, that contains this instant: each
+    /// start `w` with `w ≡ 0 (mod hop)` (epoch-aligned, like [`bucketed`]) and
+    /// `w ≤ t < w + size` (closed-open). `hop == size` degenerates to the
+    /// tumbling `bucketed` start; `hop > size` leaves gaps (an instant between
+    /// windows yields an **empty** list — a real answer, not an error).
+    /// Negative ticks (pre-epoch) floor correctly. `None` when either duration
+    /// is non-positive or not exactly representable at `self.unit` (same
+    /// contract as [`bucketed`], never-silent at the call site).
+    ///
+    /// [`bucketed`]: DateTime::bucketed
+    pub fn hop_starts(&self, size: Duration, hop: Duration) -> Option<Vec<i64>> {
+        let to_self_ticks = |d: Duration| -> Option<i64> {
+            if d.ticks <= 0 {
+                return None;
+            }
+            let n = d.ticks as i128 * self.unit.per_sec() as i128;
+            let per = d.unit.per_sec() as i128;
+            if n % per != 0 {
+                return None;
+            }
+            i64::try_from(n / per).ok()
+        };
+        let size = to_self_ticks(size)?;
+        let hop = to_self_ticks(hop)?;
+        let t = self.ticks;
+        // Last start ≤ t, first start > t - size — both hop-aligned (floor
+        // division handles negatives; i128 guards `t - size` overflow).
+        let floor_div = |a: i128, b: i128| a.div_euclid(b);
+        let last = floor_div(t as i128, hop as i128) * hop as i128;
+        let first = floor_div(t as i128 - size as i128, hop as i128) * hop as i128 + hop as i128;
+        let mut out = Vec::new();
+        let mut w = first;
+        while w <= last {
+            if let Ok(ticks) = i64::try_from(w) {
+                out.push(ticks);
+            }
+            w += hop as i128;
+        }
+        Some(out)
     }
 
     /// Parse `s` with a `strptime`-style `fmt` (tokens `yyyy`/`yy`/`MM`/`dd`/
@@ -818,16 +885,22 @@ impl fmt::Display for DateTime {
     /// `.SSSSSS` / `.SSSSSSSSS`) so declared precision is never silently
     /// dropped on output; the `Sec` rendering is unchanged (no fraction).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The common era (year 0..=9999) rides the LUT writer — one
+        // implementation shared with the sink's direct-push path. Outside it,
+        // the canonical template path renders the `{y:04}` sign/width form.
+        let mut s = String::with_capacity(32);
+        if self.push_default(&mut s) {
+            return f.write_str(&s);
+        }
         f.write_str(&self.format("yyyy-MM-ddTHH:mm:ss"))?;
         let ps = self.unit.per_sec();
         if ps > 1 {
-            let width = match self.unit {
-                TimeUnit::Milli => 3,
-                TimeUnit::Micro => 6,
-                TimeUnit::Nano => 9,
-                TimeUnit::Sec => unreachable!(),
-            };
-            write!(f, ".{:0width$}", self.ticks.rem_euclid(ps), width = width)?;
+            write!(
+                f,
+                ".{:0width$}",
+                self.ticks.rem_euclid(ps),
+                width = Self::unit_width(self.unit)
+            )?;
         }
         Ok(())
     }
@@ -1091,6 +1164,14 @@ impl Date {
         civil_from_days(self.epoch_day as i64)
     }
 
+    /// Append the ISO `yyyy-MM-dd` rendering directly (LUT digits, no `fmt`
+    /// machinery) and return `true`; `false` (buffer untouched) for a year
+    /// outside `0..=9999`. Shared by `Display` and the sink's cell writers.
+    pub fn push_iso(&self, out: &mut String) -> bool {
+        let (y, m, d) = self.ymd();
+        crate::numfmt::push_date_ymd(out, y, m, d)
+    }
+
     /// Day of week, `0 = Monday … 6 = Sunday` (ISO). Exact integer arithmetic.
     pub fn weekday(&self) -> u8 {
         // 1970-01-01 was a Thursday (=3 in Mon..Sun). rem_euclid keeps it in 0..6
@@ -1130,8 +1211,60 @@ impl Date {
 
 impl fmt::Display for Date {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Common era (0..=9999) rides the LUT writer (shared with the sink's
+        // direct-push path); outside it, `{y:04}` renders sign/width forms.
+        let mut s = String::with_capacity(10);
+        if self.push_iso(&mut s) {
+            return f.write_str(&s);
+        }
         let (y, m, d) = self.ymd();
         write!(f, "{y:04}-{m:02}-{d:02}")
+    }
+}
+
+#[cfg(test)]
+mod hop_starts_tests {
+    use super::{DateTime, Duration, TimeUnit};
+
+    fn dt(secs: i64) -> DateTime {
+        DateTime::new(secs, TimeUnit::Sec)
+    }
+    fn dur(secs: i64) -> Duration {
+        Duration::new(secs, TimeUnit::Sec)
+    }
+
+    #[test]
+    fn hop_starts_covers_containing_windows_ascending() {
+        // t=130, size=120 hop=60: windows [60,180) and [120,240) contain it.
+        assert_eq!(dt(130).hop_starts(dur(120), dur(60)), Some(vec![60, 120]));
+        // Boundary: t exactly on a start belongs to it (closed-open) and to
+        // the previous overlapping window.
+        assert_eq!(dt(120).hop_starts(dur(120), dur(60)), Some(vec![60, 120]));
+        // hop == size degenerates to the tumbling bucket start.
+        assert_eq!(dt(130).hop_starts(dur(60), dur(60)), Some(vec![120]));
+        assert_eq!(
+            dt(130).bucketed(dur(60)).map(|b| b.ticks),
+            Some(120),
+            "degenerate hops start == bucket start"
+        );
+        // hop > size leaves gaps: t=90 with size=60 hop=180 is in no window.
+        assert_eq!(dt(90).hop_starts(dur(60), dur(180)), Some(vec![]));
+        assert_eq!(dt(30).hop_starts(dur(60), dur(180)), Some(vec![0]));
+    }
+
+    #[test]
+    fn hop_starts_negative_ticks_floor_correctly() {
+        // Pre-epoch: t=-10, size=120 hop=60 → starts -120 and -60.
+        assert_eq!(dt(-10).hop_starts(dur(120), dur(60)), Some(vec![-120, -60]));
+    }
+
+    #[test]
+    fn hop_starts_refuses_bad_durations_like_bucketed() {
+        assert_eq!(dt(10).hop_starts(dur(0), dur(60)), None, "size ≤ 0");
+        assert_eq!(dt(10).hop_starts(dur(60), dur(0)), None, "hop ≤ 0");
+        // A sub-second duration is not representable at the Sec unit.
+        let half_ms = Duration::new(500, TimeUnit::Milli);
+        assert_eq!(dt(10).hop_starts(half_ms, dur(60)), None);
     }
 }
 
@@ -1211,6 +1344,24 @@ impl TimeOfDay {
         (total_s / 3600, (total_s / 60) % 60, total_s % 60, sub)
     }
 
+    /// Append the default `HH:mm:ss[.frac]` rendering directly (LUT digits,
+    /// no `fmt` machinery) and return `true`; `false` (buffer untouched) when
+    /// a component wouldn't fit two digits (ticks are bounded to one day, so
+    /// this is purely defensive). Shared by `Display` and the sink writers.
+    pub fn push_default(&self, out: &mut String) -> bool {
+        let (h, m, s, sub) = self.parts();
+        if !(0..100).contains(&h) || !(0..100).contains(&m) || !(0..100).contains(&s) {
+            return false;
+        }
+        crate::numfmt::push_hms(out, h, m, s);
+        let w = unit_sub_digits(self.unit);
+        if w > 0 && sub != 0 {
+            out.push('.');
+            crate::numfmt::push_frac(out, sub, w);
+        }
+        true
+    }
+
     /// Parse `HH:mm:ss[.frac]` at `unit`. `None` for a malformed or out-of-range
     /// time (hour `0..23`, minute/second `0..59`) — never-silent, so a bad time
     /// never silently maps to a nearby one.
@@ -1254,6 +1405,10 @@ impl TimeOfDay {
 
 impl fmt::Display for TimeOfDay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = String::with_capacity(18);
+        if self.push_default(&mut out) {
+            return f.write_str(&out);
+        }
         let (h, m, s, sub) = self.parts();
         write!(f, "{h:02}:{m:02}:{s:02}")?;
         let w = unit_sub_digits(self.unit);

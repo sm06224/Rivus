@@ -11,6 +11,7 @@
 
 pub mod chunk;
 pub mod error;
+pub mod numfmt;
 pub mod numparse;
 pub mod schema;
 pub mod suggest;

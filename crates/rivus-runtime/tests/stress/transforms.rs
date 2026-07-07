@@ -1228,3 +1228,49 @@ fn fill_mean_median_fill_numeric_null_cells() {
         assert_eq!(got.iter().filter(|s| *s == "20.5").count(), 2, "@cs={cs}");
     }
 }
+
+#[test]
+fn path_funcs_and_negative_split_part() {
+    // #199: basename/stem/dirname + split_part(-1) — the "short filename in a
+    // report" idiom for provenance columns. Deterministic across platforms
+    // (splits on `/` and `\`).
+    let text = "p\n/tmp/x/sales/jp.csv\nplain.txt\n.env\na/b/c.tar.gz\n";
+    let f = TempCsv(gendata::write_temp_bytes("path_funcs", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "P:\n open {p} (p:str)\n |> (basename(p)) as b (stem(p)) as s \
+         (dirname(p)) as d (split_part(p, \"/\", -1)) as last\n;"
+    );
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "P", "b"),
+        vec!["jp.csv", "plain.txt", ".env", "c.tar.gz"]
+    );
+    assert_eq!(
+        collect_strings(&res, "P", "s"),
+        vec!["jp", "plain", ".env", "c.tar"],
+        "stem strips only the final extension; a leading dot is a name"
+    );
+    assert_eq!(
+        collect_strings(&res, "P", "d"),
+        vec!["/tmp/x/sales", ".", ".", "a/b"],
+        "POSIX dirname: no separator → `.`"
+    );
+    assert_eq!(
+        collect_strings(&res, "P", "last"),
+        vec!["jp.csv", "plain.txt", ".env", "c.tar.gz"],
+        "split_part -1 = last field"
+    );
+}
+
+#[test]
+fn unary_minus_literal_evaluates() {
+    // #199 companion: `(x * -1)` — the negative literal rides the normal
+    // arithmetic path end-to-end.
+    let text = "x\n7\n-3\n";
+    let f = TempCsv(gendata::write_temp_bytes("unary_minus", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("N:\n open {p} (x:int)\n |> ((x * -1)) as neg\n;");
+    let res = run_src(&flow, 4096);
+    assert_eq!(collect_i64(&res, "N", "neg"), vec![-7, 3]);
+}

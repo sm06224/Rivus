@@ -662,8 +662,12 @@ Used in `|?` predicates and `(…)` computed columns.
 
 - *string* — `upper(s)`, `lower(s)`, `trim(s)`, `len(s)` → int,
   `substr(s, start, len)` (1-based start, SQL convention),
-  `replace(s, from, to)`, `split_part(s, sep, n)` (1-based field),
-  `concat(a, b, …)`.
+  `replace(s, from, to)`, `split_part(s, sep, n)` (1-based field; negative
+  counts from the end, `-1` = last), `concat(a, b, …)`.
+- *path* — `basename(p)` (final segment: `/x/y/jp.csv` → `jp.csv`),
+  `stem(p)` (basename without its extension: `jp`), `dirname(p)` (the path
+  up to the final segment, POSIX style: no separator → `.`). The idiomatic
+  way to shorten a `with filename` provenance column for reports (#199).
 - *predicates* (→ bool) — `contains(s, sub)`, `starts_with(s, p)`,
   `ends_with(s, p)`, `like(s, pat)`, `glob(s, pat)`, and (with `--features
   regex`) the regex test: `s ~ 're'` — the **`~` infix** with a raw `'…'`
@@ -808,7 +812,15 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   non-instant (continue-first; only `!=` holds against it).
 - **Functions**: `year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)`
   `second(ts)` (→ integers); `trunc(ts, "day"|"hour"|"minute"|"month"|"year")`
-  (→ datetime bucket key); `format(ts, "fmt")` (→ text, same tokens incl.
+  (→ datetime bucket key); `bucket(ts, "15m")` (→ arbitrary-width tumbling
+  window key, closed-open, epoch-aligned); `hops(ts, size, hop)` (→ the *list*
+  of **sliding-window** start keys containing `ts` — explode it and group:
+  `|> (hops(ts, "5m", "1m")) as w price` → `explode w` → `|# w avg:price`;
+  `hops(x, s, s)` degenerates to `bucket`, §36); **session windows**:
+  `sessionize ts gap "30m" [by user]` appends a `session` column (the session's
+  start datetime — group on it: `|# user session …`; a new session starts when
+  the per-group gap exceeds the duration, out-of-order input is surfaced, §36.5);
+  `format(ts, "fmt")` (→ text, same tokens incl.
   `ddd`/`[ja-jp]`/`n…n` — `format(ts, "[ja-jp]ddd")` renders `水`). Default
   rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss` (+ full-width fraction on a
   sub-second lane).

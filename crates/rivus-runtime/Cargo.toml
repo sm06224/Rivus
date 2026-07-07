@@ -32,8 +32,8 @@ notify = { version = "8.2", optional = true, default-features = false, features 
 ] }
 # Off-by-default: Apache Parquet input (read-only slice). The official
 # apache/arrow-rs `parquet` crate **without the arrow feature** — the row/
-# column API only, which keeps the transitive tree at ~22 pure-Rust crates
-# (no C build step anywhere). Codecs: uncompressed + snappy (`snap`, the
+# column API only, which keeps the transitive tree at 30 pure-Rust crates
+# (measured via `cargo tree`; no C build step anywhere). Codecs: uncompressed + snappy (`snap`, the
 # de-facto writer default) + gzip via the same pure-Rust `flate2` backend the
 # `gzip` feature already vets. See SUPPLY-CHAIN.md (selected adapter).
 parquet = { version = "59", optional = true, default-features = false, features = [

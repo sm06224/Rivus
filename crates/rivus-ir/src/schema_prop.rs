@@ -96,6 +96,19 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
                     .collect(),
             )
         }),
+        // `sessionize` appends the `session` column (the ts column's datetime
+        // lane) when the named ts column exists on a datetime lane; otherwise
+        // the runtime warns and passes through, so the schema stays unchanged.
+        Op::Sessionize { ts, .. } => input.map(|s| {
+            let mut s = s;
+            if let Some(i) = s.index_of(ts) {
+                if matches!(s.fields[i].dtype, DataType::DateTime { .. }) {
+                    let dtype = s.fields[i].dtype;
+                    s.fields.push(Field::new("session", dtype));
+                }
+            }
+            s
+        }),
         // `explode COL` keeps every column but replaces the `List` lane with its
         // element field (§32 s4c); other columns are unchanged. A non-list (or
         // unknown) `COL` leaves the schema untouched (runtime warns).
@@ -403,6 +416,8 @@ fn func_type(func: Func, args: &[Expr], schema: &Schema) -> DataType {
             .first()
             .map(|a| expr_type(a, schema))
             .unwrap_or(DataType::F64),
+        // The sliding-window derived keys: a list of datetime starts (§30.4).
+        Hops => DataType::List,
         Date => DataType::Date,
         // Text-producing / null-coalescing / everything else is nominal text.
         _ => DataType::Str,

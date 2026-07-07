@@ -82,9 +82,19 @@ pub enum Func {
     Regexp,
     /// `replace(s, from, to)` — replace every occurrence of a literal substring.
     Replace,
-    /// `split_part(s, sep, n)` — the `n`-th field (1-based) after splitting `s`
-    /// on the literal separator `sep`; empty string when out of range.
+    /// `split_part(s, sep, n)` — the `n`-th field (1-based; negative counts
+    /// from the end, `-1` = last) after splitting `s` on the literal separator
+    /// `sep`; empty string when out of range. #199.
     SplitPart,
+    /// `basename(path)` — the final path segment (`/x/y/jp.csv` → `jp.csv`).
+    /// Splits on `/` and `\` (deterministic across platforms). #199.
+    Basename,
+    /// `stem(path)` — the basename without its final extension (`jp.csv` →
+    /// `jp`; a leading-dot name like `.env` keeps the dot). #199.
+    Stem,
+    /// `dirname(path)` — the path up to (excluding) the final segment, POSIX
+    /// style: no separator → `.`, root-only → `/`. #199.
+    Dirname,
     /// `concat(a, b, …)` — concatenate all arguments as text (any arity).
     Concat,
     /// `abs(x)` — absolute value (numeric).
@@ -112,6 +122,12 @@ pub enum Func {
     Trunc,
     /// `bucket(ts, dur)` — bucket a datetime into arbitrary dur boundaries (closed-open).
     Bucket,
+    /// `hops(ts, size, hop)` — the **list** of sliding-window start datetimes
+    /// (epoch-aligned, closed-open, ascending) containing `ts`. The sliding
+    /// generalization of `bucket` under §30's "a window is a derived grouping
+    /// key": `hops` derives the *keys* (plural) and the existing `explode` +
+    /// `|#` do the rest. `hop == size` degenerates to `bucket`. §30.4 / #60.
+    Hops,
     /// `format(ts, "yyyy-MM-dd")` — render a datetime as text. Design 23.
     Format,
     /// `weekday(x)` — ISO day-of-week of a date/datetime: `0 = Mon … 6 = Sun`
@@ -146,6 +162,9 @@ impl Func {
             "regexp",
             "replace",
             "split_part",
+            "basename",
+            "stem",
+            "dirname",
             "concat",
             "abs",
             "round",
@@ -165,6 +184,7 @@ impl Func {
             "date",
             "time",
             "bucket",
+            "hops",
         ]
     }
 
@@ -183,6 +203,9 @@ impl Func {
             "regexp" | "regex" | "matches" => Func::Regexp,
             "replace" => Func::Replace,
             "split_part" => Func::SplitPart,
+            "basename" => Func::Basename,
+            "stem" => Func::Stem,
+            "dirname" => Func::Dirname,
             "concat" => Func::Concat,
             "abs" => Func::Abs,
             "round" => Func::Round,
@@ -197,6 +220,7 @@ impl Func {
             "second" => Func::Second,
             "trunc" => Func::Trunc,
             "bucket" => Func::Bucket,
+            "hops" => Func::Hops,
             "format" => Func::Format,
             "weekday" => Func::Weekday,
             "is_weekend" => Func::IsWeekend,
@@ -220,6 +244,9 @@ impl Func {
             Func::Regexp => "regexp",
             Func::Replace => "replace",
             Func::SplitPart => "split_part",
+            Func::Basename => "basename",
+            Func::Stem => "stem",
+            Func::Dirname => "dirname",
             Func::Concat => "concat",
             Func::Abs => "abs",
             Func::Round => "round",
@@ -234,6 +261,7 @@ impl Func {
             Func::Second => "second",
             Func::Trunc => "trunc",
             Func::Bucket => "bucket",
+            Func::Hops => "hops",
             Func::Format => "format",
             Func::Weekday => "weekday",
             Func::IsWeekend => "is_weekend",
