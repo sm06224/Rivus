@@ -654,3 +654,139 @@ fn test_bucket_tumbling_window_evaluation() {
         ]
     );
 }
+
+// --- sliding windows via `hops(ts, size, hop)` + explode + `|#` (§30.4 / #60,
+// research prototype: sliding = derived grouping KEYS, plural). ---
+
+#[test]
+fn sliding_window_hops_explode_group_matches_oracle() {
+    // 5 ticks, size=2m hop=1m: each row lands in exactly two windows (the
+    // epoch-aligned starts covering it), and the per-window avg/count follow.
+    let text = "ts,price\n\
+                2024-06-03T09:00:10,100\n\
+                2024-06-03T09:00:50,110\n\
+                2024-06-03T09:01:30,120\n\
+                2024-06-03T09:02:10,130\n\
+                2024-06-03T09:04:30,200\n";
+    let f = TempCsv(gendata::write_temp_bytes("slide_oracle", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "W:\n open {p} (ts:datetime price:int)\n |> (hops(ts, \"2m\", \"1m\")) as w price\n \
+         explode w\n |# w avg:price\n sort w\n;"
+    );
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "W", "w"),
+            vec![
+                "2024-06-03T08:59:00",
+                "2024-06-03T09:00:00",
+                "2024-06-03T09:01:00",
+                "2024-06-03T09:02:00",
+                "2024-06-03T09:03:00",
+                "2024-06-03T09:04:00",
+            ],
+            "window starts @cz={cz}"
+        );
+        assert_eq!(
+            collect_i64(&res, "W", "count"),
+            vec![2, 3, 2, 1, 1, 1],
+            "per-window membership @cz={cz}"
+        );
+        assert_eq!(
+            collect_strings(&res, "W", "avg_price"),
+            vec!["105", "110", "125", "130", "200", "200"],
+            "per-window avg @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn hops_gap_and_degenerate_cases() {
+    // hop > size leaves gaps: a tick between windows yields an EMPTY list →
+    // explode drops the row (zero windows is a real answer, not an error).
+    // hop == size degenerates to tumbling (== bucket).
+    let text = "ts,v\n2024-01-01T00:00:30,1\n2024-01-01T00:03:30,2\n";
+    let f = TempCsv(gendata::write_temp_bytes("slide_gap", text.as_bytes()));
+    let p = f.0.display();
+    // size=1m hop=3m: only ticks in the first minute of each 3m hop belong.
+    let flow = format!(
+        "G:\n open {p} (ts:datetime v:int)\n |> (hops(ts, \"1m\", \"3m\")) as w v\n \
+         explode w\n |# w count:v\n sort w\n;"
+    );
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "G", "w"),
+        vec!["2024-01-01T00:00:00", "2024-01-01T00:03:00"],
+        "hop>size: each tick in ≤1 window, gap ticks in none"
+    );
+    // hop == size ≡ bucket: identical keys.
+    let tumbling = format!(
+        "T:\n open {p} (ts:datetime v:int)\n |> (hops(ts, \"3m\", \"3m\")) as w v\n \
+         explode w\n |# w count:v\n sort w\n;"
+    );
+    let bucketed = format!(
+        "T:\n open {p} (ts:datetime v:int)\n |> (bucket(ts, \"3m\")) as w v\n \
+         |# w count:v\n sort w\n;"
+    );
+    assert_eq!(
+        collect_strings(&run_src(&tumbling, 4096), "T", "w"),
+        collect_strings(&run_src(&bucketed, 4096), "T", "w"),
+        "hops(size==hop) must degenerate to bucket"
+    );
+}
+
+#[test]
+fn sliding_window_serial_parallel_chunk_size_byte_identical() {
+    // Exact aggregates (count/max) over sliding windows are byte-identical
+    // across the serial and parallel paths and chunk sizes (§30.6: windows add
+    // no new parallel hazard — the window key is just another group key).
+    let rows = 200_000usize;
+    let mut text = String::from("ts,v\n");
+    for i in 0..rows {
+        let (h, m, s) = ((i / 3600) % 24, (i / 60) % 60, i % 60);
+        text.push_str(&format!("2024-06-03T{h:02}:{m:02}:{s:02},{}\n", i % 1000));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("slide_bi", text.as_bytes()));
+    let p = f.0.display();
+    let run_one = |cz: usize, pref: rivus_runtime::MemoryPref| {
+        let flow = format!(
+            "B:\n open {p} (ts:datetime v:int)\n |> (hops(ts, \"10m\", \"5m\")) as w v\n \
+             explode w\n |# w count:v max:v\n sort w\n;"
+        );
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cz,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let mut lines = Vec::new();
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("B"))
+            .expect("output");
+        for c in &o.chunks {
+            for r in 0..c.len {
+                let cells: Vec<String> = (0..c.columns.len())
+                    .map(|ci| c.value(r, ci).to_string())
+                    .collect();
+                lines.push(cells.join("\u{1f}"));
+            }
+        }
+        lines
+    };
+    let oracle = run_one(1024, rivus_runtime::MemoryPref::Low);
+    assert!(!oracle.is_empty());
+    for cz in [777usize, 4096] {
+        assert_eq!(
+            run_one(cz, rivus_runtime::MemoryPref::Fast),
+            oracle,
+            "sliding window must be serial==parallel==chunk-size @cz={cz}"
+        );
+    }
+}

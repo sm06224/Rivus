@@ -811,7 +811,11 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   non-instant (continue-first; only `!=` holds against it).
 - **Functions**: `year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)`
   `second(ts)` (→ integers); `trunc(ts, "day"|"hour"|"minute"|"month"|"year")`
-  (→ datetime bucket key); `format(ts, "fmt")` (→ text, same tokens incl.
+  (→ datetime bucket key); `bucket(ts, "15m")` (→ arbitrary-width tumbling
+  window key, closed-open, epoch-aligned); `hops(ts, size, hop)` (→ the *list*
+  of **sliding-window** start keys containing `ts` — explode it and group:
+  `|> (hops(ts, "5m", "1m")) as w price` → `explode w` → `|# w avg:price`;
+  `hops(x, s, s)` degenerates to `bucket`, §36); `format(ts, "fmt")` (→ text, same tokens incl.
   `ddd`/`[ja-jp]`/`n…n` — `format(ts, "[ja-jp]ddd")` renders `水`). Default
   rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss` (+ full-width fraction on a
   sub-second lane).

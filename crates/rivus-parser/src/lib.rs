@@ -4620,6 +4620,18 @@ Import:
     }
 
     #[test]
+    fn hops_parses_and_round_trips() {
+        // §36: sliding-window derived keys — hops + explode + group.
+        let g = parse(
+            "W:\n open t.csv (ts:datetime v:int)\n |> (hops(ts, \"2m\", \"1m\")) as w v\n explode w\n |# w avg:v\n;",
+        )
+        .unwrap();
+        let src = g.to_source();
+        assert!(src.contains("hops($_.ts, \"2m\", \"1m\")"), "{src}");
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+    }
+
+    #[test]
     fn map_and_bare_blocks_refuse_with_guidance() {
         // #203: `| map { … }` / `| { … }` used to parse and silently drop the
         // block (a no-op the user reads as a working transform).
