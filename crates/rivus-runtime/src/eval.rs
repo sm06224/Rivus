@@ -834,6 +834,15 @@ fn cast_str_column_temporal(
 /// `fails` counts non-null string cells that fail a temporal parse (→ `null`,
 /// continue-first); the operator surfaces the total (never-silent, BUG-D §23.6).
 pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column {
+    // Identity fast-path: a column already in the exact target lane (dtype
+    // carries scale/unit, so this is precise) needs no work — returning it
+    // verbatim is byte-identical and skips the per-cell `Value` round-trip that
+    // otherwise rebuilds every cell. Dominates union-by-name `read`
+    // reconciliation, where each file's columns usually already match the union
+    // type. No parse happens, so `fails` is unchanged.
+    if col.dtype() == ty {
+        return col;
+    }
     let n = col.len();
     // Source-aware temporal parse: a *string* column cast to datetime/date/time
     // is parsed per cell (auto formats), not reinterpreted as ticks.
@@ -1044,7 +1053,46 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
                 // Numeric / coalesce funcs produce a value whose lane depends on
                 // the data (e.g. `round` is integral, `coalesce` may be text),
                 // so pick the narrowest fitting lane per chunk.
-                Func::Abs | Func::Round | Func::Floor | Func::Ceil | Func::Coalesce => {
+                // Columnar `coalesce` fast path: evaluate each argument to a
+                // column once, and when they all ride the `Str` lane pick the
+                // first non-null cell per row by **borrowing** the winning
+                // column's `&str` — no per-cell `Value` box / `String` alloc (the
+                // dominant cost of `coalesce(col, "…")` over a large chunk). Mixed
+                // lanes fall back to the per-cell path (byte-identical either way).
+                Func::Coalesce => {
+                    let cols: Vec<Column> =
+                        args.iter().map(|a| eval_column(a, chunk, fails)).collect();
+                    if !cols.is_empty()
+                        && cols.iter().all(|c| matches!(c.data(), ColumnData::Str(_)))
+                    {
+                        let mut out = StrColumn::with_capacity(n, n * 4);
+                        let mut valid = Vec::with_capacity(n);
+                        for r in 0..n {
+                            let mut hit = false;
+                            for c in &cols {
+                                if !c.is_null(r) {
+                                    if let ColumnData::Str(s) = c.data() {
+                                        out.push(s.get(r));
+                                    }
+                                    valid.push(true);
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            if !hit {
+                                out.push("");
+                                valid.push(false);
+                            }
+                        }
+                        Column::new(ColumnData::Str(out), Validity::from_bits(&valid))
+                    } else {
+                        let vals: Vec<Value> = (0..n)
+                            .map(|r| call_func(*func, args, chunk, r, fails))
+                            .collect();
+                        column_from_values(vals)
+                    }
+                }
+                Func::Abs | Func::Round | Func::Floor | Func::Ceil => {
                     let vals: Vec<Value> = (0..n)
                         .map(|r| call_func(*func, args, chunk, r, fails))
                         .collect();

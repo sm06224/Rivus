@@ -650,30 +650,40 @@ impl Operator for GroupBy {
         // borrow `self.aggs` while `self.groups` is mutably borrowed.
         let funcs: Vec<AggFunc> = self.aggs.iter().map(|(f, _)| *f).collect();
 
+        // Composite map key built into a REUSED buffer across rows: the previous
+        // form allocated a fresh `String` per row AND a throwaway `Vec<String>`
+        // (`parts`) per row — but only *new* groups need `parts`, so 3M rows over
+        // 16 groups wasted ~3M allocations each. Now the key reuses one buffer and
+        // `parts` is rendered only when a group is first inserted. Byte-identical.
+        let mut composite = String::new();
         for row in 0..chunk.len {
-            // Composite map key: the key values joined by the ASCII unit
-            // separator (0x1F), which can't appear in a parsed CSV field, so
-            // distinct key tuples never collide. The parts are kept on the state
-            // for output.
-            let parts: Vec<String> = key_idx
-                .iter()
-                .map(|&i| chunk.value(row, i).to_string())
-                .collect();
             // Dedup composite tags null distinctly so a `null` key folds into one
-            // group and never collides with a real value (§26.2b); `parts` keeps
-            // the rendered text for the output key column.
-            let mut composite = String::new();
+            // group and never collides with a real value (§26.2b).
+            composite.clear();
             for (j, &i) in key_idx.iter().enumerate() {
                 if j > 0 {
                     composite.push('\u{1f}');
                 }
                 push_group_key_field(&mut composite, &chunk, i, row);
             }
-            let state = self.groups.entry(composite).or_insert_with(|| GroupState {
-                key_parts: parts,
-                count: 0,
-                accs: funcs.iter().map(|f| AggAcc::new(*f)).collect(),
-            });
+            // Hot path: an existing group needs no allocation (`String: Borrow<str>`
+            // looks the buffer up directly). A new group renders its output key
+            // parts once.
+            if !self.groups.contains_key(composite.as_str()) {
+                let parts: Vec<String> = key_idx
+                    .iter()
+                    .map(|&i| chunk.value(row, i).to_string())
+                    .collect();
+                self.groups.insert(
+                    composite.clone(),
+                    GroupState {
+                        key_parts: parts,
+                        count: 0,
+                        accs: funcs.iter().map(|f| AggAcc::new(*f)).collect(),
+                    },
+                );
+            }
+            let state = self.groups.get_mut(composite.as_str()).unwrap();
             state.count += 1;
             for (j, idx) in agg_idx.iter().enumerate() {
                 if let Some(ci) = idx {

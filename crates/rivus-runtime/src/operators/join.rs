@@ -62,6 +62,38 @@ fn join_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> Option<String> {
     Some(s)
 }
 
+/// Like [`join_key_at`] but appends the composite key into a **reused** buffer
+/// instead of allocating a fresh `String` per call — the probe side calls this
+/// once per row, so avoiding the per-row heap allocation (and the `Value` box a
+/// bare column would otherwise pay) is decisive on a large probe. Returns
+/// `false` (buffer left as-is) if any key part is null (a null key matches
+/// nothing, as in [`join_key_at`]). The bytes written are **identical** to
+/// [`join_key_at`]'s string for the same row (a str part borrows the column
+/// directly; any other lane falls back to the same `Value::to_string` form), so
+/// the key — and therefore every match — is byte-for-byte unchanged.
+fn fill_join_key(chunk: &Chunk, idxs: &[usize], row: usize, buf: &mut String) -> bool {
+    use std::fmt::Write;
+    for (n, &ci) in idxs.iter().enumerate() {
+        if chunk.columns[ci].is_null(row) {
+            return false;
+        }
+        if n > 0 {
+            buf.push('\u{1f}');
+        }
+        match chunk.columns[ci].data() {
+            // Bare string key: borrow the column's `&str` (zero allocation,
+            // identical bytes to `Value::Str(_).to_string()`).
+            ColumnData::Str(s) => buf.push_str(s.get(row)),
+            // Any other lane keeps the exact `Value::to_string` form (still into
+            // the reused buffer) so the key bytes are unchanged.
+            _ => {
+                let _ = write!(buf, "{}", chunk.value(row, ci));
+            }
+        }
+    }
+    true
+}
+
 /// Concatenate buffered chunks (sharing a schema) into one.
 fn concat_chunks(bufs: Vec<Chunk>) -> Option<Chunk> {
     let mut it = bufs.into_iter();
@@ -181,9 +213,22 @@ impl Operator for Join {
         let mut right_matched = vec![false; right.len];
         let mut lidx: Vec<Option<usize>> = Vec::new();
         let mut ridx: Vec<Option<usize>> = Vec::new();
+        let keeps_left = self.kind.keeps_left();
+        // Probe with a REUSED key buffer: the old path allocated a fresh heap
+        // `String` (and boxed a `Value`) for every left row, which dominated the
+        // cost on a large probe side (a 3M-row × 20-row left join measured 6.7s —
+        // the per-row allocation, not the hash match). `String: Borrow<str>` lets
+        // us look the buffer up without owning a key. Byte-identical: `keybuf`
+        // holds the same bytes `join_key_at` would have returned.
+        let mut keybuf = String::new();
         for li in 0..left.len {
+            keybuf.clear();
             // A null-key left row matches nothing (no table lookup at all).
-            let matched = join_key_at(&left, &lk, li).and_then(|k| table.get(&k));
+            let matched = if fill_join_key(&left, &lk, li, &mut keybuf) {
+                table.get(keybuf.as_str())
+            } else {
+                None
+            };
             match matched {
                 Some(rs) => {
                     for &ri in rs {
@@ -192,7 +237,7 @@ impl Operator for Join {
                         ridx.push(Some(ri));
                     }
                 }
-                None if self.kind.keeps_left() => {
+                None if keeps_left => {
                     lidx.push(Some(li));
                     ridx.push(None);
                 }

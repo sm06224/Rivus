@@ -524,7 +524,15 @@ pub(crate) fn push_group_key_field(key: &mut String, chunk: &Chunk, ci: usize, r
         key.push('\u{0}');
     } else {
         key.push('\u{1}');
-        key.push_str(&chunk.value(row, ci).to_string());
+        match chunk.columns[ci].data() {
+            // Bare string key: borrow the column's `&str` (zero allocation;
+            // identical bytes to `Value::Str(_).to_string()`).
+            ColumnData::Str(s) => key.push_str(s.get(row)),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(key, "{}", chunk.value(row, ci));
+            }
+        }
     }
 }
 

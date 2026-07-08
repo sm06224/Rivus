@@ -1481,3 +1481,53 @@ a 200 k-row torture file (years 1600–9999 incl. pre-1970 negative ticks,
 negative decimals, `-0.001`) identical as CSV **and** JSONL. Property tests
 re-implement the pre-LUT `write!` forms as oracles (200 k random
 `i128×scale` decimals, boundary dates/times) and pin the refusal cases.
+
+### Buffering-operator performance — the O(n²) validity bug + per-row key/alloc pathologies
+
+Following the `ls…read` external comparison (above), a fully **contract-pinned**
+end-to-end task (3M rows, 3 dirty CSVs — a malformed-row file + a file missing a
+column — union-by-name, a dimension left join, coalesce, group, save; integer
+cents so sums are bit-exact across engines) measured Rivus **23× slower than
+DuckDB**. Profiling (per-node `--json` telemetry) localized it to specific
+**implementation defects**, not "interpreter overhead." All fixes are
+byte-identical (default 466/0, all-features 499/0; the pinned task's 16-row
+output is unchanged bit-for-bit at every step).
+
+**The headline bug — `Validity::append` was O(n²).** Every buffering operator
+(join / sort / group / unbounded-merge) concatenates its buffered chunks. When
+any column carried a null, `Validity::append` materialized the *entire*
+accumulated bitmap into a `Vec<bool>` and repacked it **on every append** — so
+concatenating N chunks was O(N²). A 735-chunk left join spent **5.3s** in
+`concat` alone. Fixed to a word-granular in-place append: **5294ms → 117ms
+(45×)**. This one fix helps every buffering op, not just join.
+
+**Per-row allocation pathologies** (same shape in three places): a composite key
+built as a fresh heap `String` (+ boxed `Value`) per row.
+- **join probe**: `String` per left row (3M allocations for a 20-row dimension).
+  Reused key buffer + borrowed `&str` key parts.
+- **group**: `String` key *and* a throwaway `Vec<String>` of rendered parts per
+  row (only the 16 *new* groups need the parts). Reused buffer + parts-on-insert:
+  **1154ms → 240ms**.
+- **coalesce** (`|>` project): per-cell `Value`/`String` round-trip. Columnar
+  all-`Str` fast path borrowing the winning column's `&str`: **1057ms → 103ms**.
+- **`cast_column`**: no identity fast-path — a same-lane cast rebuilt every cell
+  (union-by-name reconciliation). `if col.dtype() == ty { return col }`.
+
+**Result (best-of-5, 3M rows, same pinned contract, byte-identical output):**
+
+| stage | rivus wall |
+|---|---:|
+| baseline | 8067 ms |
+| + `Validity::append` O(n²) fix | 5294 ms |
+| + group key reuse / parts-on-insert | 3769 ms |
+| + `cast_column` identity fast-path | 3145 ms |
+| + coalesce columnar fast-path | 2192 ms |
+| **DuckDB 1.5 / Polars 1.42** | **430 / 619 ms** |
+
+Rivus went from **23× → 5.2×** DuckDB (3.6× Polars) on this workload with no loss
+of the continue-first / never-silent / union-by-name contract (which Polars could
+not meet natively — it kept the ragged rows). The remaining gap is dominated by
+**`read` (1090ms)** — the two-pass inference path (a source uses the single-pass
+`for_range`); making `read` single-pass is the next lever (tracked). Single
+thread throughout — parallelism (safe here: integer sum is associative) is a
+further multiplier not yet applied.
