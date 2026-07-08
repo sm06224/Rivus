@@ -1481,3 +1481,65 @@ a 200 k-row torture file (years 1600–9999 incl. pre-1970 negative ticks,
 negative decimals, `-0.001`) identical as CSV **and** JSONL. Property tests
 re-implement the pre-LUT `write!` forms as oracles (200 k random
 `i128×scale` decimals, boundary dates/times) and pin the refusal cases.
+
+### `ls … read` multi-file fan-out — the tax is per-row, not per-file (投書: 「凄まじく重たい」)
+
+A user report that piping many files from `ls` into `read` is "tremendously
+heavy" (2026-07-08). Benchmarked the whole path to find where the time goes.
+
+**Setup.** 1,000,000 total rows, 4 columns (`id:int v:int amount:float
+region:str`), ~20 MB, split two ways to isolate per-file vs per-row cost.
+Release, best-of-3, each path ends in `|# region count:id` (consumes every row):
+
+| path (1 M rows total) | best | vs `open` |
+|---|---:|---:|
+| `open concat.csv` (1 file) | **162 ms** | 1.0× |
+| `ls "few/*.csv" read` (20 files) | 597 ms | 3.7× |
+| `ls "many/*.csv" read` (200 files) | 609 ms | 3.8× |
+| `ls "many/*.csv"` only (200 files, no `read`) | **5 ms** | — |
+
+**Findings (measured, not assumed).**
+
+1. **Discovery (`ls`) is innocent** — 5 ms for 200 handles.
+2. **The cost is per-row, not per-file** — 20 files (597 ms) ≈ 200 files
+   (609 ms). "Multiple files are heavy" is really a flat **~3.8× per-row tax the
+   `read` operator adds**, independent of file count. Reading a *single* 1 M-row
+   file through `read` (609 ms) is the same 3.8× over `open` (162 ms) — so it is
+   not the union-across-files either.
+3. **`read.finish` phase breakdown** (instrumented, single 1 M file):
+   - **type-inference pass — 154 ms** (`CsvChunker::open` streams the whole file
+     once just to infer types), then
+   - **decode pass — 184 ms** (streams it again to materialize columns), then
+   - reconcile ~20 ms.
+4. **Root cause — `read` is on the slow reader path the *source* already left
+   behind.** `open` is fast because it (a) **sample-infers** types from the first
+   chunk (Phase 0.5), (b) gets **projection pushdown** so only the columns the
+   query needs are decoded (Phase 0.4), and (c) decodes in a **single typed pass**
+   (`CsvChunker::for_range` with known dtypes). `read` does none of these: it
+   full-file-infers, decodes **every** column, and pays **two passes** per file.
+
+**Landed now (safe, byte-identical).** `eval::cast_column` had **no identity
+fast-path** — even a cast to a column's own lane rebuilt every cell via a
+`Value` round-trip. `read`'s union-by-name reconciliation called it on every
+column of every chunk unconditionally, so a no-op cast on 1 M×4 cells cost
+~80 ms. Added `if col.dtype() == ty { return col }` (dtype carries scale/unit, so
+it is exact). Reconcile 80 ms → 20 ms; `read` 685 → 609 ms (~12–17%). Verified
+byte-identical (read + byte_identity + io_formats stress, 51 tests green). This
+is a general win — any same-lane cast across the engine now skips the rebuild.
+
+**The bigger levers (the ~154 ms inference pass = 43 % of the per-file cost).**
+Three ways to close the remaining gap, in ascending risk:
+
+- **Projection pushdown into `read`** (byte-identical) — decode only the columns
+  the downstream needs, exactly as the source does (Phase 0.4). Big win for the
+  common `ls … read |# …` / `|> …` shapes; no type changes.
+- **infer+decode fusion in `CsvChunker`** (byte-identical) — keep full-file
+  inference for correctness, but materialize columns *during* the inference pass
+  so the second pass disappears (~150 ms). A core-reader change touching every
+  caller, so a careful, well-tested slice.
+- **Sample inference for `read`** (⚠ **ratification** — changes byte-identity) —
+  make `read` sample-infer like `open`. ~2× the win, but a column that only
+  widens *past* the sample (e.g. `int` for 4096 rows then `"N/A"`) would be
+  typed differently than `read`'s current honest full-file inference. `open`
+  already accepts this trade-off, so this makes `read` *consistent* with `open`
+  — but it changes `read`'s current output, so it is not taken silently.

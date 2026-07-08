@@ -834,6 +834,16 @@ fn cast_str_column_temporal(
 /// `fails` counts non-null string cells that fail a temporal parse (→ `null`,
 /// continue-first); the operator surfaces the total (never-silent, BUG-D §23.6).
 pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column {
+    // Identity fast-path: a column already in the exact target lane (dtype
+    // carries scale/unit, so this is precise) needs no work — returning it
+    // verbatim is byte-identical and skips the per-cell `Value` round-trip that
+    // otherwise rebuilds every cell. This dominates union-by-name `read`
+    // reconciliation, where each file's columns usually already match the union
+    // type: a no-op cast on 1M×4 cells was ~4.5× the cost of `open` (#62-adjacent
+    // read fan-out). No parse happens, so `fails` is unchanged.
+    if col.dtype() == ty {
+        return col;
+    }
     let n = col.len();
     // Source-aware temporal parse: a *string* column cast to datetime/date/time
     // is parsed per cell (auto formats), not reinterpreted as ticks.
