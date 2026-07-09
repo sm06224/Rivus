@@ -1585,6 +1585,18 @@ Per-node at 10M (CSV): read 1285 / join 1373 / group 760 / cast+filter+project
 ~1180 — no single villain left; the gap is now the **serial sum of nodes**
 (DuckDB runs the whole pipeline on 4 cores). JSONL: read 7926ms — the serial
 `infer_global` (a full JSON parse of every line) plus the decode re-parse
-dominates; parallelizing JSONL inference like CSV's `infer_range` is the next
-format-specific lever. The engine-level levers stay: pipeline parallelism
-(integer sums here are associative ⇒ safe) and the buffering-memory ceiling.
+dominated.
+
+**Landed next — parallel JSONL inference.** `jsonl::plan_parallel` now infers
+each newline-aligned range on its own thread and folds the results in range
+order. The fold reproduces the sequential scan exactly: global column order =
+the earliest started range's first valid object (= the file's first valid
+object); each key's `Infer` merges commutatively (scalar flags AND/OR; a
+struct's child order adopts the earliest range's first object; lists merge
+recursively); keys outside the global set are discarded; malformed counts sum.
+Verified: 10M JSONL output row-identical to DuckDB, malformed counts intact.
+JSONL `read` 7926 → **4257ms**; JSONL pipeline 11223 → **7684ms** (from 16.9s at
+the start of the catch-up = 2.2×).
+
+The engine-level levers stay: pipeline parallelism (integer sums here are
+associative ⇒ safe) and the buffering-memory ceiling.

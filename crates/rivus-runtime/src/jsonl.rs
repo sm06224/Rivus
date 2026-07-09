@@ -250,6 +250,36 @@ impl Infer {
             JType::Scalar(self.scalar.resolve())
         }
     }
+
+    /// Fold a LATER range's observations into this (earlier-range) inference —
+    /// the parallel-inference merge. Merging per-range `Infer`s **in range
+    /// order** reproduces the sequential scan exactly:
+    /// - scalar flags are commutative (`Flags::merge`);
+    /// - a struct's child-name order comes from the first object seen for the
+    ///   column — the earliest range that saw one (range-order fold ⇒ the same
+    ///   object the sequential scan would have hit first); a later range's
+    ///   extra child keys are ignored, mirroring `observe`;
+    /// - list element inference merges recursively.
+    fn merge(&mut self, other: &Infer) {
+        self.saw_scalar |= other.saw_scalar;
+        self.scalar.merge(&other.scalar);
+        match (&mut self.structs, &other.structs) {
+            (Some(a), Some(b)) => {
+                for (k, child) in b.names.iter().zip(&b.children) {
+                    if let Some(idx) = a.names.iter().position(|n| n == k) {
+                        a.children[idx].merge(child);
+                    }
+                }
+            }
+            (None, Some(b)) => self.structs = Some(b.clone()),
+            _ => {}
+        }
+        match (&mut self.list, &other.list) {
+            (Some(a), Some(b)) => a.merge(b),
+            (None, Some(b)) => self.list = Some(b.clone()),
+            _ => {}
+        }
+    }
 }
 
 /// A recursive [`Field`] (with nested detail) for an inferred [`JType`].
@@ -536,6 +566,15 @@ impl Flags {
             DataType::Str
         }
     }
+    /// Fold another range's observations in. Pure conjunction/disjunction, so
+    /// merging per-range flags in any order equals observing every value
+    /// sequentially — the parallel-inference merge is byte-identical.
+    fn merge(&mut self, o: &Flags) {
+        self.any |= o.any;
+        self.all_int &= o.all_int;
+        self.all_num &= o.all_num;
+        self.all_bool &= o.all_bool;
+    }
 }
 
 /// Does the file begin with a top-level JSON array (`[ … ]`)? Such a document is
@@ -559,6 +598,63 @@ pub fn is_json_array(path: &str) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// One range's pass-1 result: the first-seen keys with their inference state,
+/// the range's first valid object's key list (`None` if the range saw no valid
+/// object), and its malformed-line count.
+type RangeInfer = (Vec<(String, Infer)>, Option<Vec<String>>, usize);
+
+/// One byte range's inference (the parallel pass-1 worker): every first-seen
+/// key in the range with its [`Infer`], the range's **first valid object's key
+/// list** (the global column order comes from the earliest started range = the
+/// file's first valid object), and the malformed-line count. Observes ALL keys
+/// it encounters — a range may start inside rows that lack a global column, so
+/// restricting to the range's first object (as the sequential scan does with
+/// the file's first object) would drop observations the sequential scan makes.
+/// The merge in [`plan_parallel`] restricts to the global names, so extra keys
+/// are discarded there, exactly as the sequential scan never observes them.
+fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
+    let mut r = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    r.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut seen: Vec<(String, Infer)> = Vec::new();
+    // `Some` once the range saw a valid object — even an empty `{}` claims the
+    // column order (matching the sequential scan's `started` flag exactly).
+    let mut first_names: Option<Vec<String>> = None;
+    let mut bad_rows = 0usize;
+    let mut pos = start;
+    let mut line = String::new();
+    while pos < end {
+        line.clear();
+        match r.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(n) => pos += n as u64,
+            Err(_) => break,
+        }
+        let l = line.trim_end_matches(['\n', '\r']);
+        if l.trim().is_empty() {
+            continue;
+        }
+        match parse_object(l) {
+            Some(obj) => {
+                if first_names.is_none() {
+                    first_names = Some(obj.iter().map(|(k, _)| k.clone()).collect());
+                }
+                for (k, v) in &obj {
+                    match seen.iter_mut().find(|(n, _)| n == k) {
+                        Some((_, inf)) => inf.observe(v),
+                        None => {
+                            let mut inf = Infer::new();
+                            inf.observe(v);
+                            seen.push((k.clone(), inf));
+                        }
+                    }
+                }
+            }
+            None => bad_rows += 1,
+        }
+    }
+    Ok((seen, first_names, bad_rows))
 }
 
 /// Global type plan for a JSON-Lines file (pass 1): the column order from the
@@ -910,11 +1006,56 @@ pub fn plan_parallel(path: &str, nparts: usize) -> Option<JsonlPlan> {
     if is_json_array(path) {
         return None;
     }
-    let (names, jtypes, bad_rows) = infer_global(path).ok()?;
     let ranges = snap_ranges(path, nparts)?;
     if ranges.len() < 2 {
+        // Too small to split: the caller stays on the serial reader (which
+        // runs `infer_global` itself).
         return None;
     }
+    // Pass 1 IN PARALLEL: infer each newline-aligned range on its own thread,
+    // then fold the results **in range order**. The fold reproduces the
+    // sequential `infer_global` exactly: the global column order is the first
+    // valid object's key list from the earliest started range (= the file's
+    // first valid object), each global key's type merges every range's
+    // observations of that key (`Infer::merge` is order-respecting), keys
+    // outside the global set are discarded (the sequential scan never observes
+    // them), and malformed-line counts sum. Previously this pass was a serial
+    // full-file JSON parse — the dominant cost of a large JSONL `read`.
+    let infers: Vec<Result<RangeInfer, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(a, b)| s.spawn(move || infer_range(path, a, b)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut names: Option<Vec<String>> = None;
+    let mut merged: Vec<(String, Infer)> = Vec::new();
+    let mut bad_rows = 0usize;
+    for r in infers {
+        let (seen, first_names, bad) = r.ok()?;
+        bad_rows += bad;
+        if names.is_none() {
+            names = first_names;
+        }
+        for (k, inf) in seen {
+            match merged.iter_mut().find(|(n, _)| n == &k) {
+                Some((_, m)) => m.merge(&inf),
+                None => merged.push((k, inf)),
+            }
+        }
+    }
+    // No valid object anywhere → the serial reader surfaces its own error.
+    let names = names?;
+    let jtypes: Vec<JType> = names
+        .iter()
+        .map(|n| {
+            merged
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, inf)| inf.resolve())
+                .unwrap_or(JType::Scalar(DataType::Str))
+        })
+        .collect();
     let schema = schema_from(&names, &jtypes);
     Some((schema, names, jtypes, ranges, bad_rows))
 }
