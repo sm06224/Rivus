@@ -68,23 +68,77 @@ impl Read {
     fn decode(&self, uri: &str) -> Result<(Schema, Vec<Vec<Column>>, usize), String> {
         match self.fmt_for(uri) {
             FileFmt::Csv(delim) => {
-                let (schema, mut ch) = crate::csv::CsvChunker::open(
+                // Fast path: reuse the parallel-source machinery — infer the
+                // schema by streaming newline-aligned ranges IN PARALLEL
+                // (`plan_parallel`), then decode each range in file order with
+                // the types already known (`for_range`, one typed pass). The old
+                // path (`CsvChunker::open`) paid a full serial inference scan and
+                // THEN a full decode scan per file — the dominant cost of a
+                // multi-file `read` (measured: ~340ms/M rows vs the source's
+                // ~155ms/M on the same machine). The inferred schema is pinned
+                // byte-identical to the serial reader's by the engine's
+                // serial==parallel invariant, and ranges are contiguous in file
+                // order, so row order — and therefore the output — is unchanged.
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(8);
+                match crate::csv::plan_parallel(
                     uri,
                     None,
-                    self.chunk_size,
-                    false,
+                    threads,
                     &[],
                     &[],
                     true,
                     None,
                     &[],
                     delim,
-                )?;
-                let mut chunks = Vec::new();
-                while let Some(cols) = ch.decode_chunk() {
-                    chunks.push(cols);
+                ) {
+                    Ok(plan) => {
+                        let mut chunks = Vec::new();
+                        for &(a, b) in &plan.ranges {
+                            let mut ch = crate::csv::CsvChunker::for_range(
+                                uri,
+                                plan.dtypes.clone(),
+                                plan.dt_specs.clone(),
+                                plan.keep.clone(),
+                                plan.ncols,
+                                a,
+                                b,
+                                self.chunk_size,
+                                plan.prefilter.clone(),
+                                plan.str_prefilter.clone(),
+                                delim,
+                            )?;
+                            while let Some(cols) = ch.decode_chunk() {
+                                chunks.push(cols);
+                            }
+                        }
+                        // bad rows are counted on the inference pass (same total
+                        // as the serial reader — it counts on ITS inference pass).
+                        Ok((plan.schema, chunks, plan.bad_rows))
+                    }
+                    // Unseekable / unstattable → the buffered serial reader.
+                    Err(_) => {
+                        let (schema, mut ch) = crate::csv::CsvChunker::open(
+                            uri,
+                            None,
+                            self.chunk_size,
+                            false,
+                            &[],
+                            &[],
+                            true,
+                            None,
+                            &[],
+                            delim,
+                        )?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((schema, chunks, ch.bad_rows))
+                    }
                 }
-                Ok((schema, chunks, ch.bad_rows))
             }
             FileFmt::Jsonl => {
                 let (schema, mut ch) = crate::jsonl::JsonlChunker::open(uri, self.chunk_size)?;

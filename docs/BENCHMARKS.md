@@ -1522,12 +1522,24 @@ built as a fresh heap `String` (+ boxed `Value`) per row.
 | + group key reuse / parts-on-insert | 3769 ms |
 | + `cast_column` identity fast-path | 3145 ms |
 | + coalesce columnar fast-path | 2192 ms |
-| **DuckDB 1.5 / Polars 1.42** | **430 / 619 ms** |
+| + `read` typed single decode pass (parallel-inference plan) | **1501 ms** |
+| **DuckDB 1.5 / Polars 1.42** | **345 / 532 ms** |
 
-Rivus went from **23× → 5.2×** DuckDB (3.6× Polars) on this workload with no loss
+Rivus went from **23× → 4.4×** DuckDB (2.8× Polars) on this workload with no loss
 of the continue-first / never-silent / union-by-name contract (which Polars could
-not meet natively — it kept the ragged rows). The remaining gap is dominated by
-**`read` (1090ms)** — the two-pass inference path (a source uses the single-pass
-`for_range`); making `read` single-pass is the next lever (tracked). Single
-thread throughout — parallelism (safe here: integer sum is associative) is a
-further multiplier not yet applied.
+not meet natively — it kept the ragged rows).
+
+**`read` typed single decode pass.** The remaining peak was `read` (1090ms): the
+old path (`CsvChunker::open`) paid a full serial inference scan THEN a full
+decode scan per file. `read` now reuses the parallel-source machinery —
+`plan_parallel` infers over newline-aligned byte ranges in parallel and
+`for_range` decodes each range in file order with types known (one typed pass).
+The inferred schema is pinned byte-identical to the serial reader's by the
+engine's serial==parallel invariant; ranges are contiguous, so row order — and
+the output, including the malformed-row count — is unchanged. `read`
+1090 → 631ms. Unseekable inputs fall back to the buffered serial reader.
+
+Remaining levers: the execution pipeline itself is still single-threaded
+(parallelism is safe here — integer sum is associative — a further multiplier),
+and join/group still render composite keys as text rather than hashing typed
+lanes directly.
