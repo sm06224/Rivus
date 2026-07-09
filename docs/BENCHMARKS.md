@@ -1543,3 +1543,48 @@ Remaining levers: the execution pipeline itself is still single-threaded
 (parallelism is safe here — integer sum is associative — a further multiplier),
 and join/group still render composite keys as text rather than hashing typed
 lanes directly.
+
+### The 10M × ⌈2.2·cores⌉-file standard fixture (統括指示) — and what it exposed
+
+New mandatory perf fixture (see CLAUDE.md): **10M rows CSV and 10M JSON objects
+JSONL, split across ⌈2.2 × physical cores⌉ files** (this box: 4 physical cores →
+9 files; 181MB CSV / 606MB JSONL), dirty data in the mix (5 ragged/truncated
+lines + 5 non-numeric amounts in file 1; file 9 missing the `category` column;
+unknown regions in file 5). Same pinned contract as above; **rivus CSV ==
+rivus JSONL == DuckDB CSV == DuckDB JSONL, all row-identical** (cross-format AND
+cross-engine). Polars: CSV differs by exactly the 5 ragged rows it cannot
+exclude; JSONL is a hard **DNF** (`read_ndjson(ignore_errors=true)` still aborts
+on a truncated JSON line — the ragged-CSV story again).
+
+A single-file test had hidden two structural problems the fan-out exposes:
+
+1. **Peak RSS ~1.4GB on a 181MB dataset** — `read` buffers every decoded file
+   and the blocking join buffers both sides again; DuckDB streams the same job
+   in 258MB. The "bounded memory" claim currently holds for straight-through
+   flows, not for `read`+blocking pipelines. Structural fix (streaming read /
+   stream-probe join) tracked as the memory lever.
+2. **JSONL `read` was 3× the CSV path** (16.9s vs 5.6s): `JsonlChunker::open`
+   still paid serial full-file inference + a second decode parse.
+
+**Landed now — parallel range decode inside `read` (both formats).** The range
+plans (`csv::plan_parallel` / `jsonl::plan_parallel`) already exist for the
+parallel source; `read` now decodes those newline-aligned ranges on scoped
+threads and splices in range order (contiguous ranges ⇒ row order unchanged ⇒
+byte-identical; verified: 10M CSV, 10M JSONL, and the 3M fixture all
+bit-identical, error counts included).
+
+| 10M × 9 files, warm best-of-3 | wall | peak RSS |
+|---|---:|---:|
+| rivus CSV (before → after) | 5559 → **4770 ms** | 1459 → 1169 MB |
+| rivus JSONL (before → after) | 16901 → **11223 ms** | 1302 → 1155 MB |
+| DuckDB CSV / JSONL | 920 / 1461 ms | 240 / 404 MB |
+| Polars CSV | 1501 ms | 1974 MB |
+| Polars JSONL | DNF (malformed line) | — |
+
+Per-node at 10M (CSV): read 1285 / join 1373 / group 760 / cast+filter+project
+~1180 — no single villain left; the gap is now the **serial sum of nodes**
+(DuckDB runs the whole pipeline on 4 cores). JSONL: read 7926ms — the serial
+`infer_global` (a full JSON parse of every line) plus the decode re-parse
+dominates; parallelizing JSONL inference like CSV's `infer_range` is the next
+format-specific lever. The engine-level levers stay: pipeline parallelism
+(integer sums here are associative ⇒ safe) and the buffering-memory ceiling.

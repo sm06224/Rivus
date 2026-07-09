@@ -83,6 +83,14 @@ That has caused over-claiming commit messages and broken pushes. So:
   `tests/optimizer_equiv.rs`). Correctness is the gate; speed is the reward.
 - "Faster" is never asserted without a measured number.
 - SIMD / assembler-level optimization is allowed **where a bench proves the win**.
+- **Scale fixture is mandatory for perf claims（統括指示 2026-07-09）**: a
+  single monolithic file is NOT a valid perf test. Minimum: **10M rows (CSV) and
+  10M JSON objects (JSONL), split across ⌈2.2 × physical cores⌉ files** (this
+  box: 4 cores → 9 files), with dirty data in the mix (malformed rows/lines, a
+  file missing a column) so the never-silent contract is exercised at scale.
+  Fan-out across files is what exposes serial bottlenecks and buffering-memory
+  ceilings that a 1-file test hides. Compare against DuckDB/Polars equivalents
+  (equal contract, verified row-identical) and report wall + peak RSS.
 
 ## Supply-chain vigilance
 

@@ -95,8 +95,15 @@ impl Read {
                     delim,
                 ) {
                     Ok(plan) => {
-                        let mut chunks = Vec::new();
-                        for &(a, b) in &plan.ranges {
+                        // Decode the ranges in PARALLEL and splice in range
+                        // order (ranges are contiguous, so row order — and the
+                        // output — is byte-identical to a serial decode; only
+                        // internal chunk boundaries differ, and results are
+                        // pinned chunk-size independent).
+                        let cz = self.chunk_size;
+                        let plan = &plan;
+                        let chunks = decode_ranges_parallel(plan.ranges.len(), |i| {
+                            let (a, b) = plan.ranges[i];
                             let mut ch = crate::csv::CsvChunker::for_range(
                                 uri,
                                 plan.dtypes.clone(),
@@ -105,18 +112,20 @@ impl Read {
                                 plan.ncols,
                                 a,
                                 b,
-                                self.chunk_size,
+                                cz,
                                 plan.prefilter.clone(),
                                 plan.str_prefilter.clone(),
                                 delim,
                             )?;
+                            let mut out = Vec::new();
                             while let Some(cols) = ch.decode_chunk() {
-                                chunks.push(cols);
+                                out.push(cols);
                             }
-                        }
+                            Ok(out)
+                        })?;
                         // bad rows are counted on the inference pass (same total
                         // as the serial reader — it counts on ITS inference pass).
-                        Ok((plan.schema, chunks, plan.bad_rows))
+                        Ok((plan.schema.clone(), chunks, plan.bad_rows))
                     }
                     // Unseekable / unstattable → the buffered serial reader.
                     Err(_) => {
@@ -141,15 +150,73 @@ impl Read {
                 }
             }
             FileFmt::Jsonl => {
-                let (schema, mut ch) = crate::jsonl::JsonlChunker::open(uri, self.chunk_size)?;
-                let mut chunks = Vec::new();
-                while let Some(cols) = ch.decode_chunk() {
-                    chunks.push(cols);
+                // Same shape as the CSV fast path: a global-schema range plan
+                // (serial inference — JSONL has no parallel infer yet), then the
+                // ranges decoded in parallel and spliced in range order (row
+                // order unchanged ⇒ byte-identical). A top-level JSON array or
+                // a small/unseekable file falls back to the serial reader.
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(8);
+                match crate::jsonl::plan_parallel(uri, threads) {
+                    Some((schema, names, jtypes, ranges, bad_rows)) => {
+                        let cz = self.chunk_size;
+                        let (names, jtypes, ranges) = (&names, &jtypes, &ranges);
+                        let chunks = decode_ranges_parallel(ranges.len(), |i| {
+                            let (a, b) = ranges[i];
+                            let mut ch = crate::jsonl::JsonlChunker::for_range(
+                                uri,
+                                names.clone(),
+                                jtypes.clone(),
+                                a,
+                                b,
+                                cz,
+                            )?;
+                            let mut out = Vec::new();
+                            while let Some(cols) = ch.decode_chunk() {
+                                out.push(cols);
+                            }
+                            Ok(out)
+                        })?;
+                        Ok((schema, chunks, bad_rows))
+                    }
+                    None => {
+                        let (schema, mut ch) =
+                            crate::jsonl::JsonlChunker::open(uri, self.chunk_size)?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((schema, chunks, ch.bad_rows))
+                    }
                 }
-                Ok((schema, chunks, ch.bad_rows))
             }
         }
     }
+}
+
+/// Decode `nranges` byte ranges concurrently (one scoped thread each; the
+/// planners cap ranges at ~the core count) and splice the decoded chunk lists
+/// **in range order**. Ranges are contiguous and newline-aligned, so the spliced
+/// row order equals a serial front-to-back decode — the output is
+/// byte-identical; only internal chunk boundaries differ (pinned chunk-size
+/// independent). An `Err` from any range fails the whole file (the caller
+/// quarantines it, same as the serial path).
+fn decode_ranges_parallel<F>(nranges: usize, worker: F) -> Result<Vec<Vec<Column>>, String>
+where
+    F: Fn(usize) -> Result<Vec<Vec<Column>>, String> + Sync,
+{
+    let worker = &worker;
+    let results: Vec<Result<Vec<Vec<Column>>, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..nranges).map(|i| s.spawn(move || worker(i))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut out = Vec::new();
+    for r in results {
+        out.extend(r?);
+    }
+    Ok(out)
 }
 
 /// Numeric widening lattice for union-by-name (§28.3): `int ⊆ float ⊆ decimal`
