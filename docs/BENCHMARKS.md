@@ -1626,3 +1626,33 @@ exercised by these fixtures; ratification question in design/40 §40.4).
 Compressed is now at parity with plain (csv.gz) or faster (jsonl.gz beats plain
 jsonl — one sampled parse instead of a full inference parse), so disk IO no
 longer dominates the scale fixtures（圧縮ストリーム採用指示の充足）.
+
+### Parallel read→group pipeline (slice 6) — per-file streaming workers
+
+`ls → read → [stateless]* → (⋈ small-source)* → group → [sort]* → [sink]` now
+runs ONE streaming worker per file: schema up front (`FileDecoder` separates
+inference from decode, resolving union-by-name's chicken-and-egg), rows decoded
+on demand, reconciled per chunk, pushed through per-worker op instances (a
+broadcast join is pre-fed its serially-materialized small right side) into a
+partial `GroupBy`; partials merge like #41 and the tiny post-group tail
+(sort/sink) runs serially. Prerequisite fix: **I64 Sum/Avg joined the exact
+club** — an `i128` lane accumulates alongside the f64 moments and an
+all-integer Sum/Avg outputs `int_sum as f64` (correctly rounded, partition-order
+independent; serial uses the same accumulator ⇒ serial==parallel by
+construction; output stays the F64 lane so nothing renders differently).
+
+| 10M × 9 files, warm best-of-3 | slice 5 | **slice 6** | DuckDB |
+|---|---:|---:|---:|
+| csv | 4879 ms | **1919 ms** | 920 ms |
+| jsonl | 8801 ms | **5348 ms** | 1461 ms |
+| csv.gz | 4480 ms | **1720 ms** | 1260 ms |
+| jsonl.gz | 6393 ms | **3677 ms** | 1774 ms |
+| peak RSS | ~1.1 GB | **~600 MB** | 240–400 MB |
+
+All five fixtures (3M dirty + the four 10M variants) stay **bit-identical**,
+malformed/cast counts included. Compressed CSV is now within **1.37×** of
+DuckDB; plain CSV 2.1×, jsonl.gz 2.1×, jsonl 3.7× (the JSONL residue is the
+decode re-parse — the fusion lever). From the catch-up baseline: csv 5559→1919
+(2.9×), jsonl 16901→5348 (3.2×), with memory halved. Remaining levers: JSONL
+single-parse, stream-probe join (drop the per-worker join buffer), and worker
+`busy` telemetry for the new path.

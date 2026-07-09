@@ -32,6 +32,18 @@ pub(crate) struct AggAcc {
     /// `i128` so the result is exact and order-independent — the property that
     /// lets a decimal `sum`/`avg` parallelize byte-identically (#41). `overflow`
     /// degrades that aggregate to the f64 lane (continue-first; §21.7).
+    /// Exact integer lane (#41 slice 6): while every numeric observation is an
+    /// `I64`, the sum ALSO accumulates in `i128` (exact, associative). At output
+    /// a Sum/Avg over an all-integer column uses `int_sum as f64` — the
+    /// correctly-rounded value, identical however the input was partitioned —
+    /// which is what makes an I64 `sum`/`avg` safe on the parallel
+    /// partition→merge paths. Serial uses the same accumulator, so
+    /// serial == parallel bit-identically by construction. Any non-integer
+    /// numeric observation drops the lane (`int_only = false` → the plain f64
+    /// path, exactly the old behavior).
+    int_only: bool,
+    int_sum: i128,
+    int_overflow: bool,
     dec_scale: Option<u8>,
     dec_sum: i128,
     dec_min: i128,
@@ -108,6 +120,9 @@ impl AggAcc {
             last: None,
             distinct: std::collections::HashSet::new(),
             values: Vec::new(),
+            int_only: true,
+            int_sum: 0,
+            int_overflow: false,
             dec_scale: None,
             dec_sum: 0,
             dec_min: i128::MAX,
@@ -142,6 +157,18 @@ impl AggAcc {
                     self.min = self.min.min(x);
                     self.max = self.max.max(x);
                     self.n += 1;
+                    // Exact integer lane: accumulate i128 alongside the f64
+                    // moments while the column stays all-integer.
+                    if let Value::I64(i) = v {
+                        if !self.int_overflow {
+                            match self.int_sum.checked_add(*i as i128) {
+                                Some(s) => self.int_sum = s,
+                                None => self.int_overflow = true,
+                            }
+                        }
+                    } else {
+                        self.int_only = false;
+                    }
                     // Exact decimal lane: accumulate the unscaled i128 in parallel
                     // with the f64 moments (the f64 side still backs `std` and the
                     // overflow fallback). A column shares one scale.
@@ -249,6 +276,15 @@ impl AggAcc {
     pub(crate) fn merge(&mut self, other: &AggAcc) {
         self.sum += other.sum;
         self.sum_sq += other.sum_sq;
+        // Exact integer lane: associative i128 (order-independent merge).
+        self.int_only &= other.int_only;
+        self.int_overflow |= other.int_overflow;
+        if !self.int_overflow {
+            match self.int_sum.checked_add(other.int_sum) {
+                Some(s) => self.int_sum = s,
+                None => self.int_overflow = true,
+            }
+        }
         self.n += other.n;
         self.non_null += other.non_null;
         self.min = self.min.min(other.min);
@@ -317,8 +353,13 @@ impl AggAcc {
 
     /// Numeric aggregate value (sum/avg/min/max/std). `0.0` for an empty group.
     pub(crate) fn num_value(&self) -> f64 {
+        // All-integer Sum/Avg: the exact i128 sum, correctly rounded to f64 —
+        // partition-order independent (the f64 running sum is not, past 2^53).
+        let exact_int = self.int_only && !self.int_overflow && self.n > 0;
         match self.func {
+            AggFunc::Sum if exact_int => self.int_sum as f64,
             AggFunc::Sum => self.sum,
+            AggFunc::Avg if exact_int => self.int_sum as f64 / self.n as f64,
             AggFunc::Avg => {
                 if self.n > 0 {
                     self.sum / self.n as f64
@@ -591,10 +632,12 @@ pub(crate) fn group_parallel_safe(
         | AggFunc::Pct(_) => true,
         // Exact integer lanes (decimal i128, duration i64) make sum/avg
         // associative → parallel byte-identical; f64 sum/avg are not. #57.
+        // I64 joins the exact club via the int lane (i128 accumulation with the
+        // correctly-rounded f64 output — see `AggAcc::num_value`).
         AggFunc::Sum | AggFunc::Avg => {
             matches!(
                 col_type(col),
-                Some(DataType::Decimal { .. } | DataType::Duration { .. })
+                Some(DataType::I64 | DataType::Decimal { .. } | DataType::Duration { .. })
             )
         }
         AggFunc::Std => false,

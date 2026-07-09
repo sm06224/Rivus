@@ -491,7 +491,6 @@ mod watch;
 // dispatch/tests below see the submodules' items via these globs.
 use aggregate::*;
 use join::*;
-use read::*;
 use sink::*;
 use source::*;
 use transform::*;
@@ -500,6 +499,7 @@ use watch::SourceWatch;
 
 // Re-exports for `engine.rs` (which refers to these as `operators::X`).
 pub(crate) use aggregate::{group_parallel_safe, new_group, GroupBy};
+pub(crate) use read::{reconcile_chunk, union_by_name, FileDecoder, Read};
 pub(crate) use sink::{
     json_object_row, write_cell, write_csv_file, write_json_file, write_jsonl_file,
 };
