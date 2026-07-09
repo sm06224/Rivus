@@ -849,7 +849,7 @@ impl crate::codec::Decoder for JsonlChunker {
 /// inferred from a buffered sample of the first `chunk_size` objects, then the
 /// rest is streamed. Same trade-off as the compressed CSV path: a key/type that
 /// only appears (or widens) past the sample is missed (documented, §33).
-#[cfg(feature = "net")]
+#[cfg(any(feature = "net", feature = "gzip", feature = "zstd"))]
 pub struct StreamJsonlReader {
     reader: Box<dyn BufRead + Send>,
     names: Vec<String>,
@@ -863,7 +863,7 @@ pub struct StreamJsonlReader {
     pub bad_rows: usize,
 }
 
-#[cfg(feature = "net")]
+#[cfg(any(feature = "net", feature = "gzip", feature = "zstd"))]
 impl StreamJsonlReader {
     /// Sample-infer the schema from an already-opened stream, then yield rows.
     pub fn from_reader(
@@ -989,7 +989,7 @@ impl StreamJsonlReader {
     }
 }
 
-#[cfg(feature = "net")]
+#[cfg(any(feature = "net", feature = "gzip", feature = "zstd"))]
 impl crate::codec::Decoder for StreamJsonlReader {
     fn decode_chunk(&mut self) -> Option<Vec<Column>> {
         self.next_columns()

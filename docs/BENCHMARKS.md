@@ -1600,3 +1600,29 @@ the start of the catch-up = 2.2×).
 
 The engine-level levers stay: pipeline parallelism (integer sums here are
 associative ⇒ safe) and the buffering-memory ceiling.
+
+### Compressed-stream read（統括指示: 全てが流れ）— file-level parallel decode
+
+Policy v2 makes compression default (`gzip`+`zstd` features on; pure-Rust
+decoders, SUPPLY-CHAIN vetted). `read` now handles `.gz`/`.zst` handles by
+riding the decompression stream (`CompressedCsvReader` / `StreamJsonlReader`,
+single-pass sample inference — never decompress-to-buffer), and — because a
+compressed stream has no splittable ranges — `read` decodes **files in
+parallel** (waves of ≤ core count, uri-ordered slots ⇒ reconciliation order,
+and therefore the output, is unchanged).
+
+| 10M × 9 files, warm best-of-3 | before | after | DuckDB |
+|---|---:|---:|---:|
+| csv.gz (49MB on disk) | 6058 ms (serial files) | **4746 ms** | 1260 ms |
+| jsonl.gz (52MB on disk) | 11256 ms | **6522 ms** | 1774 ms |
+| plain csv | 4723 ms | 4828 ms (noise) | 920 ms |
+| plain jsonl | 7684 ms | **7393 ms** | 1461 ms |
+
+All five fixtures (3M dirty, 10M csv/jsonl plain+gz) remain **bit-identical**
+(including malformed-row counts). The compressed path inherits the documented
+sample-inference trade-off of the source's compressed/HTTP readers (a column
+that only widens past the sample can differ from full-scan inference — not
+exercised by these fixtures; ratification question in design/40 §40.4).
+Compressed is now at parity with plain (csv.gz) or faster (jsonl.gz beats plain
+jsonl — one sampled parse instead of a full inference parse), so disk IO no
+longer dominates the scale fixtures（圧縮ストリーム採用指示の充足）.

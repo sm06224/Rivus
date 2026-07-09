@@ -38,10 +38,9 @@ The maintainer squash-merges and wants near-zero merge effort. So:
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets   # (CI uses -D warnings; keep zero)
   cargo test --workspace
-  # Feature-gated code (compression: gzip/zstd, regex) is NOT in the default
-  # zero-dep build, so a feature-only break (a struct field, a signature) is
-  # INVISIBLE to the two lines above. CI compiles it, so the gate must too —
-  # this is exactly how #79's gzip break should have been caught before push.
+  # Policy v2: gzip/zstd are default features. Still-gated code (regex, parquet,
+  # net/quic, unbounded) is invisible to the two lines above; CI compiles it,
+  # so the gate must too (#79's gzip break is the cautionary tale).
   RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features
   cargo test --workspace --all-features    # runs the gzip/zstd oracle tests
   gitleaks detect --no-git --source .
@@ -63,7 +62,9 @@ That has caused over-claiming commit messages and broken pushes. So:
   found) means the change did NOT apply — fix it before moving on, never paper over.
 - **Gate is a numeric checkpoint, not a vibe.** Before every push confirm with
   counts: clippy `warning/error` count **= 0**, `test result` FAILED **= 0**,
-  zero-dep (`cargo tree -p rivus-cli --edges normal` = rivus-* only). Build must
+  dependency tree audited (`cargo tree -p rivus-cli --edges normal` = rivus-*
+  plus exactly the SUPPLY-CHAIN.md-documented adapters — under policy v2 the
+  check is "documented", not "zero"). Build must
   succeed — a build failure makes `cargo test` report `0 passed`, which is NOT green.
 - **Commit messages claim only what's on disk.** If a message says "hardens X",
   `git show HEAD:path` must contain that change. No aspirational wording.
@@ -91,16 +92,25 @@ That has caused over-claiming commit messages and broken pushes. So:
   Fan-out across files is what exposes serial bottlenecks and buffering-memory
   ceilings that a 1-file test hides. Compare against DuckDB/Polars equivalents
   (equal contract, verified row-identical) and report wall + peak RSS.
+- **Stream IO first（統括指示 2026-07-09）**: so disk IO never dominates the
+  scale fixtures, the standard fixtures also run **compressed** (gzip/zstd read
+  as streams) — everything must flow（全てが流れ）. A path that materializes a
+  whole file (decompress-to-buffer, read-whole) is a defect; decode must ride
+  the decompression stream.
 
 ## Supply-chain vigilance
 
-- The **default build has zero third-party dependencies** (core/ir/parser/
-  optimizer/runtime/cli are std-only with default features). Keep it that way;
-  isolate tooling under `[dev-dependencies]`.
-- **Heavy/standard formats (compression, Parquet, pickle) may use a vetted crate**,
-  but only **off-by-default, feature-gated, and behind the source/sink trait** so
-  the default build stays dep-free (maintainer-approved 2026-05; see selected
-  adapters in `docs/SUPPLY-CHAIN.md`). Prefer mature, major, stable, pure-Rust.
+- **Policy v2（統括指示 2026-07-09）: external crates are ALLOWED, including in
+  the default build.** The invariants are now: (a) **single-binary release**,
+  (b) **license / dependency tree / supply chain explicitly documented** in
+  `docs/SUPPLY-CHAIN.md`, (c) `cargo deny check` green. The old zero-dep-default
+  rule is retired; dep-zero remains a nice property of individual crates, not a
+  product constraint. Competitive performance outranks dependency purity —
+  losing to other solutions is not acceptable（負けるな）.
+- **Heavy/standard formats (compression, Parquet, pickle) use vetted crates**;
+  feature-gating is now an *option* (niche backends), not a requirement.
+  Compression (gzip/zstd) is **on by default** so compressed streams are
+  first-class. Prefer mature, major, stable, pure-Rust.
 - Before adding any crate, run the `docs/SUPPLY-CHAIN.md` checklist: needed?
   mature/major/stable (not obsolete, not a typosquat)? trusted maintainer?
   feature-gated? pin & vet *transitive* deps? permissive license? Verify with

@@ -23,6 +23,9 @@ enum FileFmt {
     Jsonl,
 }
 
+/// One file's decode result: `(schema, chunks-of-columns, malformed rows)`.
+type FileDecode = Result<(Schema, Vec<Vec<Column>>, usize), String>;
+
 pub(crate) struct Read {
     fmt: Option<ReadFmt>,
     provenance: Provenance,
@@ -46,7 +49,10 @@ impl Read {
     }
 
     /// The format for one uri: an explicit `as FMT` wins; else the extension
-    /// (`.jsonl`/`.ndjson`/`.json` → JSONL, `.tsv`/`.tab` → TSV, else CSV).
+    /// (`.jsonl`/`.ndjson`/`.json` → JSONL, `.tsv`/`.tab` → TSV, else CSV). A
+    /// compression suffix (`.gz`/`.zst`) is stripped first, so `part.jsonl.gz`
+    /// reads as compressed JSONL（全てが流れ — compressed streams are
+    /// first-class, 統括指示 2026-07-09）.
     fn fmt_for(&self, uri: &str) -> FileFmt {
         match self.fmt {
             Some(ReadFmt::Csv) => FileFmt::Csv(b','),
@@ -54,10 +60,14 @@ impl Read {
             Some(ReadFmt::Jsonl) => FileFmt::Jsonl,
             None => {
                 let l = uri.to_ascii_lowercase();
+                let l = l
+                    .strip_suffix(".gz")
+                    .or_else(|| l.strip_suffix(".zst"))
+                    .unwrap_or(&l);
                 if l.ends_with(".jsonl") || l.ends_with(".ndjson") || l.ends_with(".json") {
                     FileFmt::Jsonl
                 } else {
-                    FileFmt::Csv(rivus_ir::delim_for_path(uri))
+                    FileFmt::Csv(rivus_ir::delim_for_path(l))
                 }
             }
         }
@@ -65,7 +75,56 @@ impl Read {
 
     /// Open + fully decode one file into `(schema, chunks, bad_rows)`. `Err` (a
     /// non-file / unopenable handle, a fatal decode) is quarantined by the caller.
-    fn decode(&self, uri: &str) -> Result<(Schema, Vec<Vec<Column>>, usize), String> {
+    fn decode(&self, uri: &str) -> FileDecode {
+        // Compressed handle (`.gz`/`.zst`): decode RIDES the decompression
+        // stream — the same single-pass sample-inference readers the source
+        // uses for its compressed/HTTP paths (never decompress-to-buffer;
+        // 全てが流れ). A build without the compression features quarantines the
+        // file with rebuild guidance instead of misreading raw bytes.
+        if crate::transport::Scheme::of(uri).is_compressed() {
+            return match self.fmt_for(uri) {
+                FileFmt::Csv(_delim) => {
+                    #[cfg(any(feature = "gzip", feature = "zstd"))]
+                    {
+                        let (schema, mut ch) = crate::csv::CompressedCsvReader::open(
+                            uri,
+                            None,
+                            self.chunk_size,
+                            true,
+                            None,
+                            &[],
+                            _delim,
+                        )?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((schema, chunks, ch.bad_rows))
+                    }
+                    #[cfg(not(any(feature = "gzip", feature = "zstd")))]
+                    Err(format!(
+                        "'{uri}' is compressed; rebuild with `--features gzip`/`zstd` to read it"
+                    ))
+                }
+                FileFmt::Jsonl => {
+                    #[cfg(any(feature = "gzip", feature = "zstd"))]
+                    {
+                        let reader = crate::transport::open_compressed(uri)?;
+                        let (schema, mut ch) =
+                            crate::jsonl::StreamJsonlReader::from_reader(reader, self.chunk_size)?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((schema, chunks, ch.bad_rows))
+                    }
+                    #[cfg(not(any(feature = "gzip", feature = "zstd")))]
+                    Err(format!(
+                        "'{uri}' is compressed; rebuild with `--features gzip`/`zstd` to read it"
+                    ))
+                }
+            };
+        }
         match self.fmt_for(uri) {
             FileFmt::Csv(delim) => {
                 // Fast path: reuse the parallel-source machinery — infer the
@@ -294,10 +353,40 @@ impl Operator for Read {
         // Deterministic order: concatenate files in uri-ascending order.
         self.uris.sort();
 
-        // Decode each file once (MVP buffers); quarantine the ones that fail.
+        // Decode the files IN PARALLEL, in waves of ≤ the core count, collecting
+        // into uri-ordered slots — the reconciliation below walks the slots in
+        // uri order, so the output is byte-identical to the old sequential loop.
+        // File-level parallelism is what a compressed stream needs (a gzip/zstd
+        // stream has no splittable ranges, so per-file range parallelism cannot
+        // apply — the fan-out across files IS the parallelism; 全てが流れ).
+        // Errors are quarantined per file afterwards, in uri order (§24),
+        // exactly like the sequential loop reported them.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let mut results: Vec<Option<FileDecode>> = (0..self.uris.len()).map(|_| None).collect();
+        for (wave_start, wave) in self
+            .uris
+            .chunks(threads)
+            .enumerate()
+            .map(|(w, c)| (w * threads, c))
+        {
+            let this = &*self;
+            let wave_results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|uri| s.spawn(move || this.decode(uri)))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (i, r) in wave_results.into_iter().enumerate() {
+                results[wave_start + i] = Some(r);
+            }
+        }
         let mut decoded: Vec<(String, Schema, Vec<Vec<Column>>)> = Vec::new();
-        for uri in &self.uris {
-            match self.decode(uri) {
+        for (uri, res) in self.uris.iter().zip(results) {
+            match res.expect("every slot filled") {
                 Ok((schema, chunks, bad_rows)) => {
                     if bad_rows > 0 {
                         ctx.raise(
