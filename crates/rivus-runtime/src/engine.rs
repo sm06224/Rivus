@@ -1354,19 +1354,13 @@ fn try_parallel_read_group(
         .map(|t| t.get())
         .unwrap_or(1);
     if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
-        {
-            return None;
-        }
+        return None;
     }
     if opts.max_capture.is_some() && !must_drain(graph) {
-        {
-            return None;
-        }
+        return None;
     }
     let Op::Read { fmt, provenance } = &graph.nodes[shape.read_id].op else {
-        {
-            return None;
-        }
+        return None;
     };
     let (fmt, provenance) = (*fmt, *provenance);
     let read_label = label_of(graph, shape.read_id);
@@ -1402,9 +1396,7 @@ fn try_parallel_read_group(
         .filter_map(|u| std::fs::metadata(u).ok().map(|m| m.len()))
         .sum();
     if total_bytes < parallel_min_bytes_for(opts.memory) {
-        {
-            return None;
-        }
+        return None;
     }
 
     // 2) Broadcast right sides, serially (small bounded sources).
@@ -1425,9 +1417,7 @@ fn try_parallel_read_group(
         }
     }
     if pre_errors.iter().any(ErrorEvent::is_fatal) {
-        {
-            return None;
-        }
+        return None;
     }
 
     // 3) Phase 1 — open every file lazily (schema now, rows later), in waves.
@@ -1469,9 +1459,7 @@ fn try_parallel_read_group(
         }
     }
     if opened.is_empty() {
-        {
-            return None;
-        }
+        return None;
     }
 
     // 4) The union schema every worker reconciles to (single source of truth).
@@ -1564,9 +1552,7 @@ fn try_parallel_read_group(
             in_schema.index_of(name).map(|i| in_schema.fields[i].dtype)
         });
         if !safe {
-            {
-                return None;
-            }
+            return None;
         }
     }
 
@@ -1769,18 +1755,16 @@ fn eligible_read_group_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
     for n in &graph.nodes {
         match &n.op {
             Op::Read { .. } => {
-                if read.replace(n.id).is_some() {
-                    {
-                        return None;
-                    }
+                if read.is_some() {
+                    return None;
                 }
+                read = Some(n.id);
             }
             Op::GroupBy { .. } => {
-                if group.replace(n.id).is_some() {
-                    {
-                        return None;
-                    }
+                if group.is_some() {
+                    return None;
                 }
+                group = Some(n.id);
             }
             _ => {}
         }
@@ -1789,23 +1773,17 @@ fn eligible_read_group_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
     // read's single input: a bounded discovery source feeding only read.
     let ins = graph.inputs_of(read_id);
     if ins.len() != 1 {
-        {
-            return None;
-        }
+        return None;
     }
     let disc = ins[0];
     let Op::Source { discovery, .. } = &graph.nodes[disc].op else {
-        {
-            return None;
-        }
+        return None;
     };
     if discovery.is_unbounded()
         || graph.outputs_of(disc).len() != 1
         || !graph.inputs_of(disc).is_empty()
     {
-        {
-            return None;
-        }
+        return None;
     }
     // read → group: a single-consumer chain of allowlisted stateless ops and
     // broadcast-able joins (read side LEFT, kind inner/left, right = bare
@@ -1815,9 +1793,7 @@ fn eligible_read_group_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
     loop {
         let outs = graph.outputs_of(cur);
         if outs.len() != 1 {
-            {
-                return None;
-            }
+            return None;
         }
         let next = outs[0];
         if next == group_id {
@@ -1834,17 +1810,13 @@ fn eligible_read_group_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
                 }
                 let right = jins[1];
                 let Op::Source { discovery: d2, .. } = &graph.nodes[right].op else {
-                    {
-                        return None;
-                    }
+                    return None;
                 };
                 if d2.is_unbounded()
                     || graph.outputs_of(right).len() != 1
                     || !graph.inputs_of(right).is_empty()
                 {
-                    {
-                        return None;
-                    }
+                    return None;
                 }
                 path.push(ReadPathStep::Broadcast {
                     join_id: next,
@@ -1857,9 +1829,7 @@ fn eligible_read_group_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
         cur = next;
     }
     if graph.inputs_of(group_id).as_slice() != [cur] {
-        {
-            return None;
-        }
+        return None;
     }
     // group tail: sorts then an optional leaf sink, single-consumer throughout.
     let mut tail = Vec::new();
@@ -1876,9 +1846,7 @@ fn eligible_read_group_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
                     }
                     Op::Sink { .. } => {
                         if !graph.outputs_of(n).is_empty() {
-                            {
-                                return None;
-                            }
+                            return None;
                         }
                         tail.push(n);
                         break;
@@ -1895,9 +1863,7 @@ fn eligible_read_group_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
         .filter(|s| matches!(s, ReadPathStep::Broadcast { .. }))
         .count();
     if graph.nodes.len() != 2 + path.len() + rights + 1 + tail.len() {
-        {
-            return None;
-        }
+        return None;
     }
     Some(ReadGroupShape {
         discovery_id: disc,
