@@ -1656,3 +1656,28 @@ decode re-parse — the fusion lever). From the catch-up baseline: csv 5559→19
 (2.9×), jsonl 16901→5348 (3.2×), with memory halved. Remaining levers: JSONL
 single-parse, stream-probe join (drop the per-worker join buffer), and worker
 `busy` telemetry for the new path.
+
+### JSONL pass-1 without allocations — the scanner (slice 7)
+
+The JSONL gap's root is parsing every line TWICE (inference, then decode). This
+slice removes pass-1's cost: a `scan_*` family mirrors `parse_*` **exactly**
+(same acceptance incl. `\uXXXX` validity, same Int/Float/Bool/Str
+classification incl. the i64-overflow→float rule, same duplicate-key and
+first-object-name-order semantics) but builds no `JVal` and no value `String`s
+— a key allocates only when first seen for its column. Equivalence is pinned by
+`scanner_matches_parser_inference` over a hazard corpus (escapes, bad `\u` hex,
+numeric edges, top-level and nested duplicate keys, heterogeneous columns,
+truncated lines). Decode-side, the per-row per-column `find` (which CLONED
+every `JVal`, O(cols²) compares) now moves values straight into their columns
+with an O(1) in-order hint (first-occurrence-wins, missing→Null — the same
+semantics).
+
+| 10M × 9 files, warm best-of-3 | slice 6 | **slice 7** | DuckDB |
+|---|---:|---:|---:|
+| jsonl | 5139 ms | **~4300 ms** | 1395 ms |
+| jsonl.gz | 3734 ms | ~3850 ms (noise; sample-inference path unaffected) | 1733 ms |
+
+All outputs remain bit-identical (jsonl, jsonl.gz, csv re-verified). Remaining
+JSONL cost is the decode-pass parse + `build_column`; the next lever is fusing
+value materialization into column builders (parse straight into columnar
+buffers, no per-cell `JVal`).

@@ -553,6 +553,30 @@ impl Flags {
             }
         }
     }
+    /// Class-only observers for the allocation-free inference scanner — each
+    /// mirrors the corresponding `observe` arm exactly (same flag updates), so
+    /// scanning classifies identically to parsing.
+    fn observe_int(&mut self) {
+        self.any = true;
+        self.all_bool = false;
+    }
+    fn observe_float(&mut self) {
+        self.any = true;
+        self.all_int = false;
+        self.all_bool = false;
+    }
+    fn observe_bool(&mut self) {
+        self.any = true;
+        self.all_int = false;
+        self.all_num = false;
+    }
+    fn observe_str(&mut self) {
+        self.any = true;
+        self.all_int = false;
+        self.all_num = false;
+        self.all_bool = false;
+    }
+
     fn resolve(&self) -> DataType {
         if !self.any {
             DataType::Str
@@ -635,23 +659,11 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
         if l.trim().is_empty() {
             continue;
         }
-        match parse_object(l) {
-            Some(obj) => {
-                if first_names.is_none() {
-                    first_names = Some(obj.iter().map(|(k, _)| k.clone()).collect());
-                }
-                for (k, v) in &obj {
-                    match seen.iter_mut().find(|(n, _)| n == k) {
-                        Some((_, inf)) => inf.observe(v),
-                        None => {
-                            let mut inf = Infer::new();
-                            inf.observe(v);
-                            seen.push((k.clone(), inf));
-                        }
-                    }
-                }
-            }
-            None => bad_rows += 1,
+        // Allocation-free scan (pass 1): observes classes directly into `seen`
+        // without building a `JVal` — pinned byte-identical to the parser path
+        // by `scanner_matches_parser_inference`.
+        if !scan_line_infer(l, &mut seen, &mut first_names) {
+            bad_rows += 1;
         }
     }
     Ok((seen, first_names, bad_rows))
@@ -810,12 +822,29 @@ impl JsonlChunker {
             }
             // Malformed lines are skipped (already counted in pass 1).
             if let Some(obj) = parse_object(l) {
-                for (i, name) in self.names.iter().enumerate() {
-                    let v = obj
-                        .iter()
-                        .find(|(k, _)| k == name)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(JVal::Null);
+                // Move each value straight into its column (the old per-column
+                // `find` cloned every JVal and paid O(cols²) compares). The
+                // FIRST occurrence of a name wins (duplicate keys ignored) and
+                // a missing name is Null — exactly the old `find` semantics.
+                // Keys usually arrive in column order, so index j is an O(1)
+                // hint; a reordered key falls back to the position scan.
+                let ncols = self.names.len();
+                let mut row: Vec<JVal> = (0..ncols).map(|_| JVal::Null).collect();
+                let mut filled = vec![false; ncols];
+                for (j, (k, v)) in obj.into_iter().enumerate() {
+                    let idx = if self.names.get(j).is_some_and(|n| n == &k) {
+                        Some(j)
+                    } else {
+                        self.names.iter().position(|n| n == &k)
+                    };
+                    if let Some(ix) = idx {
+                        if !filled[ix] {
+                            filled[ix] = true;
+                            row[ix] = v;
+                        }
+                    }
+                }
+                for (i, v) in row.into_iter().enumerate() {
                     per_col[i].push(v);
                 }
                 got += 1;
@@ -924,13 +953,28 @@ impl StreamJsonlReader {
     }
 
     /// Project one parsed object onto the schema's column order (missing → null).
-    fn push_obj(&self, per_col: &mut [Vec<JVal>], obj: &[(String, JVal)]) {
-        for (i, name) in self.names.iter().enumerate() {
-            let v = obj
-                .iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
-                .unwrap_or(JVal::Null);
+    fn push_obj(&self, per_col: &mut [Vec<JVal>], obj: Vec<(String, JVal)>) {
+        // Move each value straight into its column (the old per-column `find`
+        // cloned every JVal and paid O(cols²) compares). First occurrence of a
+        // name wins, missing → Null — the old `find` semantics exactly. Keys
+        // usually arrive in column order → index j is an O(1) hint.
+        let ncols = self.names.len();
+        let mut row: Vec<JVal> = (0..ncols).map(|_| JVal::Null).collect();
+        let mut filled = vec![false; ncols];
+        for (j, (k, v)) in obj.into_iter().enumerate() {
+            let idx = if self.names.get(j).is_some_and(|n| n == &k) {
+                Some(j)
+            } else {
+                self.names.iter().position(|n| n == &k)
+            };
+            if let Some(ix) = idx {
+                if !filled[ix] {
+                    filled[ix] = true;
+                    row[ix] = v;
+                }
+            }
+        }
+        for (i, v) in row.into_iter().enumerate() {
             per_col[i].push(v);
         }
     }
@@ -946,7 +990,7 @@ impl StreamJsonlReader {
             let line = std::mem::take(&mut self.pending[self.pending_pos]);
             self.pending_pos += 1;
             if let Some(obj) = parse_object(&line) {
-                self.push_obj(&mut per_col, &obj);
+                self.push_obj(&mut per_col, obj);
                 got += 1;
             }
         }
@@ -970,7 +1014,7 @@ impl StreamJsonlReader {
             }
             match parse_object(l) {
                 Some(obj) => {
-                    self.push_obj(&mut per_col, &obj);
+                    self.push_obj(&mut per_col, obj);
                     got += 1;
                 }
                 None => self.bad_rows += 1,
@@ -1091,6 +1135,342 @@ fn snap_ranges(path: &str, nparts: usize) -> Option<Vec<(u64, u64)>> {
 }
 
 // ----------------------------------------------------------------- JSON parsing
+
+// ---------------------------------------------------------------------------
+// Allocation-free inference scanner (pass 1;統括カリカリ指示). Each `scan_*`
+// mirrors the corresponding `parse_*` EXACTLY — same acceptance, same
+// Int/Float/Bool/Str classification, same duplicate-key handling — but builds
+// no `JVal` and no value `String`s (a key allocates only when first seen for
+// its column). Inference over the scanner is therefore byte-identical to
+// inference over the parser (pinned by `scanner_matches_parser_inference`)
+// while skipping ~all pass-1 allocations of a large JSONL read.
+
+/// Scan one line as a top-level object, observing directly into `seen`
+/// (per-key [`Infer`]s, first-seen order) and capturing `first_names` from the
+/// first valid object. `false` = malformed (counted by the caller), with the
+/// same acceptance as [`parse_object`].
+fn scan_line_infer(
+    line: &str,
+    seen: &mut Vec<(String, Infer)>,
+    first_names: &mut Option<Vec<String>>,
+) -> bool {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    skip_ws(b, &mut i);
+    if i >= b.len() || b[i] != b'{' {
+        return false;
+    }
+    i += 1;
+    skip_ws(b, &mut i);
+    let first_line = first_names.is_none();
+    let mut names_acc: Vec<String> = Vec::new();
+    if i < b.len() && b[i] == b'}' {
+        // empty object: still "started" (claims the column order), like parse.
+        if first_line {
+            *first_names = Some(names_acc);
+        }
+        return true;
+    }
+    loop {
+        skip_ws(b, &mut i);
+        let Some(key) = scan_key(b, &mut i) else {
+            return false;
+        };
+        skip_ws(b, &mut i);
+        if i >= b.len() || b[i] != b':' {
+            return false;
+        }
+        i += 1;
+        skip_ws(b, &mut i);
+        if first_line {
+            names_acc.push(key.clone().into_owned());
+        }
+        // Observe into the key's Infer (first-seen appends), or skip the value
+        // structurally if this key is outside the tracked set. Mirrors
+        // `infer_range`'s "observe every key" rule.
+        let idx = match seen.iter().position(|(n, _)| n.as_str() == key.as_ref()) {
+            Some(ix) => ix,
+            None => {
+                seen.push((key.into_owned(), Infer::new()));
+                seen.len() - 1
+            }
+        };
+        if !scan_value_into(b, &mut i, &mut seen[idx].1) {
+            return false;
+        }
+        skip_ws(b, &mut i);
+        match b.get(i) {
+            Some(b',') => {
+                i += 1;
+                continue;
+            }
+            Some(b'}') => break,
+            _ => return false,
+        }
+    }
+    if first_line {
+        *first_names = Some(names_acc);
+    }
+    true
+}
+
+/// Scan a JSON string, allocating only if it contains an escape (keys are
+/// almost always escape-free → borrowed). Same acceptance as [`parse_string`].
+fn scan_key<'a>(b: &'a [u8], i: &mut usize) -> Option<std::borrow::Cow<'a, str>> {
+    if *i >= b.len() || b[*i] != b'"' {
+        return None;
+    }
+    let start = *i + 1;
+    let mut j = start;
+    while j < b.len() {
+        match b[j] {
+            b'"' => {
+                *i = j + 1;
+                // SAFETY-free: the line came from &str, so the slice is UTF-8.
+                return Some(std::borrow::Cow::Borrowed(
+                    std::str::from_utf8(&b[start..j]).ok()?,
+                ));
+            }
+            b'\\' => {
+                // Escapes present: fall back to the allocating parser (rare).
+                let mut k = start - 1;
+                return parse_string(b, &mut k).map(|s| {
+                    *i = k;
+                    std::borrow::Cow::Owned(s)
+                });
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Scan a string VALUE without materializing it. Byte-for-byte the same
+/// acceptance as [`parse_string`] (escape validity incl. `\uXXXX` hex).
+fn scan_string(b: &[u8], i: &mut usize) -> bool {
+    if *i >= b.len() || b[*i] != b'"' {
+        return false;
+    }
+    *i += 1;
+    while *i < b.len() {
+        let c = b[*i];
+        *i += 1;
+        match c {
+            b'"' => return true,
+            b'\\' => {
+                let Some(&e) = b.get(*i) else { return false };
+                *i += 1;
+                if e == b'u' {
+                    let Some(hex) = b.get(*i..*i + 4) else {
+                        return false;
+                    };
+                    if std::str::from_utf8(hex)
+                        .ok()
+                        .and_then(|h| u32::from_str_radix(h, 16).ok())
+                        .is_none()
+                    {
+                        return false;
+                    }
+                    *i += 4;
+                }
+            }
+            _ => {}
+        }
+    }
+    false // unterminated
+}
+
+/// Scan any value, observing its class into `inf`. Mirrors [`parse_value`].
+fn scan_value_into(b: &[u8], i: &mut usize, inf: &mut Infer) -> bool {
+    skip_ws(b, i);
+    let Some(&c) = b.get(*i) else { return false };
+    match c {
+        b'"' => {
+            if !scan_string(b, i) {
+                return false;
+            }
+            inf.saw_scalar = true;
+            inf.scalar.observe_str();
+            true
+        }
+        b'{' => scan_obj_into(b, i, inf),
+        b'[' => scan_arr_into(b, i, inf),
+        b't' => {
+            if !scan_lit(b, i, "true") {
+                return false;
+            }
+            inf.saw_scalar = true;
+            inf.scalar.observe_bool();
+            true
+        }
+        b'f' => {
+            if !scan_lit(b, i, "false") {
+                return false;
+            }
+            inf.saw_scalar = true;
+            inf.scalar.observe_bool();
+            true
+        }
+        b'n' => scan_lit(b, i, "null"), // null observes nothing (like observe)
+        _ => match scan_number(b, i) {
+            Some(is_float) => {
+                inf.saw_scalar = true;
+                if is_float {
+                    inf.scalar.observe_float();
+                } else {
+                    inf.scalar.observe_int();
+                }
+                true
+            }
+            None => false,
+        },
+    }
+}
+
+/// Scan a nested object into the column's struct inference. Mirrors
+/// `Infer::observe(JVal::Obj)` exactly: the FIRST object seen for this column
+/// fixes the child-name order (duplicate keys included, matching the
+/// `fields.iter().map(k).collect()` + first-`position` semantics); later
+/// objects observe known children and ignore extra keys.
+fn scan_obj_into(b: &[u8], i: &mut usize, inf: &mut Infer) -> bool {
+    if *i >= b.len() || b[*i] != b'{' {
+        return false;
+    }
+    *i += 1;
+    let first_obj = inf.structs.is_none();
+    let st = inf.structs.get_or_insert_with(|| StructInfer {
+        names: Vec::new(),
+        children: Vec::new(),
+    });
+    skip_ws(b, i);
+    if *i < b.len() && b[*i] == b'}' {
+        *i += 1;
+        return true;
+    }
+    loop {
+        skip_ws(b, i);
+        let Some(key) = scan_key(b, i) else {
+            return false;
+        };
+        skip_ws(b, i);
+        if *i >= b.len() || b[*i] != b':' {
+            return false;
+        }
+        *i += 1;
+        // First object: append unconditionally (dupes included) — identical to
+        // the parser path's names. Observation always targets the FIRST match.
+        if first_obj {
+            st.names.push(key.clone().into_owned());
+            st.children.push(Infer::new());
+        }
+        match st.names.iter().position(|n| n.as_str() == key.as_ref()) {
+            Some(ix) => {
+                if !scan_value_into(b, i, &mut st.children[ix]) {
+                    return false;
+                }
+            }
+            None => {
+                if !scan_value_skip(b, i) {
+                    return false;
+                }
+            }
+        }
+        skip_ws(b, i);
+        match b.get(*i) {
+            Some(b',') => {
+                *i += 1;
+                continue;
+            }
+            Some(b'}') => {
+                *i += 1;
+                break;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Scan a nested array into the column's list inference (element-wise merge,
+/// mirroring `Infer::observe(JVal::Arr)`).
+fn scan_arr_into(b: &[u8], i: &mut usize, inf: &mut Infer) -> bool {
+    if *i >= b.len() || b[*i] != b'[' {
+        return false;
+    }
+    *i += 1;
+    let el = inf.list.get_or_insert_with(|| Box::new(Infer::new()));
+    skip_ws(b, i);
+    if *i < b.len() && b[*i] == b']' {
+        *i += 1;
+        return true;
+    }
+    loop {
+        skip_ws(b, i);
+        if !scan_value_into(b, i, el) {
+            return false;
+        }
+        skip_ws(b, i);
+        match b.get(*i) {
+            Some(b',') => {
+                *i += 1;
+                continue;
+            }
+            Some(b']') => {
+                *i += 1;
+                break;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Structurally skip any value (no observation), same acceptance as parsing.
+fn scan_value_skip(b: &[u8], i: &mut usize) -> bool {
+    let mut scratch = Infer::new();
+    scan_value_into(b, i, &mut scratch)
+}
+
+fn scan_lit(b: &[u8], i: &mut usize, lit: &str) -> bool {
+    if b[*i..].starts_with(lit.as_bytes()) {
+        *i += lit.len();
+        true
+    } else {
+        false
+    }
+}
+
+/// Scan a number; `Some(is_float)` with [`parse_number`]'s exact
+/// classification (incl. the i64-overflow → float fallback).
+fn scan_number(b: &[u8], i: &mut usize) -> Option<bool> {
+    let start = *i;
+    let mut is_float = false;
+    if b.get(*i) == Some(&b'-') {
+        *i += 1;
+    }
+    while *i < b.len() {
+        match b[*i] {
+            b'0'..=b'9' => *i += 1,
+            b'.' | b'e' | b'E' | b'+' | b'-' => {
+                is_float = true;
+                *i += 1;
+            }
+            _ => break,
+        }
+    }
+    let text = std::str::from_utf8(&b[start..*i]).ok()?;
+    if text.is_empty() || text == "-" {
+        return None;
+    }
+    if is_float {
+        text.parse::<f64>().ok().map(|_| true)
+    } else {
+        match text.parse::<i64>() {
+            Ok(_) => Some(false),
+            Err(_) => text.parse::<f64>().ok().map(|_| true),
+        }
+    }
+}
 
 /// Parse a single JSON object line into `(key, value)` pairs. Returns `None` if
 /// the line is not a well-formed object (→ counted as a bad row). Nested values
@@ -1316,6 +1696,83 @@ fn skip_balanced(b: &[u8], i: &mut usize, open: u8, close: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The allocation-free inference scanner must ACCEPT exactly the lines the
+    /// parser accepts and infer exactly the same shape — over a corpus that
+    /// hits every divergence hazard: escapes (incl. bad `\\uXXXX`), numeric
+    /// edges (i64 overflow → float, bare `-`, `1e5`), duplicate keys (top and
+    /// nested — the first-object name-order rule), heterogeneous columns,
+    /// nested obj/arr recursion, empty objects, truncated lines.
+    #[test]
+    fn scanner_matches_parser_inference() {
+        let corpus: &[&str] = &[
+            r#"{"a":1,"b":"x","c":true}"#,
+            r#"{"a":1.5,"b":null}"#,
+            r#"{"a":9223372036854775808}"#, // i64 overflow → float
+            r#"{"a":-,"b":1}"#,             // bad number
+            r#"{"a":1e5,"b":-2.5e-3}"#,
+            r#"{"a":"esc\"q","b":"\u0041","c":"\u00ZZ"}"#, // bad \u hex → reject
+            r#"{"a":"\u0041"}"#,
+            r#"{"dup":1,"dup":2}"#,           // duplicate top-level keys
+            r#"{"o":{"x":1,"x":2,"y":"s"}}"#, // duplicate nested keys
+            r#"{"o":{"x":1},"o":{"y":2}}"#,
+            r#"{"l":[1,2,3],"m":[{"k":1},{"k":2.5}]}"#,
+            r#"{"l":[]}"#,
+            r#"{}"#,
+            r#"{"a":"#,  // truncated
+            r#"{"a":1"#, // missing close
+            r#"not json"#,
+            r#"{"mixed":1}"#,
+            r#"{"mixed":"s"}"#,
+            r#"{"n":null}"#,
+            r#"{"neg":-42,"z":0}"#,
+        ];
+        // Parser-path reference (the old infer_range body, verbatim semantics).
+        let mut ref_seen: Vec<(String, Infer)> = Vec::new();
+        let mut ref_first: Option<Vec<String>> = None;
+        let mut ref_bad = 0usize;
+        for l in corpus {
+            match parse_object(l) {
+                Some(obj) => {
+                    if ref_first.is_none() {
+                        ref_first = Some(obj.iter().map(|(k, _)| k.clone()).collect());
+                    }
+                    for (k, v) in &obj {
+                        match ref_seen.iter_mut().find(|(n, _)| n == k) {
+                            Some((_, inf)) => inf.observe(v),
+                            None => {
+                                let mut inf = Infer::new();
+                                inf.observe(v);
+                                ref_seen.push((k.clone(), inf));
+                            }
+                        }
+                    }
+                }
+                None => ref_bad += 1,
+            }
+        }
+        // Scanner path.
+        let mut scan_seen: Vec<(String, Infer)> = Vec::new();
+        let mut scan_first: Option<Vec<String>> = None;
+        let mut scan_bad = 0usize;
+        for l in corpus {
+            if !scan_line_infer(l, &mut scan_seen, &mut scan_first) {
+                scan_bad += 1;
+            }
+        }
+        assert_eq!(scan_bad, ref_bad, "acceptance diverged");
+        assert_eq!(scan_first, ref_first, "first-object names diverged");
+        let names_r: Vec<&String> = ref_seen.iter().map(|(n, _)| n).collect();
+        let names_s: Vec<&String> = scan_seen.iter().map(|(n, _)| n).collect();
+        assert_eq!(names_s, names_r, "seen-key order diverged");
+        for ((n, r), (_, sc)) in ref_seen.iter().zip(&scan_seen) {
+            assert_eq!(
+                format!("{:?}", sc.resolve()),
+                format!("{:?}", r.resolve()),
+                "inferred type diverged for key '{n}'"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
