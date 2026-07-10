@@ -1014,6 +1014,68 @@ impl StreamJsonlReader {
     }
 
     /// Project one parsed object onto the schema's column order (missing → null).
+    /// Fused flat-scalar decode for the compressed stream (see
+    /// `JsonlChunker::next_columns_fused`): sample replay first, then the
+    /// stream; a malformed streamed line counts into `bad_rows` exactly like
+    /// the general path (sample lines were counted at open).
+    fn next_columns_fused(&mut self) -> Option<Vec<Column>> {
+        let dtypes: Vec<DataType> = self
+            .jtypes
+            .iter()
+            .map(|t| match t {
+                JType::Scalar(d) => *d,
+                _ => unreachable!("fused path is flat-only"),
+            })
+            .collect();
+        let mut builders: Vec<ColBuilder> = dtypes
+            .iter()
+            .map(|d| ColBuilder::new(*d, self.chunk_size))
+            .collect();
+        let mut got = 0usize;
+        while got < self.chunk_size && self.pending_pos < self.pending.len() {
+            let line = std::mem::take(&mut self.pending[self.pending_pos]);
+            self.pending_pos += 1;
+            let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
+            if scan_row(&line, &self.names, &mut scratch) {
+                for (b, v) in builders.iter_mut().zip(&scratch) {
+                    b.push(v);
+                }
+                got += 1;
+            }
+        }
+        while got < self.chunk_size && !self.eof {
+            self.line.clear();
+            match self.reader.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.eof = true;
+                    break;
+                }
+            }
+            let l = self.line.trim_end_matches(['\n', '\r']);
+            if l.trim().is_empty() {
+                continue;
+            }
+            let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
+            if scan_row(l, &self.names, &mut scratch) {
+                for (b, v) in builders.iter_mut().zip(&scratch) {
+                    b.push(v);
+                }
+                got += 1;
+            } else {
+                self.bad_rows += 1;
+            }
+        }
+        if got == 0 {
+            return None;
+        }
+        Some(builders.into_iter().map(ColBuilder::finish).collect())
+    }
+
     fn push_obj(&self, per_col: &mut [Vec<JVal>], obj: Vec<(String, JVal)>) {
         // Move each value straight into its column (the old per-column `find`
         // cloned every JVal and paid O(cols²) compares). First occurrence of a
@@ -1043,6 +1105,14 @@ impl StreamJsonlReader {
     pub fn next_columns(&mut self) -> Option<Vec<Column>> {
         if self.eof && self.pending_pos >= self.pending.len() {
             return None;
+        }
+        // Fused fast path (same machinery and pinned semantics as
+        // `JsonlChunker::next_columns_fused`): a FLAT all-scalar schema decodes
+        // straight into per-column builders — no per-cell JVal. The compressed
+        // stream replays its buffered sample lines first, exactly like the
+        // general path below.
+        if self.names.len() <= 128 && self.jtypes.iter().all(|t| matches!(t, JType::Scalar(_))) {
+            return self.next_columns_fused();
         }
         let mut per_col: Vec<Vec<JVal>> = self.names.iter().map(|_| Vec::new()).collect();
         let mut got = 0usize;

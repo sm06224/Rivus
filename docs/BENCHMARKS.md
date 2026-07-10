@@ -1726,3 +1726,32 @@ story inverts the comparison: Rivus now runs the whole contract-pinned job in
 **~1/20th of DuckDB's memory** (a chunk + the group states + a 20-row broadcast
 side is all that's ever resident) while sitting 1.15–1.7× on wall — the
 bounded-memory promise（全てが流れ）is no longer aspirational for this shape.
+
+### Beyond the favorable shape（統括指示: 勝ちやすいパターンだけではダメ）— slices 10–11
+
+Two directives answered at once: **more speed** and **stop winning only the
+read→group shape**.
+
+**Slice 10 — fused decode for compressed JSONL.** The `StreamJsonlReader` now
+takes the same flat-scalar fused path as the plain reader (sample replay
+included; a malformed streamed line still counts into `bad_rows`).
+jsonl.gz: 3683 → **2116 ms** (DuckDB 1733 → **1.22×**), bit-identical.
+
+**Slice 11 — the pure-ETL shape.** `ls → read → [stateless/⋈]* → save` (NO
+group) previously ran the fully-serial engine loop: 3491 ms / 598 MB against
+DuckDB 1330 ms and Polars 598 ms — losing 2.6× on an *unfavorable* shape.
+`try_parallel_read_sink` streams each file through a per-worker pipeline into a
+**headerless temp segment** (the serial sink's own `write_cell` formatter),
+then concatenates header + segments in uri order. `cmp` against the serial
+writer's 9.5M-row output: **byte-identical**.
+
+| ETL shape (10M rows in, 9.5M out) | wall | peak RSS |
+|---|---:|---:|
+| rivus (serial engine, before) | 3491 ms | 598 MB |
+| **rivus (parallel segments)** | **1668 ms** | **13 MB** |
+| DuckDB | 1330 ms (**1.25×**) | 691 MB |
+| Polars | 598 ms | 519 MB |
+
+Polars stays ahead on wall for this shape (eager whole-file write) — with 40×
+our memory and no never-silent contract; the gap to DuckDB is 1.25× at 1/50th
+of its memory. All group fixtures + the 3M task re-verified bit-identical.
