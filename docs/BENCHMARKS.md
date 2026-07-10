@@ -1681,3 +1681,21 @@ All outputs remain bit-identical (jsonl, jsonl.gz, csv re-verified). Remaining
 JSONL cost is the decode-pass parse + `build_column`; the next lever is fusing
 value materialization into column builders (parse straight into columnar
 buffers, no per-cell `JVal`).
+
+### Fused JSONL decode — parse straight into columnar builders (slice 8)
+
+For a FLAT all-scalar schema (the dominant case), `JsonlChunker` now decodes
+each line directly into per-column scalar builders: no per-cell `JVal`, no
+value `String`s (escape-free strings borrow the line), row-atomic commit from a
+scratch (a malformed line contributes nothing). Semantics mirror
+`parse_object`+`build_scalar` exactly — duplicate-key first-wins, missing→null,
+an I64 column nulls a float cell, and a Str column re-renders numbers via
+`f64::to_string` (never the raw slice: `"1.50"` → `"1.5"` on both paths).
+Nested schemas keep the general JVal path.
+
+| 10M × 9 files, warm best-of-3 | slice 7 | **slice 8** | DuckDB |
+|---|---:|---:|---:|
+| jsonl | ~4300 ms | **2893 ms** | 1395 ms (**2.1×**) |
+
+Outputs re-verified bit-identical (jsonl / jsonl.gz / csv), malformed counts
+intact. The JSONL gap has closed from 12.1× (start) → 2.1×.

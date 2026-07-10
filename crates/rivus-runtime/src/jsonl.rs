@@ -792,9 +792,70 @@ impl JsonlChunker {
 
     /// Yield up to `chunk_size` rows as typed columns, or `None` at the end of
     /// the file / byte range. Malformed lines are skipped (counted in pass 1).
+    /// The fused flat-scalar decode (see the fused-decode header comment):
+    /// one pass, values committed row-atomically from a reused scratch, so a
+    /// malformed line contributes nothing (it was counted in pass 1).
+    fn next_columns_fused(&mut self) -> Option<Vec<Column>> {
+        let dtypes: Vec<DataType> = self
+            .jtypes
+            .iter()
+            .map(|t| match t {
+                JType::Scalar(d) => *d,
+                _ => unreachable!("fused path is flat-only"),
+            })
+            .collect();
+        let mut builders: Vec<ColBuilder> = dtypes
+            .iter()
+            .map(|d| ColBuilder::new(*d, self.chunk_size))
+            .collect();
+        let mut got = 0usize;
+        while got < self.chunk_size {
+            if matches!(self.limit, Some(end) if self.pos >= end) {
+                self.eof = true;
+                break;
+            }
+            self.line.clear();
+            let n = match self.reader.read_line(&mut self.line) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    self.eof = true;
+                    break;
+                }
+            };
+            self.pos += n as u64;
+            let l = self.line.trim_end_matches(['\n', '\r']);
+            if l.trim().is_empty() {
+                continue;
+            }
+            let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
+            // Malformed lines are skipped (already counted in pass 1).
+            if scan_row(l, &self.names, &mut scratch) {
+                for (b, v) in builders.iter_mut().zip(&scratch) {
+                    b.push(v);
+                }
+                got += 1;
+            }
+        }
+        if got == 0 {
+            return None;
+        }
+        Some(builders.into_iter().map(ColBuilder::finish).collect())
+    }
+
     pub fn next_columns(&mut self) -> Option<Vec<Column>> {
         if self.eof {
             return None;
+        }
+        // Fused fast path: a FLAT all-scalar schema decodes straight into
+        // per-column builders (no per-cell JVal; strings borrow the line).
+        // Semantics pinned identical to the JVal path (see the fused-decode
+        // header comment); nested schemas keep the general path below.
+        if self.names.len() <= 128 && self.jtypes.iter().all(|t| matches!(t, JType::Scalar(_))) {
+            return self.next_columns_fused();
         }
         let mut per_col: Vec<Vec<JVal>> = self.names.iter().map(|_| Vec::new()).collect();
         let mut got = 0usize;
@@ -1468,6 +1529,290 @@ fn scan_number(b: &[u8], i: &mut usize) -> Option<bool> {
         match text.parse::<i64>() {
             Ok(_) => Some(false),
             Err(_) => text.parse::<f64>().ok().map(|_| true),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused decode (pass 2;統括「進めろ！打ち勝て！」): for a FLAT all-scalar
+// schema, parse each line straight into per-column scalar builders — no
+// per-cell `JVal`, no value `String`s (strings borrow the line; escapes and
+// the rare hetero-nested cell fall back per value). Semantics mirror
+// `parse_object` + `build_scalar` EXACTLY: same acceptance, first occurrence
+// of a duplicate key wins, missing key → null, an I64 column nulls a float
+// cell, a Str column re-renders numbers via `f64::to_string` (never the raw
+// text slice — `"1.50"` renders `"1.5"` on both paths). A malformed line
+// commits nothing (row scratch is discarded).
+
+/// One scanned cell, borrowing from the line where possible.
+enum ScVal<'a> {
+    Null,
+    I(i64),
+    F(f64),
+    B(bool),
+    /// Escape-free string: a borrowed slice of the line.
+    S(&'a str),
+    /// String with escapes: unescaped (allocates, rare).
+    SOwned(String),
+    /// Nested value in a (heterogeneous) Str column: its JSON text.
+    NestedJson(String),
+}
+
+/// Per-column output builder for the fused path (one per scalar column).
+enum ColBuilder {
+    I64(Vec<i64>, Vec<bool>),
+    F64(Vec<f64>, Vec<bool>),
+    Bool(Vec<bool>, Vec<bool>),
+    Str(StrColumn, Vec<bool>),
+}
+
+impl ColBuilder {
+    fn new(dtype: DataType, cap: usize) -> ColBuilder {
+        match dtype {
+            DataType::I64 => ColBuilder::I64(Vec::with_capacity(cap), Vec::with_capacity(cap)),
+            DataType::F64 => ColBuilder::F64(Vec::with_capacity(cap), Vec::with_capacity(cap)),
+            DataType::Bool => ColBuilder::Bool(Vec::with_capacity(cap), Vec::with_capacity(cap)),
+            _ => ColBuilder::Str(
+                StrColumn::with_capacity(cap, cap * 8),
+                Vec::with_capacity(cap),
+            ),
+        }
+    }
+    fn push(&mut self, v: &ScVal<'_>) {
+        match self {
+            // Mirrors `build_scalar`'s I64 arm: Int valid, anything else null.
+            ColBuilder::I64(out, valid) => match v {
+                ScVal::I(i) => {
+                    out.push(*i);
+                    valid.push(true);
+                }
+                _ => {
+                    out.push(0);
+                    valid.push(false);
+                }
+            },
+            ColBuilder::F64(out, valid) => match v {
+                ScVal::I(i) => {
+                    out.push(*i as f64);
+                    valid.push(true);
+                }
+                ScVal::F(f) => {
+                    out.push(*f);
+                    valid.push(true);
+                }
+                _ => {
+                    out.push(0.0);
+                    valid.push(false);
+                }
+            },
+            ColBuilder::Bool(out, valid) => match v {
+                ScVal::B(b) => {
+                    out.push(*b);
+                    valid.push(true);
+                }
+                _ => {
+                    out.push(false);
+                    valid.push(false);
+                }
+            },
+            ColBuilder::Str(out, valid) => match v {
+                ScVal::Null => {
+                    out.push("");
+                    valid.push(false);
+                }
+                ScVal::B(b) => {
+                    out.push(if *b { "true" } else { "false" });
+                    valid.push(true);
+                }
+                ScVal::I(i) => {
+                    out.push(&i.to_string());
+                    valid.push(true);
+                }
+                ScVal::F(f) => {
+                    out.push(&f.to_string());
+                    valid.push(true);
+                }
+                ScVal::S(x) => {
+                    out.push(x);
+                    valid.push(true);
+                }
+                ScVal::SOwned(x) => {
+                    out.push(x);
+                    valid.push(true);
+                }
+                ScVal::NestedJson(t) => {
+                    out.push(t);
+                    valid.push(true);
+                }
+            },
+        }
+    }
+    fn finish(self) -> Column {
+        match self {
+            ColBuilder::I64(out, valid) => {
+                Column::new(ColumnData::I64(out), Validity::from_bits(&valid))
+            }
+            ColBuilder::F64(out, valid) => {
+                Column::new(ColumnData::F64(out), Validity::from_bits(&valid))
+            }
+            ColBuilder::Bool(out, valid) => {
+                Column::new(ColumnData::Bool(out), Validity::from_bits(&valid))
+            }
+            ColBuilder::Str(out, valid) => {
+                Column::new(ColumnData::Str(out), Validity::from_bits(&valid))
+            }
+        }
+    }
+}
+
+/// Scan one line into the reused row `scratch` (one slot per column,
+/// first-occurrence-wins, missing → Null). `false` = malformed line (same
+/// acceptance as `parse_object`); nothing is committed for it.
+fn scan_row<'a>(line: &'a str, names: &[String], scratch: &mut Vec<ScVal<'a>>) -> bool {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    scratch.clear();
+    for _ in 0..names.len() {
+        scratch.push(ScVal::Null);
+    }
+    let mut filled = 0u128; // ncols ≤ 128 fused (checked at construction)
+    skip_ws(b, &mut i);
+    if i >= b.len() || b[i] != b'{' {
+        return false;
+    }
+    i += 1;
+    skip_ws(b, &mut i);
+    if i < b.len() && b[i] == b'}' {
+        return true; // empty object: every column null
+    }
+    loop {
+        skip_ws(b, &mut i);
+        let Some(key) = scan_key(b, &mut i) else {
+            return false;
+        };
+        skip_ws(b, &mut i);
+        if i >= b.len() || b[i] != b':' {
+            return false;
+        }
+        i += 1;
+        skip_ws(b, &mut i);
+        // Column index: in-order hint impossible here (scratch has no j
+        // counter tie); position scan over ≤ a handful of names is fine.
+        let idx = names.iter().position(|n| n.as_str() == key.as_ref());
+        match idx {
+            Some(ix) if filled & (1u128 << ix) == 0 => {
+                let Some(v) = scan_cell(b, &mut i) else {
+                    return false;
+                };
+                scratch[ix] = v;
+                filled |= 1u128 << ix;
+            }
+            _ => {
+                // Unknown key or duplicate (first wins): structurally skip.
+                let mut sink = Infer::new();
+                if !scan_value_into(b, &mut i, &mut sink) {
+                    return false;
+                }
+            }
+        }
+        skip_ws(b, &mut i);
+        match b.get(i) {
+            Some(b',') => {
+                i += 1;
+                continue;
+            }
+            Some(b'}') => break,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Scan one scalar cell into a borrowed [`ScVal`]. Mirrors `parse_value`'s
+/// acceptance and classification; a nested value renders to its JSON text
+/// (the heterogeneous Str-column fallback of `build_scalar`).
+fn scan_cell<'a>(b: &'a [u8], i: &mut usize) -> Option<ScVal<'a>> {
+    match *b.get(*i)? {
+        b'"' => {
+            // Fast path: escape-free string borrows the line.
+            let start = *i + 1;
+            let mut j = start;
+            while j < b.len() {
+                match b[j] {
+                    b'"' => {
+                        *i = j + 1;
+                        return std::str::from_utf8(&b[start..j]).ok().map(ScVal::S);
+                    }
+                    b'\\' => {
+                        let mut k = start - 1;
+                        return parse_string(b, &mut k).map(|s| {
+                            *i = k;
+                            ScVal::SOwned(s)
+                        });
+                    }
+                    _ => j += 1,
+                }
+            }
+            None
+        }
+        b'{' | b'[' => {
+            // Heterogeneous cell in a Str column: parse + render as JSON text
+            // (rare; identical to the JVal path's `jval_json`).
+            let v = parse_value(b, i)?;
+            let mut t = String::new();
+            jval_json(&v, &mut t);
+            Some(ScVal::NestedJson(t))
+        }
+        b't' => {
+            if scan_lit(b, i, "true") {
+                Some(ScVal::B(true))
+            } else {
+                None
+            }
+        }
+        b'f' => {
+            if scan_lit(b, i, "false") {
+                Some(ScVal::B(false))
+            } else {
+                None
+            }
+        }
+        b'n' => {
+            if scan_lit(b, i, "null") {
+                Some(ScVal::Null)
+            } else {
+                None
+            }
+        }
+        _ => {
+            // Numbers: identical classification to `parse_number`.
+            let start = *i;
+            let mut is_float = false;
+            if b.get(*i) == Some(&b'-') {
+                *i += 1;
+            }
+            while *i < b.len() {
+                match b[*i] {
+                    b'0'..=b'9' => *i += 1,
+                    b'.' | b'e' | b'E' | b'+' | b'-' => {
+                        is_float = true;
+                        *i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let text = std::str::from_utf8(&b[start..*i]).ok()?;
+            if text.is_empty() || text == "-" {
+                return None;
+            }
+            if is_float {
+                text.parse::<f64>().ok().map(ScVal::F)
+            } else {
+                match text.parse::<i64>() {
+                    Ok(n) => Some(ScVal::I(n)),
+                    Err(_) => text.parse::<f64>().ok().map(ScVal::F),
+                }
+            }
         }
     }
 }
