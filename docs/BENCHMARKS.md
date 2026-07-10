@@ -1815,3 +1815,44 @@ Worker decode fell ~115 → ~78 ms per file (−32%; ~330 ms CPU across 9 files,
 eager whole-file write, 38× our memory, and it cannot meet the ragged/
 malformed contract. The group shape's residual is now **feed** (~330 ms/file:
 broadcast-probe + partial-group hashing), which is the next lever.
+
+### Cast without copies + columnar Str↔numeric conversion (slice 14)
+
+A per-op split of the group worker's feed (now printed by
+`RIVUS_WORKER_PROF`) broke ~255 ms/file into: group 93 / join-probe 73 /
+cast 58 / project 28 / filter 1 ms. Three findings, three fixes — and one
+negative result worth keeping:
+
+- **`Cast::process` cloned every column of every chunk** (`columns.clone()`
+  plus a second clone of the cast target) before `cast_column`'s identity
+  check could return anything. It now short-circuits when every cast is
+  already at its target type, and otherwise **moves** the owned chunk's
+  columns through take-then-refill slots (a repeated name still re-casts the
+  rebuilt column, like the old sequential form).
+- **The fixture round-trips `amount`** — one dirty file pins the union lane
+  to `Str`, so each clean file renders its decoded `I64` lane to strings
+  (reconcile) and the downstream `cast amount :int` parses them straight
+  back. Both directions paid a heap `Value`/`String` per cell:
+  - Str → I64/F64/Decimal in `cast_column` parsed via
+    `cast_value(col.value_at(i))`, i.e. a fresh `Value::Str` (heap `String`)
+    per cell. It now parses from the borrowed `&str` with exactly
+    `cast_value`'s trim/empty/fallback table. **58 → 21 ms/file.**
+  - X → Str rendered `value_at(i).to_string()` — a `Value` plus a fresh
+    `String` per cell. The `I64` source (the widening hot case) now writes
+    digits off the lane into a reused buffer; other sources keep `Value`
+    `Display` but reuse the buffer. Identical bytes by the same `Display`.
+    **Reconcile 72 → 33 ms/file.**
+- **Negative result — cast pushdown into the reader is NOT
+  semantics-preserving.** Folding `read → cast amount :int` into a declared
+  type at the read looked like it would erase the whole round trip, but
+  `cast_value`'s string→int rule falls back through `f64` (`"1.5"` → `1`)
+  while the reader's I64 lane nulls it (`"1.5"` → null + parse failure). An
+  optimizer rule must hold universally, so it stays out; recorded here so
+  the next profiler doesn't re-derive it.
+
+Combined ≈ −73 ms CPU per file (~660 ms across 9 files, ÷4 cores ≈ 165 ms
+wall). Measured back-to-back on a noisy box (interleaved best-of-3): ETL
+1743 → 1578 ms, group 1813 → 1684 ms with the slice-13 binary as control —
+the deltas match the per-op accounting. Group/ETL × parallel/serial all
+`cmp`-identical against the pre-slice-13 binary's outputs. Feed residual is
+now join-probe 73 + partial-group ~96 ms/file — the hash paths.

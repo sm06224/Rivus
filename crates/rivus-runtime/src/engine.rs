@@ -2563,15 +2563,21 @@ fn worker_read_partial_group(
     let handle = provenance.source(uri);
 
     // Push chunks from `start_idx` onward; the group consumes the survivors.
+    // `t_ops` accumulates per-op wall (one slot per pipeline op, last = the
+    // group) for the WPROF breakdown — a handful of `Instant` reads per chunk,
+    // free at chunk granularity.
+    let mut t_ops: Vec<std::time::Duration> = vec![std::time::Duration::ZERO; ops.len() + 1];
     let feed = |ops: &mut [(NodeId, NodeId, Box<dyn Operator>)],
                 start_idx: usize,
                 start: Vec<Chunk>,
                 group: &mut operators::GroupBy,
                 errors: &mut Vec<ErrorEvent>,
                 next_id: &mut u64,
-                rows: &mut u64| {
+                rows: &mut u64,
+                t_ops: &mut [std::time::Duration]| {
         let mut level = start;
-        for (nid, from, op) in ops.iter_mut().skip(start_idx) {
+        for (i, (nid, from, op)) in ops.iter_mut().enumerate().skip(start_idx) {
+            let t = Instant::now();
             let mut out = Vec::new();
             let mut ctx = OpCtx {
                 label: label_of(graph, *nid),
@@ -2582,7 +2588,9 @@ fn worker_read_partial_group(
                 out.extend(op.process(*from, c, &mut ctx));
             }
             level = out;
+            t_ops[i] += t.elapsed();
         }
+        let t = Instant::now();
         let mut ctx = OpCtx {
             label: label_of(graph, shape.group_id),
             errors,
@@ -2592,6 +2600,7 @@ fn worker_read_partial_group(
             *rows += c.len as u64;
             group.process(shape.group_id, c, &mut ctx);
         }
+        *t_ops.last_mut().expect("group slot") += t.elapsed();
     };
 
     let mut t_dec = std::time::Duration::ZERO;
@@ -2616,15 +2625,24 @@ fn worker_read_partial_group(
             &mut errors,
             &mut next_id,
             &mut rows,
+            &mut t_ops,
         );
         t_feed += t2.elapsed();
     }
     if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        let per_op: Vec<String> = ops
+            .iter()
+            .map(|(nid, _, _)| label_of(graph, *nid))
+            .chain(std::iter::once("group".to_string()))
+            .zip(t_ops.iter())
+            .map(|(l, d)| format!("{l}={}ms", d.as_millis()))
+            .collect();
         eprintln!(
-            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms",
+            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms [{}]",
             t_dec.as_millis(),
             t_rec.as_millis(),
-            t_feed.as_millis()
+            t_feed.as_millis(),
+            per_op.join(" ")
         );
     }
     // Drain: cascade each op's finish through the rest of the pipeline (a
@@ -2649,6 +2667,7 @@ fn worker_read_partial_group(
                 &mut errors,
                 &mut next_id,
                 &mut rows,
+                &mut t_ops,
             );
         }
     }

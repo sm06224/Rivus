@@ -854,21 +854,45 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
     // Numeric lanes from a STRING column parse checked per cell (#190): an
     // unparseable non-empty cell → null + counted (never a silent 0/NaN); an
     // empty cell and a null cell stay null uncounted (reader parity / §26.2c).
-    if matches!(ty, DataType::I64 | DataType::F64 | DataType::Decimal { .. })
-        && matches!(col.data(), ColumnData::Str(_))
-    {
-        {
+    // Columnar: each cell parses from the borrowed `&str` — the old per-cell
+    // `value_at` built a `Value::Str` (a heap String per cell; ~55ms/file on
+    // the 10M group feed). The trim/parse/fallback table is exactly
+    // `cast_value`'s string arm.
+    if matches!(ty, DataType::I64 | DataType::F64 | DataType::Decimal { .. }) {
+        if let ColumnData::Str(sc) = col.data() {
             let mut valid = Vec::with_capacity(n);
+            // Null in → null out, uncounted; empty/whitespace → missing →
+            // null, uncounted; only a non-empty parse failure counts.
+            let cell = |i: usize| -> Option<&str> {
+                if col.validity().is_null(i) {
+                    return None;
+                }
+                let t = sc.get(i).trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            };
             return match ty {
                 DataType::I64 => {
                     let mut out = Vec::with_capacity(n);
                     for i in 0..n {
-                        match cast_value(col.value_at(i), ty, fails) {
-                            Value::I64(x) => {
+                        let parsed = cell(i).map(|t| {
+                            t.parse::<i64>()
+                                .or_else(|_| t.parse::<f64>().map(|f| f as i64))
+                        });
+                        match parsed {
+                            Some(Ok(x)) => {
                                 out.push(x);
                                 valid.push(true);
                             }
-                            _ => {
+                            Some(Err(_)) => {
+                                *fails += 1;
+                                out.push(0);
+                                valid.push(false);
+                            }
+                            None => {
                                 out.push(0);
                                 valid.push(false);
                             }
@@ -879,12 +903,17 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
                 DataType::F64 => {
                     let mut out = Vec::with_capacity(n);
                     for i in 0..n {
-                        match cast_value(col.value_at(i), ty, fails) {
-                            Value::F64(x) => {
+                        match cell(i).map(str::parse::<f64>) {
+                            Some(Ok(x)) => {
                                 out.push(x);
                                 valid.push(true);
                             }
-                            _ => {
+                            Some(Err(_)) => {
+                                *fails += 1;
+                                out.push(0.0);
+                                valid.push(false);
+                            }
+                            None => {
                                 out.push(0.0);
                                 valid.push(false);
                             }
@@ -895,12 +924,17 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
                 DataType::Decimal { scale } => {
                     let mut unscaled = Vec::with_capacity(n);
                     for i in 0..n {
-                        match cast_value(col.value_at(i), ty, fails) {
-                            Value::Dec(d) => {
-                                unscaled.push(d.unscaled);
+                        match cell(i).map(str::parse::<f64>) {
+                            Some(Ok(x)) => {
+                                unscaled.push(f64_to_decimal(x, scale).unscaled);
                                 valid.push(true);
                             }
-                            _ => {
+                            Some(Err(_)) => {
+                                *fails += 1;
+                                unscaled.push(0);
+                                valid.push(false);
+                            }
+                            None => {
                                 unscaled.push(0);
                                 valid.push(false);
                             }
@@ -943,10 +977,40 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
         DataType::Time => ColumnData::Time((0..n).map(|i| to_i64(col.value_at(i))).collect()),
         DataType::Bool => ColumnData::Bool((0..n).map(|i| to_bool(col.value_at(i))).collect()),
         DataType::Str => {
+            use std::fmt::Write as _;
             let mut s = StrColumn::with_capacity(n, n * 8);
-            for i in 0..n {
-                // A null renders empty here, but `validity` below keeps it null.
-                s.push(&col.value_at(i).to_string());
+            let mut buf = String::new();
+            match col.data() {
+                // I64 → Str is the union-by-name widening hot case (one dirty
+                // file pinning a column to Str makes every clean file render
+                // its whole I64 lane; ~72ms/file on the 10M group standard):
+                // render the digits straight off the lane — `i64`'s own
+                // `Display`, exactly what `Value::I64` writes — with no
+                // per-cell `Value` or fresh `String`.
+                ColumnData::I64(v) => {
+                    for (i, x) in v.iter().enumerate() {
+                        // A null renders empty here, but `validity` below
+                        // keeps it null.
+                        if col.validity().is_null(i) {
+                            s.push("");
+                        } else {
+                            buf.clear();
+                            let _ = write!(buf, "{x}");
+                            s.push(&buf);
+                        }
+                    }
+                }
+                _ => {
+                    for i in 0..n {
+                        // A null renders empty here (`Value::Null` displays as
+                        // ""), but `validity` below keeps it null. The reused
+                        // buffer only drops the per-cell `String`; the bytes
+                        // are the same `Display` output as before.
+                        buf.clear();
+                        let _ = write!(buf, "{}", col.value_at(i));
+                        s.push(&buf);
+                    }
+                }
             }
             ColumnData::Str(s)
         }
