@@ -202,7 +202,9 @@ impl Operator for Join {
         // with defaults; an unmatched right row (right/full) has `None` on the
         // left and pads the left columns — except the join-key columns, which
         // take the right key so the key is never lost.
-        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        // Fx-hashed (see `JoinTable`): probe/pad order is row order on both
+        // sides, never table iteration order, so the hasher is unobservable.
+        let mut table = JoinTable::default();
         for ri in 0..right.len {
             // A null-key right row is never inserted, so it matches nothing; it
             // still surfaces as an unmatched row for right/full joins below.
@@ -337,11 +339,18 @@ fn join_key_column(
 /// is pinned chunk-size independent, so the result is byte-identical to the
 /// serial blocking join. Inner/left kinds only (the shape detector enforces
 /// this — an unmatched RIGHT row never has to be emitted).
+/// The join hash table: composite key → right row indices. Fx-hashed (the
+/// in-tree deterministic hasher, `crate::fxhash`): the probe does one lookup
+/// per left row and emits in **left-row order**, so table iteration order
+/// never reaches the output — the hasher swap is byte-identical by
+/// construction.
+pub(crate) type JoinTable = HashMap<String, Vec<usize>, crate::fxhash::FxBuild>;
+
 /// A prebuilt broadcast right side: concatenated chunk, hash table, and
 /// right-key column indices (shared across workers via `Arc`).
 pub(crate) type BuiltRight = (
     std::sync::Arc<Chunk>,
-    std::sync::Arc<HashMap<String, Vec<usize>>>,
+    std::sync::Arc<JoinTable>,
     std::sync::Arc<Vec<usize>>,
 );
 
@@ -350,7 +359,7 @@ pub(crate) struct BroadcastProbe {
     kind: JoinKind,
     right: std::sync::Arc<Chunk>,
     /// Right-side hash table: composite key → right row indices.
-    table: std::sync::Arc<HashMap<String, Vec<usize>>>,
+    table: std::sync::Arc<JoinTable>,
     /// Right key column indices (dropped from the output).
     rk: std::sync::Arc<Vec<usize>>,
     /// Resolved left key indices + output schema, cached on the first chunk
@@ -375,7 +384,7 @@ impl BroadcastProbe {
         for idx in &rresolved {
             rk.push((*idx)?);
         }
-        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut table = JoinTable::default();
         for ri in 0..right.len {
             if let Some(k) = join_key_at(&right, &rk, ri) {
                 table.entry(k).or_default().push(ri);
@@ -392,7 +401,7 @@ impl BroadcastProbe {
         left_keys: Vec<PathExpr>,
         kind: JoinKind,
         right: std::sync::Arc<Chunk>,
-        table: std::sync::Arc<HashMap<String, Vec<usize>>>,
+        table: std::sync::Arc<JoinTable>,
         rk: std::sync::Arc<Vec<usize>>,
     ) -> Self {
         BroadcastProbe {

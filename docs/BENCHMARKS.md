@@ -1856,3 +1856,31 @@ wall). Measured back-to-back on a noisy box (interleaved best-of-3): ETL
 the deltas match the per-op accounting. Group/ETL × parallel/serial all
 `cmp`-identical against the pre-slice-13 binary's outputs. Feed residual is
 now join-probe 73 + partial-group ~96 ms/file — the hash paths.
+
+### Fx-hashed group scratch + probe table (slice 15)
+
+The two remaining feed dominants were pure lookup cost:
+
+- **Group-by keyed a `BTreeMap<String, GroupState>` per row** — O(log g)
+  *string comparisons*, twice (a `contains_key` probe then `get_mut`).
+  The row-hot accumulation now goes to an Fx-hashed scratch `HashMap`
+  (one lookup per existing group), and `seal()` drains it into the same
+  sorted `BTreeMap` before finish/merge reads anything — output row order
+  stays composite-key order, so hash iteration order never reaches the
+  output. **93 → 65 ms/file.**
+- **The broadcast-probe table hashed ~10 M short keys with SipHash.** The
+  table (build + probe, and the serial `Join::finish` table) now uses the
+  same Fx hasher; probe/pad order is row order on both sides, so the hasher
+  is unobservable. **73 → 51 ms/file.**
+
+The hasher is ~30 lines in-tree (`fxhash.rs`, rustc's multiply-rotate
+shape, std-only): deterministic, no seed, supply chain unchanged. Not for
+anything attacker-facing or persisted — the doc comment says so.
+
+Feed: 255 → **165 ms/file**. Interleaved best-of-3 against the slice-14
+binary on the same (still noisy) box: group 1641 → **1552 ms** wall
+(−450 ms CPU ÷ 4 cores ≈ the −90 ms observed). Group/ETL × parallel/serial
+all `cmp`-identical. The worker cost sheet now reads decode 110 /
+feed 165 / reconcile 33 — decode is back on top, and inside feed the
+residual is `Value`-per-row `observe` (group 65) and key-build + gather
+(probe 51).

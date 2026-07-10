@@ -562,7 +562,16 @@ pub(crate) struct GroupState {
 pub(crate) struct GroupBy {
     keys: Vec<PathExpr>,
     aggs: Vec<(AggFunc, String)>,
+    /// The canonical, **sorted** group store: everything emitted (finish) or
+    /// merged reads this, so output row order is the composite-key order — the
+    /// same whether groups arrived via a serial stream or a parallel merge.
     groups: BTreeMap<String, GroupState>,
+    /// Row-hot accumulation happens here instead: one Fx hash lookup per row,
+    /// where the `BTreeMap` costs O(log g) *string comparisons* per row twice
+    /// (~93ms/file on the 10M group standard). [`GroupBy::seal`] drains it
+    /// into `groups` before anything is observed, so hash-map iteration order
+    /// never reaches the output — byte-identical by construction.
+    scratch: std::collections::HashMap<String, GroupState, crate::fxhash::FxBuild>,
     emitted: bool,
     /// Nested key-path structural misses (§32.8③), accumulated across chunks and
     /// surfaced once on finish (never-silent, not per-chunk spam).
@@ -575,8 +584,30 @@ impl GroupBy {
             keys,
             aggs,
             groups: BTreeMap::new(),
+            scratch: std::collections::HashMap::default(),
             emitted: false,
             key_fails: 0,
+        }
+    }
+
+    /// Fold the row-hot scratch into the sorted canonical store. Called before
+    /// every read of `groups` (finish, merge). In the real lifecycles (process*
+    /// → finish; process* → merge_from) every scratch entry is a pure move —
+    /// but if a group somehow exists on both sides, fold scratch (the later
+    /// observations) into it in stream order rather than silently replacing.
+    fn seal(&mut self) {
+        for (key, state) in self.scratch.drain() {
+            match self.groups.get_mut(&key) {
+                Some(s) => {
+                    s.count += state.count;
+                    for (a, oa) in s.accs.iter_mut().zip(state.accs.iter()) {
+                        a.merge(oa);
+                    }
+                }
+                None => {
+                    self.groups.insert(key, state);
+                }
+            }
         }
     }
 
@@ -586,7 +617,11 @@ impl GroupBy {
     /// output row order is identical to a serial run); shared groups merge their
     /// counts and per-aggregate accumulators via [`AggAcc::merge`]. `other` must
     /// have the same keys and aggregates and follow `self` in source order.
-    pub(crate) fn merge_from(&mut self, other: GroupBy) {
+    pub(crate) fn merge_from(&mut self, mut other: GroupBy) {
+        // Both sides fold their row-hot scratch into the sorted store first,
+        // so the merge below sees complete, canonical group states.
+        self.seal();
+        other.seal();
         // Nested key-path misses (§32.8③) sum across merged partitions, like the
         // per-group counts, so the finish-time surface is the true total.
         self.key_fails += other.key_fails;
@@ -709,29 +744,37 @@ impl Operator for GroupBy {
                 }
                 push_group_key_field(&mut composite, &chunk, i, row);
             }
-            // Hot path: an existing group needs no allocation (`String: Borrow<str>`
-            // looks the buffer up directly). A new group renders its output key
-            // parts once.
-            if !self.groups.contains_key(composite.as_str()) {
-                let parts: Vec<String> = key_idx
-                    .iter()
-                    .map(|&i| chunk.value(row, i).to_string())
-                    .collect();
-                self.groups.insert(
-                    composite.clone(),
-                    GroupState {
+            // Hot path: an existing group is ONE Fx-hash lookup, no allocation
+            // (`String: Borrow<str>` looks the buffer up directly). Only a new
+            // group allocates: its output key parts, its owned map key, and
+            // the accumulators.
+            match self.scratch.get_mut(composite.as_str()) {
+                Some(state) => {
+                    state.count += 1;
+                    for (j, idx) in agg_idx.iter().enumerate() {
+                        if let Some(ci) = idx {
+                            let v = chunk.value(row, *ci);
+                            state.accs[j].observe(&v);
+                        }
+                    }
+                }
+                None => {
+                    let parts: Vec<String> = key_idx
+                        .iter()
+                        .map(|&i| chunk.value(row, i).to_string())
+                        .collect();
+                    let mut state = GroupState {
                         key_parts: parts,
-                        count: 0,
+                        count: 1,
                         accs: funcs.iter().map(|f| AggAcc::new(*f)).collect(),
-                    },
-                );
-            }
-            let state = self.groups.get_mut(composite.as_str()).unwrap();
-            state.count += 1;
-            for (j, idx) in agg_idx.iter().enumerate() {
-                if let Some(ci) = idx {
-                    let v = chunk.value(row, *ci);
-                    state.accs[j].observe(&v);
+                    };
+                    for (j, idx) in agg_idx.iter().enumerate() {
+                        if let Some(ci) = idx {
+                            let v = chunk.value(row, *ci);
+                            state.accs[j].observe(&v);
+                        }
+                    }
+                    self.scratch.insert(composite.clone(), state);
                 }
             }
         }
@@ -743,6 +786,9 @@ impl Operator for GroupBy {
             return Vec::new();
         }
         self.emitted = true;
+        // Fold the row-hot scratch into the sorted store: every emit below
+        // iterates `groups` in composite-key order, exactly as before.
+        self.seal();
         super::surface_key_path_fails(self.key_fails, "group", ctx);
 
         // One Str column per group key (values pulled from each group's stored

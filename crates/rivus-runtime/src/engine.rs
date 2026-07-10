@@ -1356,11 +1356,7 @@ type SegmentResult = (Vec<ErrorEvent>, u64, Option<String>);
 
 /// A broadcast join's prebuilt right side: concatenated chunk, hash table,
 /// and right-key column indices — built once, shared by every worker.
-type BroadcastRight = (
-    std::sync::Arc<Chunk>,
-    std::sync::Arc<std::collections::HashMap<String, Vec<usize>>>,
-    std::sync::Arc<Vec<usize>>,
-);
+type BroadcastRight = operators::BuiltRight;
 
 fn try_parallel_read_group(
     graph: &PlanGraph,

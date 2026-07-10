@@ -499,7 +499,7 @@ use watch::SourceWatch;
 
 // Re-exports for `engine.rs` (which refers to these as `operators::X`).
 pub(crate) use aggregate::{group_parallel_safe, new_group, GroupBy};
-pub(crate) use join::BroadcastProbe;
+pub(crate) use join::{BroadcastProbe, BuiltRight};
 pub(crate) use read::{reconcile_chunk, union_by_name, FileDecoder, Read};
 pub(crate) use sink::{
     json_object_row, write_cell, write_csv_file, write_json_file, write_jsonl_file,

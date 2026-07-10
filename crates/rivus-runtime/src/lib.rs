@@ -11,6 +11,7 @@ mod csv;
 mod discovery;
 mod engine;
 mod eval;
+mod fxhash;
 mod jsonl;
 mod kernel;
 // §33 networking transport (feature `net`): a std-only HTTP/1.1 GET client and a
