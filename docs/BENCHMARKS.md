@@ -1768,3 +1768,50 @@ columns straight into the chunk; the widening path moves each matched column
 exactly once (union names are unique). Byte-identical by construction.
 ETL: 1668 → **1551 ms**; all group fixtures + the 3M task + the ETL `cmp`
 re-verified identical.
+
+### Block-based CSV decode + column-major cell batching (slice 13)
+
+With reconcile addressed, decode (~115 ms per 20 MB file) was the largest
+remaining worker cost. A standalone decomposition benchmark against a real
+fixture file pinned the waste: a minimal block-read + SWAR-split + typed-parse
+loop needs only ~55 ms per file — the other half was the decode loop's
+*structure*, not its parsing. Per file: `str::trim` per cell ≈ 20 ms (Unicode
+scan × 4.4 M cells), the per-cell `match` on the lane enum ≈ 21 ms
+(jump-table dispatch × 4.4 M), and `read_line`'s per-line UTF-8 validation +
+copy into a `String` ≈ 15 ms. All three are structural, so all three went:
+
+- **Block walk in place** — `next_columns` now iterates lines directly inside
+  the reader's 256 KiB buffered block (`fill_buf`/`consume`), validating UTF-8
+  once per block ('\n' is a char boundary, so every line inside is valid by
+  subslice). Only a block-straddling line is copied (once per 256 KiB) into a
+  byte carry and takes the old row-at-a-time path.
+- **Column-major cell batching** — the walk accumulates field byte-ranges per
+  kept column and drains them lane-at-a-time via `ColBuilder::push_many`, so
+  the lane `match` runs once per column per block instead of once per cell. A
+  quoted record drains the batch first (row order preserved), then takes the
+  owned slow path as before.
+- **`fast_trim`** — `str::trim` is skipped when a cell's first and last bytes
+  are plain ASCII non-whitespace (`0x21..=0x7F`), the overwhelmingly common
+  case; any other edge byte (incl. ≥ `0x80`, which may start U+00A0) defers to
+  the real `trim`, so the result is always exactly `s.trim()`.
+
+Semantics pinned line-for-line: EOL handling (`\r\n`, lone `\r`s, the
+unterminated final line keeping its `\r`), empty-line and arity skips, both
+prefilters, quoted fallback, the worker byte-range `limit`, and the
+read-error/invalid-UTF-8 stop point all match the `read_line` loop exactly.
+Verified by building the pre-change binary and `cmp`-ing outputs: group and
+ETL shapes, parallel and `RIVUS_NO_PARALLEL` serial — all byte-identical
+(9.5 M-row ETL output included).
+
+Measured on the 10M standard (best of 3, wall / peak RSS):
+
+| shape | before | after | DuckDB | ratio |
+|---|---|---|---|---|
+| CSV read→join→group | 1522 ms / 15.1 MB | **1428 ms / 15.7 MB** | 954 ms / 219 MB | 1.50× |
+| CSV ETL (filter→project→save) | 1497 ms / 12.1 MB | **1393 ms / 13.5 MB** | 1243 ms / 680 MB | **1.12×** |
+
+Worker decode fell ~115 → ~78 ms per file (−32%; ~330 ms CPU across 9 files,
+÷4 cores ≈ the ~100 ms wall gain). Polars ETL stays at 571 ms / 520 MB —
+eager whole-file write, 38× our memory, and it cannot meet the ragged/
+malformed contract. The group shape's residual is now **feed** (~330 ms/file:
+broadcast-probe + partial-group hashing), which is the next lever.

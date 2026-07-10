@@ -107,7 +107,12 @@ pub struct CsvChunker {
     /// otherwise. Aligned to `dtypes`/`keep` order.
     dt_specs: Vec<Option<Arc<DtSpec>>>,
     chunk_size: usize,
-    line: String,
+    /// Partial-line carry for the block-based reader: bytes of a line that
+    /// straddles a buffered block (or ends the file without a newline),
+    /// completed on the next fill. Raw bytes, not `String` — a multi-byte
+    /// character may itself straddle the block, so the fragment alone can be
+    /// invalid UTF-8; validation happens when the line completes.
+    carry: Vec<u8>,
     /// Rows skipped in pass 1 for wrong arity (reported once by the source).
     pub bad_rows: usize,
     /// Rows the pushed-down prefilter skipped *building* (definitely-out rows).
@@ -262,7 +267,7 @@ impl CsvChunker {
                 dtypes,
                 dt_specs,
                 chunk_size: chunk_size.max(1),
-                line: String::new(),
+                carry: Vec::new(),
                 bad_rows: bad,
                 rows_prefiltered: 0,
                 eof: false,
@@ -348,7 +353,7 @@ impl CsvChunker {
                 dtypes,
                 dt_specs,
                 chunk_size: chunk_size.max(1),
-                line: String::new(),
+                carry: Vec::new(),
                 bad_rows: bad,
                 rows_prefiltered: 0,
                 eof: false,
@@ -393,7 +398,7 @@ impl CsvChunker {
             dtypes,
             dt_specs,
             chunk_size: chunk_size.max(1),
-            line: String::new(),
+            carry: Vec::new(),
             bad_rows: 0,
             rows_prefiltered: 0,
             eof: false,
@@ -412,6 +417,15 @@ impl CsvChunker {
     /// Yield the next batch of up to `chunk_size` rows as typed columns, or
     /// `None` at end of file. Malformed rows (wrong arity) are skipped — already
     /// counted in `bad_rows` during pass 1.
+    ///
+    /// Block-based hot path: lines are walked **in place** inside the reader's
+    /// buffered block (one UTF-8 validation per block, no per-line copy), and
+    /// their field ranges accumulate **column-major** so the per-cell lane
+    /// dispatch of [`ColBuilder::push`] runs once per column per block via
+    /// [`ColBuilder::push_many`] — the per-cell `match` was ~20% of decode
+    /// wall on the 10M standard. Only block-straddling lines take the old
+    /// row-at-a-time path (once per 256 KiB). Output is byte-identical to the
+    /// former `read_line` loop.
     pub fn next_columns(&mut self) -> Option<Vec<Column>> {
         if self.eof {
             return None;
@@ -427,76 +441,253 @@ impl CsvChunker {
         // Reused field byte-ranges (no per-row allocation on the unquoted fast
         // path); quoted records fall back to an owned split.
         let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(self.ncols);
+        // Column-major cell batches: byte ranges into the current block's
+        // validated text, one Vec per kept column, drained lane-at-a-time at
+        // block end (or before a quoted row, to keep row order).
+        let mut batch: Vec<Vec<(usize, usize)>> = self.keep.iter().map(|_| Vec::new()).collect();
         let mut got = 0usize;
         while got < self.chunk_size {
             // Stop at the worker's byte range end (lines never straddle a
             // newline-aligned boundary, so the last line ends exactly at it).
+            // A carried partial line never reaches here with `pos >= end`: the
+            // range end sits on a line boundary, so mid-line `pos` is < end.
             if matches!(self.limit, Some(end) if self.pos >= end) {
                 self.eof = true;
                 break;
             }
-            self.line.clear();
-            let n = match self.reader.read_line(&mut self.line) {
-                Ok(0) => {
+            let buf = match self.reader.fill_buf() {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => {
+                    // EOF. A trailing line without a newline sits in the carry
+                    // — decode it exactly as `read_line` returned it (no EOL
+                    // to trim; an invalid-UTF-8 tail is dropped just as a
+                    // `read_line` error stopped the old loop).
                     self.eof = true;
+                    if !self.carry.is_empty() {
+                        let bytes = std::mem::take(&mut self.carry);
+                        if let Ok(s) = std::str::from_utf8(&bytes) {
+                            if self.push_row(trim_eol(s), &mut builders, &mut offsets) {
+                                got += 1;
+                            }
+                        }
+                    }
                     break;
                 }
-                Ok(n) => n,
                 Err(_) => {
+                    // Read error: stop without decoding the partial carry —
+                    // `read_line` returned `Err` for that line, undecoded.
                     self.eof = true;
                     break;
                 }
             };
-            self.pos += n as u64;
-            let l = trim_eol(&self.line);
-            if l.trim().is_empty() {
-                continue;
+
+            // Complete a carried block-straddling line first (the batch is
+            // always empty here — it drains at the end of every block walk —
+            // so row order is preserved).
+            if !self.carry.is_empty() {
+                match buf.iter().position(|&b| b == b'\n') {
+                    None => {
+                        let n = buf.len();
+                        self.carry.extend_from_slice(buf);
+                        self.reader.consume(n);
+                        self.pos += n as u64;
+                        continue;
+                    }
+                    Some(nl) => {
+                        self.carry.extend_from_slice(&buf[..nl]);
+                        let bytes = std::mem::take(&mut self.carry);
+                        self.reader.consume(nl + 1);
+                        self.pos += (nl + 1) as u64;
+                        match std::str::from_utf8(&bytes) {
+                            Ok(s) => {
+                                let l = s.strip_suffix('\r').unwrap_or(s);
+                                if self.push_row(l, &mut builders, &mut offsets) {
+                                    got += 1;
+                                }
+                            }
+                            Err(_) => {
+                                // `read_line` would have errored on this line:
+                                // stop decoding, keep what's built.
+                                self.eof = true;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
             }
-            // String prefilter: a required literal substring is missing from the
-            // raw line, so no field can satisfy the predicate — skip before
-            // splitting (ripgrep-style; FilterProject stays authoritative).
-            if !self.str_prefilter.is_empty()
-                && !self.str_prefilter.iter().all(|n| l.contains(n.as_str()))
-            {
-                self.rows_prefiltered += 1;
-                continue;
-            }
-            if split_offsets(l, &mut offsets, self.delim) {
-                if offsets.len() != self.ncols {
+
+            // No complete line in the block: carry the fragment and refill.
+            let last_nl = match buf.iter().rposition(|&b| b == b'\n') {
+                None => {
+                    let n = buf.len();
+                    self.carry.extend_from_slice(buf);
+                    self.reader.consume(n);
+                    self.pos += n as u64;
                     continue;
                 }
-                // Pushed-down prefilter: skip building rows that are definitely
-                // out (conservative; the downstream FilterProject is final).
-                if !self.prefilter.is_empty() && !row_passes_prefilter(&self.prefilter, l, &offsets)
+                Some(p) => p,
+            };
+
+            // Validate the complete-lines region once; '\n' is a char
+            // boundary, so every line inside is valid UTF-8 by subslice. On
+            // an invalid byte, decode the fully-valid lines before it — the
+            // old loop decoded exactly those before `read_line` errored.
+            let region = &buf[..=last_nl];
+            let text = match std::str::from_utf8(region) {
+                Ok(t) => t,
+                Err(e) => {
+                    match region[..e.valid_up_to()].iter().rposition(|&b| b == b'\n') {
+                        Some(c) => std::str::from_utf8(&region[..=c]).unwrap(),
+                        None => {
+                            // The very next line is invalid: stop before it.
+                            self.eof = true;
+                            break;
+                        }
+                    }
+                }
+            };
+            let stop_after = text.len() < region.len();
+
+            // Walk the lines in place, batching field ranges column-major.
+            // Only free functions and disjoint fields are touched while `buf`
+            // borrows the reader; `consume` happens after the walk.
+            let mut cur = 0usize; // cursor into `text` (always at a line start)
+            let mut walked = 0usize; // bytes fully processed, incl. each '\n'
+            while cur < text.len() {
+                if got >= self.chunk_size {
+                    break;
+                }
+                if matches!(self.limit, Some(end) if self.pos + walked as u64 >= end) {
+                    self.eof = true;
+                    break;
+                }
+                let rest = &text[cur..];
+                // The region ends with '\n', so a newline always exists.
+                let nl = rest.as_bytes().iter().position(|&b| b == b'\n').unwrap();
+                let base = cur;
+                cur += nl + 1;
+                walked = cur;
+                let raw = &rest[..nl];
+                let l = raw.strip_suffix('\r').unwrap_or(raw);
+                if l.trim().is_empty() {
+                    continue;
+                }
+                // String prefilter: a required literal substring is missing
+                // from the raw line, so no field can satisfy the predicate —
+                // skip before splitting (ripgrep-style; FilterProject stays
+                // authoritative).
+                if !self.str_prefilter.is_empty()
+                    && !self.str_prefilter.iter().all(|n| l.contains(n.as_str()))
                 {
                     self.rows_prefiltered += 1;
                     continue;
                 }
-                for (k, &ci) in self.keep.iter().enumerate() {
-                    let (s, e) = offsets[ci];
-                    if builders[k].push(&l[s..e], false) {
-                        self.parse_failures[k] += 1;
+                if split_offsets(l, &mut offsets, self.delim) {
+                    if offsets.len() != self.ncols {
+                        continue;
+                    }
+                    // Pushed-down prefilter: skip building rows that are
+                    // definitely out (conservative; FilterProject is final).
+                    if !self.prefilter.is_empty()
+                        && !row_passes_prefilter(&self.prefilter, l, &offsets)
+                    {
+                        self.rows_prefiltered += 1;
+                        continue;
+                    }
+                    for (k, &ci) in self.keep.iter().enumerate() {
+                        let (s, e) = offsets[ci];
+                        batch[k].push((base + s, base + e));
+                    }
+                } else {
+                    // Quoted records take the owned slow path and skip the
+                    // prefilter (rare; FilterProject still filters them
+                    // downstream). Drain the batch first to keep row order.
+                    let fields = split_record_q(l, self.delim);
+                    if fields.len() != self.ncols {
+                        continue;
+                    }
+                    for (k, cells) in batch.iter_mut().enumerate() {
+                        self.parse_failures[k] += builders[k].push_many(text, cells);
+                        cells.clear();
+                    }
+                    for (k, &ci) in self.keep.iter().enumerate() {
+                        if builders[k].push(&fields[ci].0, fields[ci].1) {
+                            self.parse_failures[k] += 1;
+                        }
                     }
                 }
-            } else {
-                // Quoted records take the owned slow path and skip the prefilter
-                // (rare; FilterProject still filters them downstream).
-                let fields = split_record_q(l, self.delim);
-                if fields.len() != self.ncols {
-                    continue;
-                }
-                for (k, &ci) in self.keep.iter().enumerate() {
-                    if builders[k].push(&fields[ci].0, fields[ci].1) {
-                        self.parse_failures[k] += 1;
-                    }
-                }
+                got += 1;
             }
-            got += 1;
+
+            // Drain the batch while `text` is still alive, then release the
+            // block: consume only the fully-processed lines, so an early stop
+            // (chunk full / range end) resumes at the right line.
+            for (k, cells) in batch.iter_mut().enumerate() {
+                self.parse_failures[k] += builders[k].push_many(text, cells);
+                cells.clear();
+            }
+            let text_len = text.len();
+            self.reader.consume(walked);
+            self.pos += walked as u64;
+            // Invalid UTF-8 after the last valid line, and the walk reached
+            // it: stop exactly where `read_line` would have errored. (If the
+            // chunk filled first, the unconsumed bytes re-validate next call.)
+            if stop_after && walked == text_len {
+                self.eof = true;
+                break;
+            }
         }
         if got == 0 {
             return None;
         }
         Some(builders.iter_mut().map(ColBuilder::finish).collect())
+    }
+
+    /// Row-at-a-time push — the pre-batch path, kept for the rare lines that
+    /// straddle a buffered block or end the file without a newline. Returns
+    /// whether the row was materialized (counts toward the chunk).
+    fn push_row(
+        &mut self,
+        l: &str,
+        builders: &mut [ColBuilder],
+        offsets: &mut Vec<(usize, usize)>,
+    ) -> bool {
+        if l.trim().is_empty() {
+            return false;
+        }
+        if !self.str_prefilter.is_empty()
+            && !self.str_prefilter.iter().all(|n| l.contains(n.as_str()))
+        {
+            self.rows_prefiltered += 1;
+            return false;
+        }
+        if split_offsets(l, offsets, self.delim) {
+            if offsets.len() != self.ncols {
+                return false;
+            }
+            if !self.prefilter.is_empty() && !row_passes_prefilter(&self.prefilter, l, offsets) {
+                self.rows_prefiltered += 1;
+                return false;
+            }
+            for (k, &ci) in self.keep.iter().enumerate() {
+                let (s, e) = offsets[ci];
+                if builders[k].push(&l[s..e], false) {
+                    self.parse_failures[k] += 1;
+                }
+            }
+        } else {
+            let fields = split_record_q(l, self.delim);
+            if fields.len() != self.ncols {
+                return false;
+            }
+            for (k, &ci) in self.keep.iter().enumerate() {
+                if builders[k].push(&fields[ci].0, fields[ci].1) {
+                    self.parse_failures[k] += 1;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -789,6 +980,35 @@ fn apply_declared_types(
             }
         }
     }
+}
+
+/// `str::trim`, skipping the whitespace scan when the first and last bytes
+/// are plain ASCII non-whitespace (`0x21..=0x7F`) — the overwhelmingly common
+/// CSV cell (~15% of decode wall recovered on the 10M standard). Any other
+/// edge byte (ASCII whitespace, or ≥ `0x80`, which may start a multi-byte
+/// Unicode whitespace like U+00A0) defers to `str::trim`, so the result is
+/// always exactly `s.trim()`.
+#[inline(always)]
+fn fast_trim(s: &str) -> &str {
+    let b = s.as_bytes();
+    match (b.first(), b.last()) {
+        (Some(&f), Some(&l)) if f > 0x20 && f < 0x80 && l > 0x20 && l < 0x80 => s,
+        _ => s.trim(),
+    }
+}
+
+/// [`ColBuilder::record`]'s body as a free function, so `push_many` can
+/// interleave it with a held lane borrow (disjoint-field form of the same
+/// lazy-validity logic).
+#[inline]
+fn record_into(valid: &mut Vec<bool>, len: &mut usize, ok: bool) {
+    if !valid.is_empty() {
+        valid.push(ok);
+    } else if !ok {
+        *valid = vec![true; *len];
+        valid.push(false);
+    }
+    *len += 1;
 }
 
 /// Strip a trailing `\n` or `\r\n` (mirrors `str::lines` semantics).
@@ -1336,13 +1556,7 @@ impl ColBuilder {
     /// counter bump; the first null back-fills the prior rows as valid.
     #[inline]
     fn record(&mut self, valid: bool) {
-        if !self.valid.is_empty() {
-            self.valid.push(valid);
-        } else if !valid {
-            self.valid = vec![true; self.len];
-            self.valid.push(false);
-        }
-        self.len += 1;
+        record_into(&mut self.valid, &mut self.len, valid);
     }
 
     /// Parse one cell into the lane and record its validity (design 26 §26.3),
@@ -1359,7 +1573,7 @@ impl ColBuilder {
     ///   (`a,"",b`); an unquoted empty (`a,,b`) is `null`, like every other lane.
     #[inline]
     fn push(&mut self, cell: &str, quoted: bool) -> bool {
-        let t = cell.trim();
+        let t = fast_trim(cell);
         let (valid, fail) = match &mut self.lane {
             Lane::Bool(v) => {
                 v.push(t == "true");
@@ -1457,6 +1671,149 @@ impl ColBuilder {
         };
         self.record(valid);
         fail
+    }
+
+    /// Column-major batch push: every cell of one column for a block of rows,
+    /// with the lane resolved **once** instead of per cell (`next_columns`
+    /// batches rows per buffered block; the per-cell lane `match` was ~20% of
+    /// decode wall on the 10M standard). `cells` are byte ranges into `text`.
+    /// Rows on this path are never quoted — quoted records take the
+    /// row-at-a-time slow path — so the `Str` empty-cell rule uses
+    /// `quoted = false`. Parse, null and failure semantics mirror
+    /// [`ColBuilder::push`] arm for arm; returns how many **non-empty** cells
+    /// failed to parse (the caller adds it to `parse_failures`).
+    fn push_many(&mut self, text: &str, cells: &[(usize, usize)]) -> u64 {
+        let mut fails = 0u64;
+        let ColBuilder { lane, valid, len } = self;
+        match lane {
+            Lane::Bool(v) => {
+                for &(s, e) in cells {
+                    let t = fast_trim(&text[s..e]);
+                    v.push(t == "true");
+                    record_into(valid, len, !t.is_empty());
+                }
+            }
+            Lane::I64(v) => {
+                for &(s, e) in cells {
+                    let t = fast_trim(&text[s..e]);
+                    match parse_i64_fast(t).or_else(|| t.parse::<i64>().ok()) {
+                        Some(n) => {
+                            v.push(n);
+                            record_into(valid, len, true);
+                        }
+                        None => {
+                            v.push(0);
+                            record_into(valid, len, false);
+                            fails += u64::from(!t.is_empty());
+                        }
+                    }
+                }
+            }
+            Lane::F64(v) => {
+                for &(s, e) in cells {
+                    let t = fast_trim(&text[s..e]);
+                    match t.parse::<f64>() {
+                        Ok(n) => {
+                            v.push(n);
+                            record_into(valid, len, true);
+                        }
+                        Err(_) => {
+                            v.push(0.0);
+                            record_into(valid, len, false);
+                            fails += u64::from(!t.is_empty());
+                        }
+                    }
+                }
+            }
+            Lane::Dec(v, scale) => {
+                for &(s, e) in cells {
+                    let t = fast_trim(&text[s..e]);
+                    match Decimal::parse_scaled(t, *scale) {
+                        Some(d) => {
+                            v.push(d.unscaled);
+                            record_into(valid, len, true);
+                        }
+                        None => {
+                            v.push(0);
+                            record_into(valid, len, false);
+                            fails += u64::from(!t.is_empty());
+                        }
+                    }
+                }
+            }
+            Lane::DateTime(v, spec, hint) => {
+                for &(s, e) in cells {
+                    let cell = &text[s..e];
+                    match spec.parse_opt(cell, hint) {
+                        Some(ticks) => {
+                            v.push(ticks);
+                            record_into(valid, len, true);
+                        }
+                        None => {
+                            v.push(0);
+                            record_into(valid, len, false);
+                            fails += u64::from(!fast_trim(cell).is_empty());
+                        }
+                    }
+                }
+            }
+            Lane::Duration(v, unit) => {
+                for &(s, e) in cells {
+                    let cell = &text[s..e];
+                    match rivus_core::Duration::parse_at(cell, *unit) {
+                        Some(d) => {
+                            v.push(d.ticks);
+                            record_into(valid, len, true);
+                        }
+                        None => {
+                            v.push(0);
+                            record_into(valid, len, false);
+                            fails += u64::from(!fast_trim(cell).is_empty());
+                        }
+                    }
+                }
+            }
+            Lane::Date(v) => {
+                for &(s, e) in cells {
+                    let cell = &text[s..e];
+                    match rivus_core::Date::parse(cell) {
+                        Some(d) => {
+                            v.push(d.epoch_day);
+                            record_into(valid, len, true);
+                        }
+                        None => {
+                            v.push(0);
+                            record_into(valid, len, false);
+                            fails += u64::from(!fast_trim(cell).is_empty());
+                        }
+                    }
+                }
+            }
+            Lane::Time(v) => {
+                for &(s, e) in cells {
+                    let cell = &text[s..e];
+                    match rivus_core::TimeOfDay::parse_at(cell, rivus_core::TimeUnit::Sec) {
+                        Some(tod) => {
+                            v.push(tod.ticks);
+                            record_into(valid, len, true);
+                        }
+                        None => {
+                            v.push(0);
+                            record_into(valid, len, false);
+                            fails += u64::from(!fast_trim(cell).is_empty());
+                        }
+                    }
+                }
+            }
+            Lane::Str(v) => {
+                for &(s, e) in cells {
+                    let cell = &text[s..e];
+                    v.push(cell);
+                    record_into(valid, len, !cell.is_empty());
+                }
+            }
+        }
+        fails
     }
 
     fn finish(&mut self) -> Column {
