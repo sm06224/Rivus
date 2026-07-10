@@ -1755,3 +1755,16 @@ writer's 9.5M-row output: **byte-identical**.
 Polars stays ahead on wall for this shape (eager whole-file write) — with 40×
 our memory and no never-silent contract; the gap to DuckDB is 1.25× at 1/50th
 of its memory. All group fixtures + the 3M task re-verified bit-identical.
+
+### Reconcile without copies (slice 12)
+
+The ETL worker profile (env-gated `RIVUS_WORKER_PROF`, kept in-tree) split the
+per-file time as decode 1040 / reconcile 487 / emit 582 / ops 415 ms — and the
+reconcile cost was pure **column cloning**: `reconcile_chunk` cloned every
+column of every chunk before the identity cast returned it unchanged.
+`reconcile_chunk` now takes the columns by value: a file whose schema already
+equals the union (names, order, lanes — 8 of the 9 fixture files) **moves** its
+columns straight into the chunk; the widening path moves each matched column
+exactly once (union names are unique). Byte-identical by construction.
+ETL: 1668 → **1551 ms**; all group fixtures + the 3M task + the ETL `cmp`
+re-verified identical.

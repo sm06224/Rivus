@@ -1510,7 +1510,7 @@ fn try_parallel_read_group(
             &provenance.source(uri0),
             uri0,
             schema0,
-            &cols0,
+            cols0,
             0,
         );
         // Mini-pipeline: process the one chunk, then cascade finishes.
@@ -1897,13 +1897,35 @@ fn worker_read_to_segment(
         }
         level
     };
-    while let Some(cols) = dec.next_chunk() {
+    let mut t_dec = std::time::Duration::ZERO;
+    let mut t_rec = std::time::Duration::ZERO;
+    let mut t_ops = std::time::Duration::ZERO;
+    let mut t_emit = std::time::Duration::ZERO;
+    loop {
+        let t0 = Instant::now();
+        let Some(cols) = dec.next_chunk() else { break };
+        t_dec += t0.elapsed();
         let id = next_id;
         next_id += 1;
+        let t1 = Instant::now();
         let ch =
-            operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, &cols, id);
+            operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, cols, id);
+        t_rec += t1.elapsed();
+        let t2 = Instant::now();
         let out = run_level(&mut ops, 0, vec![ch], &mut errors, &mut next_id);
+        t_ops += t2.elapsed();
+        let t3 = Instant::now();
         emit(out, &mut header, &mut rows, &mut errors);
+        t_emit += t3.elapsed();
+    }
+    if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        eprintln!(
+            "[WPROF-SINK] {uri}: decode={}ms reconcile={}ms ops={}ms emit={}ms",
+            t_dec.as_millis(),
+            t_rec.as_millis(),
+            t_ops.as_millis(),
+            t_emit.as_millis()
+        );
     }
     for i in 0..ops.len() {
         let fin = {
@@ -2583,7 +2605,7 @@ fn worker_read_partial_group(
         next_id += 1;
         let t1 = Instant::now();
         let ch =
-            operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, &cols, id);
+            operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, cols, id);
         t_rec += t1.elapsed();
         let t2 = Instant::now();
         feed(
