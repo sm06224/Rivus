@@ -1343,6 +1343,14 @@ fn pre_group_op_allowed(op: &Op) -> bool {
 /// One worker's partial result: its `GroupBy` state, errors, and rows grouped.
 type PartialGroup = (operators::GroupBy, Vec<ErrorEvent>, u64);
 
+/// A broadcast join's prebuilt right side: concatenated chunk, hash table,
+/// and right-key column indices — built once, shared by every worker.
+type BroadcastRight = (
+    std::sync::Arc<Chunk>,
+    std::sync::Arc<std::collections::HashMap<String, Vec<usize>>>,
+    std::sync::Arc<Vec<usize>>,
+);
+
 fn try_parallel_read_group(
     graph: &PlanGraph,
     opts: &RunOptions,
@@ -1399,10 +1407,11 @@ fn try_parallel_read_group(
         return None;
     }
 
-    // 2) Broadcast right sides, serially (small bounded sources).
-    let mut rights: Vec<(NodeId, std::sync::Arc<Vec<Chunk>>)> = Vec::new();
+    // 2) Broadcast right sides, serially (small bounded sources): concat +
+    //    hash-index ONCE, shared by every worker's streaming prober.
+    let mut rights: Vec<(NodeId, BroadcastRight)> = Vec::new();
     for step in &shape.path {
-        if let ReadPathStep::Broadcast { right_src, .. } = step {
+        if let ReadPathStep::Broadcast { join_id, right_src } = step {
             let mut op = operators::build(&graph.nodes[*right_src].op, &[], opts.chunk_size, false);
             let mut chunks = Vec::new();
             let mut ctx = OpCtx {
@@ -1413,7 +1422,11 @@ fn try_parallel_read_group(
             while let Some(ch) = op.pull(&mut ctx) {
                 chunks.push(ch);
             }
-            rights.push((*right_src, std::sync::Arc::new(chunks)));
+            let Op::Join { right_keys, .. } = &graph.nodes[*join_id].op else {
+                return None;
+            };
+            let built = operators::BroadcastProbe::build_right(&chunks, right_keys)?;
+            rights.push((*right_src, built));
         }
     }
     if pre_errors.iter().any(ErrorEvent::is_fatal) {
@@ -1508,25 +1521,24 @@ fn try_parallel_read_group(
                     prev = *nid;
                 }
                 ReadPathStep::Broadcast { join_id, right_src } => {
-                    let mut op = operators::build(
-                        &graph.nodes[*join_id].op,
-                        &graph.inputs_of(*join_id),
-                        opts.chunk_size,
-                        false,
-                    );
-                    let chunks = &rights
+                    let Op::Join {
+                        left_keys, kind, ..
+                    } = &graph.nodes[*join_id].op
+                    else {
+                        return None;
+                    };
+                    let (right, table, rk) = &rights
                         .iter()
                         .find(|(id, _)| id == right_src)
                         .expect("right side")
                         .1;
-                    let mut ctx = OpCtx {
-                        label: label_of(graph, *join_id),
-                        errors: &mut serrors,
-                        next_chunk_id: &mut sid,
-                    };
-                    for c in chunks.iter() {
-                        let _ = op.process(*right_src, c.clone(), &mut ctx);
-                    }
+                    let op: Box<dyn Operator> = Box::new(operators::BroadcastProbe::new(
+                        left_keys.clone(),
+                        *kind,
+                        right.clone(),
+                        table.clone(),
+                        rk.clone(),
+                    ));
                     ops.push((*join_id, prev, op));
                     prev = *join_id;
                 }
@@ -1908,7 +1920,7 @@ fn worker_read_partial_group(
     uschema: &std::sync::Arc<rivus_core::Schema>,
     fname: Option<&str>,
     provenance: rivus_ir::Provenance,
-    rights: &[(NodeId, std::sync::Arc<Vec<Chunk>>)],
+    rights: &[(NodeId, BroadcastRight)],
     read_label: &str,
 ) -> (operators::GroupBy, Vec<ErrorEvent>, u64) {
     let mut errors = Vec::new();
@@ -1929,25 +1941,29 @@ fn worker_read_partial_group(
                 prev = *nid;
             }
             ReadPathStep::Broadcast { join_id, right_src } => {
-                let mut op = operators::build(
-                    &graph.nodes[*join_id].op,
-                    &graph.inputs_of(*join_id),
-                    opts.chunk_size,
-                    false,
-                );
-                let chunks = &rights
+                // Streaming prober: probes each arriving chunk against the
+                // shared prebuilt right side and emits immediately — no left
+                // buffering, no drain-time concat (which dominated the worker
+                // profile). Byte-identical to the blocking join (see
+                // `BroadcastProbe`).
+                let Op::Join {
+                    left_keys, kind, ..
+                } = &graph.nodes[*join_id].op
+                else {
+                    unreachable!("shape detector matched a join");
+                };
+                let (right, table, rk) = &rights
                     .iter()
                     .find(|(id, _)| id == right_src)
-                    .expect("materialized right side")
+                    .expect("prebuilt right side")
                     .1;
-                let mut ctx = OpCtx {
-                    label: label_of(graph, *join_id),
-                    errors: &mut errors,
-                    next_chunk_id: &mut next_id,
-                };
-                for c in chunks.iter() {
-                    let _ = op.process(*right_src, c.clone(), &mut ctx);
-                }
+                let op: Box<dyn Operator> = Box::new(operators::BroadcastProbe::new(
+                    left_keys.clone(),
+                    *kind,
+                    right.clone(),
+                    table.clone(),
+                    rk.clone(),
+                ));
                 ops.push((*join_id, prev, op));
                 prev = *join_id;
             }
@@ -1989,11 +2005,20 @@ fn worker_read_partial_group(
         }
     };
 
-    while let Some(cols) = dec.next_chunk() {
+    let mut t_dec = std::time::Duration::ZERO;
+    let mut t_rec = std::time::Duration::ZERO;
+    let mut t_feed = std::time::Duration::ZERO;
+    loop {
+        let t0 = Instant::now();
+        let Some(cols) = dec.next_chunk() else { break };
+        t_dec += t0.elapsed();
         let id = next_id;
         next_id += 1;
+        let t1 = Instant::now();
         let ch =
             operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, &cols, id);
+        t_rec += t1.elapsed();
+        let t2 = Instant::now();
         feed(
             &mut ops,
             0,
@@ -2003,9 +2028,19 @@ fn worker_read_partial_group(
             &mut next_id,
             &mut rows,
         );
+        t_feed += t2.elapsed();
+    }
+    if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        eprintln!(
+            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms",
+            t_dec.as_millis(),
+            t_rec.as_millis(),
+            t_feed.as_millis()
+        );
     }
     // Drain: cascade each op's finish through the rest of the pipeline (a
     // blocking join emits everything here).
+    let t3 = Instant::now();
     for i in 0..ops.len() {
         let fin = {
             let (nid, _, op) = &mut ops[i];
@@ -2027,6 +2062,9 @@ fn worker_read_partial_group(
                 &mut rows,
             );
         }
+    }
+    if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        eprintln!("[WPROF] {uri}: drain={}ms", t3.elapsed().as_millis());
     }
     // Per-file malformed rows AFTER draining (compressed streams accrue while
     // decoding); same message the serial read raises, at the read node.

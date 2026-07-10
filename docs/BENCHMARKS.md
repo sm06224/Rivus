@@ -1699,3 +1699,30 @@ Nested schemas keep the general JVal path.
 
 Outputs re-verified bit-identical (jsonl / jsonl.gz / csv), malformed counts
 intact. The JSONL gap has closed from 12.1× (start) → 2.1×.
+
+### Streaming broadcast probe — 全てが流れ, realized (slice 9)
+
+The worker profile showed **4.6s of a 10M CSV run inside the blocking join's
+finish** (buffer → concat → probe → gather), while decode/reconcile/feed were
+healthy. The parallel read→group path now builds the broadcast join's right
+side ONCE (concat + hash + key indices, `BroadcastProbe::build_right`, shared
+`Arc` across workers) and each worker probes every arriving chunk **immediately**
+(`BroadcastProbe`: per-chunk probe → gather → emit; output schema, `_r`
+collisions, key preservation and null-key semantics mirror `Join::finish`
+exactly; inner/left only — the shape detector's rule). No left buffering
+remains anywhere in the pipeline: decode → reconcile → probe → partial group is
+chunk-at-a-time end to end.
+
+| 10M × 9 files, warm best-of-3 | slice 8 | **slice 9** | DuckDB |
+|---|---:|---:|---:|
+| csv | 2060 ms | **1499 ms** | 877 ms (**1.7×**) |
+| jsonl | 2893 ms | **2300 ms** | 1395 ms (**1.6×**) |
+| csv.gz | 1797 ms | **1347 ms** | 1175 ms (**1.15×**) |
+| jsonl.gz | ~3800 ms | 3683 ms | 1733 ms (2.1×) |
+| **peak RSS** | ~600 MB | **12–16 MB** | 240–405 MB |
+
+All five fixtures (3M + four 10M variants) remain bit-identical. The memory
+story inverts the comparison: Rivus now runs the whole contract-pinned job in
+**~1/20th of DuckDB's memory** (a chunk + the group states + a 20-row broadcast
+side is all that's ever resident) while sitting 1.15–1.7× on wall — the
+bounded-memory promise（全てが流れ）is no longer aspirational for this shape.
