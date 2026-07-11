@@ -1884,3 +1884,37 @@ all `cmp`-identical. The worker cost sheet now reads decode 110 /
 feed 165 / reconcile 33 — decode is back on top, and inside feed the
 residual is `Value`-per-row `observe` (group 65) and key-build + gather
 (probe 51).
+
+### Phase accounting + safety-sample without a second inference pass (slice 16)
+
+The per-worker sheet (~310 ms CPU/file × 9 ÷ 4 cores ≈ 700 ms) did not
+explain the group wall — so `RIVUS_WORKER_PROF` now also prints the
+**phase** split of the parallel read-group driver. First reading:
+`open=318ms scratch=~130ms workers=730ms merge+tail=0ms`. Two findings:
+
+- **The parallel-safety check re-opened the first file** — a full second
+  inference pass of one 20 MB file (~130 ms of serial wall) just to type
+  one sample chunk. The check now decodes that chunk from the
+  already-opened decoder (a one-chunk clone feeds the scratch pipeline)
+  and hands the original columns to worker 0 as a **preface**, so every
+  row still streams exactly once, in order, with the same chunk ids —
+  byte-identical, one inference pass cheaper. `scratch` phase: → **1 ms**.
+- A tempting stronger form — typing the scratch pipeline with a 0-row
+  chunk instead of a decoded one — is **rejected**: `BroadcastProbe` and
+  `FilterProject` drop empty chunks, and expression typing on 0 rows is
+  not guaranteed to match the value-bearing case; a wrong dtype there
+  could mis-approve a non-associative parallel plan (the #41 trap). The
+  sample chunk stays real.
+
+With the box back to its quiet baseline, the standings (interleaved, same
+window, wall / peak RSS):
+
+| shape | rivus | DuckDB | ratio |
+|---|---|---|---|
+| CSV read→join→group | **1108 ms / 16 MB** | 917 ms / 236 MB | 1.21× |
+| CSV ETL filter→project→save | **1177 ms / 13 MB** | 1221 ms / 692 MB | **0.96× — first outright wall win, at 1/53rd the memory** |
+
+Confirmed across three interleaved rounds (rivus 1177–1221 ms vs DuckDB
+1221–1429 ms). Remaining group-shape account: workers 730 ms (decode 110 +
+feed 165 + reconcile 33 per file) and **open 318 ms — the inference pass
+is now the single biggest serial block**, and the next lever.

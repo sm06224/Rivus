@@ -1481,6 +1481,7 @@ fn try_parallel_read_group(
     if opened.is_empty() {
         return None;
     }
+    let t_open = t0.elapsed();
 
     // 4) The union schema every worker reconciles to (single source of truth).
     let (union, fname) = operators::union_by_name(opened.iter().map(|(_, s, _)| s), provenance);
@@ -1493,10 +1494,16 @@ fn try_parallel_read_group(
         Op::GroupBy { aggs, .. } => aggs.clone(),
         _ => return None,
     };
+    // The sample chunk comes from the ALREADY-OPENED first file's decoder —
+    // the old form re-opened the file, which re-ran its whole inference pass
+    // (a full serial scan) just to type-check one chunk. The columns are
+    // cloned for the scratch run and the originals are handed to worker 0 as
+    // a preface, so the worker still processes every row exactly once, in
+    // order — byte-identical, one inference pass cheaper.
+    let preface0: Vec<rivus_core::Column>;
     {
-        let (uri0, schema0, _) = &opened[0];
-        let (_, mut scratch_dec) = planner.open_file_stream(uri0).ok()?;
-        let cols0 = scratch_dec.next_chunk()?;
+        let (uri0, schema0, dec0) = &mut opened[0];
+        let cols0 = dec0.next_chunk()?;
         let mut serrors = Vec::new();
         let mut sid = 0u64;
         let ch0 = operators::reconcile_chunk(
@@ -1506,7 +1513,7 @@ fn try_parallel_read_group(
             &provenance.source(uri0),
             uri0,
             schema0,
-            cols0,
+            cols0.clone(),
             0,
         );
         // Mini-pipeline: process the one chunk, then cascade finishes.
@@ -1573,12 +1580,16 @@ fn try_parallel_read_group(
         if !safe {
             return None;
         }
+        preface0 = cols0;
     }
+    let t_scratch = t0.elapsed();
 
-    // 6) Workers: one file each, in waves of ≤ core count.
+    // 6) Workers: one file each, in waves of ≤ core count. Worker 0 receives
+    // the safety-check chunk's columns as a preface (decoded once, above).
     let mut partials: Vec<Option<PartialGroup>> = (0..opened.len()).map(|_| None).collect();
     let opened_files: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = opened;
     {
+        let mut preface0 = Some(preface0);
         let mut wave: Vec<(usize, (String, rivus_core::Schema, operators::FileDecoder))> =
             Vec::new();
         let mut it = opened_files.into_iter().enumerate();
@@ -1602,12 +1613,13 @@ fn try_parallel_read_group(
                 let handles: Vec<_> = wave
                     .drain(..)
                     .map(|(idx, (uri, schema, dec))| {
+                        let preface = if idx == 0 { preface0.take() } else { None };
                         s.spawn(move || {
                             (
                                 idx,
                                 worker_read_partial_group(
-                                    graph, opts, shape, &uri, &schema, dec, union, uschema, fname,
-                                    provenance, rights, read_label,
+                                    graph, opts, shape, &uri, &schema, dec, preface, union,
+                                    uschema, fname, provenance, rights, read_label,
                                 ),
                             )
                         })
@@ -1620,6 +1632,8 @@ fn try_parallel_read_group(
             }
         }
     }
+
+    let t_workers = t0.elapsed();
 
     // 7) Merge partials in uri order; then the serial tail on the tiny result.
     let mut partials_iter = partials.into_iter().map(|p| p.expect("worker ran"));
@@ -1740,6 +1754,17 @@ fn try_parallel_read_group(
         strategy: None,
     };
     res.strategy = Some("parallel read group-by (per-file workers)".to_string());
+    if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        // Wall between phase boundaries: discovery+rights+open / the one
+        // scratch safety chunk / worker waves / merge+serial tail.
+        eprintln!(
+            "[WPROF-PHASE] open={}ms scratch={}ms workers={}ms merge+tail={}ms",
+            t_open.as_millis(),
+            (t_scratch - t_open).as_millis(),
+            (t_workers - t_scratch).as_millis(),
+            (t0.elapsed() - t_workers).as_millis()
+        );
+    }
     if let Some(h) = hook.as_mut() {
         h(&final_snapshot(&res, shape.discovery_id, t0.elapsed()));
     }
@@ -2501,6 +2526,9 @@ fn worker_read_partial_group(
     uri: &str,
     file_schema: &rivus_core::Schema,
     mut dec: operators::FileDecoder,
+    // Columns already decoded from this file (the parallel-safety sample
+    // chunk): processed FIRST, so the stream is the whole file in order.
+    preface: Option<Vec<rivus_core::Column>>,
     union: &[rivus_core::Field],
     uschema: &std::sync::Arc<rivus_core::Schema>,
     fname: Option<&str>,
@@ -2602,6 +2630,27 @@ fn worker_read_partial_group(
     let mut t_dec = std::time::Duration::ZERO;
     let mut t_rec = std::time::Duration::ZERO;
     let mut t_feed = std::time::Duration::ZERO;
+    // The pre-decoded safety-sample chunk streams first (file order).
+    if let Some(cols) = preface {
+        let id = next_id;
+        next_id += 1;
+        let t1 = Instant::now();
+        let ch =
+            operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, cols, id);
+        t_rec += t1.elapsed();
+        let t2 = Instant::now();
+        feed(
+            &mut ops,
+            0,
+            vec![ch],
+            &mut group,
+            &mut errors,
+            &mut next_id,
+            &mut rows,
+            &mut t_ops,
+        );
+        t_feed += t2.elapsed();
+    }
     loop {
         let t0 = Instant::now();
         let Some(cols) = dec.next_chunk() else { break };
