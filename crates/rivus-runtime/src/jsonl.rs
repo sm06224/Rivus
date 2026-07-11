@@ -646,24 +646,111 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
     // column order (matching the sequential scan's `started` flag exactly).
     let mut first_names: Option<Vec<String>> = None;
     let mut bad_rows = 0usize;
+    // Block walk, like the CSV `infer_range` (slice 17): lines observed in
+    // place inside the buffered block — one UTF-8 validation per block, no
+    // per-line copy. The range end is newline-aligned, so capping each block
+    // at `end − pos` always cuts on a line boundary.
     let mut pos = start;
-    let mut line = String::new();
-    while pos < end {
-        line.clear();
-        match r.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(n) => pos += n as u64,
-            Err(_) => break,
+    let mut carry: Vec<u8> = Vec::new();
+    // Allocation-free scan (pass 1): observes classes directly into `seen`
+    // without building a `JVal` — pinned byte-identical to the parser path
+    // by `scanner_matches_parser_inference`.
+    let observe = |l: &str,
+                   seen: &mut Vec<(String, Infer)>,
+                   first_names: &mut Option<Vec<String>>,
+                   bad_rows: &mut usize| {
+        if !l.trim().is_empty() && !scan_line_infer(l, seen, first_names) {
+            *bad_rows += 1;
         }
-        let l = line.trim_end_matches(['\n', '\r']);
-        if l.trim().is_empty() {
-            continue;
+    };
+    loop {
+        if pos >= end {
+            break;
         }
-        // Allocation-free scan (pass 1): observes classes directly into `seen`
-        // without building a `JVal` — pinned byte-identical to the parser path
-        // by `scanner_matches_parser_inference`.
-        if !scan_line_infer(l, &mut seen, &mut first_names) {
-            bad_rows += 1;
+        let buf = match r.fill_buf() {
+            Ok(b) if !b.is_empty() => b,
+            _ => {
+                // EOF: a trailing unterminated line sits in the carry (only
+                // possible when `end` is the file end); read errors observed
+                // nothing more, exactly like the old `read_line` loop.
+                if !carry.is_empty() {
+                    let bytes = std::mem::take(&mut carry);
+                    if let Ok(s) = std::str::from_utf8(&bytes) {
+                        let l = s.trim_end_matches(['\n', '\r']);
+                        observe(l, &mut seen, &mut first_names, &mut bad_rows);
+                    }
+                }
+                break;
+            }
+        };
+        let avail = usize::try_from(end - pos)
+            .map(|lim| buf.len().min(lim))
+            .unwrap_or(buf.len());
+        let buf = &buf[..avail];
+
+        if !carry.is_empty() {
+            match buf.iter().position(|&b| b == b'\n') {
+                None => {
+                    carry.extend_from_slice(buf);
+                    r.consume(avail);
+                    pos += avail as u64;
+                    continue;
+                }
+                Some(nl) => {
+                    carry.extend_from_slice(&buf[..nl]);
+                    let bytes = std::mem::take(&mut carry);
+                    r.consume(nl + 1);
+                    pos += (nl + 1) as u64;
+                    match std::str::from_utf8(&bytes) {
+                        Ok(s) => {
+                            let l = s.trim_end_matches(['\n', '\r']);
+                            observe(l, &mut seen, &mut first_names, &mut bad_rows);
+                        }
+                        Err(_) => break, // read_line would have errored here
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let last_nl = match buf.iter().rposition(|&b| b == b'\n') {
+            None => {
+                carry.extend_from_slice(buf);
+                r.consume(avail);
+                pos += avail as u64;
+                continue;
+            }
+            Some(p) => p,
+        };
+        let region = &buf[..=last_nl];
+        let (text, stop_after) = match std::str::from_utf8(region) {
+            Ok(t) => (t, false),
+            Err(e) => match region[..e.valid_up_to()].iter().rposition(|&b| b == b'\n') {
+                Some(c) => (
+                    std::str::from_utf8(&region[..=c]).expect("valid prefix"),
+                    true,
+                ),
+                None => break,
+            },
+        };
+        let mut cur = 0usize;
+        while cur < text.len() {
+            let rest = &text[cur..];
+            let nl = rest
+                .as_bytes()
+                .iter()
+                .position(|&b| b == b'\n')
+                .expect("region ends with newline");
+            let raw = &rest[..nl];
+            cur += nl + 1;
+            let l = raw.trim_end_matches(['\n', '\r']);
+            observe(l, &mut seen, &mut first_names, &mut bad_rows);
+        }
+        let walked = text.len();
+        r.consume(walked);
+        pos += walked as u64;
+        if stop_after {
+            break;
         }
     }
     Ok((seen, first_names, bad_rows))
@@ -734,6 +821,9 @@ pub struct JsonlChunker {
     jtypes: Vec<JType>,
     chunk_size: usize,
     line: String,
+    /// Partial-line carry for the fused block-based reader (raw bytes — a
+    /// multi-byte character may straddle a block; validated on completion).
+    carry: Vec<u8>,
     eof: bool,
     pos: u64,
     limit: Option<u64>,
@@ -754,6 +844,7 @@ impl JsonlChunker {
                 jtypes,
                 chunk_size: chunk_size.max(1),
                 line: String::new(),
+                carry: Vec::new(),
                 eof: false,
                 pos: 0,
                 limit: None,
@@ -783,6 +874,7 @@ impl JsonlChunker {
             jtypes,
             chunk_size: chunk_size.max(1),
             line: String::new(),
+            carry: Vec::new(),
             eof: false,
             pos: start,
             limit: Some(end),
@@ -795,6 +887,14 @@ impl JsonlChunker {
     /// The fused flat-scalar decode (see the fused-decode header comment):
     /// one pass, values committed row-atomically from a reused scratch, so a
     /// malformed line contributes nothing (it was counted in pass 1).
+    /// Block-based, like the CSV reader's `next_columns` (slice 13): lines are
+    /// scanned **in place** inside the buffered block — one UTF-8 validation
+    /// per block, no per-line copy — and the `ScVal` scratch (which borrows
+    /// the line) is allocated once per block instead of once per row (the
+    /// per-row `Vec` was ~10M heap allocations on the 10M standard). A worker
+    /// byte range is newline-aligned, so capping each block at `limit − pos`
+    /// always cuts on a line boundary. Only a block-straddling line is copied
+    /// into the byte carry. Output is byte-identical to the `read_line` loop.
     fn next_columns_fused(&mut self) -> Option<Vec<Column>> {
         let dtypes: Vec<DataType> = self
             .jtypes
@@ -814,30 +914,148 @@ impl JsonlChunker {
                 self.eof = true;
                 break;
             }
-            self.line.clear();
-            let n = match self.reader.read_line(&mut self.line) {
-                Ok(0) => {
+            let buf = match self.reader.fill_buf() {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => {
+                    // EOF: a trailing unterminated line sits in the carry —
+                    // decoded exactly as `read_line` returned it (JSONL trims
+                    // trailing `\r`s with or without a newline). An
+                    // invalid-UTF-8 tail is dropped, as a `read_line` error
+                    // stopped the old loop.
                     self.eof = true;
+                    if !self.carry.is_empty() {
+                        let bytes = std::mem::take(&mut self.carry);
+                        if let Ok(s) = std::str::from_utf8(&bytes) {
+                            let l = s.trim_end_matches(['\n', '\r']);
+                            if !l.trim().is_empty() {
+                                let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
+                                if scan_row(l, &self.names, &mut scratch) {
+                                    for (b, v) in builders.iter_mut().zip(&scratch) {
+                                        b.push(v);
+                                    }
+                                    got += 1;
+                                }
+                            }
+                        }
+                    }
                     break;
                 }
-                Ok(n) => n,
                 Err(_) => {
                     self.eof = true;
                     break;
                 }
             };
-            self.pos += n as u64;
-            let l = self.line.trim_end_matches(['\n', '\r']);
-            if l.trim().is_empty() {
-                continue;
-            }
-            let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-            // Malformed lines are skipped (already counted in pass 1).
-            if scan_row(l, &self.names, &mut scratch) {
-                for (b, v) in builders.iter_mut().zip(&scratch) {
-                    b.push(v);
+            // Never look past the range end: it sits on a line boundary.
+            let avail = match self.limit {
+                Some(end) => usize::try_from(end - self.pos)
+                    .map(|lim| buf.len().min(lim))
+                    .unwrap_or(buf.len()),
+                None => buf.len(),
+            };
+            let buf = &buf[..avail];
+
+            // Complete a carried block-straddling line first (rare).
+            if !self.carry.is_empty() {
+                match buf.iter().position(|&b| b == b'\n') {
+                    None => {
+                        self.carry.extend_from_slice(buf);
+                        self.reader.consume(avail);
+                        self.pos += avail as u64;
+                        continue;
+                    }
+                    Some(nl) => {
+                        self.carry.extend_from_slice(&buf[..nl]);
+                        let bytes = std::mem::take(&mut self.carry);
+                        self.reader.consume(nl + 1);
+                        self.pos += (nl + 1) as u64;
+                        match std::str::from_utf8(&bytes) {
+                            Ok(s) => {
+                                let l = s.trim_end_matches(['\n', '\r']);
+                                if !l.trim().is_empty() {
+                                    let mut scratch: Vec<ScVal> =
+                                        Vec::with_capacity(self.names.len());
+                                    if scan_row(l, &self.names, &mut scratch) {
+                                        for (b, v) in builders.iter_mut().zip(&scratch) {
+                                            b.push(v);
+                                        }
+                                        got += 1;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                self.eof = true;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                 }
-                got += 1;
+            }
+
+            let last_nl = match buf.iter().rposition(|&b| b == b'\n') {
+                None => {
+                    self.carry.extend_from_slice(buf);
+                    self.reader.consume(avail);
+                    self.pos += avail as u64;
+                    continue;
+                }
+                Some(p) => p,
+            };
+            // One UTF-8 validation per complete-lines region ('\n' is a char
+            // boundary). On an invalid byte: decode the valid lines before it,
+            // then stop exactly where `read_line` errored.
+            let region = &buf[..=last_nl];
+            let (text, stop_after) = match std::str::from_utf8(region) {
+                Ok(t) => (t, false),
+                Err(e) => match region[..e.valid_up_to()].iter().rposition(|&b| b == b'\n') {
+                    Some(c) => (
+                        std::str::from_utf8(&region[..=c]).expect("valid prefix"),
+                        true,
+                    ),
+                    None => {
+                        self.eof = true;
+                        break;
+                    }
+                },
+            };
+            let mut cur = 0usize;
+            let mut walked = 0usize;
+            {
+                // Per-block scratch: `ScVal` borrows `text`, which outlives
+                // every line in this block (the whole point of the block walk).
+                let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
+                while cur < text.len() {
+                    if got >= self.chunk_size {
+                        break;
+                    }
+                    let rest = &text[cur..];
+                    let nl = rest
+                        .as_bytes()
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .expect("region ends with newline");
+                    let raw = &rest[..nl];
+                    cur += nl + 1;
+                    walked = cur;
+                    let l = raw.trim_end_matches(['\n', '\r']);
+                    if l.trim().is_empty() {
+                        continue;
+                    }
+                    // Malformed lines are skipped (already counted in pass 1).
+                    if scan_row(l, &self.names, &mut scratch) {
+                        for (b, v) in builders.iter_mut().zip(&scratch) {
+                            b.push(v);
+                        }
+                        got += 1;
+                    }
+                }
+            }
+            let text_len = text.len();
+            self.reader.consume(walked);
+            self.pos += walked as u64;
+            if stop_after && walked == text_len {
+                self.eof = true;
+                break;
             }
         }
         if got == 0 {

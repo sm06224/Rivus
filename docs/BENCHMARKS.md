@@ -1952,3 +1952,38 @@ All shapes × parallel/serial `cmp`-identical. The account is now workers
 the open residual is the irreducible-looking int-lane probe
 (`parse_i64_fast` per cell) and the split — further open cuts likely need
 the observe loop batched column-major like the decoder's.
+
+### Format parity: where each format stands, and the JSONL block walk (slice 18)
+
+The operator boundary keeps most of this PR format-agnostic: slices 12/14
+(reconcile/cast moves, columnar Str↔numeric), 15 (Fx hash group/probe) and
+16 (preface) sit **above** the decoder, so JSONL and the compressed
+streams inherited them without a line of format-specific code — measured,
+with all four shapes `cmp`-identical across the pre-slice-13 binary:
+
+| group shape (10M standard) | rivus | DuckDB | ratio |
+|---|---|---|---|
+| CSV | 939 ms / 15 MB | 881 ms / 241 MB | 1.07× |
+| **CSV.gz** | **1021 ms / 11 MB** | 1184 ms / 262 MB | **0.86× — win** |
+| **JSONL.gz** | **1550 ms / 12 MB** | 1719 ms / 405 MB | **0.90× — win** |
+| JSONL | 1988 ms / 13 MB | 1418 ms / 404 MB | 1.40× ← the laggard |
+
+(The compressed wins are the three-plane-flow bet paying off: decode rides
+the decompression stream while DuckDB pays materialization.)
+
+The plain-JSONL gap was the one format-specific hole left: its fused
+decode and `infer_range` still ran the `read_line` structure, and the
+fused loop allocated the `ScVal` scratch `Vec` **per row** (~10 M heap
+allocations) because `ScVal` borrows the line and the reused `String`'s
+lifetime forced re-creation. Both now walk lines in place inside the
+buffered block (slice-13/17 shape; range end capped on the newline-aligned
+boundary), which also lets the scratch live **per block** — the borrow
+outlives every line in the block. JSONL trims trailing `\r`s with or
+without a newline (unlike CSV's `trim_eol`), pinned as before.
+
+JSONL group: 1984 → **1898–1905 ms** (interleaved control), open
+540 ms / workers 1305 ms. All JSONL/gz shapes × parallel/serial
+`cmp`-identical. The remaining 1.34× vs DuckDB is the scan itself
+(`scan_row`/`scan_line_infer` byte-walking every object twice) — the next
+JSONL lever is SWAR inside the scanner (delimiter/quote scanning), not
+loop structure.
