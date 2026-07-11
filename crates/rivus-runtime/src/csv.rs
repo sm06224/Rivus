@@ -840,22 +840,118 @@ fn infer_range(
     if r.seek(SeekFrom::Start(start)).is_err() {
         return (flags, bad);
     }
+    // Block walk, like `next_columns`: lines observed in place inside the
+    // buffered block (one UTF-8 validation per block, no per-line copy). The
+    // range end is newline-aligned, so capping each block at `end - pos`
+    // always cuts exactly on a line boundary — no per-line limit check.
     let mut pos = start;
-    let mut line = String::new();
+    let mut carry: Vec<u8> = Vec::new();
     let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
-    while pos < end {
-        line.clear();
-        match r.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(n) => pos += n as u64,
-            Err(_) => break,
+    loop {
+        if pos >= end {
+            break;
         }
-        let l = trim_eol(&line);
-        if l.trim().is_empty() {
-            continue;
+        let buf = match r.fill_buf() {
+            Ok(b) if !b.is_empty() => b,
+            _ => {
+                // EOF: a trailing unterminated line sits in the carry (only
+                // possible when `end` is the file end). Read errors observed
+                // nothing more, exactly like the old `read_line` loop.
+                if !carry.is_empty() {
+                    let bytes = std::mem::take(&mut carry);
+                    if let Ok(s) = std::str::from_utf8(&bytes) {
+                        let l = trim_eol(s);
+                        if !l.trim().is_empty()
+                            && !observe_line(l, ncols, keep, &mut flags, &mut offsets, delim)
+                        {
+                            bad += 1;
+                        }
+                    }
+                }
+                break;
+            }
+        };
+        let avail = usize::try_from(end - pos)
+            .map(|lim| buf.len().min(lim))
+            .unwrap_or(buf.len());
+        let buf = &buf[..avail];
+
+        // Complete a carried block-straddling line first.
+        if !carry.is_empty() {
+            match buf.iter().position(|&b| b == b'\n') {
+                None => {
+                    carry.extend_from_slice(buf);
+                    r.consume(avail);
+                    pos += avail as u64;
+                    continue;
+                }
+                Some(nl) => {
+                    carry.extend_from_slice(&buf[..nl]);
+                    let bytes = std::mem::take(&mut carry);
+                    r.consume(nl + 1);
+                    pos += (nl + 1) as u64;
+                    match std::str::from_utf8(&bytes) {
+                        Ok(s) => {
+                            let l = s.strip_suffix('\r').unwrap_or(s);
+                            if !l.trim().is_empty()
+                                && !observe_line(l, ncols, keep, &mut flags, &mut offsets, delim)
+                            {
+                                bad += 1;
+                            }
+                        }
+                        Err(_) => break, // read_line would have errored here
+                    }
+                    continue;
+                }
+            }
         }
-        if !observe_line(l, ncols, keep, &mut flags, &mut offsets, delim) {
-            bad += 1;
+
+        let last_nl = match buf.iter().rposition(|&b| b == b'\n') {
+            None => {
+                carry.extend_from_slice(buf);
+                r.consume(avail);
+                pos += avail as u64;
+                continue;
+            }
+            Some(p) => p,
+        };
+        // One UTF-8 validation per complete-lines region ('\n' is a char
+        // boundary); on an invalid byte, observe the fully-valid lines before
+        // it, then stop — exactly where `read_line` errored.
+        let region = &buf[..=last_nl];
+        let (text, stop_after) = match std::str::from_utf8(region) {
+            Ok(t) => (t, false),
+            Err(e) => match region[..e.valid_up_to()].iter().rposition(|&b| b == b'\n') {
+                Some(c) => (
+                    std::str::from_utf8(&region[..=c]).expect("valid prefix"),
+                    true,
+                ),
+                None => break,
+            },
+        };
+        let mut cur = 0usize;
+        while cur < text.len() {
+            let rest = &text[cur..];
+            let nl = rest
+                .as_bytes()
+                .iter()
+                .position(|&b| b == b'\n')
+                .expect("region ends with newline");
+            let raw = &rest[..nl];
+            cur += nl + 1;
+            let l = raw.strip_suffix('\r').unwrap_or(raw);
+            if l.trim().is_empty() {
+                continue;
+            }
+            if !observe_line(l, ncols, keep, &mut flags, &mut offsets, delim) {
+                bad += 1;
+            }
+        }
+        let walked = text.len();
+        r.consume(walked);
+        pos += walked as u64;
+        if stop_after {
+            break;
         }
     }
     (flags, bad)
@@ -1300,7 +1396,21 @@ impl Flags {
     }
 
     fn observe(&mut self, cell: &str) {
-        let c = cell.trim();
+        // Settled fast-out: a value was seen and every lane is already dead —
+        // `resolve()` is pinned to `Str` and nothing here can change again, so
+        // skip even the trim. (A `Str` column settles on its FIRST cell; the
+        // remaining ~1M observes of that column were pure no-op work.)
+        if self.any
+            && !(self.all_int
+                || self.all_float
+                || self.all_bool
+                || self.all_datetime
+                || self.all_date
+                || self.all_time)
+        {
+            return;
+        }
+        let c = fast_trim(cell);
         if c.is_empty() {
             return;
         }

@@ -1918,3 +1918,37 @@ Confirmed across three interleaved rounds (rivus 1177–1221 ms vs DuckDB
 1221–1429 ms). Remaining group-shape account: workers 730 ms (decode 110 +
 feed 165 + reconcile 33 per file) and **open 318 ms — the inference pass
 is now the single biggest serial block**, and the next lever.
+
+### Block-based inference + settled-column fast-out (slice 17)
+
+The open phase is `plan_parallel` per file: `infer_range` streams every
+byte once more to type the columns, with the same structural costs the
+slice-13 decode loop had (`read_line`'s per-line UTF-8 + copy, `str::trim`
+per cell) plus one of its own:
+
+- **A `Str` column settles on its FIRST cell** — every lane flag goes
+  dead and `resolve()` is pinned — yet `observe` kept trimming and
+  branch-checking the remaining ~1.1 M cells of that column per file.
+  `Flags::observe` now returns immediately once a value was seen and every
+  lane is dead (nothing can change; identical outcome), and uses
+  `fast_trim` otherwise.
+- **`infer_range` now walks lines in place** inside the buffered block,
+  like `next_columns`: one UTF-8 validation per block, no per-line copy.
+  The worker's byte range is newline-aligned, so capping each block at
+  `end − pos` cuts exactly on a line boundary — the per-line limit check
+  disappears too. EOL/empty/arity/invalid-UTF-8 semantics pinned to the
+  `read_line` loop, as in slice 13.
+
+Open phase: 318 → **210 ms** (−34%). Same-window standings (wall / RSS):
+
+| shape | rivus | DuckDB | ratio |
+|---|---|---|---|
+| CSV read→join→group | **939 ms / 15 MB** | 881 ms / 241 MB | **1.07×, 1/16th memory** |
+| CSV ETL filter→project→save | **1010 ms / 13 MB** | 1224 ms / 662 MB | **0.83×, 1/52nd memory** |
+
+Group broke the 1-second mark (1055 → 928–939 ms, interleaved control).
+All shapes × parallel/serial `cmp`-identical. The account is now workers
+~735 ms (decode 110 / feed 165 / reconcile 33 per file) + open 210 ms;
+the open residual is the irreducible-looking int-lane probe
+(`parse_i64_fast` per cell) and the split — further open cuts likely need
+the observe loop batched column-major like the decoder's.
