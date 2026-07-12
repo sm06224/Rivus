@@ -93,6 +93,7 @@ mod groupby;
 mod io_formats;
 mod joins;
 mod null;
+mod parallel_read_identity;
 mod plan_gate;
 mod provenance;
 mod read;

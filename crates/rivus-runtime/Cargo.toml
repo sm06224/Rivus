@@ -68,6 +68,10 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # Test-only: write `.zst` fixtures for the zstd-decode oracle. Encode-side only,
 # never shipped (dev-dependency). The runtime decodes with pure-Rust `ruzstd`.
 zstd = "0.13"
+# Test-only: write `.gz` fixtures for the gz serial==parallel byte-identity
+# guard (#237 R1). Same crate+version+backend the `gzip` feature already vets —
+# zero new supply-chain surface, never shipped (dev-dependency).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [[bench]]
 name = "pipeline"
