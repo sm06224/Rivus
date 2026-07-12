@@ -1481,3 +1481,509 @@ a 200 k-row torture file (years 1600–9999 incl. pre-1970 negative ticks,
 negative decimals, `-0.001`) identical as CSV **and** JSONL. Property tests
 re-implement the pre-LUT `write!` forms as oracles (200 k random
 `i128×scale` decimals, boundary dates/times) and pin the refusal cases.
+
+### Buffering-operator performance — the O(n²) validity bug + per-row key/alloc pathologies
+
+Following the `ls…read` external comparison (above), a fully **contract-pinned**
+end-to-end task (3M rows, 3 dirty CSVs — a malformed-row file + a file missing a
+column — union-by-name, a dimension left join, coalesce, group, save; integer
+cents so sums are bit-exact across engines) measured Rivus **23× slower than
+DuckDB**. Profiling (per-node `--json` telemetry) localized it to specific
+**implementation defects**, not "interpreter overhead." All fixes are
+byte-identical (default 466/0, all-features 499/0; the pinned task's 16-row
+output is unchanged bit-for-bit at every step).
+
+**The headline bug — `Validity::append` was O(n²).** Every buffering operator
+(join / sort / group / unbounded-merge) concatenates its buffered chunks. When
+any column carried a null, `Validity::append` materialized the *entire*
+accumulated bitmap into a `Vec<bool>` and repacked it **on every append** — so
+concatenating N chunks was O(N²). A 735-chunk left join spent **5.3s** in
+`concat` alone. Fixed to a word-granular in-place append: **5294ms → 117ms
+(45×)**. This one fix helps every buffering op, not just join.
+
+**Per-row allocation pathologies** (same shape in three places): a composite key
+built as a fresh heap `String` (+ boxed `Value`) per row.
+- **join probe**: `String` per left row (3M allocations for a 20-row dimension).
+  Reused key buffer + borrowed `&str` key parts.
+- **group**: `String` key *and* a throwaway `Vec<String>` of rendered parts per
+  row (only the 16 *new* groups need the parts). Reused buffer + parts-on-insert:
+  **1154ms → 240ms**.
+- **coalesce** (`|>` project): per-cell `Value`/`String` round-trip. Columnar
+  all-`Str` fast path borrowing the winning column's `&str`: **1057ms → 103ms**.
+- **`cast_column`**: no identity fast-path — a same-lane cast rebuilt every cell
+  (union-by-name reconciliation). `if col.dtype() == ty { return col }`.
+
+**Result (best-of-5, 3M rows, same pinned contract, byte-identical output):**
+
+| stage | rivus wall |
+|---|---:|
+| baseline | 8067 ms |
+| + `Validity::append` O(n²) fix | 5294 ms |
+| + group key reuse / parts-on-insert | 3769 ms |
+| + `cast_column` identity fast-path | 3145 ms |
+| + coalesce columnar fast-path | 2192 ms |
+| + `read` typed single decode pass (parallel-inference plan) | **1501 ms** |
+| **DuckDB 1.5 / Polars 1.42** | **345 / 532 ms** |
+
+Rivus went from **23× → 4.4×** DuckDB (2.8× Polars) on this workload with no loss
+of the continue-first / never-silent / union-by-name contract (which Polars could
+not meet natively — it kept the ragged rows).
+
+**`read` typed single decode pass.** The remaining peak was `read` (1090ms): the
+old path (`CsvChunker::open`) paid a full serial inference scan THEN a full
+decode scan per file. `read` now reuses the parallel-source machinery —
+`plan_parallel` infers over newline-aligned byte ranges in parallel and
+`for_range` decodes each range in file order with types known (one typed pass).
+The inferred schema is pinned byte-identical to the serial reader's by the
+engine's serial==parallel invariant; ranges are contiguous, so row order — and
+the output, including the malformed-row count — is unchanged. `read`
+1090 → 631ms. Unseekable inputs fall back to the buffered serial reader.
+
+Remaining levers: the execution pipeline itself is still single-threaded
+(parallelism is safe here — integer sum is associative — a further multiplier),
+and join/group still render composite keys as text rather than hashing typed
+lanes directly.
+
+### The 10M × ⌈2.2·cores⌉-file standard fixture (統括指示) — and what it exposed
+
+New mandatory perf fixture (see CLAUDE.md): **10M rows CSV and 10M JSON objects
+JSONL, split across ⌈2.2 × physical cores⌉ files** (this box: 4 physical cores →
+9 files; 181MB CSV / 606MB JSONL), dirty data in the mix (5 ragged/truncated
+lines + 5 non-numeric amounts in file 1; file 9 missing the `category` column;
+unknown regions in file 5). Same pinned contract as above; **rivus CSV ==
+rivus JSONL == DuckDB CSV == DuckDB JSONL, all row-identical** (cross-format AND
+cross-engine). Polars: CSV differs by exactly the 5 ragged rows it cannot
+exclude; JSONL is a hard **DNF** (`read_ndjson(ignore_errors=true)` still aborts
+on a truncated JSON line — the ragged-CSV story again).
+
+A single-file test had hidden two structural problems the fan-out exposes:
+
+1. **Peak RSS ~1.4GB on a 181MB dataset** — `read` buffers every decoded file
+   and the blocking join buffers both sides again; DuckDB streams the same job
+   in 258MB. The "bounded memory" claim currently holds for straight-through
+   flows, not for `read`+blocking pipelines. Structural fix (streaming read /
+   stream-probe join) tracked as the memory lever.
+2. **JSONL `read` was 3× the CSV path** (16.9s vs 5.6s): `JsonlChunker::open`
+   still paid serial full-file inference + a second decode parse.
+
+**Landed now — parallel range decode inside `read` (both formats).** The range
+plans (`csv::plan_parallel` / `jsonl::plan_parallel`) already exist for the
+parallel source; `read` now decodes those newline-aligned ranges on scoped
+threads and splices in range order (contiguous ranges ⇒ row order unchanged ⇒
+byte-identical; verified: 10M CSV, 10M JSONL, and the 3M fixture all
+bit-identical, error counts included).
+
+| 10M × 9 files, warm best-of-3 | wall | peak RSS |
+|---|---:|---:|
+| rivus CSV (before → after) | 5559 → **4770 ms** | 1459 → 1169 MB |
+| rivus JSONL (before → after) | 16901 → **11223 ms** | 1302 → 1155 MB |
+| DuckDB CSV / JSONL | 920 / 1461 ms | 240 / 404 MB |
+| Polars CSV | 1501 ms | 1974 MB |
+| Polars JSONL | DNF (malformed line) | — |
+
+Per-node at 10M (CSV): read 1285 / join 1373 / group 760 / cast+filter+project
+~1180 — no single villain left; the gap is now the **serial sum of nodes**
+(DuckDB runs the whole pipeline on 4 cores). JSONL: read 7926ms — the serial
+`infer_global` (a full JSON parse of every line) plus the decode re-parse
+dominated.
+
+**Landed next — parallel JSONL inference.** `jsonl::plan_parallel` now infers
+each newline-aligned range on its own thread and folds the results in range
+order. The fold reproduces the sequential scan exactly: global column order =
+the earliest started range's first valid object (= the file's first valid
+object); each key's `Infer` merges commutatively (scalar flags AND/OR; a
+struct's child order adopts the earliest range's first object; lists merge
+recursively); keys outside the global set are discarded; malformed counts sum.
+Verified: 10M JSONL output row-identical to DuckDB, malformed counts intact.
+JSONL `read` 7926 → **4257ms**; JSONL pipeline 11223 → **7684ms** (from 16.9s at
+the start of the catch-up = 2.2×).
+
+The engine-level levers stay: pipeline parallelism (integer sums here are
+associative ⇒ safe) and the buffering-memory ceiling.
+
+### Compressed-stream read（統括指示: 全てが流れ）— file-level parallel decode
+
+Policy v2 makes compression default (`gzip`+`zstd` features on; pure-Rust
+decoders, SUPPLY-CHAIN vetted). `read` now handles `.gz`/`.zst` handles by
+riding the decompression stream (`CompressedCsvReader` / `StreamJsonlReader`,
+single-pass sample inference — never decompress-to-buffer), and — because a
+compressed stream has no splittable ranges — `read` decodes **files in
+parallel** (waves of ≤ core count, uri-ordered slots ⇒ reconciliation order,
+and therefore the output, is unchanged).
+
+| 10M × 9 files, warm best-of-3 | before | after | DuckDB |
+|---|---:|---:|---:|
+| csv.gz (49MB on disk) | 6058 ms (serial files) | **4746 ms** | 1260 ms |
+| jsonl.gz (52MB on disk) | 11256 ms | **6522 ms** | 1774 ms |
+| plain csv | 4723 ms | 4828 ms (noise) | 920 ms |
+| plain jsonl | 7684 ms | **7393 ms** | 1461 ms |
+
+All five fixtures (3M dirty, 10M csv/jsonl plain+gz) remain **bit-identical**
+(including malformed-row counts). The compressed path inherits the documented
+sample-inference trade-off of the source's compressed/HTTP readers (a column
+that only widens past the sample can differ from full-scan inference — not
+exercised by these fixtures; ratification question in design/40 §40.4).
+Compressed is now at parity with plain (csv.gz) or faster (jsonl.gz beats plain
+jsonl — one sampled parse instead of a full inference parse), so disk IO no
+longer dominates the scale fixtures（圧縮ストリーム採用指示の充足）.
+
+### Parallel read→group pipeline (slice 6) — per-file streaming workers
+
+`ls → read → [stateless]* → (⋈ small-source)* → group → [sort]* → [sink]` now
+runs ONE streaming worker per file: schema up front (`FileDecoder` separates
+inference from decode, resolving union-by-name's chicken-and-egg), rows decoded
+on demand, reconciled per chunk, pushed through per-worker op instances (a
+broadcast join is pre-fed its serially-materialized small right side) into a
+partial `GroupBy`; partials merge like #41 and the tiny post-group tail
+(sort/sink) runs serially. Prerequisite fix: **I64 Sum/Avg joined the exact
+club** — an `i128` lane accumulates alongside the f64 moments and an
+all-integer Sum/Avg outputs `int_sum as f64` (correctly rounded, partition-order
+independent; serial uses the same accumulator ⇒ serial==parallel by
+construction; output stays the F64 lane so nothing renders differently).
+
+| 10M × 9 files, warm best-of-3 | slice 5 | **slice 6** | DuckDB |
+|---|---:|---:|---:|
+| csv | 4879 ms | **1919 ms** | 920 ms |
+| jsonl | 8801 ms | **5348 ms** | 1461 ms |
+| csv.gz | 4480 ms | **1720 ms** | 1260 ms |
+| jsonl.gz | 6393 ms | **3677 ms** | 1774 ms |
+| peak RSS | ~1.1 GB | **~600 MB** | 240–400 MB |
+
+All five fixtures (3M dirty + the four 10M variants) stay **bit-identical**,
+malformed/cast counts included. Compressed CSV is now within **1.37×** of
+DuckDB; plain CSV 2.1×, jsonl.gz 2.1×, jsonl 3.7× (the JSONL residue is the
+decode re-parse — the fusion lever). From the catch-up baseline: csv 5559→1919
+(2.9×), jsonl 16901→5348 (3.2×), with memory halved. Remaining levers: JSONL
+single-parse, stream-probe join (drop the per-worker join buffer), and worker
+`busy` telemetry for the new path.
+
+### JSONL pass-1 without allocations — the scanner (slice 7)
+
+The JSONL gap's root is parsing every line TWICE (inference, then decode). This
+slice removes pass-1's cost: a `scan_*` family mirrors `parse_*` **exactly**
+(same acceptance incl. `\uXXXX` validity, same Int/Float/Bool/Str
+classification incl. the i64-overflow→float rule, same duplicate-key and
+first-object-name-order semantics) but builds no `JVal` and no value `String`s
+— a key allocates only when first seen for its column. Equivalence is pinned by
+`scanner_matches_parser_inference` over a hazard corpus (escapes, bad `\u` hex,
+numeric edges, top-level and nested duplicate keys, heterogeneous columns,
+truncated lines). Decode-side, the per-row per-column `find` (which CLONED
+every `JVal`, O(cols²) compares) now moves values straight into their columns
+with an O(1) in-order hint (first-occurrence-wins, missing→Null — the same
+semantics).
+
+| 10M × 9 files, warm best-of-3 | slice 6 | **slice 7** | DuckDB |
+|---|---:|---:|---:|
+| jsonl | 5139 ms | **~4300 ms** | 1395 ms |
+| jsonl.gz | 3734 ms | ~3850 ms (noise; sample-inference path unaffected) | 1733 ms |
+
+All outputs remain bit-identical (jsonl, jsonl.gz, csv re-verified). Remaining
+JSONL cost is the decode-pass parse + `build_column`; the next lever is fusing
+value materialization into column builders (parse straight into columnar
+buffers, no per-cell `JVal`).
+
+### Fused JSONL decode — parse straight into columnar builders (slice 8)
+
+For a FLAT all-scalar schema (the dominant case), `JsonlChunker` now decodes
+each line directly into per-column scalar builders: no per-cell `JVal`, no
+value `String`s (escape-free strings borrow the line), row-atomic commit from a
+scratch (a malformed line contributes nothing). Semantics mirror
+`parse_object`+`build_scalar` exactly — duplicate-key first-wins, missing→null,
+an I64 column nulls a float cell, and a Str column re-renders numbers via
+`f64::to_string` (never the raw slice: `"1.50"` → `"1.5"` on both paths).
+Nested schemas keep the general JVal path.
+
+| 10M × 9 files, warm best-of-3 | slice 7 | **slice 8** | DuckDB |
+|---|---:|---:|---:|
+| jsonl | ~4300 ms | **2893 ms** | 1395 ms (**2.1×**) |
+
+Outputs re-verified bit-identical (jsonl / jsonl.gz / csv), malformed counts
+intact. The JSONL gap has closed from 12.1× (start) → 2.1×.
+
+### Streaming broadcast probe — 全てが流れ, realized (slice 9)
+
+The worker profile showed **4.6s of a 10M CSV run inside the blocking join's
+finish** (buffer → concat → probe → gather), while decode/reconcile/feed were
+healthy. The parallel read→group path now builds the broadcast join's right
+side ONCE (concat + hash + key indices, `BroadcastProbe::build_right`, shared
+`Arc` across workers) and each worker probes every arriving chunk **immediately**
+(`BroadcastProbe`: per-chunk probe → gather → emit; output schema, `_r`
+collisions, key preservation and null-key semantics mirror `Join::finish`
+exactly; inner/left only — the shape detector's rule). No left buffering
+remains anywhere in the pipeline: decode → reconcile → probe → partial group is
+chunk-at-a-time end to end.
+
+| 10M × 9 files, warm best-of-3 | slice 8 | **slice 9** | DuckDB |
+|---|---:|---:|---:|
+| csv | 2060 ms | **1499 ms** | 877 ms (**1.7×**) |
+| jsonl | 2893 ms | **2300 ms** | 1395 ms (**1.6×**) |
+| csv.gz | 1797 ms | **1347 ms** | 1175 ms (**1.15×**) |
+| jsonl.gz | ~3800 ms | 3683 ms | 1733 ms (2.1×) |
+| **peak RSS** | ~600 MB | **12–16 MB** | 240–405 MB |
+
+All five fixtures (3M + four 10M variants) remain bit-identical. The memory
+story inverts the comparison: Rivus now runs the whole contract-pinned job in
+**~1/20th of DuckDB's memory** (a chunk + the group states + a 20-row broadcast
+side is all that's ever resident) while sitting 1.15–1.7× on wall — the
+bounded-memory promise（全てが流れ）is no longer aspirational for this shape.
+
+### Beyond the favorable shape（統括指示: 勝ちやすいパターンだけではダメ）— slices 10–11
+
+Two directives answered at once: **more speed** and **stop winning only the
+read→group shape**.
+
+**Slice 10 — fused decode for compressed JSONL.** The `StreamJsonlReader` now
+takes the same flat-scalar fused path as the plain reader (sample replay
+included; a malformed streamed line still counts into `bad_rows`).
+jsonl.gz: 3683 → **2116 ms** (DuckDB 1733 → **1.22×**), bit-identical.
+
+**Slice 11 — the pure-ETL shape.** `ls → read → [stateless/⋈]* → save` (NO
+group) previously ran the fully-serial engine loop: 3491 ms / 598 MB against
+DuckDB 1330 ms and Polars 598 ms — losing 2.6× on an *unfavorable* shape.
+`try_parallel_read_sink` streams each file through a per-worker pipeline into a
+**headerless temp segment** (the serial sink's own `write_cell` formatter),
+then concatenates header + segments in uri order. `cmp` against the serial
+writer's 9.5M-row output: **byte-identical**.
+
+| ETL shape (10M rows in, 9.5M out) | wall | peak RSS |
+|---|---:|---:|
+| rivus (serial engine, before) | 3491 ms | 598 MB |
+| **rivus (parallel segments)** | **1668 ms** | **13 MB** |
+| DuckDB | 1330 ms (**1.25×**) | 691 MB |
+| Polars | 598 ms | 519 MB |
+
+Polars stays ahead on wall for this shape (eager whole-file write) — with 40×
+our memory and no never-silent contract; the gap to DuckDB is 1.25× at 1/50th
+of its memory. All group fixtures + the 3M task re-verified bit-identical.
+
+### Reconcile without copies (slice 12)
+
+The ETL worker profile (env-gated `RIVUS_WORKER_PROF`, kept in-tree) split the
+per-file time as decode 1040 / reconcile 487 / emit 582 / ops 415 ms — and the
+reconcile cost was pure **column cloning**: `reconcile_chunk` cloned every
+column of every chunk before the identity cast returned it unchanged.
+`reconcile_chunk` now takes the columns by value: a file whose schema already
+equals the union (names, order, lanes — 8 of the 9 fixture files) **moves** its
+columns straight into the chunk; the widening path moves each matched column
+exactly once (union names are unique). Byte-identical by construction.
+ETL: 1668 → **1551 ms**; all group fixtures + the 3M task + the ETL `cmp`
+re-verified identical.
+
+### Block-based CSV decode + column-major cell batching (slice 13)
+
+With reconcile addressed, decode (~115 ms per 20 MB file) was the largest
+remaining worker cost. A standalone decomposition benchmark against a real
+fixture file pinned the waste: a minimal block-read + SWAR-split + typed-parse
+loop needs only ~55 ms per file — the other half was the decode loop's
+*structure*, not its parsing. Per file: `str::trim` per cell ≈ 20 ms (Unicode
+scan × 4.4 M cells), the per-cell `match` on the lane enum ≈ 21 ms
+(jump-table dispatch × 4.4 M), and `read_line`'s per-line UTF-8 validation +
+copy into a `String` ≈ 15 ms. All three are structural, so all three went:
+
+- **Block walk in place** — `next_columns` now iterates lines directly inside
+  the reader's 256 KiB buffered block (`fill_buf`/`consume`), validating UTF-8
+  once per block ('\n' is a char boundary, so every line inside is valid by
+  subslice). Only a block-straddling line is copied (once per 256 KiB) into a
+  byte carry and takes the old row-at-a-time path.
+- **Column-major cell batching** — the walk accumulates field byte-ranges per
+  kept column and drains them lane-at-a-time via `ColBuilder::push_many`, so
+  the lane `match` runs once per column per block instead of once per cell. A
+  quoted record drains the batch first (row order preserved), then takes the
+  owned slow path as before.
+- **`fast_trim`** — `str::trim` is skipped when a cell's first and last bytes
+  are plain ASCII non-whitespace (`0x21..=0x7F`), the overwhelmingly common
+  case; any other edge byte (incl. ≥ `0x80`, which may start U+00A0) defers to
+  the real `trim`, so the result is always exactly `s.trim()`.
+
+Semantics pinned line-for-line: EOL handling (`\r\n`, lone `\r`s, the
+unterminated final line keeping its `\r`), empty-line and arity skips, both
+prefilters, quoted fallback, the worker byte-range `limit`, and the
+read-error/invalid-UTF-8 stop point all match the `read_line` loop exactly.
+Verified by building the pre-change binary and `cmp`-ing outputs: group and
+ETL shapes, parallel and `RIVUS_NO_PARALLEL` serial — all byte-identical
+(9.5 M-row ETL output included).
+
+Measured on the 10M standard (best of 3, wall / peak RSS):
+
+| shape | before | after | DuckDB | ratio |
+|---|---|---|---|---|
+| CSV read→join→group | 1522 ms / 15.1 MB | **1428 ms / 15.7 MB** | 954 ms / 219 MB | 1.50× |
+| CSV ETL (filter→project→save) | 1497 ms / 12.1 MB | **1393 ms / 13.5 MB** | 1243 ms / 680 MB | **1.12×** |
+
+Worker decode fell ~115 → ~78 ms per file (−32%; ~330 ms CPU across 9 files,
+÷4 cores ≈ the ~100 ms wall gain). Polars ETL stays at 571 ms / 520 MB —
+eager whole-file write, 38× our memory, and it cannot meet the ragged/
+malformed contract. The group shape's residual is now **feed** (~330 ms/file:
+broadcast-probe + partial-group hashing), which is the next lever.
+
+### Cast without copies + columnar Str↔numeric conversion (slice 14)
+
+A per-op split of the group worker's feed (now printed by
+`RIVUS_WORKER_PROF`) broke ~255 ms/file into: group 93 / join-probe 73 /
+cast 58 / project 28 / filter 1 ms. Three findings, three fixes — and one
+negative result worth keeping:
+
+- **`Cast::process` cloned every column of every chunk** (`columns.clone()`
+  plus a second clone of the cast target) before `cast_column`'s identity
+  check could return anything. It now short-circuits when every cast is
+  already at its target type, and otherwise **moves** the owned chunk's
+  columns through take-then-refill slots (a repeated name still re-casts the
+  rebuilt column, like the old sequential form).
+- **The fixture round-trips `amount`** — one dirty file pins the union lane
+  to `Str`, so each clean file renders its decoded `I64` lane to strings
+  (reconcile) and the downstream `cast amount :int` parses them straight
+  back. Both directions paid a heap `Value`/`String` per cell:
+  - Str → I64/F64/Decimal in `cast_column` parsed via
+    `cast_value(col.value_at(i))`, i.e. a fresh `Value::Str` (heap `String`)
+    per cell. It now parses from the borrowed `&str` with exactly
+    `cast_value`'s trim/empty/fallback table. **58 → 21 ms/file.**
+  - X → Str rendered `value_at(i).to_string()` — a `Value` plus a fresh
+    `String` per cell. The `I64` source (the widening hot case) now writes
+    digits off the lane into a reused buffer; other sources keep `Value`
+    `Display` but reuse the buffer. Identical bytes by the same `Display`.
+    **Reconcile 72 → 33 ms/file.**
+- **Negative result — cast pushdown into the reader is NOT
+  semantics-preserving.** Folding `read → cast amount :int` into a declared
+  type at the read looked like it would erase the whole round trip, but
+  `cast_value`'s string→int rule falls back through `f64` (`"1.5"` → `1`)
+  while the reader's I64 lane nulls it (`"1.5"` → null + parse failure). An
+  optimizer rule must hold universally, so it stays out; recorded here so
+  the next profiler doesn't re-derive it.
+
+Combined ≈ −73 ms CPU per file (~660 ms across 9 files, ÷4 cores ≈ 165 ms
+wall). Measured back-to-back on a noisy box (interleaved best-of-3): ETL
+1743 → 1578 ms, group 1813 → 1684 ms with the slice-13 binary as control —
+the deltas match the per-op accounting. Group/ETL × parallel/serial all
+`cmp`-identical against the pre-slice-13 binary's outputs. Feed residual is
+now join-probe 73 + partial-group ~96 ms/file — the hash paths.
+
+### Fx-hashed group scratch + probe table (slice 15)
+
+The two remaining feed dominants were pure lookup cost:
+
+- **Group-by keyed a `BTreeMap<String, GroupState>` per row** — O(log g)
+  *string comparisons*, twice (a `contains_key` probe then `get_mut`).
+  The row-hot accumulation now goes to an Fx-hashed scratch `HashMap`
+  (one lookup per existing group), and `seal()` drains it into the same
+  sorted `BTreeMap` before finish/merge reads anything — output row order
+  stays composite-key order, so hash iteration order never reaches the
+  output. **93 → 65 ms/file.**
+- **The broadcast-probe table hashed ~10 M short keys with SipHash.** The
+  table (build + probe, and the serial `Join::finish` table) now uses the
+  same Fx hasher; probe/pad order is row order on both sides, so the hasher
+  is unobservable. **73 → 51 ms/file.**
+
+The hasher is ~30 lines in-tree (`fxhash.rs`, rustc's multiply-rotate
+shape, std-only): deterministic, no seed, supply chain unchanged. Not for
+anything attacker-facing or persisted — the doc comment says so.
+
+Feed: 255 → **165 ms/file**. Interleaved best-of-3 against the slice-14
+binary on the same (still noisy) box: group 1641 → **1552 ms** wall
+(−450 ms CPU ÷ 4 cores ≈ the −90 ms observed). Group/ETL × parallel/serial
+all `cmp`-identical. The worker cost sheet now reads decode 110 /
+feed 165 / reconcile 33 — decode is back on top, and inside feed the
+residual is `Value`-per-row `observe` (group 65) and key-build + gather
+(probe 51).
+
+### Phase accounting + safety-sample without a second inference pass (slice 16)
+
+The per-worker sheet (~310 ms CPU/file × 9 ÷ 4 cores ≈ 700 ms) did not
+explain the group wall — so `RIVUS_WORKER_PROF` now also prints the
+**phase** split of the parallel read-group driver. First reading:
+`open=318ms scratch=~130ms workers=730ms merge+tail=0ms`. Two findings:
+
+- **The parallel-safety check re-opened the first file** — a full second
+  inference pass of one 20 MB file (~130 ms of serial wall) just to type
+  one sample chunk. The check now decodes that chunk from the
+  already-opened decoder (a one-chunk clone feeds the scratch pipeline)
+  and hands the original columns to worker 0 as a **preface**, so every
+  row still streams exactly once, in order, with the same chunk ids —
+  byte-identical, one inference pass cheaper. `scratch` phase: → **1 ms**.
+- A tempting stronger form — typing the scratch pipeline with a 0-row
+  chunk instead of a decoded one — is **rejected**: `BroadcastProbe` and
+  `FilterProject` drop empty chunks, and expression typing on 0 rows is
+  not guaranteed to match the value-bearing case; a wrong dtype there
+  could mis-approve a non-associative parallel plan (the #41 trap). The
+  sample chunk stays real.
+
+With the box back to its quiet baseline, the standings (interleaved, same
+window, wall / peak RSS):
+
+| shape | rivus | DuckDB | ratio |
+|---|---|---|---|
+| CSV read→join→group | **1108 ms / 16 MB** | 917 ms / 236 MB | 1.21× |
+| CSV ETL filter→project→save | **1177 ms / 13 MB** | 1221 ms / 692 MB | **0.96× — first outright wall win, at 1/53rd the memory** |
+
+Confirmed across three interleaved rounds (rivus 1177–1221 ms vs DuckDB
+1221–1429 ms). Remaining group-shape account: workers 730 ms (decode 110 +
+feed 165 + reconcile 33 per file) and **open 318 ms — the inference pass
+is now the single biggest serial block**, and the next lever.
+
+### Block-based inference + settled-column fast-out (slice 17)
+
+The open phase is `plan_parallel` per file: `infer_range` streams every
+byte once more to type the columns, with the same structural costs the
+slice-13 decode loop had (`read_line`'s per-line UTF-8 + copy, `str::trim`
+per cell) plus one of its own:
+
+- **A `Str` column settles on its FIRST cell** — every lane flag goes
+  dead and `resolve()` is pinned — yet `observe` kept trimming and
+  branch-checking the remaining ~1.1 M cells of that column per file.
+  `Flags::observe` now returns immediately once a value was seen and every
+  lane is dead (nothing can change; identical outcome), and uses
+  `fast_trim` otherwise.
+- **`infer_range` now walks lines in place** inside the buffered block,
+  like `next_columns`: one UTF-8 validation per block, no per-line copy.
+  The worker's byte range is newline-aligned, so capping each block at
+  `end − pos` cuts exactly on a line boundary — the per-line limit check
+  disappears too. EOL/empty/arity/invalid-UTF-8 semantics pinned to the
+  `read_line` loop, as in slice 13.
+
+Open phase: 318 → **210 ms** (−34%). Same-window standings (wall / RSS):
+
+| shape | rivus | DuckDB | ratio |
+|---|---|---|---|
+| CSV read→join→group | **939 ms / 15 MB** | 881 ms / 241 MB | **1.07×, 1/16th memory** |
+| CSV ETL filter→project→save | **1010 ms / 13 MB** | 1224 ms / 662 MB | **0.83×, 1/52nd memory** |
+
+Group broke the 1-second mark (1055 → 928–939 ms, interleaved control).
+All shapes × parallel/serial `cmp`-identical. The account is now workers
+~735 ms (decode 110 / feed 165 / reconcile 33 per file) + open 210 ms;
+the open residual is the irreducible-looking int-lane probe
+(`parse_i64_fast` per cell) and the split — further open cuts likely need
+the observe loop batched column-major like the decoder's.
+
+### Format parity: where each format stands, and the JSONL block walk (slice 18)
+
+The operator boundary keeps most of this PR format-agnostic: slices 12/14
+(reconcile/cast moves, columnar Str↔numeric), 15 (Fx hash group/probe) and
+16 (preface) sit **above** the decoder, so JSONL and the compressed
+streams inherited them without a line of format-specific code — measured,
+with all four shapes `cmp`-identical across the pre-slice-13 binary:
+
+| group shape (10M standard) | rivus | DuckDB | ratio |
+|---|---|---|---|
+| CSV | 939 ms / 15 MB | 881 ms / 241 MB | 1.07× |
+| **CSV.gz** | **1021 ms / 11 MB** | 1184 ms / 262 MB | **0.86× — win** |
+| **JSONL.gz** | **1550 ms / 12 MB** | 1719 ms / 405 MB | **0.90× — win** |
+| JSONL | 1988 ms / 13 MB | 1418 ms / 404 MB | 1.40× ← the laggard |
+
+(The compressed wins are the three-plane-flow bet paying off: decode rides
+the decompression stream while DuckDB pays materialization.)
+
+The plain-JSONL gap was the one format-specific hole left: its fused
+decode and `infer_range` still ran the `read_line` structure, and the
+fused loop allocated the `ScVal` scratch `Vec` **per row** (~10 M heap
+allocations) because `ScVal` borrows the line and the reused `String`'s
+lifetime forced re-creation. Both now walk lines in place inside the
+buffered block (slice-13/17 shape; range end capped on the newline-aligned
+boundary), which also lets the scratch live **per block** — the borrow
+outlives every line in the block. JSONL trims trailing `\r`s with or
+without a newline (unlike CSV's `trim_eol`), pinned as before.
+
+JSONL group: 1984 → **1898–1905 ms** (interleaved control), open
+540 ms / workers 1305 ms. All JSONL/gz shapes × parallel/serial
+`cmp`-identical. The remaining 1.34× vs DuckDB is the scan itself
+(`scan_row`/`scan_line_infer` byte-walking every object twice) — the next
+JSONL lever is SWAR inside the scanner (delimiter/quote scanning), not
+loop structure.

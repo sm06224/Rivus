@@ -239,6 +239,28 @@ fn run_dispatch(
     // path — observing the run must not throttle it. The parallel paths feed the
     // hook an aggregate cross-worker snapshot instead (see `ParProgress`), so the
     // view is coarser but the *processing* stays fully parallel.
+    // Parallel read→group (slice 6, 統括指示: 負けるな): a
+    // `ls → read → [stateless/broadcast-join]* → group → [sort]* → [sink]`
+    // flow runs one streaming worker per FILE with partial GroupBys merged like
+    // #41 (associative lanes only — checked; bails to serial else). The
+    // size-based strategy chooser can't see a multi-file input's size (there is
+    // no single file source), so the shape is detected here and the size/memory
+    // threshold is honored inside the runner (sum of file sizes vs the same
+    // autotuner threshold).
+    if let Some(shape) = eligible_read_group_flow(graph) {
+        let attempt = try_parallel_read_group(graph, &opts, &shape, hook.as_deref_mut());
+        if let Some(res) = attempt {
+            return Ok(res);
+        }
+    }
+    // Slice 10: the pure-ETL shape (read→…→save, no group) — per-file segment
+    // encoding, concatenated in uri order (byte-identical to the serial sink).
+    if let Some(shape) = eligible_read_sink_flow(graph) {
+        let attempt = try_parallel_read_sink(graph, &opts, &shape, hook.as_deref_mut());
+        if let Some(res) = attempt {
+            return Ok(res);
+        }
+    }
     if strat == crate::analytics::Strategy::Parallel {
         // Parallel group-by (#41): a linear `source → … → group` flow whose
         // aggregates are byte-identical under partition→merge. Tried before the
@@ -1322,6 +1344,1397 @@ fn pre_group_op_allowed(op: &Op) -> bool {
 /// ops → GroupBy → (leaf | one sink)`, return `(source_id, group_id,
 /// optional_sink_id)` — the shape the *bounded* parallel group-by scheduler
 /// (#41) handles. `None` keeps the caller on the serial (bounded) path.
+/// Run a [`ReadGroupShape`]: discovery serially, broadcast right sides
+/// serially (they are small bounded sources), then one worker per file (waves
+/// of ≤ core count) streaming into partial `GroupBy`s, merged like #41; the
+/// post-group tail (sorts, sink) runs serially on the merged output.
+/// One worker's partial result: its `GroupBy` state, errors, and rows grouped.
+type PartialGroup = (operators::GroupBy, Vec<ErrorEvent>, u64);
+
+/// One read→sink segment worker's result: errors, rows written, header line.
+type SegmentResult = (Vec<ErrorEvent>, u64, Option<String>);
+
+/// A broadcast join's prebuilt right side: concatenated chunk, hash table,
+/// and right-key column indices — built once, shared by every worker.
+type BroadcastRight = operators::BuiltRight;
+
+fn try_parallel_read_group(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    shape: &ReadGroupShape,
+    mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
+) -> Option<RunResult> {
+    let t0 = Instant::now();
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
+        return None;
+    }
+    if opts.max_capture.is_some() && !must_drain(graph) {
+        return None;
+    }
+    let Op::Read { fmt, provenance } = &graph.nodes[shape.read_id].op else {
+        return None;
+    };
+    let (fmt, provenance) = (*fmt, *provenance);
+    let read_label = label_of(graph, shape.read_id);
+
+    // 1) Discovery, serially (milliseconds): pull every handle chunk.
+    let mut pre_errors: Vec<ErrorEvent> = Vec::new();
+    let mut pre_id = 0u64;
+    let mut uris: Vec<String> = Vec::new();
+    {
+        let mut op = operators::build(
+            &graph.nodes[shape.discovery_id].op,
+            &[],
+            opts.chunk_size,
+            false,
+        );
+        let mut ctx = OpCtx {
+            label: label_of(graph, shape.discovery_id),
+            errors: &mut pre_errors,
+            next_chunk_id: &mut pre_id,
+        };
+        while let Some(ch) = op.pull(&mut ctx) {
+            uris_of_chunk(&ch, &mut uris);
+        }
+    }
+    if uris.is_empty() || pre_errors.iter().any(ErrorEvent::is_fatal) {
+        return None; // let the serial path raise its own errors
+    }
+    uris.sort();
+    // Honor the same size threshold the single-source autotuner uses (a small
+    // input isn't worth the fan-out; MemoryPref::Low keeps its serial promise).
+    let total_bytes: u64 = uris
+        .iter()
+        .filter_map(|u| std::fs::metadata(u).ok().map(|m| m.len()))
+        .sum();
+    if total_bytes < parallel_min_bytes_for(opts.memory) {
+        return None;
+    }
+
+    // 2) Broadcast right sides, serially (small bounded sources): concat +
+    //    hash-index ONCE, shared by every worker's streaming prober.
+    let mut rights: Vec<(NodeId, BroadcastRight)> = Vec::new();
+    for step in &shape.path {
+        if let ReadPathStep::Broadcast { join_id, right_src } = step {
+            let mut op = operators::build(&graph.nodes[*right_src].op, &[], opts.chunk_size, false);
+            let mut chunks = Vec::new();
+            let mut ctx = OpCtx {
+                label: label_of(graph, *right_src),
+                errors: &mut pre_errors,
+                next_chunk_id: &mut pre_id,
+            };
+            while let Some(ch) = op.pull(&mut ctx) {
+                chunks.push(ch);
+            }
+            let Op::Join { right_keys, .. } = &graph.nodes[*join_id].op else {
+                return None;
+            };
+            let built = operators::BroadcastProbe::build_right(&chunks, right_keys)?;
+            rights.push((*right_src, built));
+        }
+    }
+    if pre_errors.iter().any(ErrorEvent::is_fatal) {
+        return None;
+    }
+
+    // 3) Phase 1 — open every file lazily (schema now, rows later), in waves.
+    let planner = operators::Read::new(fmt, provenance, opts.chunk_size);
+    let mut opened: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
+    let mut quarantined: Vec<ErrorEvent> = Vec::new();
+    {
+        let mut slots: Vec<Option<Result<(rivus_core::Schema, operators::FileDecoder), String>>> =
+            (0..uris.len()).map(|_| None).collect();
+        for (wave_start, wave) in uris
+            .chunks(threads)
+            .enumerate()
+            .map(|(w, c)| (w * threads, c))
+        {
+            let planner = &planner;
+            let wave_results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|uri| s.spawn(move || planner.open_file_stream(uri)))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (i, r) in wave_results.into_iter().enumerate() {
+                slots[wave_start + i] = Some(r);
+            }
+        }
+        for (uri, slot) in uris.iter().zip(slots) {
+            match slot.expect("slot filled") {
+                Ok((schema, dec)) => opened.push((uri.clone(), schema, dec)),
+                Err(e) => quarantined.push(
+                    ErrorEvent::new(
+                        Severity::Recoverable,
+                        ErrorScope::Item,
+                        format!("read: skipped '{uri}': {e}"),
+                    )
+                    .at_node(read_label.clone()),
+                ),
+            }
+        }
+    }
+    if opened.is_empty() {
+        return None;
+    }
+    let t_open = t0.elapsed();
+
+    // 4) The union schema every worker reconciles to (single source of truth).
+    let (union, fname) = operators::union_by_name(opened.iter().map(|(_, s, _)| s), provenance);
+    let uschema = std::sync::Arc::new(rivus_core::Schema::new(union.clone()));
+
+    // 5) Partition→merge safety: run ONE chunk of the first file through a
+    //    scratch pipeline to learn the group-input schema, then check every
+    //    aggregate rides an associative lane (#41). Bail to serial otherwise.
+    let aggs = match &graph.nodes[shape.group_id].op {
+        Op::GroupBy { aggs, .. } => aggs.clone(),
+        _ => return None,
+    };
+    // The sample chunk comes from the ALREADY-OPENED first file's decoder —
+    // the old form re-opened the file, which re-ran its whole inference pass
+    // (a full serial scan) just to type-check one chunk. The columns are
+    // cloned for the scratch run and the originals are handed to worker 0 as
+    // a preface, so the worker still processes every row exactly once, in
+    // order — byte-identical, one inference pass cheaper.
+    let preface0: Vec<rivus_core::Column>;
+    {
+        let (uri0, schema0, dec0) = &mut opened[0];
+        let cols0 = dec0.next_chunk()?;
+        let mut serrors = Vec::new();
+        let mut sid = 0u64;
+        let ch0 = operators::reconcile_chunk(
+            &union,
+            &uschema,
+            fname.as_deref(),
+            &provenance.source(uri0),
+            uri0,
+            schema0,
+            cols0.clone(),
+            0,
+        );
+        // Mini-pipeline: process the one chunk, then cascade finishes.
+        let mut ops: Vec<(NodeId, NodeId, Box<dyn Operator>)> = Vec::new();
+        let mut prev = shape.read_id;
+        for step in &shape.path {
+            match step {
+                ReadPathStep::Stateless(nid) => {
+                    ops.push((
+                        *nid,
+                        prev,
+                        operators::build(
+                            &graph.nodes[*nid].op,
+                            &graph.inputs_of(*nid),
+                            opts.chunk_size,
+                            false,
+                        ),
+                    ));
+                    prev = *nid;
+                }
+                ReadPathStep::Broadcast { join_id, right_src } => {
+                    let Op::Join {
+                        left_keys, kind, ..
+                    } = &graph.nodes[*join_id].op
+                    else {
+                        return None;
+                    };
+                    let (right, table, rk) = &rights
+                        .iter()
+                        .find(|(id, _)| id == right_src)
+                        .expect("right side")
+                        .1;
+                    let op: Box<dyn Operator> = Box::new(operators::BroadcastProbe::new(
+                        left_keys.clone(),
+                        *kind,
+                        right.clone(),
+                        table.clone(),
+                        rk.clone(),
+                    ));
+                    ops.push((*join_id, prev, op));
+                    prev = *join_id;
+                }
+            }
+        }
+        let mut level = vec![ch0];
+        for (nid, from, op) in ops.iter_mut() {
+            let mut ctx = OpCtx {
+                label: label_of(graph, *nid),
+                errors: &mut serrors,
+                next_chunk_id: &mut sid,
+            };
+            let mut out = Vec::new();
+            for c in std::mem::take(&mut level) {
+                out.extend(op.process(*from, c, &mut ctx));
+            }
+            out.extend(op.finish(&mut ctx));
+            level = out;
+        }
+        let sample = level.first()?;
+        let in_schema = sample.schema.clone();
+        let safe = operators::group_parallel_safe(&aggs, |name| {
+            in_schema.index_of(name).map(|i| in_schema.fields[i].dtype)
+        });
+        if !safe {
+            return None;
+        }
+        preface0 = cols0;
+    }
+    let t_scratch = t0.elapsed();
+
+    // 6) Workers: one file each, in waves of ≤ core count. Worker 0 receives
+    // the safety-check chunk's columns as a preface (decoded once, above).
+    let mut partials: Vec<Option<PartialGroup>> = (0..opened.len()).map(|_| None).collect();
+    let opened_files: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = opened;
+    {
+        let mut preface0 = Some(preface0);
+        let mut wave: Vec<(usize, (String, rivus_core::Schema, operators::FileDecoder))> =
+            Vec::new();
+        let mut it = opened_files.into_iter().enumerate();
+        loop {
+            wave.clear();
+            for _ in 0..threads {
+                match it.next() {
+                    Some(x) => wave.push(x),
+                    None => break,
+                }
+            }
+            if wave.is_empty() {
+                break;
+            }
+            let results: Vec<(usize, PartialGroup)> = std::thread::scope(|s| {
+                let union = &union;
+                let uschema = &uschema;
+                let fname = fname.as_deref();
+                let rights = &rights;
+                let read_label = read_label.as_str();
+                let handles: Vec<_> = wave
+                    .drain(..)
+                    .map(|(idx, (uri, schema, dec))| {
+                        let preface = if idx == 0 { preface0.take() } else { None };
+                        s.spawn(move || {
+                            (
+                                idx,
+                                worker_read_partial_group(
+                                    graph, opts, shape, &uri, &schema, dec, preface, union,
+                                    uschema, fname, provenance, rights, read_label,
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (idx, r) in results {
+                partials[idx] = Some(r);
+            }
+        }
+    }
+
+    let t_workers = t0.elapsed();
+
+    // 7) Merge partials in uri order; then the serial tail on the tiny result.
+    let mut partials_iter = partials.into_iter().map(|p| p.expect("worker ran"));
+    let (mut merged, mut errors, mut total_rows) = partials_iter.next()?;
+    let mut workers = vec![WorkerTelemetry {
+        worker: 0,
+        rows_out: total_rows,
+        busy: Duration::ZERO,
+    }];
+    for (i, (g, errs, rows)) in partials_iter.enumerate() {
+        merged.merge_from(g);
+        errors.extend(errs);
+        total_rows += rows;
+        workers.push(WorkerTelemetry {
+            worker: i + 1,
+            rows_out: rows,
+            busy: Duration::ZERO,
+        });
+    }
+    // Prepend discovery/right-side/quarantine events so the stream reads in
+    // graph order like the serial run.
+    let mut all_errors = pre_errors;
+    all_errors.extend(quarantined);
+    all_errors.extend(errors);
+    let mut errors = all_errors;
+
+    let mut fin_id = 0u64;
+    let mut level = {
+        let mut ctx = OpCtx {
+            label: label_of(graph, shape.group_id),
+            errors: &mut errors,
+            next_chunk_id: &mut fin_id,
+        };
+        merged.finish(&mut ctx)
+    };
+    let group_rows_out: u64 = level.iter().map(|c| c.len as u64).sum();
+
+    let mut outputs: Vec<Output> = Vec::new();
+    let mut wrote_sink = false;
+    for &nid in &shape.tail {
+        if let Op::Sink { .. } = &graph.nodes[nid].op {
+            if let Some((path, result, eval_fails)) = write_sink(&graph.nodes[nid].op, &level) {
+                if eval_fails > 0 {
+                    errors.push(route_eval_event(eval_fails, label_of(graph, nid)));
+                }
+                if let Err(e) = result {
+                    errors.push(
+                        ErrorEvent::new(
+                            Severity::Critical,
+                            ErrorScope::Graph,
+                            format!("cannot write '{path}': {e}"),
+                        )
+                        .at_node(label_of(graph, nid)),
+                    );
+                }
+            }
+            wrote_sink = true;
+        } else {
+            let mut op = operators::build(
+                &graph.nodes[nid].op,
+                &graph.inputs_of(nid),
+                opts.chunk_size,
+                false,
+            );
+            let mut ctx = OpCtx {
+                label: label_of(graph, nid),
+                errors: &mut errors,
+                next_chunk_id: &mut fin_id,
+            };
+            let mut out = Vec::new();
+            for c in std::mem::take(&mut level) {
+                out.extend(op.process(nid, c, &mut ctx));
+            }
+            out.extend(op.finish(&mut ctx));
+            level = out;
+        }
+    }
+    if !wrote_sink {
+        let last = shape.tail.iter().copied().last().unwrap_or(shape.group_id);
+        outputs.push(Output {
+            node_id: last,
+            label: graph.nodes[last].label.clone(),
+            chunks: level,
+        });
+    }
+
+    // Telemetry: one entry per node, key counts filled.
+    let mut telemetry: Vec<NodeTelemetry> = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let mut t = NodeTelemetry::new(
+                node.id,
+                label_of(graph, node.id),
+                node.op.kind_str().to_string(),
+            );
+            t.finished = true;
+            t
+        })
+        .collect();
+    telemetry[shape.read_id].rows_out = total_rows;
+    telemetry[shape.group_id].rows_in = total_rows;
+    telemetry[shape.group_id].rows_out = group_rows_out;
+
+    let final_mode = if errors.iter().any(ErrorEvent::is_fatal) {
+        Mode::Halted
+    } else {
+        Mode::Normal
+    };
+    let mut res = RunResult {
+        telemetry,
+        errors,
+        final_mode,
+        outputs,
+        workers,
+        first_row_latency: None,
+        inference: Vec::new(),
+        strategy: None,
+    };
+    res.strategy = Some("parallel read group-by (per-file workers)".to_string());
+    if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        // Wall between phase boundaries: discovery+rights+open / the one
+        // scratch safety chunk / worker waves / merge+serial tail.
+        eprintln!(
+            "[WPROF-PHASE] open={}ms scratch={}ms workers={}ms merge+tail={}ms",
+            t_open.as_millis(),
+            (t_scratch - t_open).as_millis(),
+            (t_workers - t_scratch).as_millis(),
+            (t0.elapsed() - t_workers).as_millis()
+        );
+    }
+    if let Some(h) = hook.as_mut() {
+        h(&final_snapshot(&res, shape.discovery_id, t0.elapsed()));
+    }
+    Some(res)
+}
+
+/// Slice 10（統括指示: 勝ちやすいパターンだけではダメ）: a parallelizable
+/// **read→sink** flow — the pure-ETL shape `ls → read → [stateless]* →
+/// (⋈ small-source)* → save file.csv` with NO group. Each worker streams ONE
+/// file through its pipeline and encodes rows into a **per-file temp segment**
+/// (headerless, the same `write_cell` formatter as the serial sink); the
+/// finalize step writes the header and concatenates the segments **in uri
+/// order** — the bytes are identical to the serial run (same formatter, same
+/// row order), with bounded memory (a chunk + a write buffer per worker).
+/// One read→sink worker: stream one file through the per-worker pipeline and
+/// encode surviving rows into a headerless CSV segment (same `write_cell`
+/// formatter as the serial sink ⇒ identical bytes). Returns its errors, rows
+/// written, and the header line of its output schema (captured from the first
+/// chunk it saw — every worker's is identical).
+#[allow(clippy::too_many_arguments)]
+fn worker_read_to_segment(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    shape: &ReadGroupShape,
+    uri: &str,
+    file_schema: &rivus_core::Schema,
+    mut dec: operators::FileDecoder,
+    union: &[rivus_core::Field],
+    uschema: &std::sync::Arc<rivus_core::Schema>,
+    fname: Option<&str>,
+    provenance: rivus_ir::Provenance,
+    rights: &[(NodeId, BroadcastRight)],
+    read_label: &str,
+    seg: &str,
+    delim: u8,
+) -> (Vec<ErrorEvent>, u64, Option<String>) {
+    use std::io::Write as _;
+    let mut errors = Vec::new();
+    let mut next_id = 0u64;
+    let mut ops: Vec<(NodeId, NodeId, Box<dyn Operator>)> = Vec::new();
+    let mut prev = shape.read_id;
+    for step in &shape.path {
+        match step {
+            ReadPathStep::Stateless(nid) => {
+                let op = operators::build(
+                    &graph.nodes[*nid].op,
+                    &graph.inputs_of(*nid),
+                    opts.chunk_size,
+                    false,
+                );
+                ops.push((*nid, prev, op));
+                prev = *nid;
+            }
+            ReadPathStep::Broadcast { join_id, right_src } => {
+                let Op::Join {
+                    left_keys, kind, ..
+                } = &graph.nodes[*join_id].op
+                else {
+                    unreachable!("shape detector matched a join");
+                };
+                let (right, table, rk) = &rights
+                    .iter()
+                    .find(|(id, _)| id == right_src)
+                    .expect("prebuilt right side")
+                    .1;
+                let op: Box<dyn Operator> = Box::new(operators::BroadcastProbe::new(
+                    left_keys.clone(),
+                    *kind,
+                    right.clone(),
+                    table.clone(),
+                    rk.clone(),
+                ));
+                ops.push((*join_id, prev, op));
+                prev = *join_id;
+            }
+        }
+    }
+    let handle = provenance.source(uri);
+    let mut rows = 0u64;
+    let mut header: Option<String> = None;
+    let file = match std::fs::File::create(seg) {
+        Ok(f) => f,
+        Err(e) => {
+            errors.push(
+                ErrorEvent::new(
+                    Severity::Critical,
+                    ErrorScope::Graph,
+                    format!("cannot write segment '{seg}': {e}"),
+                )
+                .at_node(read_label.to_string()),
+            );
+            return (errors, 0, None);
+        }
+    };
+    let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let sep = delim as char;
+    let mut line = String::new();
+    let mut emit = |chunks: Vec<Chunk>,
+                    header: &mut Option<String>,
+                    rows: &mut u64,
+                    errors: &mut Vec<ErrorEvent>| {
+        for ch in chunks {
+            if header.is_none() {
+                *header = Some(format!(
+                    "{}\n",
+                    ch.schema.field_names().join(&sep.to_string())
+                ));
+            }
+            for row in 0..ch.len {
+                line.clear();
+                for c in 0..ch.columns.len() {
+                    if c > 0 {
+                        line.push(sep);
+                    }
+                    operators::write_cell(&mut line, &ch.columns[c], row, delim);
+                }
+                line.push('\n');
+                if let Err(e) = w.write_all(line.as_bytes()) {
+                    errors.push(
+                        ErrorEvent::new(
+                            Severity::Critical,
+                            ErrorScope::Graph,
+                            format!("segment write failed: {e}"),
+                        )
+                        .at_node(read_label.to_string()),
+                    );
+                    return;
+                }
+                *rows += 1;
+            }
+        }
+    };
+    let run_level = |ops: &mut [(NodeId, NodeId, Box<dyn Operator>)],
+                     start_idx: usize,
+                     start: Vec<Chunk>,
+                     errors: &mut Vec<ErrorEvent>,
+                     next_id: &mut u64|
+     -> Vec<Chunk> {
+        let mut level = start;
+        for (nid, from, op) in ops.iter_mut().skip(start_idx) {
+            let mut out = Vec::new();
+            let mut ctx = OpCtx {
+                label: label_of(graph, *nid),
+                errors,
+                next_chunk_id: next_id,
+            };
+            for c in level {
+                out.extend(op.process(*from, c, &mut ctx));
+            }
+            level = out;
+        }
+        level
+    };
+    let mut t_dec = std::time::Duration::ZERO;
+    let mut t_rec = std::time::Duration::ZERO;
+    let mut t_ops = std::time::Duration::ZERO;
+    let mut t_emit = std::time::Duration::ZERO;
+    loop {
+        let t0 = Instant::now();
+        let Some(cols) = dec.next_chunk() else { break };
+        t_dec += t0.elapsed();
+        let id = next_id;
+        next_id += 1;
+        let t1 = Instant::now();
+        let ch =
+            operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, cols, id);
+        t_rec += t1.elapsed();
+        let t2 = Instant::now();
+        let out = run_level(&mut ops, 0, vec![ch], &mut errors, &mut next_id);
+        t_ops += t2.elapsed();
+        let t3 = Instant::now();
+        emit(out, &mut header, &mut rows, &mut errors);
+        t_emit += t3.elapsed();
+    }
+    if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        eprintln!(
+            "[WPROF-SINK] {uri}: decode={}ms reconcile={}ms ops={}ms emit={}ms",
+            t_dec.as_millis(),
+            t_rec.as_millis(),
+            t_ops.as_millis(),
+            t_emit.as_millis()
+        );
+    }
+    for i in 0..ops.len() {
+        let fin = {
+            let (nid, _, op) = &mut ops[i];
+            let mut ctx = OpCtx {
+                label: label_of(graph, *nid),
+                errors: &mut errors,
+                next_chunk_id: &mut next_id,
+            };
+            op.finish(&mut ctx)
+        };
+        if !fin.is_empty() {
+            let out = run_level(&mut ops, i + 1, fin, &mut errors, &mut next_id);
+            emit(out, &mut header, &mut rows, &mut errors);
+        }
+    }
+    let _ = w.flush();
+    let bad = dec.bad_rows();
+    if bad > 0 {
+        errors.push(
+            ErrorEvent::new(
+                Severity::Recoverable,
+                ErrorScope::Item,
+                format!("read '{uri}': {bad} malformed row(s) skipped"),
+            )
+            .at_node(read_label.to_string()),
+        );
+    }
+    (errors, rows, header)
+}
+
+fn try_parallel_read_sink(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    shape: &ReadGroupShape,
+    mut hook: Option<&mut (dyn FnMut(&RuntimeSnapshot) + '_)>,
+) -> Option<RunResult> {
+    let t0 = Instant::now();
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
+        return None;
+    }
+    // Only the plain fixed-path CSV sink in this slice (jsonl/json/partitioned
+    // routes fall back to serial).
+    let sink_id = shape.group_id; // for this shape, `group_id` slot holds the sink
+    let Op::Sink {
+        route: rivus_ir::Route::Fixed(out_path),
+        codec: SinkCodec::Csv { delim },
+        ..
+    } = &graph.nodes[sink_id].op
+    else {
+        return None;
+    };
+    if out_path == "-" {
+        return None;
+    }
+    let Op::Read { fmt, provenance } = &graph.nodes[shape.read_id].op else {
+        return None;
+    };
+    let (fmt, provenance, delim) = (*fmt, *provenance, *delim);
+    let read_label = label_of(graph, shape.read_id);
+
+    // Discovery + broadcast right sides + lazy opens + union: identical to the
+    // read→group runner.
+    let mut pre_errors: Vec<ErrorEvent> = Vec::new();
+    let mut pre_id = 0u64;
+    let mut uris: Vec<String> = Vec::new();
+    {
+        let mut op = operators::build(
+            &graph.nodes[shape.discovery_id].op,
+            &[],
+            opts.chunk_size,
+            false,
+        );
+        let mut ctx = OpCtx {
+            label: label_of(graph, shape.discovery_id),
+            errors: &mut pre_errors,
+            next_chunk_id: &mut pre_id,
+        };
+        while let Some(ch) = op.pull(&mut ctx) {
+            uris_of_chunk(&ch, &mut uris);
+        }
+    }
+    if uris.is_empty() || pre_errors.iter().any(ErrorEvent::is_fatal) {
+        return None;
+    }
+    uris.sort();
+    let total_bytes: u64 = uris
+        .iter()
+        .filter_map(|u| std::fs::metadata(u).ok().map(|m| m.len()))
+        .sum();
+    if total_bytes < parallel_min_bytes_for(opts.memory) {
+        return None;
+    }
+    let mut rights: Vec<(NodeId, BroadcastRight)> = Vec::new();
+    for step in &shape.path {
+        if let ReadPathStep::Broadcast { join_id, right_src } = step {
+            let mut op = operators::build(&graph.nodes[*right_src].op, &[], opts.chunk_size, false);
+            let mut chunks = Vec::new();
+            let mut ctx = OpCtx {
+                label: label_of(graph, *right_src),
+                errors: &mut pre_errors,
+                next_chunk_id: &mut pre_id,
+            };
+            while let Some(ch) = op.pull(&mut ctx) {
+                chunks.push(ch);
+            }
+            let Op::Join { right_keys, .. } = &graph.nodes[*join_id].op else {
+                return None;
+            };
+            let built = operators::BroadcastProbe::build_right(&chunks, right_keys)?;
+            rights.push((*right_src, built));
+        }
+    }
+    if pre_errors.iter().any(ErrorEvent::is_fatal) {
+        return None;
+    }
+    let planner = operators::Read::new(fmt, provenance, opts.chunk_size);
+    let mut opened: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
+    let mut quarantined: Vec<ErrorEvent> = Vec::new();
+    {
+        let mut slots: Vec<Option<Result<(rivus_core::Schema, operators::FileDecoder), String>>> =
+            (0..uris.len()).map(|_| None).collect();
+        for (wave_start, wave) in uris
+            .chunks(threads)
+            .enumerate()
+            .map(|(w, c)| (w * threads, c))
+        {
+            let planner = &planner;
+            let wave_results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|uri| s.spawn(move || planner.open_file_stream(uri)))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (i, r) in wave_results.into_iter().enumerate() {
+                slots[wave_start + i] = Some(r);
+            }
+        }
+        for (uri, slot) in uris.iter().zip(slots) {
+            match slot.expect("slot filled") {
+                Ok((schema, dec)) => opened.push((uri.clone(), schema, dec)),
+                Err(e) => quarantined.push(
+                    ErrorEvent::new(
+                        Severity::Recoverable,
+                        ErrorScope::Item,
+                        format!("read: skipped '{uri}': {e}"),
+                    )
+                    .at_node(read_label.clone()),
+                ),
+            }
+        }
+    }
+    if opened.is_empty() {
+        return None;
+    }
+    let (union, fname) = operators::union_by_name(opened.iter().map(|(_, s, _)| s), provenance);
+    let uschema = std::sync::Arc::new(rivus_core::Schema::new(union.clone()));
+
+    // Workers: stream file → ops → encode rows into a temp segment.
+    let seg_path = |i: usize| format!("{out_path}.rivus-part-{i:04}");
+    let mut worker_results: Vec<Option<SegmentResult>> = (0..opened.len()).map(|_| None).collect();
+    {
+        let mut wave: Vec<(usize, (String, rivus_core::Schema, operators::FileDecoder))> =
+            Vec::new();
+        let mut it = opened.into_iter().enumerate();
+        loop {
+            wave.clear();
+            for _ in 0..threads {
+                match it.next() {
+                    Some(x) => wave.push(x),
+                    None => break,
+                }
+            }
+            if wave.is_empty() {
+                break;
+            }
+            let results: Vec<(usize, SegmentResult)> = std::thread::scope(|s| {
+                let union = &union;
+                let uschema = &uschema;
+                let fname = fname.as_deref();
+                let rights = &rights;
+                let read_label = read_label.as_str();
+                let seg_path = &seg_path;
+                let handles: Vec<_> = wave
+                    .drain(..)
+                    .map(|(idx, (uri, schema, dec))| {
+                        s.spawn(move || {
+                            (
+                                idx,
+                                worker_read_to_segment(
+                                    graph,
+                                    opts,
+                                    shape,
+                                    &uri,
+                                    &schema,
+                                    dec,
+                                    union,
+                                    uschema,
+                                    fname,
+                                    provenance,
+                                    rights,
+                                    read_label,
+                                    &seg_path(idx),
+                                    delim,
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (idx, r) in results {
+                worker_results[idx] = Some(r);
+            }
+        }
+    }
+
+    // Finalize: header + segments in uri order → the target (byte-identical to
+    // the serial writer: same formatter, same row order).
+    let mut errors = pre_errors;
+    errors.extend(quarantined);
+    let mut total_rows = 0u64;
+    let mut header: Option<String> = None;
+    let nseg = worker_results.len();
+    for r in worker_results.into_iter() {
+        let (errs, rows, hdr) = r.expect("worker ran");
+        errors.extend(errs);
+        total_rows += rows;
+        if header.is_none() {
+            header = hdr; // first worker (uri order) that saw a chunk
+        }
+    }
+    // Header + segments in uri order. No chunk anywhere → an empty file,
+    // exactly like the serial `write_csv_file` with no chunks.
+    let write_res: std::io::Result<()> = (|| {
+        use std::io::Write as _;
+        let p = crate::transport::adjust_path(out_path);
+        let f = std::fs::File::create(p)?;
+        let mut w = std::io::BufWriter::with_capacity(256 * 1024, f);
+        if let Some(h) = &header {
+            w.write_all(h.as_bytes())?;
+        }
+        for i in 0..nseg {
+            if let Ok(mut rf) = std::fs::File::open(seg_path(i)) {
+                std::io::copy(&mut rf, &mut w)?;
+            }
+        }
+        w.flush()
+    })();
+    for i in 0..nseg {
+        let _ = std::fs::remove_file(seg_path(i));
+    }
+    if let Err(e) = write_res {
+        errors.push(
+            ErrorEvent::new(
+                Severity::Critical,
+                ErrorScope::Graph,
+                format!("cannot write '{out_path}': {e}"),
+            )
+            .at_node(label_of(graph, sink_id)),
+        );
+    }
+
+    let mut telemetry: Vec<NodeTelemetry> = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let mut t = NodeTelemetry::new(
+                node.id,
+                label_of(graph, node.id),
+                node.op.kind_str().to_string(),
+            );
+            t.finished = true;
+            t
+        })
+        .collect();
+    telemetry[shape.read_id].rows_out = total_rows;
+    telemetry[sink_id].rows_in = total_rows;
+    let final_mode = if errors.iter().any(ErrorEvent::is_fatal) {
+        Mode::Halted
+    } else {
+        Mode::Normal
+    };
+    let mut res = RunResult {
+        telemetry,
+        errors,
+        final_mode,
+        outputs: Vec::new(),
+        workers: Vec::new(),
+        first_row_latency: None,
+        inference: Vec::new(),
+        strategy: None,
+    };
+    res.strategy = Some("parallel read sink (per-file segments)".to_string());
+    if let Some(h) = hook.as_mut() {
+        h(&final_snapshot(&res, shape.discovery_id, t0.elapsed()));
+    }
+    Some(res)
+}
+
+/// Slice 6（統括指示: 負けるな・全てが流れ）: a parallelizable **read→group**
+/// flow — `ls → read → [stateless]* → (⋈ small-source)* → group → [sort]* →
+/// [sink]`. Each worker streams ONE file (schema known up front, rows on
+/// demand) through its own copy of the pipeline into a partial `GroupBy`;
+/// partials merge exactly like the byte-range parallel group-by (#41), so the
+/// group output is byte-identical to the serial path (associative lanes only,
+/// checked). A broadcast join's right side (a bare bounded source) is
+/// materialized once and pre-fed to every worker's join instance.
+struct ReadGroupShape {
+    discovery_id: NodeId,
+    read_id: NodeId,
+    path: Vec<ReadPathStep>,
+    group_id: NodeId,
+    /// group → … → leaf inclusive (sorts, then an optional sink); run serially
+    /// on the merged group output (16 rows, not 10M — serial is right here).
+    tail: Vec<NodeId>,
+}
+
+enum ReadPathStep {
+    Stateless(NodeId),
+    Broadcast { join_id: NodeId, right_src: NodeId },
+}
+
+/// Slice 10 shape: `ls → read → [stateless/broadcast-join]* → sink` (a leaf
+/// fixed-path sink, NO group). Reuses [`ReadGroupShape`] with the sink node in
+/// the `group_id` slot and an empty tail.
+fn eligible_read_sink_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
+    let mut read = None;
+    let mut sink = None;
+    for n in &graph.nodes {
+        match &n.op {
+            Op::Read { .. } => {
+                if read.is_some() {
+                    return None;
+                }
+                read = Some(n.id);
+            }
+            Op::Sink { .. } => {
+                if sink.is_some() {
+                    return None;
+                }
+                sink = Some(n.id);
+            }
+            Op::GroupBy { .. } => return None, // the group runner owns that shape
+            _ => {}
+        }
+    }
+    let (read_id, sink_id) = (read?, sink?);
+    if !graph.outputs_of(sink_id).is_empty() {
+        return None;
+    }
+    let ins = graph.inputs_of(read_id);
+    if ins.len() != 1 {
+        return None;
+    }
+    let disc = ins[0];
+    let Op::Source { discovery, .. } = &graph.nodes[disc].op else {
+        return None;
+    };
+    if discovery.is_unbounded()
+        || graph.outputs_of(disc).len() != 1
+        || !graph.inputs_of(disc).is_empty()
+    {
+        return None;
+    }
+    let mut path = Vec::new();
+    let mut cur = read_id;
+    loop {
+        let outs = graph.outputs_of(cur);
+        if outs.len() != 1 {
+            return None;
+        }
+        let next = outs[0];
+        if next == sink_id {
+            break;
+        }
+        match &graph.nodes[next].op {
+            Op::Join {
+                kind: rivus_ir::JoinKind::Inner | rivus_ir::JoinKind::Left,
+                ..
+            } => {
+                let jins = graph.inputs_of(next);
+                if jins.len() != 2 || jins[0] != cur {
+                    return None;
+                }
+                let right = jins[1];
+                let Op::Source { discovery: d2, .. } = &graph.nodes[right].op else {
+                    return None;
+                };
+                if d2.is_unbounded()
+                    || graph.outputs_of(right).len() != 1
+                    || !graph.inputs_of(right).is_empty()
+                {
+                    return None;
+                }
+                path.push(ReadPathStep::Broadcast {
+                    join_id: next,
+                    right_src: right,
+                });
+            }
+            op if pre_group_op_allowed(op) => path.push(ReadPathStep::Stateless(next)),
+            _ => return None,
+        }
+        cur = next;
+    }
+    let rights = path
+        .iter()
+        .filter(|s| matches!(s, ReadPathStep::Broadcast { .. }))
+        .count();
+    if graph.nodes.len() != 2 + path.len() + rights + 1 {
+        return None;
+    }
+    Some(ReadGroupShape {
+        discovery_id: disc,
+        read_id,
+        path,
+        group_id: sink_id,
+        tail: Vec::new(),
+    })
+}
+
+fn eligible_read_group_flow(graph: &PlanGraph) -> Option<ReadGroupShape> {
+    let (mut read, mut group) = (None, None);
+    for n in &graph.nodes {
+        match &n.op {
+            Op::Read { .. } => {
+                if read.is_some() {
+                    return None;
+                }
+                read = Some(n.id);
+            }
+            Op::GroupBy { .. } => {
+                if group.is_some() {
+                    return None;
+                }
+                group = Some(n.id);
+            }
+            _ => {}
+        }
+    }
+    let (read_id, group_id) = (read?, group?);
+    // read's single input: a bounded discovery source feeding only read.
+    let ins = graph.inputs_of(read_id);
+    if ins.len() != 1 {
+        return None;
+    }
+    let disc = ins[0];
+    let Op::Source { discovery, .. } = &graph.nodes[disc].op else {
+        return None;
+    };
+    if discovery.is_unbounded()
+        || graph.outputs_of(disc).len() != 1
+        || !graph.inputs_of(disc).is_empty()
+    {
+        return None;
+    }
+    // read → group: a single-consumer chain of allowlisted stateless ops and
+    // broadcast-able joins (read side LEFT, kind inner/left, right = bare
+    // bounded source consumed only by this join).
+    let mut path = Vec::new();
+    let mut cur = read_id;
+    loop {
+        let outs = graph.outputs_of(cur);
+        if outs.len() != 1 {
+            return None;
+        }
+        let next = outs[0];
+        if next == group_id {
+            break;
+        }
+        match &graph.nodes[next].op {
+            Op::Join {
+                kind: rivus_ir::JoinKind::Inner | rivus_ir::JoinKind::Left,
+                ..
+            } => {
+                let jins = graph.inputs_of(next);
+                if jins.len() != 2 || jins[0] != cur {
+                    return None; // the streamed (read) side must be the LEFT input
+                }
+                let right = jins[1];
+                let Op::Source { discovery: d2, .. } = &graph.nodes[right].op else {
+                    return None;
+                };
+                if d2.is_unbounded()
+                    || graph.outputs_of(right).len() != 1
+                    || !graph.inputs_of(right).is_empty()
+                {
+                    return None;
+                }
+                path.push(ReadPathStep::Broadcast {
+                    join_id: next,
+                    right_src: right,
+                });
+            }
+            op if pre_group_op_allowed(op) => path.push(ReadPathStep::Stateless(next)),
+            _ => return None,
+        }
+        cur = next;
+    }
+    if graph.inputs_of(group_id).as_slice() != [cur] {
+        return None;
+    }
+    // group tail: sorts then an optional leaf sink, single-consumer throughout.
+    let mut tail = Vec::new();
+    let mut t = group_id;
+    loop {
+        match graph.outputs_of(t).as_slice() {
+            [] => break,
+            [n] => {
+                let n = *n;
+                match &graph.nodes[n].op {
+                    Op::Sort { .. } => {
+                        tail.push(n);
+                        t = n;
+                    }
+                    Op::Sink { .. } => {
+                        if !graph.outputs_of(n).is_empty() {
+                            return None;
+                        }
+                        tail.push(n);
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    // No stray nodes: disc + read + path (+ a right source per join) + group + tail.
+    let rights = path
+        .iter()
+        .filter(|s| matches!(s, ReadPathStep::Broadcast { .. }))
+        .count();
+    if graph.nodes.len() != 2 + path.len() + rights + 1 + tail.len() {
+        return None;
+    }
+    Some(ReadGroupShape {
+        discovery_id: disc,
+        read_id,
+        path,
+        group_id,
+        tail,
+    })
+}
+
+/// Extract resource uris from a discovery chunk (mirrors `Read::process`).
+fn uris_of_chunk(chunk: &Chunk, out: &mut Vec<String>) {
+    let ci = match chunk.schema.index_of("path") {
+        Some(i) if chunk.schema.fields[i].dtype == DataType::Resource => Some(i),
+        _ => chunk
+            .schema
+            .fields
+            .iter()
+            .position(|f| f.dtype == DataType::Resource),
+    };
+    if let Some(ci) = ci {
+        for r in 0..chunk.len {
+            if let rivus_core::Value::Resource(res) = chunk.value(r, ci) {
+                out.push(res.uri().to_string());
+            }
+        }
+    }
+}
+
+/// One worker: stream one file (lazy decoder) through reconcile → the path ops
+/// (a broadcast join is pre-fed its materialized right side) into a partial
+/// `GroupBy`. Holds one chunk + the join buffer of this file + group state.
+#[allow(clippy::too_many_arguments)]
+fn worker_read_partial_group(
+    graph: &PlanGraph,
+    opts: &RunOptions,
+    shape: &ReadGroupShape,
+    uri: &str,
+    file_schema: &rivus_core::Schema,
+    mut dec: operators::FileDecoder,
+    // Columns already decoded from this file (the parallel-safety sample
+    // chunk): processed FIRST, so the stream is the whole file in order.
+    preface: Option<Vec<rivus_core::Column>>,
+    union: &[rivus_core::Field],
+    uschema: &std::sync::Arc<rivus_core::Schema>,
+    fname: Option<&str>,
+    provenance: rivus_ir::Provenance,
+    rights: &[(NodeId, BroadcastRight)],
+    read_label: &str,
+) -> (operators::GroupBy, Vec<ErrorEvent>, u64) {
+    let mut errors = Vec::new();
+    let mut next_id = 0u64;
+    // Per-worker op instances, with each broadcast join pre-fed its right side.
+    let mut ops: Vec<(NodeId, NodeId, Box<dyn Operator>)> = Vec::new(); // (node, from, op)
+    let mut prev = shape.read_id;
+    for step in &shape.path {
+        match step {
+            ReadPathStep::Stateless(nid) => {
+                let op = operators::build(
+                    &graph.nodes[*nid].op,
+                    &graph.inputs_of(*nid),
+                    opts.chunk_size,
+                    false,
+                );
+                ops.push((*nid, prev, op));
+                prev = *nid;
+            }
+            ReadPathStep::Broadcast { join_id, right_src } => {
+                // Streaming prober: probes each arriving chunk against the
+                // shared prebuilt right side and emits immediately — no left
+                // buffering, no drain-time concat (which dominated the worker
+                // profile). Byte-identical to the blocking join (see
+                // `BroadcastProbe`).
+                let Op::Join {
+                    left_keys, kind, ..
+                } = &graph.nodes[*join_id].op
+                else {
+                    unreachable!("shape detector matched a join");
+                };
+                let (right, table, rk) = &rights
+                    .iter()
+                    .find(|(id, _)| id == right_src)
+                    .expect("prebuilt right side")
+                    .1;
+                let op: Box<dyn Operator> = Box::new(operators::BroadcastProbe::new(
+                    left_keys.clone(),
+                    *kind,
+                    right.clone(),
+                    table.clone(),
+                    rk.clone(),
+                ));
+                ops.push((*join_id, prev, op));
+                prev = *join_id;
+            }
+        }
+    }
+    let mut group = operators::new_group(&graph.nodes[shape.group_id].op).expect("group op");
+    let mut rows = 0u64;
+    let handle = provenance.source(uri);
+
+    // Push chunks from `start_idx` onward; the group consumes the survivors.
+    // `t_ops` accumulates per-op wall (one slot per pipeline op, last = the
+    // group) for the WPROF breakdown — a handful of `Instant` reads per chunk,
+    // free at chunk granularity.
+    let mut t_ops: Vec<std::time::Duration> = vec![std::time::Duration::ZERO; ops.len() + 1];
+    let feed = |ops: &mut [(NodeId, NodeId, Box<dyn Operator>)],
+                start_idx: usize,
+                start: Vec<Chunk>,
+                group: &mut operators::GroupBy,
+                errors: &mut Vec<ErrorEvent>,
+                next_id: &mut u64,
+                rows: &mut u64,
+                t_ops: &mut [std::time::Duration]| {
+        let mut level = start;
+        for (i, (nid, from, op)) in ops.iter_mut().enumerate().skip(start_idx) {
+            let t = Instant::now();
+            let mut out = Vec::new();
+            let mut ctx = OpCtx {
+                label: label_of(graph, *nid),
+                errors,
+                next_chunk_id: next_id,
+            };
+            for c in level {
+                out.extend(op.process(*from, c, &mut ctx));
+            }
+            level = out;
+            t_ops[i] += t.elapsed();
+        }
+        let t = Instant::now();
+        let mut ctx = OpCtx {
+            label: label_of(graph, shape.group_id),
+            errors,
+            next_chunk_id: next_id,
+        };
+        for c in level {
+            *rows += c.len as u64;
+            group.process(shape.group_id, c, &mut ctx);
+        }
+        *t_ops.last_mut().expect("group slot") += t.elapsed();
+    };
+
+    let mut t_dec = std::time::Duration::ZERO;
+    let mut t_rec = std::time::Duration::ZERO;
+    let mut t_feed = std::time::Duration::ZERO;
+    // The pre-decoded safety-sample chunk streams first (file order).
+    if let Some(cols) = preface {
+        let id = next_id;
+        next_id += 1;
+        let t1 = Instant::now();
+        let ch =
+            operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, cols, id);
+        t_rec += t1.elapsed();
+        let t2 = Instant::now();
+        feed(
+            &mut ops,
+            0,
+            vec![ch],
+            &mut group,
+            &mut errors,
+            &mut next_id,
+            &mut rows,
+            &mut t_ops,
+        );
+        t_feed += t2.elapsed();
+    }
+    loop {
+        let t0 = Instant::now();
+        let Some(cols) = dec.next_chunk() else { break };
+        t_dec += t0.elapsed();
+        let id = next_id;
+        next_id += 1;
+        let t1 = Instant::now();
+        let ch =
+            operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, cols, id);
+        t_rec += t1.elapsed();
+        let t2 = Instant::now();
+        feed(
+            &mut ops,
+            0,
+            vec![ch],
+            &mut group,
+            &mut errors,
+            &mut next_id,
+            &mut rows,
+            &mut t_ops,
+        );
+        t_feed += t2.elapsed();
+    }
+    if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        let per_op: Vec<String> = ops
+            .iter()
+            .map(|(nid, _, _)| label_of(graph, *nid))
+            .chain(std::iter::once("group".to_string()))
+            .zip(t_ops.iter())
+            .map(|(l, d)| format!("{l}={}ms", d.as_millis()))
+            .collect();
+        eprintln!(
+            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms [{}]",
+            t_dec.as_millis(),
+            t_rec.as_millis(),
+            t_feed.as_millis(),
+            per_op.join(" ")
+        );
+    }
+    // Drain: cascade each op's finish through the rest of the pipeline (a
+    // blocking join emits everything here).
+    let t3 = Instant::now();
+    for i in 0..ops.len() {
+        let fin = {
+            let (nid, _, op) = &mut ops[i];
+            let mut ctx = OpCtx {
+                label: label_of(graph, *nid),
+                errors: &mut errors,
+                next_chunk_id: &mut next_id,
+            };
+            op.finish(&mut ctx)
+        };
+        if !fin.is_empty() {
+            feed(
+                &mut ops,
+                i + 1,
+                fin,
+                &mut group,
+                &mut errors,
+                &mut next_id,
+                &mut rows,
+                &mut t_ops,
+            );
+        }
+    }
+    if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
+        eprintln!("[WPROF] {uri}: drain={}ms", t3.elapsed().as_millis());
+    }
+    // Per-file malformed rows AFTER draining (compressed streams accrue while
+    // decoding); same message the serial read raises, at the read node.
+    let bad = dec.bad_rows();
+    if bad > 0 {
+        errors.push(
+            ErrorEvent::new(
+                Severity::Recoverable,
+                ErrorScope::Item,
+                format!("read '{uri}': {bad} malformed row(s) skipped"),
+            )
+            .at_node(read_label.to_string()),
+        );
+    }
+    (group, errors, rows)
+}
+
 fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<NodeId>)> {
     eligible_group_flow_inner(graph, true)
 }

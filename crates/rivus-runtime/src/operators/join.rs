@@ -62,6 +62,38 @@ fn join_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> Option<String> {
     Some(s)
 }
 
+/// Like [`join_key_at`] but appends the composite key into a **reused** buffer
+/// instead of allocating a fresh `String` per call — the probe side calls this
+/// once per row, so avoiding the per-row heap allocation (and the `Value` box a
+/// bare column would otherwise pay) is decisive on a large probe. Returns
+/// `false` (buffer left as-is) if any key part is null (a null key matches
+/// nothing, as in [`join_key_at`]). The bytes written are **identical** to
+/// [`join_key_at`]'s string for the same row (a str part borrows the column
+/// directly; any other lane falls back to the same `Value::to_string` form), so
+/// the key — and therefore every match — is byte-for-byte unchanged.
+fn fill_join_key(chunk: &Chunk, idxs: &[usize], row: usize, buf: &mut String) -> bool {
+    use std::fmt::Write;
+    for (n, &ci) in idxs.iter().enumerate() {
+        if chunk.columns[ci].is_null(row) {
+            return false;
+        }
+        if n > 0 {
+            buf.push('\u{1f}');
+        }
+        match chunk.columns[ci].data() {
+            // Bare string key: borrow the column's `&str` (zero allocation,
+            // identical bytes to `Value::Str(_).to_string()`).
+            ColumnData::Str(s) => buf.push_str(s.get(row)),
+            // Any other lane keeps the exact `Value::to_string` form (still into
+            // the reused buffer) so the key bytes are unchanged.
+            _ => {
+                let _ = write!(buf, "{}", chunk.value(row, ci));
+            }
+        }
+    }
+    true
+}
+
 /// Concatenate buffered chunks (sharing a schema) into one.
 fn concat_chunks(bufs: Vec<Chunk>) -> Option<Chunk> {
     let mut it = bufs.into_iter();
@@ -170,7 +202,9 @@ impl Operator for Join {
         // with defaults; an unmatched right row (right/full) has `None` on the
         // left and pads the left columns — except the join-key columns, which
         // take the right key so the key is never lost.
-        let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+        // Fx-hashed (see `JoinTable`): probe/pad order is row order on both
+        // sides, never table iteration order, so the hasher is unobservable.
+        let mut table = JoinTable::default();
         for ri in 0..right.len {
             // A null-key right row is never inserted, so it matches nothing; it
             // still surfaces as an unmatched row for right/full joins below.
@@ -181,9 +215,22 @@ impl Operator for Join {
         let mut right_matched = vec![false; right.len];
         let mut lidx: Vec<Option<usize>> = Vec::new();
         let mut ridx: Vec<Option<usize>> = Vec::new();
+        let keeps_left = self.kind.keeps_left();
+        // Probe with a REUSED key buffer: the old path allocated a fresh heap
+        // `String` (and boxed a `Value`) for every left row, which dominated the
+        // cost on a large probe side (a 3M-row × 20-row left join measured 6.7s —
+        // the per-row allocation, not the hash match). `String: Borrow<str>` lets
+        // us look the buffer up without owning a key. Byte-identical: `keybuf`
+        // holds the same bytes `join_key_at` would have returned.
+        let mut keybuf = String::new();
         for li in 0..left.len {
+            keybuf.clear();
             // A null-key left row matches nothing (no table lookup at all).
-            let matched = join_key_at(&left, &lk, li).and_then(|k| table.get(&k));
+            let matched = if fill_join_key(&left, &lk, li, &mut keybuf) {
+                table.get(keybuf.as_str())
+            } else {
+                None
+            };
             match matched {
                 Some(rs) => {
                     for &ri in rs {
@@ -192,7 +239,7 @@ impl Operator for Join {
                         ridx.push(Some(ri));
                     }
                 }
-                None if self.kind.keeps_left() => {
+                None if keeps_left => {
                     lidx.push(Some(li));
                     ridx.push(None);
                 }
@@ -279,4 +326,198 @@ fn join_key_column(
         })
         .collect();
     eval::column_from_values(vals)
+}
+
+// ------------------------------------------------------- broadcast probe (#237)
+/// Streaming broadcast-join prober for the parallel read→group path: the right
+/// side (a small bounded source) is concatenated and hash-indexed ONCE and
+/// shared across every file worker; each arriving left chunk probes and emits
+/// **immediately** — no left buffering, no drain-time concat (which dominated
+/// the worker profile: 4.6s of a 10M-row run sat in the blocking `Join`'s
+/// finish). Output construction (schema, key preservation, `_r` collisions,
+/// null-key semantics) mirrors [`Join::finish`] exactly, and the group output
+/// is pinned chunk-size independent, so the result is byte-identical to the
+/// serial blocking join. Inner/left kinds only (the shape detector enforces
+/// this — an unmatched RIGHT row never has to be emitted).
+/// The join hash table: composite key → right row indices. Fx-hashed (the
+/// in-tree deterministic hasher, `crate::fxhash`): the probe does one lookup
+/// per left row and emits in **left-row order**, so table iteration order
+/// never reaches the output — the hasher swap is byte-identical by
+/// construction.
+pub(crate) type JoinTable = HashMap<String, Vec<usize>, crate::fxhash::FxBuild>;
+
+/// A prebuilt broadcast right side: concatenated chunk, hash table, and
+/// right-key column indices (shared across workers via `Arc`).
+pub(crate) type BuiltRight = (
+    std::sync::Arc<Chunk>,
+    std::sync::Arc<JoinTable>,
+    std::sync::Arc<Vec<usize>>,
+);
+
+pub(crate) struct BroadcastProbe {
+    left_keys: Vec<PathExpr>,
+    kind: JoinKind,
+    right: std::sync::Arc<Chunk>,
+    /// Right-side hash table: composite key → right row indices.
+    table: std::sync::Arc<JoinTable>,
+    /// Right key column indices (dropped from the output).
+    rk: std::sync::Arc<Vec<usize>>,
+    /// Resolved left key indices + output schema, cached on the first chunk
+    /// (every chunk of this path shares one schema).
+    lk: Option<Vec<usize>>,
+    out_schema: Option<Arc<Schema>>,
+    right_cols: Vec<usize>,
+    key_fails: u64,
+}
+
+impl BroadcastProbe {
+    /// Build the shared right side once: concat + hash + key indices. `None`
+    /// when a right key column is missing (the caller falls back to serial).
+    pub(crate) fn build_right(
+        right_chunks: &[Chunk],
+        right_keys: &[PathExpr],
+    ) -> Option<BuiltRight> {
+        let mut right = concat_chunks(right_chunks.to_vec())?;
+        let mut key_fails = 0u64;
+        let rresolved = eval::resolve_key_indices(&mut right, right_keys, &mut key_fails);
+        let mut rk = Vec::with_capacity(right_keys.len());
+        for idx in &rresolved {
+            rk.push((*idx)?);
+        }
+        let mut table = JoinTable::default();
+        for ri in 0..right.len {
+            if let Some(k) = join_key_at(&right, &rk, ri) {
+                table.entry(k).or_default().push(ri);
+            }
+        }
+        Some((
+            std::sync::Arc::new(right),
+            std::sync::Arc::new(table),
+            std::sync::Arc::new(rk),
+        ))
+    }
+
+    pub(crate) fn new(
+        left_keys: Vec<PathExpr>,
+        kind: JoinKind,
+        right: std::sync::Arc<Chunk>,
+        table: std::sync::Arc<JoinTable>,
+        rk: std::sync::Arc<Vec<usize>>,
+    ) -> Self {
+        BroadcastProbe {
+            left_keys,
+            kind,
+            right,
+            table,
+            rk,
+            lk: None,
+            out_schema: None,
+            right_cols: Vec::new(),
+            key_fails: 0,
+        }
+    }
+}
+
+impl Operator for BroadcastProbe {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let mut left = chunk;
+        let base_left = left.columns.len();
+        // Resolve left keys + output schema once (constant schema per path).
+        if self.lk.is_none() {
+            let resolved =
+                eval::resolve_key_indices(&mut left, &self.left_keys, &mut self.key_fails);
+            let mut lk = Vec::with_capacity(self.left_keys.len());
+            for (k, idx) in self.left_keys.iter().zip(&resolved) {
+                match idx {
+                    Some(i) => lk.push(*i),
+                    None => {
+                        ctx.raise(
+                            ErrorEvent::new(
+                                Severity::Warn,
+                                ErrorScope::Branch,
+                                format!("join: unknown left key '{}'", k.column_name()),
+                            )
+                            .at_node(ctx.label.clone()),
+                        );
+                        return Vec::new();
+                    }
+                }
+            }
+            let mut fields = left.schema.fields[..base_left].to_vec();
+            let mut right_cols = Vec::new();
+            for (ci, f) in self.right.schema.fields.iter().enumerate() {
+                if self.rk.contains(&ci) {
+                    continue;
+                }
+                let name = if left.schema.index_of(&f.name).is_some() {
+                    format!("{}_r", f.name)
+                } else {
+                    f.name.clone()
+                };
+                fields.push(Field::new(name, f.dtype));
+                right_cols.push(ci);
+            }
+            self.lk = Some(lk);
+            self.out_schema = Some(Arc::new(Schema::new(fields)));
+            self.right_cols = right_cols;
+        } else {
+            // Later chunks: re-materialize any derived nested-key columns.
+            let _ = eval::resolve_key_indices(&mut left, &self.left_keys, &mut self.key_fails);
+        }
+        let lk = self.lk.as_ref().expect("resolved");
+        let keeps_left = self.kind.keeps_left();
+
+        let mut lidx: Vec<Option<usize>> = Vec::new();
+        let mut ridx: Vec<Option<usize>> = Vec::new();
+        let mut keybuf = String::new();
+        for li in 0..left.len {
+            keybuf.clear();
+            let matched = if fill_join_key(&left, lk, li, &mut keybuf) {
+                self.table.get(keybuf.as_str())
+            } else {
+                None
+            };
+            match matched {
+                Some(rs) => {
+                    for &ri in rs {
+                        lidx.push(Some(li));
+                        ridx.push(Some(ri));
+                    }
+                }
+                None if keeps_left => {
+                    lidx.push(Some(li));
+                    ridx.push(None);
+                }
+                None => {}
+            }
+        }
+        if lidx.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<Column> = Vec::with_capacity(base_left + self.right_cols.len());
+        for (ci, col) in left.columns[..base_left].iter().enumerate() {
+            match lk.iter().position(|&k| k == ci) {
+                Some(kpos) => out.push(join_key_column(
+                    col,
+                    &lidx,
+                    &ridx,
+                    &self.right.columns[self.rk[kpos]],
+                )),
+                None => out.push(col.gather_opt(&lidx)),
+            }
+        }
+        for &ci in &self.right_cols {
+            out.push(self.right.columns[ci].gather_opt(&ridx));
+        }
+        vec![Chunk::new(
+            ctx.fresh_id(),
+            self.out_schema.clone().expect("schema"),
+            out,
+        )]
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        super::surface_key_path_fails(self.key_fails, "join", ctx);
+        Vec::new()
+    }
 }

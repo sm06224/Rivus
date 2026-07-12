@@ -250,11 +250,6 @@ impl Validity {
         Validity(Some(w))
     }
 
-    /// Materialize to a per-row `true = valid` vector of length `len`.
-    fn to_bits(&self, len: usize) -> Vec<bool> {
-        (0..len).map(|i| !self.is_null(i)).collect()
-    }
-
     /// Gather validity for selected rows (parallels `Column::gather`). Stays
     /// all-valid (zero-cost) when the source has no nulls.
     pub fn gather(&self, indices: &[usize]) -> Self {
@@ -282,12 +277,53 @@ impl Validity {
     /// `self_len`). Stays all-valid (zero-cost) when both sides are all-valid,
     /// so concatenating dense chunks never allocates a bitmap.
     pub fn append(&mut self, self_len: usize, other: &Validity, other_len: usize) {
+        // Both dense → stays all-valid (zero-cost); concatenating dense chunks
+        // never allocates a bitmap.
         if self.0.is_none() && other.0.is_none() {
             return;
         }
-        let mut bits = self.to_bits(self_len);
-        bits.extend(other.to_bits(other_len));
-        *self = Validity::from_bits(&bits);
+        // Word-granular in-place append. The previous form materialized the
+        // ENTIRE accumulated bitmap into a `Vec<bool>` and repacked it on every
+        // call, so a buffering operator concatenating N chunks (join/sort/group/
+        // merge) paid O(N²) once any column had a null — a 735-chunk left join
+        // spent 5.3s here. This grows the packed word buffer and OR-sets only the
+        // newly-appended range, so a full concat is ~O(total_rows / 64). The bits
+        // written are identical, so byte-identity holds.
+        let new_len = self_len + other_len;
+        let words = new_len.div_ceil(64);
+        let mut w: Vec<u64> = match self.0.take() {
+            Some(b) => {
+                let mut v = b.into_vec();
+                v.resize(words, 0);
+                v
+            }
+            None => {
+                // `self` was all-valid: bits [0, self_len) are all 1.
+                let mut v = vec![0u64; words];
+                for i in 0..self_len {
+                    v[i >> 6] |= 1u64 << (i & 63);
+                }
+                v
+            }
+        };
+        match &other.0 {
+            // `other` all-valid: set [self_len, new_len) to 1.
+            None => {
+                for i in self_len..new_len {
+                    w[i >> 6] |= 1u64 << (i & 63);
+                }
+            }
+            // `other` has a bitmap: copy each valid bit to offset self_len + j.
+            Some(ob) => {
+                for j in 0..other_len {
+                    if (ob[j >> 6] >> (j & 63)) & 1 == 1 {
+                        let i = self_len + j;
+                        w[i >> 6] |= 1u64 << (i & 63);
+                    }
+                }
+            }
+        }
+        self.0 = Some(w.into_boxed_slice());
     }
 }
 

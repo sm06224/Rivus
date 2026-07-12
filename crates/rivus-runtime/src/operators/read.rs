@@ -23,6 +23,149 @@ enum FileFmt {
     Jsonl,
 }
 
+/// One file's decode result: `(schema, chunks-of-columns, malformed rows)`.
+type FileDecode = Result<(Schema, Vec<Vec<Column>>, usize), String>;
+
+/// A lazily-draining single-file decoder: the schema is known **up front**
+/// (from the inference plan / the compressed sample) while the rows decode on
+/// demand — the building block that lets the engine's parallel read→group path
+/// stream a file through its per-worker pipeline **without materializing it**
+/// (union-by-name needs every file's schema before the first chunk is
+/// reconciled, so schema and rows must be separable; 全てが流れ).
+// A handful of instances exist at once (one per in-flight file), so the
+// variant size spread is irrelevant — boxing would only add indirection.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum FileDecoder {
+    /// Plain CSV: the range plan (typed single pass), drained range by range.
+    CsvRanges {
+        uri: String,
+        plan: crate::csv::CsvParallelPlan,
+        delim: u8,
+        cur_range: usize,
+        cur: Option<crate::csv::CsvChunker>,
+        chunk_size: usize,
+    },
+    /// Plain JSONL: the range plan, drained range by range.
+    JsonlRanges {
+        uri: String,
+        names: Vec<String>,
+        jtypes: Vec<crate::jsonl::JType>,
+        ranges: Vec<(u64, u64)>,
+        bad_rows: usize,
+        cur_range: usize,
+        cur: Option<crate::jsonl::JsonlChunker>,
+        chunk_size: usize,
+    },
+    /// Buffered fallback (unseekable / too small to split): already decoded.
+    Buffered {
+        chunks: std::vec::IntoIter<Vec<Column>>,
+        bad_rows: usize,
+    },
+    /// Compressed CSV stream (sample-inferred; the reader replays its sample).
+    #[cfg(any(feature = "gzip", feature = "zstd"))]
+    CompCsv(crate::csv::CompressedCsvReader),
+    /// Compressed JSONL stream (sample-inferred; replays its sample).
+    #[cfg(any(feature = "gzip", feature = "zstd"))]
+    CompJsonl(crate::jsonl::StreamJsonlReader),
+}
+
+impl FileDecoder {
+    /// The next decoded chunk of columns, or `None` at end of file.
+    pub(crate) fn next_chunk(&mut self) -> Option<Vec<Column>> {
+        match self {
+            FileDecoder::CsvRanges {
+                uri,
+                plan,
+                delim,
+                cur_range,
+                cur,
+                chunk_size,
+            } => loop {
+                if let Some(ch) = cur {
+                    if let Some(cols) = ch.decode_chunk() {
+                        return Some(cols);
+                    }
+                    *cur = None;
+                }
+                if *cur_range >= plan.ranges.len() {
+                    return None;
+                }
+                let (a, b) = plan.ranges[*cur_range];
+                *cur_range += 1;
+                // An IO error mid-file ends the stream (the plan opened once
+                // already, so this is a truly exceptional race); never panics.
+                *cur = crate::csv::CsvChunker::for_range(
+                    uri,
+                    plan.dtypes.clone(),
+                    plan.dt_specs.clone(),
+                    plan.keep.clone(),
+                    plan.ncols,
+                    a,
+                    b,
+                    *chunk_size,
+                    plan.prefilter.clone(),
+                    plan.str_prefilter.clone(),
+                    *delim,
+                )
+                .ok();
+                cur.as_ref()?;
+            },
+            FileDecoder::JsonlRanges {
+                uri,
+                names,
+                jtypes,
+                ranges,
+                bad_rows: _,
+                cur_range,
+                cur,
+                chunk_size,
+            } => loop {
+                if let Some(ch) = cur {
+                    if let Some(cols) = ch.decode_chunk() {
+                        return Some(cols);
+                    }
+                    *cur = None;
+                }
+                if *cur_range >= ranges.len() {
+                    return None;
+                }
+                let (a, b) = ranges[*cur_range];
+                *cur_range += 1;
+                *cur = crate::jsonl::JsonlChunker::for_range(
+                    uri,
+                    names.clone(),
+                    jtypes.clone(),
+                    a,
+                    b,
+                    *chunk_size,
+                )
+                .ok();
+                cur.as_ref()?;
+            },
+            FileDecoder::Buffered { chunks, .. } => chunks.next(),
+            #[cfg(any(feature = "gzip", feature = "zstd"))]
+            FileDecoder::CompCsv(r) => r.decode_chunk(),
+            #[cfg(any(feature = "gzip", feature = "zstd"))]
+            FileDecoder::CompJsonl(r) => r.decode_chunk(),
+        }
+    }
+
+    /// Malformed-row count. For plain files the plan's inference pass counted
+    /// the whole file up front; for compressed streams the count accrues while
+    /// decoding, so read it **after** draining.
+    pub(crate) fn bad_rows(&self) -> usize {
+        match self {
+            FileDecoder::CsvRanges { plan, .. } => plan.bad_rows,
+            FileDecoder::JsonlRanges { bad_rows, .. } => *bad_rows,
+            FileDecoder::Buffered { bad_rows, .. } => *bad_rows,
+            #[cfg(any(feature = "gzip", feature = "zstd"))]
+            FileDecoder::CompCsv(r) => r.bad_rows,
+            #[cfg(any(feature = "gzip", feature = "zstd"))]
+            FileDecoder::CompJsonl(r) => r.bad_rows,
+        }
+    }
+}
+
 pub(crate) struct Read {
     fmt: Option<ReadFmt>,
     provenance: Provenance,
@@ -46,7 +189,10 @@ impl Read {
     }
 
     /// The format for one uri: an explicit `as FMT` wins; else the extension
-    /// (`.jsonl`/`.ndjson`/`.json` → JSONL, `.tsv`/`.tab` → TSV, else CSV).
+    /// (`.jsonl`/`.ndjson`/`.json` → JSONL, `.tsv`/`.tab` → TSV, else CSV). A
+    /// compression suffix (`.gz`/`.zst`) is stripped first, so `part.jsonl.gz`
+    /// reads as compressed JSONL（全てが流れ — compressed streams are
+    /// first-class, 統括指示 2026-07-09）.
     fn fmt_for(&self, uri: &str) -> FileFmt {
         match self.fmt {
             Some(ReadFmt::Csv) => FileFmt::Csv(b','),
@@ -54,48 +200,351 @@ impl Read {
             Some(ReadFmt::Jsonl) => FileFmt::Jsonl,
             None => {
                 let l = uri.to_ascii_lowercase();
+                let l = l
+                    .strip_suffix(".gz")
+                    .or_else(|| l.strip_suffix(".zst"))
+                    .unwrap_or(&l);
                 if l.ends_with(".jsonl") || l.ends_with(".ndjson") || l.ends_with(".json") {
                     FileFmt::Jsonl
                 } else {
-                    FileFmt::Csv(rivus_ir::delim_for_path(uri))
+                    FileFmt::Csv(rivus_ir::delim_for_path(l))
                 }
             }
         }
     }
 
-    /// Open + fully decode one file into `(schema, chunks, bad_rows)`. `Err` (a
-    /// non-file / unopenable handle, a fatal decode) is quarantined by the caller.
-    fn decode(&self, uri: &str) -> Result<(Schema, Vec<Vec<Column>>, usize), String> {
+    /// Open one file for **lazy** decoding: the schema now, the rows on demand
+    /// (`FileDecoder::next_chunk`). The engine's parallel read→group path uses
+    /// this to stream a file straight through a per-worker pipeline without
+    /// materializing it; `decode` below stays the materializing form (and keeps
+    /// its internal range parallelism for the single-file case).
+    pub(crate) fn open_file_stream(&self, uri: &str) -> Result<(Schema, FileDecoder), String> {
+        if crate::transport::Scheme::of(uri).is_compressed() {
+            return match self.fmt_for(uri) {
+                FileFmt::Csv(_delim) => {
+                    #[cfg(any(feature = "gzip", feature = "zstd"))]
+                    {
+                        let (schema, ch) = crate::csv::CompressedCsvReader::open(
+                            uri,
+                            None,
+                            self.chunk_size,
+                            true,
+                            None,
+                            &[],
+                            _delim,
+                        )?;
+                        Ok((schema, FileDecoder::CompCsv(ch)))
+                    }
+                    #[cfg(not(any(feature = "gzip", feature = "zstd")))]
+                    Err(format!(
+                        "'{uri}' is compressed; rebuild with `--features gzip`/`zstd` to read it"
+                    ))
+                }
+                FileFmt::Jsonl => {
+                    #[cfg(any(feature = "gzip", feature = "zstd"))]
+                    {
+                        let reader = crate::transport::open_compressed(uri)?;
+                        let (schema, ch) =
+                            crate::jsonl::StreamJsonlReader::from_reader(reader, self.chunk_size)?;
+                        Ok((schema, FileDecoder::CompJsonl(ch)))
+                    }
+                    #[cfg(not(any(feature = "gzip", feature = "zstd")))]
+                    Err(format!(
+                        "'{uri}' is compressed; rebuild with `--features gzip`/`zstd` to read it"
+                    ))
+                }
+            };
+        }
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
         match self.fmt_for(uri) {
             FileFmt::Csv(delim) => {
-                let (schema, mut ch) = crate::csv::CsvChunker::open(
+                match crate::csv::plan_parallel(
                     uri,
                     None,
-                    self.chunk_size,
-                    false,
+                    threads,
                     &[],
                     &[],
                     true,
                     None,
                     &[],
                     delim,
-                )?;
-                let mut chunks = Vec::new();
-                while let Some(cols) = ch.decode_chunk() {
-                    chunks.push(cols);
+                ) {
+                    Ok(plan) => Ok((
+                        plan.schema.clone(),
+                        FileDecoder::CsvRanges {
+                            uri: uri.to_string(),
+                            plan,
+                            delim,
+                            cur_range: 0,
+                            cur: None,
+                            chunk_size: self.chunk_size,
+                        },
+                    )),
+                    Err(_) => {
+                        let (schema, mut ch) = crate::csv::CsvChunker::open(
+                            uri,
+                            None,
+                            self.chunk_size,
+                            false,
+                            &[],
+                            &[],
+                            true,
+                            None,
+                            &[],
+                            delim,
+                        )?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((
+                            schema,
+                            FileDecoder::Buffered {
+                                chunks: chunks.into_iter(),
+                                bad_rows: ch.bad_rows,
+                            },
+                        ))
+                    }
                 }
-                Ok((schema, chunks, ch.bad_rows))
+            }
+            FileFmt::Jsonl => match crate::jsonl::plan_parallel(uri, threads) {
+                Some((schema, names, jtypes, ranges, bad_rows)) => Ok((
+                    schema,
+                    FileDecoder::JsonlRanges {
+                        uri: uri.to_string(),
+                        names,
+                        jtypes,
+                        ranges,
+                        bad_rows,
+                        cur_range: 0,
+                        cur: None,
+                        chunk_size: self.chunk_size,
+                    },
+                )),
+                None => {
+                    let (schema, mut ch) = crate::jsonl::JsonlChunker::open(uri, self.chunk_size)?;
+                    let mut chunks = Vec::new();
+                    while let Some(cols) = ch.decode_chunk() {
+                        chunks.push(cols);
+                    }
+                    Ok((
+                        schema,
+                        FileDecoder::Buffered {
+                            chunks: chunks.into_iter(),
+                            bad_rows: ch.bad_rows,
+                        },
+                    ))
+                }
+            },
+        }
+    }
+
+    /// Open + fully decode one file into `(schema, chunks, bad_rows)`. `Err` (a
+    /// non-file / unopenable handle, a fatal decode) is quarantined by the caller.
+    fn decode(&self, uri: &str) -> FileDecode {
+        // Compressed handle (`.gz`/`.zst`): decode RIDES the decompression
+        // stream — the same single-pass sample-inference readers the source
+        // uses for its compressed/HTTP paths (never decompress-to-buffer;
+        // 全てが流れ). A build without the compression features quarantines the
+        // file with rebuild guidance instead of misreading raw bytes.
+        if crate::transport::Scheme::of(uri).is_compressed() {
+            return match self.fmt_for(uri) {
+                FileFmt::Csv(_delim) => {
+                    #[cfg(any(feature = "gzip", feature = "zstd"))]
+                    {
+                        let (schema, mut ch) = crate::csv::CompressedCsvReader::open(
+                            uri,
+                            None,
+                            self.chunk_size,
+                            true,
+                            None,
+                            &[],
+                            _delim,
+                        )?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((schema, chunks, ch.bad_rows))
+                    }
+                    #[cfg(not(any(feature = "gzip", feature = "zstd")))]
+                    Err(format!(
+                        "'{uri}' is compressed; rebuild with `--features gzip`/`zstd` to read it"
+                    ))
+                }
+                FileFmt::Jsonl => {
+                    #[cfg(any(feature = "gzip", feature = "zstd"))]
+                    {
+                        let reader = crate::transport::open_compressed(uri)?;
+                        let (schema, mut ch) =
+                            crate::jsonl::StreamJsonlReader::from_reader(reader, self.chunk_size)?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((schema, chunks, ch.bad_rows))
+                    }
+                    #[cfg(not(any(feature = "gzip", feature = "zstd")))]
+                    Err(format!(
+                        "'{uri}' is compressed; rebuild with `--features gzip`/`zstd` to read it"
+                    ))
+                }
+            };
+        }
+        match self.fmt_for(uri) {
+            FileFmt::Csv(delim) => {
+                // Fast path: reuse the parallel-source machinery — infer the
+                // schema by streaming newline-aligned ranges IN PARALLEL
+                // (`plan_parallel`), then decode each range in file order with
+                // the types already known (`for_range`, one typed pass). The old
+                // path (`CsvChunker::open`) paid a full serial inference scan and
+                // THEN a full decode scan per file — the dominant cost of a
+                // multi-file `read` (measured: ~340ms/M rows vs the source's
+                // ~155ms/M on the same machine). The inferred schema is pinned
+                // byte-identical to the serial reader's by the engine's
+                // serial==parallel invariant, and ranges are contiguous in file
+                // order, so row order — and therefore the output — is unchanged.
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(8);
+                match crate::csv::plan_parallel(
+                    uri,
+                    None,
+                    threads,
+                    &[],
+                    &[],
+                    true,
+                    None,
+                    &[],
+                    delim,
+                ) {
+                    Ok(plan) => {
+                        // Decode the ranges in PARALLEL and splice in range
+                        // order (ranges are contiguous, so row order — and the
+                        // output — is byte-identical to a serial decode; only
+                        // internal chunk boundaries differ, and results are
+                        // pinned chunk-size independent).
+                        let cz = self.chunk_size;
+                        let plan = &plan;
+                        let chunks = decode_ranges_parallel(plan.ranges.len(), |i| {
+                            let (a, b) = plan.ranges[i];
+                            let mut ch = crate::csv::CsvChunker::for_range(
+                                uri,
+                                plan.dtypes.clone(),
+                                plan.dt_specs.clone(),
+                                plan.keep.clone(),
+                                plan.ncols,
+                                a,
+                                b,
+                                cz,
+                                plan.prefilter.clone(),
+                                plan.str_prefilter.clone(),
+                                delim,
+                            )?;
+                            let mut out = Vec::new();
+                            while let Some(cols) = ch.decode_chunk() {
+                                out.push(cols);
+                            }
+                            Ok(out)
+                        })?;
+                        // bad rows are counted on the inference pass (same total
+                        // as the serial reader — it counts on ITS inference pass).
+                        Ok((plan.schema.clone(), chunks, plan.bad_rows))
+                    }
+                    // Unseekable / unstattable → the buffered serial reader.
+                    Err(_) => {
+                        let (schema, mut ch) = crate::csv::CsvChunker::open(
+                            uri,
+                            None,
+                            self.chunk_size,
+                            false,
+                            &[],
+                            &[],
+                            true,
+                            None,
+                            &[],
+                            delim,
+                        )?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((schema, chunks, ch.bad_rows))
+                    }
+                }
             }
             FileFmt::Jsonl => {
-                let (schema, mut ch) = crate::jsonl::JsonlChunker::open(uri, self.chunk_size)?;
-                let mut chunks = Vec::new();
-                while let Some(cols) = ch.decode_chunk() {
-                    chunks.push(cols);
+                // Same shape as the CSV fast path: a global-schema range plan
+                // (serial inference — JSONL has no parallel infer yet), then the
+                // ranges decoded in parallel and spliced in range order (row
+                // order unchanged ⇒ byte-identical). A top-level JSON array or
+                // a small/unseekable file falls back to the serial reader.
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(8);
+                match crate::jsonl::plan_parallel(uri, threads) {
+                    Some((schema, names, jtypes, ranges, bad_rows)) => {
+                        let cz = self.chunk_size;
+                        let (names, jtypes, ranges) = (&names, &jtypes, &ranges);
+                        let chunks = decode_ranges_parallel(ranges.len(), |i| {
+                            let (a, b) = ranges[i];
+                            let mut ch = crate::jsonl::JsonlChunker::for_range(
+                                uri,
+                                names.clone(),
+                                jtypes.clone(),
+                                a,
+                                b,
+                                cz,
+                            )?;
+                            let mut out = Vec::new();
+                            while let Some(cols) = ch.decode_chunk() {
+                                out.push(cols);
+                            }
+                            Ok(out)
+                        })?;
+                        Ok((schema, chunks, bad_rows))
+                    }
+                    None => {
+                        let (schema, mut ch) =
+                            crate::jsonl::JsonlChunker::open(uri, self.chunk_size)?;
+                        let mut chunks = Vec::new();
+                        while let Some(cols) = ch.decode_chunk() {
+                            chunks.push(cols);
+                        }
+                        Ok((schema, chunks, ch.bad_rows))
+                    }
                 }
-                Ok((schema, chunks, ch.bad_rows))
             }
         }
     }
+}
+
+/// Decode `nranges` byte ranges concurrently (one scoped thread each; the
+/// planners cap ranges at ~the core count) and splice the decoded chunk lists
+/// **in range order**. Ranges are contiguous and newline-aligned, so the spliced
+/// row order equals a serial front-to-back decode — the output is
+/// byte-identical; only internal chunk boundaries differ (pinned chunk-size
+/// independent). An `Err` from any range fails the whole file (the caller
+/// quarantines it, same as the serial path).
+fn decode_ranges_parallel<F>(nranges: usize, worker: F) -> Result<Vec<Vec<Column>>, String>
+where
+    F: Fn(usize) -> Result<Vec<Vec<Column>>, String> + Sync,
+{
+    let worker = &worker;
+    let results: Vec<Result<Vec<Vec<Column>>, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..nranges).map(|i| s.spawn(move || worker(i))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut out = Vec::new();
+    for r in results {
+        out.extend(r?);
+    }
+    Ok(out)
 }
 
 /// Numeric widening lattice for union-by-name (§28.3): `int ⊆ float ⊆ decimal`
@@ -173,10 +622,40 @@ impl Operator for Read {
         // Deterministic order: concatenate files in uri-ascending order.
         self.uris.sort();
 
-        // Decode each file once (MVP buffers); quarantine the ones that fail.
+        // Decode the files IN PARALLEL, in waves of ≤ the core count, collecting
+        // into uri-ordered slots — the reconciliation below walks the slots in
+        // uri order, so the output is byte-identical to the old sequential loop.
+        // File-level parallelism is what a compressed stream needs (a gzip/zstd
+        // stream has no splittable ranges, so per-file range parallelism cannot
+        // apply — the fan-out across files IS the parallelism; 全てが流れ).
+        // Errors are quarantined per file afterwards, in uri order (§24),
+        // exactly like the sequential loop reported them.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let mut results: Vec<Option<FileDecode>> = (0..self.uris.len()).map(|_| None).collect();
+        for (wave_start, wave) in self
+            .uris
+            .chunks(threads)
+            .enumerate()
+            .map(|(w, c)| (w * threads, c))
+        {
+            let this = &*self;
+            let wave_results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|uri| s.spawn(move || this.decode(uri)))
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (i, r) in wave_results.into_iter().enumerate() {
+                results[wave_start + i] = Some(r);
+            }
+        }
         let mut decoded: Vec<(String, Schema, Vec<Vec<Column>>)> = Vec::new();
-        for uri in &self.uris {
-            match self.decode(uri) {
+        for (uri, res) in self.uris.iter().zip(results) {
+            match res.expect("every slot filled") {
                 Ok((schema, chunks, bad_rows)) => {
                     if bad_rows > 0 {
                         ctx.raise(
@@ -206,26 +685,7 @@ impl Operator for Read {
         }
 
         // union-by-name: ordered first-seen column names; widened types.
-        let mut union: Vec<Field> = Vec::new();
-        for (_, schema, _) in &decoded {
-            for f in &schema.fields {
-                match union.iter_mut().find(|u| u.name == f.name) {
-                    Some(u) => u.dtype = widen(u.dtype, f.dtype),
-                    None => union.push(f.clone()),
-                }
-            }
-        }
-        // `with filename` materializes the source path (§27.1); `filename_r` on
-        // collision with a data column. `with source` rides the handle only.
-        let fname = self.provenance.materializes_filename().then(|| {
-            let name = if union.iter().any(|f| f.name == "filename") {
-                "filename_r"
-            } else {
-                "filename"
-            };
-            union.push(Field::new(name.to_string(), DataType::Str));
-            name.to_string()
-        });
+        let (union, fname) = union_by_name(decoded.iter().map(|(_, s, _)| s), self.provenance);
         let uschema = Arc::new(Schema::new(union.clone()));
 
         // Reconcile every file's chunks to the union schema and emit, stamping the
@@ -233,43 +693,120 @@ impl Operator for Read {
         let mut out = Vec::new();
         for (uri, schema, chunks) in &decoded {
             let handle = self.provenance.source(uri);
-            for cols in chunks {
-                let len = cols.first().map(|c| c.len()).unwrap_or(0);
-                // union-by-name widening is a lane coercion (int⊆float⊆…⊆str), not
-                // a user temporal cast — a parse never fails here, so the cast
-                // failure count is discarded.
-                let mut _widen_fails = 0u64;
-                let rcols: Vec<Column> = union
-                    .iter()
-                    .map(|f| {
-                        if fname.as_deref() == Some(f.name.as_str()) {
-                            str_repeat(uri, len)
-                        } else {
-                            match schema.index_of(&f.name) {
-                                Some(i) => {
-                                    eval::cast_column(cols[i].clone(), f.dtype, &mut _widen_fails)
-                                }
-                                // Missing column in this file → an all-null column
-                                // of the union type (continue-first).
-                                None => eval::cast_column(
-                                    eval::column_from_values(vec![Value::Null; len]),
-                                    f.dtype,
-                                    &mut _widen_fails,
-                                ),
-                            }
-                        }
-                    })
-                    .collect();
+            for cols in chunks.iter().cloned() {
                 let id = ctx.fresh_id();
-                let mut ch = Chunk::new(id, uschema.clone(), rcols);
-                if handle.is_some() {
-                    ch.meta.source = handle.clone();
-                }
-                out.push(ch);
+                out.push(reconcile_chunk(
+                    &union,
+                    &uschema,
+                    fname.as_deref(),
+                    &handle,
+                    uri,
+                    schema,
+                    cols,
+                    id,
+                ));
             }
         }
         out
     }
+}
+
+/// The union-by-name schema over per-file schemas: ordered first-seen names,
+/// widened types, plus the materialized `filename` column name when the
+/// provenance mode asks for it (`filename_r` on collision, §27.1). Extracted
+/// from `Read::finish` so the engine's parallel read→group path derives the
+/// **same** union (single source of truth).
+pub(crate) fn union_by_name<'a>(
+    schemas: impl Iterator<Item = &'a Schema>,
+    provenance: Provenance,
+) -> (Vec<Field>, Option<String>) {
+    let mut union: Vec<Field> = Vec::new();
+    for schema in schemas {
+        for f in &schema.fields {
+            match union.iter_mut().find(|u| u.name == f.name) {
+                Some(u) => u.dtype = widen(u.dtype, f.dtype),
+                None => union.push(f.clone()),
+            }
+        }
+    }
+    let fname = provenance.materializes_filename().then(|| {
+        let name = if union.iter().any(|f| f.name == "filename") {
+            "filename_r"
+        } else {
+            "filename"
+        };
+        union.push(Field::new(name.to_string(), DataType::Str));
+        name.to_string()
+    });
+    (union, fname)
+}
+
+/// Reconcile one decoded chunk of `cols` (with its file's `schema`) to the
+/// union schema: union column order, widened lanes (a lane coercion — never a
+/// counted parse), missing columns as typed nulls, the optional materialized
+/// `filename` column, and the provenance handle stamped on the chunk meta.
+/// Extracted from `Read::finish`; the engine's parallel read→group workers call
+/// it per streamed chunk so both paths reconcile identically.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconcile_chunk(
+    union: &[Field],
+    uschema: &Arc<Schema>,
+    fname: Option<&str>,
+    handle: &Option<rivus_core::Resource>,
+    uri: &str,
+    schema: &Schema,
+    cols: Vec<Column>,
+    id: u64,
+) -> Chunk {
+    let len = cols.first().map(|c| c.len()).unwrap_or(0);
+    // Aligned fast path: the file's schema already IS the union (same names,
+    // same order, same lanes) and no filename column is materialized — the
+    // columns move straight into the chunk. The old form cloned every column
+    // of every chunk (a full data copy per read; measured 487ms of a 10M ETL
+    // run). Byte-identical: the identity cast returned the same column.
+    let aligned = fname.is_none()
+        && schema.fields.len() == union.len()
+        && schema
+            .fields
+            .iter()
+            .zip(union)
+            .all(|(a, b)| a.name == b.name && a.dtype == b.dtype);
+    let rcols: Vec<Column> = if aligned {
+        cols
+    } else {
+        // union-by-name widening is a lane coercion (int⊆float⊆…⊆str), not a
+        // user temporal cast — a parse never fails, the count is unused. Each
+        // matched column MOVES out exactly once (union names are unique).
+        let mut _widen_fails = 0u64;
+        let mut slots: Vec<Option<Column>> = cols.into_iter().map(Some).collect();
+        union
+            .iter()
+            .map(|f| {
+                if fname == Some(f.name.as_str()) {
+                    str_repeat(uri, len)
+                } else {
+                    match schema.index_of(&f.name) {
+                        Some(i) => {
+                            let col = slots[i].take().expect("each union name is unique");
+                            eval::cast_column(col, f.dtype, &mut _widen_fails)
+                        }
+                        // Missing column in this file → an all-null column of
+                        // the union type (continue-first).
+                        None => eval::cast_column(
+                            eval::column_from_values(vec![Value::Null; len]),
+                            f.dtype,
+                            &mut _widen_fails,
+                        ),
+                    }
+                }
+            })
+            .collect()
+    };
+    let mut ch = Chunk::new(id, uschema.clone(), rcols);
+    if handle.is_some() {
+        ch.meta.source = handle.clone();
+    }
+    ch
 }
 
 /// The Resource column `read` consumes: the `path` column if it is Resource-typed,

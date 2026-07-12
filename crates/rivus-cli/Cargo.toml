@@ -19,7 +19,8 @@ rivus-runtime.workspace = true
 # Off-by-default: enable full-regex `regexp()` by forwarding to the runtime's
 # `regex` feature. Default `rivus` stays zero-dependency. See SUPPLY-CHAIN.md.
 [features]
-default = []
+# Policy v2: compression on by default (see rivus-runtime).
+default = ["gzip", "zstd"]
 regex = ["rivus-runtime/regex"]
 gzip = ["rivus-runtime/gzip"]
 zstd = ["rivus-runtime/zstd"]

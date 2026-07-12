@@ -32,6 +32,18 @@ pub(crate) struct AggAcc {
     /// `i128` so the result is exact and order-independent — the property that
     /// lets a decimal `sum`/`avg` parallelize byte-identically (#41). `overflow`
     /// degrades that aggregate to the f64 lane (continue-first; §21.7).
+    /// Exact integer lane (#41 slice 6): while every numeric observation is an
+    /// `I64`, the sum ALSO accumulates in `i128` (exact, associative). At output
+    /// a Sum/Avg over an all-integer column uses `int_sum as f64` — the
+    /// correctly-rounded value, identical however the input was partitioned —
+    /// which is what makes an I64 `sum`/`avg` safe on the parallel
+    /// partition→merge paths. Serial uses the same accumulator, so
+    /// serial == parallel bit-identically by construction. Any non-integer
+    /// numeric observation drops the lane (`int_only = false` → the plain f64
+    /// path, exactly the old behavior).
+    int_only: bool,
+    int_sum: i128,
+    int_overflow: bool,
     dec_scale: Option<u8>,
     dec_sum: i128,
     dec_min: i128,
@@ -108,6 +120,9 @@ impl AggAcc {
             last: None,
             distinct: std::collections::HashSet::new(),
             values: Vec::new(),
+            int_only: true,
+            int_sum: 0,
+            int_overflow: false,
             dec_scale: None,
             dec_sum: 0,
             dec_min: i128::MAX,
@@ -142,6 +157,18 @@ impl AggAcc {
                     self.min = self.min.min(x);
                     self.max = self.max.max(x);
                     self.n += 1;
+                    // Exact integer lane: accumulate i128 alongside the f64
+                    // moments while the column stays all-integer.
+                    if let Value::I64(i) = v {
+                        if !self.int_overflow {
+                            match self.int_sum.checked_add(*i as i128) {
+                                Some(s) => self.int_sum = s,
+                                None => self.int_overflow = true,
+                            }
+                        }
+                    } else {
+                        self.int_only = false;
+                    }
                     // Exact decimal lane: accumulate the unscaled i128 in parallel
                     // with the f64 moments (the f64 side still backs `std` and the
                     // overflow fallback). A column shares one scale.
@@ -249,6 +276,15 @@ impl AggAcc {
     pub(crate) fn merge(&mut self, other: &AggAcc) {
         self.sum += other.sum;
         self.sum_sq += other.sum_sq;
+        // Exact integer lane: associative i128 (order-independent merge).
+        self.int_only &= other.int_only;
+        self.int_overflow |= other.int_overflow;
+        if !self.int_overflow {
+            match self.int_sum.checked_add(other.int_sum) {
+                Some(s) => self.int_sum = s,
+                None => self.int_overflow = true,
+            }
+        }
         self.n += other.n;
         self.non_null += other.non_null;
         self.min = self.min.min(other.min);
@@ -317,8 +353,13 @@ impl AggAcc {
 
     /// Numeric aggregate value (sum/avg/min/max/std). `0.0` for an empty group.
     pub(crate) fn num_value(&self) -> f64 {
+        // All-integer Sum/Avg: the exact i128 sum, correctly rounded to f64 —
+        // partition-order independent (the f64 running sum is not, past 2^53).
+        let exact_int = self.int_only && !self.int_overflow && self.n > 0;
         match self.func {
+            AggFunc::Sum if exact_int => self.int_sum as f64,
             AggFunc::Sum => self.sum,
+            AggFunc::Avg if exact_int => self.int_sum as f64 / self.n as f64,
             AggFunc::Avg => {
                 if self.n > 0 {
                     self.sum / self.n as f64
@@ -521,7 +562,16 @@ pub(crate) struct GroupState {
 pub(crate) struct GroupBy {
     keys: Vec<PathExpr>,
     aggs: Vec<(AggFunc, String)>,
+    /// The canonical, **sorted** group store: everything emitted (finish) or
+    /// merged reads this, so output row order is the composite-key order — the
+    /// same whether groups arrived via a serial stream or a parallel merge.
     groups: BTreeMap<String, GroupState>,
+    /// Row-hot accumulation happens here instead: one Fx hash lookup per row,
+    /// where the `BTreeMap` costs O(log g) *string comparisons* per row twice
+    /// (~93ms/file on the 10M group standard). [`GroupBy::seal`] drains it
+    /// into `groups` before anything is observed, so hash-map iteration order
+    /// never reaches the output — byte-identical by construction.
+    scratch: std::collections::HashMap<String, GroupState, crate::fxhash::FxBuild>,
     emitted: bool,
     /// Nested key-path structural misses (§32.8③), accumulated across chunks and
     /// surfaced once on finish (never-silent, not per-chunk spam).
@@ -534,8 +584,30 @@ impl GroupBy {
             keys,
             aggs,
             groups: BTreeMap::new(),
+            scratch: std::collections::HashMap::default(),
             emitted: false,
             key_fails: 0,
+        }
+    }
+
+    /// Fold the row-hot scratch into the sorted canonical store. Called before
+    /// every read of `groups` (finish, merge). In the real lifecycles (process*
+    /// → finish; process* → merge_from) every scratch entry is a pure move —
+    /// but if a group somehow exists on both sides, fold scratch (the later
+    /// observations) into it in stream order rather than silently replacing.
+    fn seal(&mut self) {
+        for (key, state) in self.scratch.drain() {
+            match self.groups.get_mut(&key) {
+                Some(s) => {
+                    s.count += state.count;
+                    for (a, oa) in s.accs.iter_mut().zip(state.accs.iter()) {
+                        a.merge(oa);
+                    }
+                }
+                None => {
+                    self.groups.insert(key, state);
+                }
+            }
         }
     }
 
@@ -545,7 +617,11 @@ impl GroupBy {
     /// output row order is identical to a serial run); shared groups merge their
     /// counts and per-aggregate accumulators via [`AggAcc::merge`]. `other` must
     /// have the same keys and aggregates and follow `self` in source order.
-    pub(crate) fn merge_from(&mut self, other: GroupBy) {
+    pub(crate) fn merge_from(&mut self, mut other: GroupBy) {
+        // Both sides fold their row-hot scratch into the sorted store first,
+        // so the merge below sees complete, canonical group states.
+        self.seal();
+        other.seal();
         // Nested key-path misses (§32.8③) sum across merged partitions, like the
         // per-group counts, so the finish-time surface is the true total.
         self.key_fails += other.key_fails;
@@ -591,10 +667,12 @@ pub(crate) fn group_parallel_safe(
         | AggFunc::Pct(_) => true,
         // Exact integer lanes (decimal i128, duration i64) make sum/avg
         // associative → parallel byte-identical; f64 sum/avg are not. #57.
+        // I64 joins the exact club via the int lane (i128 accumulation with the
+        // correctly-rounded f64 output — see `AggAcc::num_value`).
         AggFunc::Sum | AggFunc::Avg => {
             matches!(
                 col_type(col),
-                Some(DataType::Decimal { .. } | DataType::Duration { .. })
+                Some(DataType::I64 | DataType::Decimal { .. } | DataType::Duration { .. })
             )
         }
         AggFunc::Std => false,
@@ -650,35 +728,53 @@ impl Operator for GroupBy {
         // borrow `self.aggs` while `self.groups` is mutably borrowed.
         let funcs: Vec<AggFunc> = self.aggs.iter().map(|(f, _)| *f).collect();
 
+        // Composite map key built into a REUSED buffer across rows: the previous
+        // form allocated a fresh `String` per row AND a throwaway `Vec<String>`
+        // (`parts`) per row — but only *new* groups need `parts`, so 3M rows over
+        // 16 groups wasted ~3M allocations each. Now the key reuses one buffer and
+        // `parts` is rendered only when a group is first inserted. Byte-identical.
+        let mut composite = String::new();
         for row in 0..chunk.len {
-            // Composite map key: the key values joined by the ASCII unit
-            // separator (0x1F), which can't appear in a parsed CSV field, so
-            // distinct key tuples never collide. The parts are kept on the state
-            // for output.
-            let parts: Vec<String> = key_idx
-                .iter()
-                .map(|&i| chunk.value(row, i).to_string())
-                .collect();
             // Dedup composite tags null distinctly so a `null` key folds into one
-            // group and never collides with a real value (§26.2b); `parts` keeps
-            // the rendered text for the output key column.
-            let mut composite = String::new();
+            // group and never collides with a real value (§26.2b).
+            composite.clear();
             for (j, &i) in key_idx.iter().enumerate() {
                 if j > 0 {
                     composite.push('\u{1f}');
                 }
                 push_group_key_field(&mut composite, &chunk, i, row);
             }
-            let state = self.groups.entry(composite).or_insert_with(|| GroupState {
-                key_parts: parts,
-                count: 0,
-                accs: funcs.iter().map(|f| AggAcc::new(*f)).collect(),
-            });
-            state.count += 1;
-            for (j, idx) in agg_idx.iter().enumerate() {
-                if let Some(ci) = idx {
-                    let v = chunk.value(row, *ci);
-                    state.accs[j].observe(&v);
+            // Hot path: an existing group is ONE Fx-hash lookup, no allocation
+            // (`String: Borrow<str>` looks the buffer up directly). Only a new
+            // group allocates: its output key parts, its owned map key, and
+            // the accumulators.
+            match self.scratch.get_mut(composite.as_str()) {
+                Some(state) => {
+                    state.count += 1;
+                    for (j, idx) in agg_idx.iter().enumerate() {
+                        if let Some(ci) = idx {
+                            let v = chunk.value(row, *ci);
+                            state.accs[j].observe(&v);
+                        }
+                    }
+                }
+                None => {
+                    let parts: Vec<String> = key_idx
+                        .iter()
+                        .map(|&i| chunk.value(row, i).to_string())
+                        .collect();
+                    let mut state = GroupState {
+                        key_parts: parts,
+                        count: 1,
+                        accs: funcs.iter().map(|f| AggAcc::new(*f)).collect(),
+                    };
+                    for (j, idx) in agg_idx.iter().enumerate() {
+                        if let Some(ci) = idx {
+                            let v = chunk.value(row, *ci);
+                            state.accs[j].observe(&v);
+                        }
+                    }
+                    self.scratch.insert(composite.clone(), state);
                 }
             }
         }
@@ -690,6 +786,9 @@ impl Operator for GroupBy {
             return Vec::new();
         }
         self.emitted = true;
+        // Fold the row-hot scratch into the sorted store: every emit below
+        // iterates `groups` in composite-key order, exactly as before.
+        self.seal();
         super::surface_key_path_fails(self.key_fails, "group", ctx);
 
         // One Str column per group key (values pulled from each group's stored

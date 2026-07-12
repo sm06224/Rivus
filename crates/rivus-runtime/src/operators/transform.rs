@@ -524,7 +524,15 @@ pub(crate) fn push_group_key_field(key: &mut String, chunk: &Chunk, ci: usize, r
         key.push('\u{0}');
     } else {
         key.push('\u{1}');
-        key.push_str(&chunk.value(row, ci).to_string());
+        match chunk.columns[ci].data() {
+            // Bare string key: borrow the column's `&str` (zero allocation;
+            // identical bytes to `Value::Str(_).to_string()`).
+            ColumnData::Str(s) => key.push_str(s.get(row)),
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(key, "{}", chunk.value(row, ci));
+            }
+        }
     }
 }
 
@@ -1457,14 +1465,32 @@ fn surface_cast_failures(
 
 impl Operator for Cast {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        // Identity fast path: every cast resolves to a column that already
+        // has the target type — pass the chunk through untouched. The old
+        // form cloned EVERY column of EVERY chunk (a full data copy per
+        // chunk; ~58ms/file of the 10M group feed) before the per-column
+        // identity check inside `cast_column` could return it unchanged.
+        if self.casts.iter().all(|(name, ty)| {
+            chunk
+                .schema
+                .index_of(name)
+                .is_some_and(|i| chunk.schema.fields[i].dtype == *ty)
+        }) {
+            return vec![chunk];
+        }
         let mut fields = chunk.schema.fields.clone();
-        let mut columns = chunk.columns.clone();
+        // Move the columns out of the owned chunk: only actually-cast columns
+        // are rebuilt; the rest transfer without a copy. Take-then-refill
+        // keeps a repeated name re-casting the already-cast column, exactly
+        // like the old sequential in-place form.
+        let mut slots: Vec<Option<Column>> = chunk.columns.into_iter().map(Some).collect();
         let mut changed = false;
         for (name, ty) in &self.casts {
             match chunk.schema.index_of(name) {
                 Some(i) => {
                     let mut f = 0u64;
-                    columns[i] = eval::cast_column(columns[i].clone(), *ty, &mut f);
+                    let col = slots[i].take().expect("slot is always refilled");
+                    slots[i] = Some(eval::cast_column(col, *ty, &mut f));
                     if f > 0 {
                         self.fails.entry(name.clone()).or_insert((*ty, 0)).1 += f;
                     }
@@ -1482,10 +1508,15 @@ impl Operator for Cast {
                 ),
             }
         }
-        if !changed {
-            return vec![chunk];
-        }
-        let schema = Arc::new(Schema::new(fields));
+        let columns: Vec<Column> = slots
+            .into_iter()
+            .map(|s| s.expect("slot is always refilled"))
+            .collect();
+        let schema = if changed {
+            Arc::new(Schema::new(fields))
+        } else {
+            chunk.schema.clone()
+        };
         let mut out = Chunk::new(chunk.meta.id, schema, columns);
         out.meta = chunk.meta.clone();
         vec![out]

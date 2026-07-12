@@ -5,19 +5,27 @@ third-party crate as untrusted-until-vetted and minimizes the trusted surface.
 
 ## Posture
 
-- **The default build has zero third-party runtime dependencies.** With default
-  features, `rivus-cli` and every library it links (`rivus-core`, `rivus-ir`,
-  `rivus-parser`, `rivus-optimizer`, `rivus-runtime`) depend only on `std`.
-  Verify with:
+- **Policy v2（統括指示 2026-07-09）: the default build carries a small,
+  fully-documented dependency tree.** The invariants are (a) single-binary
+  release, (b) every runtime dependency (transitive included) is enumerated and
+  vetted here, (c) `cargo deny check` green. Compressed streams are first-class
+  (全てが流れ), so `gzip` + `zstd` are **default features**. The measured
+  default tree of `rivus-cli` beyond the `rivus-*` internals (8 crates, all
+  pure-Rust, permissive licenses):
 
-  ```sh
-  cargo tree -p rivus-cli --edges normal   # only rivus-* internal crates
+  ```
+  flate2 → miniz_oxide → adler2, simd-adler32; crc32fast → cfg-if   (gzip)
+  ruzstd → twox-hash                                                 (zstd)
   ```
 
-- **Heavy/standard formats are opt-in, behind feature flags.** Some formats
-  (compression, Parquet, pickle) are not reasonable to reimplement and need a
-  mature ecosystem crate. These live behind **off-by-default cargo features**
-  (e.g. `--features gzip,parquet`) and behind the existing source/sink trait
+  Verify with `cargo tree -p rivus-cli --edges normal` — the output must match
+  this list exactly; any drift is a review item. `rivus-core`/`ir`/`parser`/
+  `optimizer` individually remain std-only (a nice property, not a product
+  constraint).
+
+- **Heavier formats stay opt-in behind feature flags** (Parquet, regex, net,
+  unbounded). These need a mature ecosystem crate and live behind cargo features
+  (e.g. `--features parquet`) and behind the existing source/sink trait
   boundary, so:
   - the default binary stays dependency-free and auditable;
   - a user opts in explicitly, pulling a *vetted* crate and its reviewed tree;
