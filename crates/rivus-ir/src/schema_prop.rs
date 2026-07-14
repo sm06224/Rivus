@@ -109,6 +109,29 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
             }
             s
         }),
+        // `shift col …` appends `out`: `lag` keeps the source column's lane;
+        // `diff` of a datetime → `Duration` (exact, #57), else the source lane;
+        // `pct_change` → `f64`. Unknown `col` leaves the schema unchanged
+        // (runtime warns) — mirror the honesty of the sessionize/explode arms.
+        Op::Shift { col, kind, out, .. } => input.map(|s| {
+            let mut s = s;
+            if let Some(i) = s.index_of(col) {
+                let src = s.fields[i].dtype;
+                let dtype = match kind {
+                    crate::graph::ShiftKind::Lag => src,
+                    crate::graph::ShiftKind::Diff => {
+                        if let DataType::DateTime { unit } = src {
+                            DataType::Duration { unit }
+                        } else {
+                            src
+                        }
+                    }
+                    crate::graph::ShiftKind::PctChange => DataType::F64,
+                };
+                s.fields.push(Field::new(out.clone(), dtype));
+            }
+            s
+        }),
         // `explode COL` keeps every column but replaces the `List` lane with its
         // element field (§32 s4c); other columns are unchanged. A non-list (or
         // unknown) `COL` leaves the schema untouched (runtime warns).

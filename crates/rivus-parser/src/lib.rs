@@ -799,6 +799,67 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // `shift COL lag|diff|pct_change [N] [by COL ...] as ALIAS` —
+                // time-series shift/difference primitives (#65). `N` (rows back)
+                // defaults to 1; `by` groups the shift; `as ALIAS` names the
+                // appended column.
+                Tok::Word(w) if w == "shift" => {
+                    self.bump();
+                    let col = self.word()?;
+                    let kind = match self.bump() {
+                        Tok::Word(k) => rivus_ir::ShiftKind::parse(&k).ok_or_else(|| {
+                            self.err(format!(
+                                "shift expects `lag`, `diff`, or `pct_change`, found '{k}'"
+                            ))
+                        })?,
+                        other => {
+                            return Err(self.err(format!(
+                                "shift expects `lag`/`diff`/`pct_change`, found {other:?}"
+                            )))
+                        }
+                    };
+                    // Optional row count (defaults to 1).
+                    let n_rows = if let Tok::Int(v) = self.tok().clone() {
+                        if v < 1 {
+                            return Err(self.err("shift N (rows back) must be a positive integer"));
+                        }
+                        self.bump();
+                        v as u32
+                    } else {
+                        1
+                    };
+                    let mut by = Vec::new();
+                    if self.peek_is_word("by") {
+                        self.bump();
+                        while let Tok::Word(name) = self.tok().clone() {
+                            if is_keyword(&name) {
+                                break;
+                            }
+                            self.bump();
+                            by.push(name);
+                        }
+                        if by.is_empty() {
+                            return Err(self.err("shift `by` expects at least one column"));
+                        }
+                    }
+                    if !self.peek_is_word("as") {
+                        return Err(self.err(
+                            "shift needs `as ALIAS` to name the appended column \
+                             (e.g. `shift price diff as delta`)",
+                        ));
+                    }
+                    self.bump(); // 'as'
+                    let out = self.word()?;
+                    let node = self.g.add_node(Op::Shift {
+                        col,
+                        kind,
+                        n: n_rows,
+                        by,
+                        out,
+                    });
+                    self.g.add_edge(current, node, EdgeKind::Stream);
+                    current = node;
+                }
                 // `drop COL [COL ...]` — remove the named columns.
                 Tok::Word(w) if w == "drop" => {
                     self.bump();
@@ -2294,6 +2355,7 @@ fn is_keyword(w: &str) -> bool {
         w,
         "open"
             | "sessionize"
+            | "shift"
             | "readbin"
             | "readcsv"
             | "readjson"
@@ -4753,6 +4815,29 @@ Import:
             assert!(src.contains(f), "{f} lost in round-trip: {src}");
         }
         assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+    }
+
+    #[test]
+    fn shift_parses_and_round_trips() {
+        // #65: shift col lag|diff|pct_change [N] [by …] as alias.
+        let g = parse("T:\n open t.csv (sym:str price:int)\n shift price lag 2 by sym as p2\n;")
+            .unwrap();
+        let src = g.to_source();
+        assert!(src.contains("shift price lag 2 by sym as p2"), "{src}");
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // diff with default N=1 omits the count; pct_change keeps it.
+        let g = parse("T:\n open t.csv\n shift price diff as d\n;").unwrap();
+        assert!(
+            g.to_source().contains("shift price diff as d"),
+            "{}",
+            g.to_source()
+        );
+        // Malformed: unknown kind, missing `as`.
+        assert!(parse("T:\n open t.csv\n shift price wat as x\n;").is_err());
+        let e = parse("T:\n open t.csv\n shift price lag 1\n;")
+            .expect_err("as required")
+            .to_string();
+        assert!(e.contains("as ALIAS"), "{e}");
     }
 
     #[test]

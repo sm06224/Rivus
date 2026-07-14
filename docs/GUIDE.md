@@ -820,6 +820,12 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   `sessionize ts gap "30m" [by user]` appends a `session` column (the session's
   start datetime — group on it: `|# user session …`; a new session starts when
   the per-group gap exceeds the duration, out-of-order input is surfaced, §36.5);
+  **shift / diff** (#65): `shift col lag|diff|pct_change [N] [by keys] as alias`
+  appends a column derived from a value `N` rows back within each `by` group, in
+  source order — `lag` = the earlier value (null for the first `N`), `diff` =
+  `col − lag` (a `datetime` column yields an exact `Duration`, e.g.
+  `shift ts diff as gap`), `pct_change` = `(col − lag)/lag` as float
+  (`shift price diff by sym as delta`); chunk-size independent, serial;
   `format(ts, "fmt")` (→ text, same tokens incl.
   `ddd`/`[ja-jp]`/`n…n` — `format(ts, "[ja-jp]ddd")` renders `水`). Default
   rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss` (+ full-width fraction on a

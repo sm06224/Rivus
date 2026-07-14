@@ -1909,3 +1909,227 @@ impl Operator for Sessionize {
         Vec::new()
     }
 }
+
+// --------------------------------------------------------------- shift (#65)
+
+/// Time-series shift/difference (`shift col lag|diff|pct_change [N] by … as
+/// out`, #65): append `out` derived from a value `n` rows back **within the
+/// same `by` group, in source order**. Stateful per group (a ring of the last
+/// `n` values), streaming per-chunk emit, order-dependent → serial path (the
+/// engine keeps it off the parallel path, like `ffill`/`sessionize`).
+/// Chunk-size independent because the shift is defined in source order.
+pub(crate) struct Shift {
+    pub(crate) col: String,
+    pub(crate) kind: rivus_ir::ShiftKind,
+    pub(crate) n: usize,
+    pub(crate) by: Vec<String>,
+    pub(crate) out: String,
+    /// Composite `by` key (0x1F-joined, like GroupBy) → ring of the last `n`
+    /// source values (most recent at the back).
+    pub(crate) state:
+        std::collections::BTreeMap<String, std::collections::VecDeque<rivus_core::Value>>,
+    pub(crate) warned: bool,
+}
+
+impl Shift {
+    /// The output lane, mirrored exactly in `schema_prop` (§32.1): `lag` keeps
+    /// the source lane; `diff` of a datetime → `Duration`, of an exact numeric
+    /// lane → that lane, else `f64`; `pct_change` → `f64`.
+    fn out_dtype(kind: rivus_ir::ShiftKind, src: rivus_core::DataType) -> rivus_core::DataType {
+        use rivus_core::DataType as D;
+        use rivus_ir::ShiftKind as K;
+        match kind {
+            K::Lag => src,
+            K::Diff => match src {
+                D::DateTime { unit } => D::Duration { unit },
+                D::I64 => D::I64,
+                D::Decimal { scale } => D::Decimal { scale },
+                _ => D::F64,
+            },
+            K::PctChange => D::F64,
+        }
+    }
+
+    /// `cur − prev`, kept in the exact lane where the lane is associative
+    /// (datetime→Duration, i64, decimal); otherwise via f64. `Null` if either
+    /// operand is null or the lanes are incompatible (continue-first).
+    fn diff(cur: &rivus_core::Value, prev: &rivus_core::Value) -> rivus_core::Value {
+        use rivus_core::Value as V;
+        match (cur, prev) {
+            (V::Null, _) | (_, V::Null) => V::Null,
+            (V::DateTime(a), V::DateTime(b)) if a.unit == b.unit => {
+                V::Duration(rivus_core::Duration::new(a.ticks - b.ticks, a.unit))
+            }
+            (V::I64(a), V::I64(b)) => V::I64(a - b),
+            (V::Dec(a), V::Dec(b)) if a.scale == b.scale => {
+                V::Dec(rivus_core::Decimal::new(a.unscaled - b.unscaled, a.scale))
+            }
+            _ => match (cur.as_f64(), prev.as_f64()) {
+                (Some(a), Some(b)) => V::F64(a - b),
+                _ => V::Null,
+            },
+        }
+    }
+
+    /// `(cur − prev)/prev` as f64; `Null` on null operands or a zero base.
+    fn pct_change(cur: &rivus_core::Value, prev: &rivus_core::Value) -> rivus_core::Value {
+        match (cur.as_f64(), prev.as_f64()) {
+            (Some(a), Some(b)) if b != 0.0 => rivus_core::Value::F64((a - b) / b),
+            _ => rivus_core::Value::Null,
+        }
+    }
+}
+
+impl Operator for Shift {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let Some(ci) = chunk.schema.index_of(&self.col) else {
+            if !self.warned {
+                self.warned = true;
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!("shift: unknown column '{}' (passed through)", self.col),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+            return vec![chunk];
+        };
+        let src_dtype = chunk.schema.fields[ci].dtype;
+        let out_dtype = Self::out_dtype(self.kind, src_dtype);
+
+        // Resolve the `by` columns (missing ones warn once, group as empty).
+        let by_cols = self.by.clone();
+        let mut by_idx: Vec<Option<usize>> = Vec::with_capacity(by_cols.len());
+        for c in &by_cols {
+            let i = chunk.schema.index_of(c);
+            if i.is_none() && !self.warned {
+                self.warned = true;
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!("shift: unknown `by` column '{c}' (grouped as empty)"),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+            by_idx.push(i);
+        }
+
+        let mut out_vals: Vec<rivus_core::Value> = Vec::with_capacity(chunk.len);
+        let mut key = String::new();
+        for r in 0..chunk.len {
+            key.clear();
+            for (k, idx) in by_idx.iter().enumerate() {
+                if k > 0 {
+                    key.push('\u{1f}');
+                }
+                if let Some(i) = idx {
+                    if !chunk.columns[*i].is_null(r) {
+                        key.push_str(&chunk.value(r, *i).to_string());
+                    }
+                }
+            }
+            let cur = chunk.value(r, ci);
+            let ring = self.state.entry(key.clone()).or_default();
+            // The lagged value is the front of a full ring (row r − n).
+            let lagged = if ring.len() == self.n {
+                Some(ring.front().unwrap().clone())
+            } else {
+                None
+            };
+            use rivus_ir::ShiftKind as K;
+            let v = match (lagged, self.kind) {
+                (None, _) => rivus_core::Value::Null, // not enough history yet
+                (Some(prev), K::Lag) => prev,
+                (Some(prev), K::Diff) => Self::diff(&cur, &prev),
+                (Some(prev), K::PctChange) => Self::pct_change(&cur, &prev),
+            };
+            out_vals.push(v);
+            // Advance the ring with the current source value.
+            ring.push_back(cur);
+            if ring.len() > self.n {
+                ring.pop_front();
+            }
+        }
+
+        // Build the appended column in the schema-declared lane (preserved even
+        // when a whole chunk is null, so the lane never silently degrades).
+        let out_col = typed_column_for(&out_vals, out_dtype);
+        let name = if chunk.schema.index_of(&self.out).is_some() {
+            format!("{}_r", self.out)
+        } else {
+            self.out.clone()
+        };
+        let mut fields = chunk.schema.fields.clone();
+        fields.push(rivus_core::Field::new(name, out_dtype));
+        let mut columns = chunk.columns.clone();
+        columns.push(out_col);
+        let mut out = Chunk::new(chunk.meta.id, Arc::new(Schema::new(fields)), columns);
+        out.meta = chunk.meta.clone();
+        vec![out]
+    }
+}
+
+/// Build a column of exactly `dtype` from row values (null-aware), preserving
+/// the lane even when every value is null. Values whose lane doesn't match the
+/// target become null (continue-first). Used by `shift` so the appended
+/// column's static schema and its runtime lane agree byte-for-byte.
+fn typed_column_for(vals: &[rivus_core::Value], dtype: rivus_core::DataType) -> Column {
+    use rivus_core::{DataType as D, Value as V};
+    let n = vals.len();
+    let bits: Vec<bool> = vals.iter().map(|v| !v.is_null()).collect();
+    let validity = rivus_core::Validity::from_bits(&bits);
+    let data = match dtype {
+        D::I64 => ColumnData::I64(
+            vals.iter()
+                .map(|v| if let V::I64(x) = v { *x } else { 0 })
+                .collect(),
+        ),
+        D::F64 => ColumnData::F64(vals.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect()),
+        D::Bool => ColumnData::Bool(vals.iter().map(|v| matches!(v, V::Bool(true))).collect()),
+        D::Decimal { scale } => ColumnData::Dec(rivus_core::DecColumn {
+            unscaled: vals
+                .iter()
+                .map(|v| if let V::Dec(d) = v { d.unscaled } else { 0 })
+                .collect(),
+            scale,
+        }),
+        D::DateTime { unit } => ColumnData::DateTime(rivus_core::DtColumn {
+            ticks: vals
+                .iter()
+                .map(|v| if let V::DateTime(t) = v { t.ticks } else { 0 })
+                .collect(),
+            unit,
+        }),
+        D::Duration { unit } => ColumnData::Duration(rivus_core::DurColumn {
+            ticks: vals
+                .iter()
+                .map(|v| if let V::Duration(d) = v { d.ticks } else { 0 })
+                .collect(),
+            unit,
+        }),
+        D::Date => ColumnData::Date(
+            vals.iter()
+                .map(|v| if let V::Date(d) = v { d.epoch_day } else { 0 })
+                .collect(),
+        ),
+        D::Time => ColumnData::Time(
+            vals.iter()
+                .map(|v| if let V::Time(t) = v { t.ticks } else { 0 })
+                .collect(),
+        ),
+        // Text (and any lane not materialized above) rides the string lane; a
+        // null renders empty via validity.
+        _ => {
+            let mut s = StrColumn::with_capacity(n, n * 8);
+            for v in vals {
+                s.push(&v.to_string());
+            }
+            ColumnData::Str(s)
+        }
+    };
+    Column::new(data, validity)
+}

@@ -767,6 +767,11 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   **session 窓**：`sessionize ts gap "30m" [by user]` が `session` 列
   （セッション開始 datetime）を付与 — そのまま `|# user session …` で集計。
   グループ内 gap 超過で新セッション、時刻逆行は surface（§36.5）、
+  **シフト / 差分**（#65）：`shift col lag|diff|pct_change [N] [by keys] as alias`
+  が、各 `by` グループ内で source 順に `N` 行前の値から導いた列を付与 —
+  `lag`＝N 行前の値（先頭 N 行は null）、`diff`＝`col − lag`（`datetime` 列は
+  **正確な Duration**、例 `shift ts diff as gap`）、`pct_change`＝`(col − lag)/lag`
+  を float で（`shift price diff by sym as delta`）。chunk-size 非依存・直列、
   `format(ts, "fmt")`（文字列。`ddd`/`[ja-jp]`/`n…n` も同じトークンで使えます —
   `format(ts, "[ja-jp]ddd")` は `水` を返す）。既定の整形は ISO-8601
   `yyyy-MM-ddTHH:mm:ss`（サブ秒レーンは全幅の小数付き）。
