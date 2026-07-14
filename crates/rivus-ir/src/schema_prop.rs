@@ -204,6 +204,7 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
         // ── Reshapers. ──
         Op::GroupBy { keys, aggs } => input.map(|s| group_schema(keys, aggs, &s)),
         Op::Join { right_keys, .. } => join_schema(inputs, right_keys),
+        Op::AsofJoin { by, ts, .. } => asof_join_schema(inputs, by, ts),
         Op::Merge => merge_schema(inputs),
 
         // `describe` replaces the stream with a fixed summary table whose exact
@@ -304,6 +305,28 @@ fn join_schema(inputs: &[Option<Schema>], right_keys: &[PathExpr]) -> Option<Sch
     let mut fields = left.fields.clone();
     for f in &right.fields {
         if right_keys.iter().any(|k| k.column_name() == f.name) {
+            continue;
+        }
+        let name = if left.index_of(&f.name).is_some() {
+            format!("{}_r", f.name)
+        } else {
+            f.name.clone()
+        };
+        fields.push(Field::new(name, f.dtype));
+    }
+    Some(Schema::new(fields))
+}
+
+/// As-of join output (matches the runtime, join.rs `AsofJoin`): the left schema
+/// followed by the right schema with the right **by-keys and the `ts` column**
+/// dropped (the left carries their values), collisions suffixed `_r`. `None` if
+/// either side's schema is unknown.
+fn asof_join_schema(inputs: &[Option<Schema>], by: &[String], ts: &str) -> Option<Schema> {
+    let left = inputs.first().and_then(|s| s.clone())?;
+    let right = inputs.get(1).and_then(|s| s.clone())?;
+    let mut fields = left.fields.clone();
+    for f in &right.fields {
+        if f.name == ts || by.iter().any(|k| k == &f.name) {
             continue;
         }
         let name = if left.index_of(&f.name).is_some() {

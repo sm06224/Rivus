@@ -873,6 +873,20 @@ pub enum Op {
         right_keys: Vec<PathExpr>,
         kind: JoinKind,
     },
+    /// `&` **as-of / temporal join** (#64): `Left & Right [on KEY…] asof TS
+    /// [within "DUR"]`. Enrich each left row with the right row whose `ts` is
+    /// the **nearest ≤** the left's (backward), matched exactly on the `by`
+    /// keys. Left-outer: every left row is kept (no match → null right
+    /// columns). `tolerance` (a duration string) drops matches older than the
+    /// bound. Both inputs are assumed time-ascending; the operator sorts the
+    /// right side by `ts` per group so the result is chunk-size independent.
+    /// Order-dependent → serial path (like `join`/`sessionize`). Backward-only
+    /// in this slice; forward/nearest and inner variants are follow-ups.
+    AsofJoin {
+        by: Vec<String>,
+        ts: String,
+        tolerance: Option<String>,
+    },
     /// `print` / default leaf sink — a display leaf, not an encoded file write,
     /// so it stays outside the `Sink` unification.
     SinkPrint,
@@ -1098,6 +1112,7 @@ impl Op {
             Op::Branch => "branch",
             Op::Merge => "merge",
             Op::Join { .. } => "join",
+            Op::AsofJoin { .. } => "asof",
             Op::SinkPrint => "print",
             Op::Sink { .. } => "save",
         }
@@ -1118,7 +1133,11 @@ impl Op {
     /// `mean`/`median` (need the global statistic) — emit only on `finish`.
     pub fn is_blocking(&self) -> bool {
         match self {
-            Op::Sort { .. } | Op::GroupBy { .. } | Op::Describe | Op::Join { .. } => true,
+            Op::Sort { .. }
+            | Op::GroupBy { .. }
+            | Op::Describe
+            | Op::Join { .. }
+            | Op::AsofJoin { .. } => true,
             Op::Fill { method, .. } => matches!(
                 method,
                 FillMethod::Bfill | FillMethod::Mean | FillMethod::Median
@@ -1459,6 +1478,20 @@ impl Op {
                 right_keys,
                 kind,
             } => format!("{} {}", kind.amp(), join_on_clause(left_keys, right_keys)),
+            Op::AsofJoin { by, ts, tolerance } => {
+                // `& [on k…] asof ts [within "dur"]` — the amp is the plain `&`
+                // (as-of is a left-outer enrichment; a kind selector is a later
+                // slice), the by-keys ride the `on` clause.
+                let mut s = String::from("&");
+                if !by.is_empty() {
+                    s.push_str(&format!(" on {}", by.join(" ")));
+                }
+                s.push_str(&format!(" asof {ts}"));
+                if let Some(t) = tolerance {
+                    s.push_str(&format!(" within \"{t}\""));
+                }
+                s
+            }
             Op::SinkPrint => "print".to_string(),
             // The v1 `save` forms restore byte-identically: codec/route carry
             // exactly what the parser desugared from (§28.8 reversibility).
@@ -1886,6 +1919,20 @@ impl PlanGraph {
                     let names = self.input_labels(&inputs).join(&sep);
                     let on = join_on_clause(left_keys, right_keys);
                     let _ = writeln!(out, "{label}:\n    {names} {on}\n;");
+                    continue;
+                }
+                Op::AsofJoin { by, ts, tolerance } => {
+                    // `Label: Left & Right [on k…] asof ts [within "dur"] ;`
+                    let names = self.input_labels(&inputs).join(" & ");
+                    let mut clause = String::new();
+                    if !by.is_empty() {
+                        clause.push_str(&format!("on {} ", by.join(" ")));
+                    }
+                    clause.push_str(&format!("asof {ts}"));
+                    if let Some(t) = tolerance {
+                        clause.push_str(&format!(" within \"{t}\""));
+                    }
+                    let _ = writeln!(out, "{label}:\n    {names} {clause}\n;");
                     continue;
                 }
                 _ => {}

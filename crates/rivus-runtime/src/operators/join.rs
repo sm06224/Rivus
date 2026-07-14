@@ -418,6 +418,43 @@ impl BroadcastProbe {
     }
 }
 
+// ------------------------------------------------------------- as-of join (#64)
+
+/// As-of / temporal join (`Left & Right [on KEY…] asof TS [within "DUR"]`, #64):
+/// enrich each left row with the right row whose `ts` is the **nearest ≤** the
+/// left's, matched exactly on the `by` keys (left-outer: no match → null right
+/// columns). Buffers both sides (a blocking pipeline-breaker like `join`), then
+/// on finish sorts the right rows by `ts` per `by` group and binary-searches the
+/// nearest earlier match for each left row. Order-dependent → the engine keeps
+/// it serial; sorting the right side per group makes the result chunk-size
+/// independent. Backward-only in this slice.
+pub(crate) struct AsofJoin {
+    by: Vec<String>,
+    ts: String,
+    tolerance: Option<String>,
+    left_id: NodeId,
+    left_buf: Vec<Chunk>,
+    right_buf: Vec<Chunk>,
+}
+
+impl AsofJoin {
+    pub(crate) fn new(
+        by: Vec<String>,
+        ts: String,
+        tolerance: Option<String>,
+        left_id: NodeId,
+    ) -> Self {
+        AsofJoin {
+            by,
+            ts,
+            tolerance,
+            left_id,
+            left_buf: Vec::new(),
+            right_buf: Vec::new(),
+        }
+    }
+}
+
 impl Operator for BroadcastProbe {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
         let mut left = chunk;
@@ -519,5 +556,203 @@ impl Operator for BroadcastProbe {
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
         super::surface_key_path_fails(self.key_fails, "join", ctx);
         Vec::new()
+    }
+}
+
+/// A datetime value normalized to nanoseconds (i128, exact across units) for a
+/// unit-agnostic `≤` comparison. `None` for a non-datetime / null cell.
+fn ts_nanos(chunk: &Chunk, ci: usize, row: usize) -> Option<i128> {
+    if chunk.columns[ci].is_null(row) {
+        return None;
+    }
+    match chunk.value(row, ci) {
+        rivus_core::Value::DateTime(dt) => {
+            let per = dt.unit.per_sec() as i128;
+            Some(dt.ticks as i128 * (1_000_000_000i128 / per))
+        }
+        _ => None,
+    }
+}
+
+/// The composite `by` key of `row` (0x1F-joined), or `None` if any part is null
+/// (a null key matches nothing, like an equi-join key).
+fn by_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> Option<String> {
+    let mut s = String::new();
+    for (n, &ci) in idxs.iter().enumerate() {
+        if chunk.columns[ci].is_null(row) {
+            return None;
+        }
+        if n > 0 {
+            s.push('\u{1f}');
+        }
+        s.push_str(&chunk.value(row, ci).to_string());
+    }
+    Some(s)
+}
+
+impl Operator for AsofJoin {
+    fn process(&mut self, from: NodeId, chunk: Chunk, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        if from == self.left_id {
+            self.left_buf.push(chunk);
+        } else {
+            self.right_buf.push(chunk);
+        }
+        Vec::new() // blocking: emitted on finish
+    }
+
+    fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let left = concat_chunks(std::mem::take(&mut self.left_buf));
+        let right = concat_chunks(std::mem::take(&mut self.right_buf));
+        // No left data → no output (as-of enriches left rows). No right data →
+        // emit the left rows unchanged (we have no right schema to null-pad).
+        let (left, right) = match (left, right) {
+            (Some(l), Some(r)) => (l, r),
+            (Some(l), None) => {
+                let idx: Vec<usize> = (0..l.len).collect();
+                let cols: Vec<Column> = l.columns.iter().map(|c| c.gather(&idx)).collect();
+                return vec![Chunk::new(ctx.fresh_id(), l.schema.clone(), cols)];
+            }
+            _ => return Vec::new(),
+        };
+
+        // Resolve the ts column on both sides (must be a datetime lane).
+        let bail = |ctx: &mut OpCtx, msg: String| -> Vec<Chunk> {
+            ctx.raise(
+                ErrorEvent::new(Severity::Warn, ErrorScope::Branch, msg).at_node(ctx.label.clone()),
+            );
+            let idx: Vec<usize> = (0..left.len).collect();
+            let cols: Vec<Column> = left.columns.iter().map(|c| c.gather(&idx)).collect();
+            vec![Chunk::new(ctx.fresh_id(), left.schema.clone(), cols)]
+        };
+        let Some(lts) = left.schema.index_of(&self.ts) else {
+            return bail(ctx, format!("asof: left has no ts column '{}'", self.ts));
+        };
+        let Some(rts) = right.schema.index_of(&self.ts) else {
+            return bail(ctx, format!("asof: right has no ts column '{}'", self.ts));
+        };
+        if !matches!(
+            left.schema.fields[lts].dtype,
+            rivus_core::DataType::DateTime { .. }
+        ) || !matches!(
+            right.schema.fields[rts].dtype,
+            rivus_core::DataType::DateTime { .. }
+        ) {
+            return bail(
+                ctx,
+                format!(
+                    "asof: ts column '{}' must be a datetime on both sides",
+                    self.ts
+                ),
+            );
+        }
+
+        // Resolve `by` key columns on both sides (bare names).
+        let mut lby = Vec::with_capacity(self.by.len());
+        let mut rby = Vec::with_capacity(self.by.len());
+        for c in &self.by {
+            match (left.schema.index_of(c), right.schema.index_of(c)) {
+                (Some(li), Some(ri)) => {
+                    lby.push(li);
+                    rby.push(ri);
+                }
+                _ => {
+                    return bail(
+                        ctx,
+                        format!("asof: `on` key '{c}' must exist on both sides"),
+                    )
+                }
+            }
+        }
+
+        // Tolerance → nanoseconds (exact), if given.
+        let tol_ns: Option<i128> = match &self.tolerance {
+            Some(t) => match rivus_core::Duration::parse_interval(t, rivus_core::TimeUnit::Nano) {
+                Some(d) => {
+                    let per = d.unit.per_sec() as i128;
+                    Some(d.ticks as i128 * (1_000_000_000i128 / per))
+                }
+                None => {
+                    return bail(
+                        ctx,
+                        format!("asof: tolerance '{t}' is not a valid duration"),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // Group right rows by `by` key → (ts_ns, right_row) sorted ascending
+        // (stable: equal ts keep source order, so a tie resolves to the last one
+        // in source order — chunk-size independent).
+        let mut groups: std::collections::HashMap<String, Vec<(i128, usize)>> =
+            std::collections::HashMap::new();
+        for ri in 0..right.len {
+            let Some(key) = by_key_at(&right, &rby, ri) else {
+                continue; // null by-key → matches nothing
+            };
+            if let Some(t) = ts_nanos(&right, rts, ri) {
+                groups.entry(key).or_default().push((t, ri));
+            }
+        }
+        for v in groups.values_mut() {
+            v.sort_by_key(|&(t, _)| t); // stable sort keeps source order on ties
+        }
+
+        // For each left row (source order), find the nearest right ts ≤ left ts.
+        let mut ridx: Vec<Option<usize>> = Vec::with_capacity(left.len);
+        for li in 0..left.len {
+            let matched = (|| {
+                let key = by_key_at(&left, &lby, li)?;
+                let lt = ts_nanos(&left, lts, li)?;
+                let g = groups.get(&key)?;
+                // upper_bound: first index with ts > lt; the match is the one
+                // before it (largest ts ≤ lt).
+                let pos = g.partition_point(|&(t, _)| t <= lt);
+                if pos == 0 {
+                    return None; // no right row at or before lt
+                }
+                let (mt, mri) = g[pos - 1];
+                if let Some(tol) = tol_ns {
+                    if lt - mt > tol {
+                        return None; // older than the tolerance bound
+                    }
+                }
+                Some(mri)
+            })();
+            ridx.push(matched);
+        }
+
+        // Output schema: left fields, then right fields except the `ts` and the
+        // `by` keys (the left carries them), collisions suffixed `_r`.
+        let mut fields = left.schema.fields.clone();
+        let mut right_cols = Vec::new();
+        for (ci, f) in right.schema.fields.iter().enumerate() {
+            if ci == rts || rby.contains(&ci) {
+                continue;
+            }
+            let name = if left.schema.index_of(&f.name).is_some() {
+                format!("{}_r", f.name)
+            } else {
+                f.name.clone()
+            };
+            fields.push(Field::new(name, f.dtype));
+            right_cols.push(ci);
+        }
+
+        // Left columns are emitted verbatim in source order; right columns gather
+        // by the matched index (null-padded where no match).
+        let lidx: Vec<usize> = (0..left.len).collect();
+        let mut out: Vec<Column> = Vec::with_capacity(fields.len());
+        for col in &left.columns {
+            out.push(col.gather(&lidx));
+        }
+        for &ci in &right_cols {
+            out.push(right.columns[ci].gather_opt(&ridx));
+        }
+        vec![Chunk::new(
+            ctx.fresh_id(),
+            Arc::new(Schema::new(fields)),
+            out,
+        )]
     }
 }

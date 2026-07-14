@@ -1424,27 +1424,75 @@ impl Parser {
                         .ok_or_else(|| self.err(format!("unknown flow '{rhs}'")))?;
                     // `on k [k ...]` — each key is `lkey` (same name both sides)
                     // or `lkey:rkey`. One or more pairs form a composite key.
-                    if !self.peek_is_word("on") {
-                        return Err(self.err("join `A & B` requires `on <key>` (or `on lk:rk`)"));
-                    }
-                    self.bump(); // `on`
+                    // For an as-of join (`… asof TS`) the `on` keys are the
+                    // exact-match `by` group (same name both sides) and are
+                    // optional; for an equi-join `on` is required.
                     let mut left_keys = Vec::new();
                     let mut right_keys = Vec::new();
-                    while let Tok::Word(w) = self.tok().clone() {
-                        if is_keyword(&w) {
-                            break;
+                    if self.peek_is_word("on") {
+                        self.bump(); // `on`
+                        while let Tok::Word(w) = self.tok().clone() {
+                            if is_keyword(&w) {
+                                break;
+                            }
+                            let lk = self.word()?;
+                            let rk = if self.eat(&Tok::Colon) {
+                                self.word()?
+                            } else {
+                                lk.clone()
+                            };
+                            left_keys.push(lk);
+                            right_keys.push(rk);
                         }
-                        let lk = self.word()?;
-                        let rk = if self.eat(&Tok::Colon) {
-                            self.word()?
+                        if left_keys.is_empty() {
+                            return Err(self.err("join `on` requires at least one key"));
+                        }
+                    }
+                    // `asof TS [within "DUR"]` — as-of / temporal join (#64):
+                    // nearest right row with ts ≤ the left's, grouped by the
+                    // `on` keys. Only the plain `&` (inner qualifier) form takes
+                    // `asof` in this slice.
+                    if self.peek_is_word("asof") {
+                        if kind != JoinKind::Inner {
+                            return Err(self.err(
+                                "as-of join uses plain `&` (a left/right/full qualifier is a \
+                                 later slice)",
+                            ));
+                        }
+                        self.bump(); // `asof`
+                        let ts = self.word()?;
+                        // `on lk:rk` isn't supported for the as-of `by` (same
+                        // name both sides); reject a `:` form clearly.
+                        if left_keys != right_keys {
+                            return Err(self.err(
+                                "as-of `on` keys use the same name on both sides (no `lk:rk`)",
+                            ));
+                        }
+                        let tolerance = if self.peek_is_word("within") {
+                            self.bump();
+                            match self.bump() {
+                                Tok::Str(d) => Some(d),
+                                other => {
+                                    return Err(self.err(format!(
+                                        "asof `within` expects a duration string like \"5m\", \
+                                         found {other:?}"
+                                    )))
+                                }
+                            }
                         } else {
-                            lk.clone()
+                            None
                         };
-                        left_keys.push(lk);
-                        right_keys.push(rk);
+                        let asof = self.g.add_node(Op::AsofJoin {
+                            by: left_keys,
+                            ts,
+                            tolerance,
+                        });
+                        self.g.add_edge(first, asof, EdgeKind::Stream);
+                        self.g.add_edge(rid, asof, EdgeKind::Stream);
+                        return Ok(asof);
                     }
                     if left_keys.is_empty() {
-                        return Err(self.err("join `on` requires at least one key"));
+                        return Err(self.err("join `A & B` requires `on <key>` (or `on lk:rk`)"));
                     }
                     let left_keys = left_keys.into_iter().map(key_path).collect();
                     let right_keys = right_keys.into_iter().map(key_path).collect();
@@ -2356,6 +2404,8 @@ fn is_keyword(w: &str) -> bool {
         "open"
             | "sessionize"
             | "shift"
+            | "asof"
+            | "within"
             | "readbin"
             | "readcsv"
             | "readjson"
@@ -4293,6 +4343,26 @@ Import:
         assert!(parse("F:\n open a.csv\n cast\n;").is_err());
         assert!(parse("F:\n open a.csv\n cast age\n;").is_err());
         assert!(parse("F:\n open a.csv\n cast age:wat\n;").is_err());
+    }
+
+    #[test]
+    fn asof_join_parses_and_round_trips() {
+        // #64: `L & R [on k…] asof ts [within "d"]` — as-of / temporal join.
+        let g = parse(
+            "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
+             T: open t.csv (sym:str ts:datetime px:int) ;\n\
+             J: T & Q on sym asof ts within \"5m\" ;",
+        )
+        .unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(&n.op, Op::AsofJoin { .. })));
+        let src = g.to_source();
+        assert!(src.contains("T & Q on sym asof ts within \"5m\""), "{src}");
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // Without `on` (pure temporal) and without tolerance.
+        let g = parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T & Q asof ts ;").unwrap();
+        assert!(g.to_source().contains("T & Q asof ts"), "{}", g.to_source());
+        // A left/right/full qualifier with `asof` is rejected (later slice).
+        assert!(parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T &left Q asof ts ;").is_err());
     }
 
     #[test]

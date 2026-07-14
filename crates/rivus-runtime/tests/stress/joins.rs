@@ -296,3 +296,77 @@ fn right_and_full_outer_join_match_oracle() {
         }
     }
 }
+
+// --- as-of / temporal join `L & R on k asof ts [within "d"]` (#64): nearest
+// right row with ts ≤ the left's, matched on the by-keys, left-outer. ---
+
+#[test]
+fn asof_join_nearest_earlier_by_group_matches_oracle() {
+    let quotes = "sym,ts,bid\n\
+                  A,2024-06-03T09:00:00,100\n\
+                  A,2024-06-03T09:00:10,101\n\
+                  B,2024-06-03T09:00:08,49\n\
+                  A,2024-06-03T09:00:20,102\n";
+    let trades = "sym,ts,px\n\
+                  A,2024-06-03T09:00:05,1\n\
+                  A,2024-06-03T09:00:15,2\n\
+                  B,2024-06-03T09:00:10,3\n\
+                  A,2024-06-03T09:00:30,4\n\
+                  A,2024-06-02T00:00:00,5\n";
+    let q = TempCsv(gendata::write_temp_bytes("asof_q", quotes.as_bytes()));
+    let t = TempCsv(gendata::write_temp_bytes("asof_t", trades.as_bytes()));
+    let (qp, tp) = (q.0.display(), t.0.display());
+    let flow = format!(
+        "Q: open {qp} (sym:str ts:datetime bid:int) ;\n\
+         T: open {tp} (sym:str ts:datetime px:int) ;\n\
+         J: T & Q on sym asof ts sort sym ts ;"
+    );
+    // Chunk-size sweep: the right side is sorted per group on finish, so the
+    // match is chunk-size independent.
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow, cz);
+        // sorted by (sym, ts): A@06-02 (no earlier quote → null), then A 09:00:05/
+        // 15/30, then B 09:00:10.
+        assert_eq!(
+            collect_strings(&res, "J", "bid"),
+            vec!["", "100", "101", "102", "49"],
+            "as-of nearest-earlier per group @cz={cz}"
+        );
+        // Left columns are preserved; right ts/sym are dropped (no duplicate).
+        assert_eq!(
+            collect_i64(&res, "J", "px"),
+            vec![5, 1, 2, 4, 3],
+            "left rows kept in (sym,ts) order @cz={cz}"
+        );
+        assert!(
+            res.outputs[0].chunks[0].schema.index_of("ts_r").is_none(),
+            "right ts is dropped, not suffixed @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn asof_join_tolerance_is_closed_bound() {
+    let quotes = "sym,ts,bid\n\
+                  A,2024-06-03T09:00:00,100\n\
+                  A,2024-06-03T09:00:20,102\n";
+    let trades = "sym,ts,px\n\
+                  A,2024-06-03T09:00:05,1\n\
+                  A,2024-06-03T09:00:30,2\n";
+    let q = TempCsv(gendata::write_temp_bytes("asof_tolq", quotes.as_bytes()));
+    let t = TempCsv(gendata::write_temp_bytes("asof_tolt", trades.as_bytes()));
+    let (qp, tp) = (q.0.display(), t.0.display());
+    // 5s tolerance: 09:00:05 is 5s from 09:00:00 (== bound, kept); 09:00:30 is
+    // 10s from 09:00:20 (> bound → null).
+    let flow = format!(
+        "Q: open {qp} (sym:str ts:datetime bid:int) ;\n\
+         T: open {tp} (sym:str ts:datetime px:int) ;\n\
+         J: T & Q on sym asof ts within \"5s\" sort ts ;"
+    );
+    let res = run_src(&flow, 4096);
+    assert_eq!(
+        collect_strings(&res, "J", "bid"),
+        vec!["100", ""],
+        "== tolerance kept, > tolerance nulled"
+    );
+}
