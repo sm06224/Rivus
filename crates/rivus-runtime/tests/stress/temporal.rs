@@ -344,6 +344,82 @@ fn date_extractors_chunk_size_independent() {
 }
 
 #[test]
+fn date_bin_chunk_size_independent_epoch_and_origin() {
+    // `date_bin(ts, dur)` (epoch-aligned) and `date_bin(ts, dur, origin)`
+    // (origin-aligned) are row-wise, exact-integer, and chunk-size independent
+    // — the resample / gap-fill boundary primitive (#62). Closed-open bins.
+    let text = "ts\n\
+        2026-01-01T00:07:00\n\
+        2026-01-01T00:14:59\n\
+        2026-01-01T00:15:00\n\
+        2026-01-01T00:22:30\n";
+    let f = TempCsv(gendata::write_temp_bytes(
+        "stress_date_bin",
+        text.as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!(
+        "D:\n open {p} (ts:datetime)\n \
+         |> (date_bin(ts, \"15m\")) as b (date_bin(ts, \"15m\", \"2026-01-01T00:05:00\")) as o\n;"
+    );
+    // Epoch-aligned: boundaries at :00/:15/:30; the :15:00 instant opens a new
+    // bin (closed-open). Origin :05: boundaries at :05/:20/:35.
+    let want_b = vec![
+        "2026-01-01T00:00:00",
+        "2026-01-01T00:00:00",
+        "2026-01-01T00:15:00",
+        "2026-01-01T00:15:00",
+    ];
+    let want_o = vec![
+        "2026-01-01T00:05:00",
+        "2026-01-01T00:05:00",
+        "2026-01-01T00:05:00",
+        "2026-01-01T00:20:00",
+    ];
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert!(
+            !res.errors.iter().any(rivus_core::ErrorEvent::is_fatal),
+            "date_bin must never raise a fatal (cz={cz})"
+        );
+        assert_eq!(
+            collect_strings(&res, "D", "b"),
+            want_b,
+            "epoch bin @cz={cz}"
+        );
+        assert_eq!(
+            collect_strings(&res, "D", "o"),
+            want_o,
+            "origin bin @cz={cz}"
+        );
+        // Result stays on the datetime lane (exact ticks, not a text rendering).
+        let out = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("D"))
+            .unwrap();
+        let ci = out.chunks[0].schema.index_of("b").unwrap();
+        assert!(
+            matches!(
+                out.chunks[0].schema.fields[ci].dtype,
+                rivus_core::DataType::DateTime { .. }
+            ),
+            "date_bin must yield the datetime lane @cz={cz}"
+        );
+    }
+    // 2-arg date_bin is definitionally the existing `bucket` (epoch origin).
+    let flow_bucket = format!("D:\n open {p} (ts:datetime)\n |> (bucket(ts, \"15m\")) as b\n;");
+    for cz in [1usize, 4096] {
+        let res = run_src(&flow_bucket, cz);
+        assert_eq!(
+            collect_strings(&res, "D", "b"),
+            want_b,
+            "date_bin(ts,dur) == bucket(ts,dur) @cz={cz}"
+        );
+    }
+}
+
+#[test]
 fn datetime_auto_infer_common_formats() {
     // A bare `:datetime` (no explicit format) auto-infers common shapes per cell:
     // ISO-with-T, ISO-with-space, and bare date all resolve; junk → null.

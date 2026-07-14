@@ -122,6 +122,12 @@ pub enum Func {
     Trunc,
     /// `bucket(ts, dur)` — bucket a datetime into arbitrary dur boundaries (closed-open).
     Bucket,
+    /// `date_bin(ts, dur[, origin])` — floor a datetime to `dur` boundaries
+    /// **aligned at `origin`** (a datetime); the origin-aware generalization of
+    /// `bucket` (`floor((t − o)/d)·d + o`, closed-open). Omitting `origin`
+    /// aligns at the epoch and is exactly `bucket(ts, dur)`. Exact integer
+    /// ticks (no f64); the resample / gap-fill boundary primitive (#62).
+    DateBin,
     /// `hops(ts, size, hop)` — the **list** of sliding-window start datetimes
     /// (epoch-aligned, closed-open, ascending) containing `ts`. The sliding
     /// generalization of `bucket` under §30's "a window is a derived grouping
@@ -184,6 +190,7 @@ impl Func {
             "date",
             "time",
             "bucket",
+            "date_bin",
             "hops",
         ]
     }
@@ -220,6 +227,7 @@ impl Func {
             "second" => Func::Second,
             "trunc" => Func::Trunc,
             "bucket" => Func::Bucket,
+            "date_bin" => Func::DateBin,
             "hops" => Func::Hops,
             "format" => Func::Format,
             "weekday" => Func::Weekday,
@@ -261,6 +269,7 @@ impl Func {
             Func::Second => "second",
             Func::Trunc => "trunc",
             Func::Bucket => "bucket",
+            Func::DateBin => "date_bin",
             Func::Hops => "hops",
             Func::Format => "format",
             Func::Weekday => "weekday",

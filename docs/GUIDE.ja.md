@@ -761,6 +761,9 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
 - **関数**：`year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)` `second(ts)`
   （整数）、`trunc(ts, "day"|"hour"|"minute"|"month"|"year")`（日時バケットキー）、
   `bucket(ts, "15m")`（任意幅の tumbling 窓キー、左閉右開・epoch 整列）、
+  `date_bin(ts, "15m"[, origin])`（同じ floor を epoch でなく **`origin` 日時に整列** —
+  `floor((t − o)/d)·d + o`、左閉右開・整数 tick 厳密。`origin` 省略時は `bucket` と同一。
+  resample / gap-fill の境界プリミティブ、#62）、
   `hops(ts, size, hop)`（`ts` を含む **sliding 窓**開始キーの *List* —
   explode して group する：`|> (hops(ts, "5m", "1m")) as w price` →
   `explode w` → `|# w avg:price`。`hops(x, s, s)` は `bucket` に退化、§36）、

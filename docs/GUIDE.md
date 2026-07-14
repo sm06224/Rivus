@@ -813,7 +813,10 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
 - **Functions**: `year(ts)` `month(ts)` `day(ts)` `hour(ts)` `minute(ts)`
   `second(ts)` (→ integers); `trunc(ts, "day"|"hour"|"minute"|"month"|"year")`
   (→ datetime bucket key); `bucket(ts, "15m")` (→ arbitrary-width tumbling
-  window key, closed-open, epoch-aligned); `hops(ts, size, hop)` (→ the *list*
+  window key, closed-open, epoch-aligned); `date_bin(ts, "15m"[, origin])`
+  (→ the same floor **aligned at an `origin` datetime** instead of the epoch —
+  `floor((t − o)/d)·d + o`, closed-open, exact integer ticks; omit `origin` and
+  it *is* `bucket`; the resample / gap-fill boundary primitive, #62); `hops(ts, size, hop)` (→ the *list*
   of **sliding-window** start keys containing `ts` — explode it and group:
   `|> (hops(ts, "5m", "1m")) as w price` → `explode w` → `|# w avg:price`;
   `hops(x, s, s)` degenerates to `bucket`, §36); **session windows**:

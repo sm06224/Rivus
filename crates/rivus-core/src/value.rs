@@ -572,6 +572,48 @@ impl DateTime {
         Some(DateTime::new(q * dur_ticks, self.unit))
     }
 
+    /// Floor this instant to `dur` boundaries **aligned at `origin`** — the
+    /// `date_bin(ts, dur, origin)` primitive (#62): the greatest boundary
+    /// `origin + k·dur` (integer `k`) that is `≤ self`, at `self.unit`
+    /// (`floor((t − o)/d)·d + o`, closed-open `[start, start+dur)`).
+    /// `origin == None` aligns at the epoch and is exactly [`bucketed`] (the
+    /// 2-arg `bucket`).
+    ///
+    /// Exact throughout (integer ticks, **no f64**): `dur` **and** `origin`
+    /// must each be representable at `self.unit` without truncation, else
+    /// `None` (never-silent, same contract as [`bucketed`]). Pre-origin
+    /// instants floor toward −∞ so the mapping stays monotone.
+    ///
+    /// [`bucketed`]: DateTime::bucketed
+    pub fn date_binned(&self, dur: Duration, origin: Option<DateTime>) -> Option<DateTime> {
+        let Some(origin) = origin else {
+            return self.bucketed(dur);
+        };
+        if dur.ticks <= 0 {
+            return None;
+        }
+        let self_per_sec = self.unit.per_sec() as i128;
+        // `dur` expressed in self's unit (exact or bail).
+        let dur_ticks_self_128 = dur.ticks as i128 * self_per_sec;
+        if dur_ticks_self_128 % dur.unit.per_sec() as i128 != 0 {
+            return None;
+        }
+        let dur_ticks = (dur_ticks_self_128 / dur.unit.per_sec() as i128) as i64;
+        // `origin` expressed in self's unit (exact or bail).
+        let o_ticks_self_128 = origin.ticks as i128 * self_per_sec;
+        if o_ticks_self_128 % origin.unit.per_sec() as i128 != 0 {
+            return None;
+        }
+        let o_ticks = (o_ticks_self_128 / origin.unit.per_sec() as i128) as i64;
+        // floor((t − o)/d) toward −∞, then re-add the origin offset.
+        let delta = self.ticks - o_ticks;
+        let mut q = delta / dur_ticks;
+        if delta % dur_ticks < 0 {
+            q -= 1;
+        }
+        Some(DateTime::new(q * dur_ticks + o_ticks, self.unit))
+    }
+
     /// The start ticks (at `self.unit`, **ascending**) of every sliding window
     /// of width `size`, hopping by `hop`, that contains this instant: each
     /// start `w` with `w ≡ 0 (mod hop)` (epoch-aligned, like [`bucketed`]) and
@@ -1265,6 +1307,66 @@ mod hop_starts_tests {
         // A sub-second duration is not representable at the Sec unit.
         let half_ms = Duration::new(500, TimeUnit::Milli);
         assert_eq!(dt(10).hop_starts(half_ms, dur(60)), None);
+    }
+
+    #[test]
+    fn date_binned_epoch_origin_equals_bucketed() {
+        // origin = None ⇒ exactly `bucketed` at every instant (the 2-arg form).
+        for t in [-130i64, -1, 0, 7, 900, 901, 1799] {
+            assert_eq!(
+                dt(t).date_binned(dur(900), None).map(|b| b.ticks),
+                dt(t).bucketed(dur(900)).map(|b| b.ticks),
+                "t={t}",
+            );
+        }
+    }
+
+    #[test]
+    fn date_binned_aligns_at_origin() {
+        // 15-minute bins aligned at :05 → boundaries 300, 1200, 2100, …
+        let o = dt(300); // 00:05:00
+        assert_eq!(
+            dt(420).date_binned(dur(900), Some(o)).map(|b| b.ticks),
+            Some(300)
+        ); // 00:07 → 00:05
+        assert_eq!(
+            dt(900).date_binned(dur(900), Some(o)).map(|b| b.ticks),
+            Some(300)
+        ); // 00:15 → 00:05
+        assert_eq!(
+            dt(1200).date_binned(dur(900), Some(o)).map(|b| b.ticks),
+            Some(1200)
+        ); // 00:20 → 00:20 (closed-open)
+        assert_eq!(
+            dt(1350).date_binned(dur(900), Some(o)).map(|b| b.ticks),
+            Some(1200)
+        ); // 00:22:30 → 00:20
+    }
+
+    #[test]
+    fn date_binned_pre_origin_floors_toward_neg_inf() {
+        // Instants before the origin still floor down (monotone mapping).
+        let o = dt(300);
+        assert_eq!(
+            dt(299).date_binned(dur(900), Some(o)).map(|b| b.ticks),
+            Some(-600)
+        ); // [-600, 300)
+        assert_eq!(
+            dt(-600).date_binned(dur(900), Some(o)).map(|b| b.ticks),
+            Some(-600)
+        );
+    }
+
+    #[test]
+    fn date_binned_refuses_inexact_like_bucketed() {
+        assert_eq!(dt(10).date_binned(dur(0), Some(dt(300))), None, "dur ≤ 0");
+        // A sub-second origin/dur is not representable at the Sec unit → None.
+        let sub = DateTime::new(500, TimeUnit::Milli);
+        assert_eq!(
+            dt(10).date_binned(dur(900), Some(sub)),
+            None,
+            "inexact origin"
+        );
     }
 }
 

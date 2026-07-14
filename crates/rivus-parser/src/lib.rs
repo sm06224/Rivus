@@ -3454,6 +3454,20 @@ mod tests {
     }
 
     #[test]
+    fn date_bin_parses_both_arities_and_is_reversible() {
+        // `date_bin(ts, dur)` (epoch origin) and `date_bin(ts, dur, origin)`
+        // (aligned origin) both survive a `to_source` round-trip. #62.
+        let src = "F:\n open t.csv\n |> (date_bin(ts, \"15m\")) as b (date_bin(ts, \"15m\", \"2026-01-01T00:05:00\")) as o\n;";
+        let s = parse(src).unwrap().to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+        for needle in ["date_bin(", "\"15m\"", "\"2026-01-01T00:05:00\""] {
+            assert!(s.contains(needle), "missing {needle} in {s}");
+        }
+        // Canonical spelling and both arities are recognized by the Func table.
+        assert_eq!(Func::parse("date_bin"), Some(Func::DateBin));
+    }
+
+    #[test]
     fn stdio_paths_normalize() {
         // `stdin`/`stdout` (and `-`) map to the "-" sentinel for source & sink.
         let g = parse("F:\n open stdin\n save stdout\n;").unwrap();
