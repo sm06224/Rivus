@@ -362,10 +362,21 @@ pub(crate) struct BroadcastProbe {
     table: std::sync::Arc<JoinTable>,
     /// Right key column indices (dropped from the output).
     rk: std::sync::Arc<Vec<usize>>,
+    /// Projection pushdown (design/41 Stage A-1): when the driver proved the
+    /// downstream column set, only these output names are gathered — the
+    /// generic form copied EVERY column of every probe output row only for a
+    /// later project to drop most of them. `None` keeps every column
+    /// (exactly the pre-pushdown shape). Output NAMES are unchanged (incl.
+    /// the `_r` collision suffix, still checked against the full left
+    /// schema), so downstream name resolution is identical.
+    keep: Option<Vec<String>>,
     /// Resolved left key indices + output schema, cached on the first chunk
     /// (every chunk of this path shares one schema).
     lk: Option<Vec<usize>>,
     out_schema: Option<Arc<Schema>>,
+    /// Left input column indices that reach the output (all of
+    /// `0..base_left` unless `keep` pruned some), resolved with `lk`.
+    left_out: Vec<usize>,
     right_cols: Vec<usize>,
     key_fails: u64,
 }
@@ -403,6 +414,7 @@ impl BroadcastProbe {
         right: std::sync::Arc<Chunk>,
         table: std::sync::Arc<JoinTable>,
         rk: std::sync::Arc<Vec<usize>>,
+        keep: Option<Vec<String>>,
     ) -> Self {
         BroadcastProbe {
             left_keys,
@@ -410,8 +422,10 @@ impl BroadcastProbe {
             right,
             table,
             rk,
+            keep,
             lk: None,
             out_schema: None,
+            left_out: Vec::new(),
             right_cols: Vec::new(),
             key_fails: 0,
         }
@@ -480,7 +494,20 @@ impl Operator for BroadcastProbe {
                     }
                 }
             }
-            let mut fields = left.schema.fields[..base_left].to_vec();
+            // Pruned output (see `keep`): a column is materialized only when
+            // its OUTPUT name is in the driver-proved downstream set. The
+            // probe's own key reads (`fill_join_key`) use the INPUT chunk, so
+            // pruning the output never affects matching.
+            let keep = self.keep.clone();
+            let keeps = |name: &str| keep.as_ref().is_none_or(|k| k.iter().any(|n| n == name));
+            let mut fields = Vec::new();
+            let mut left_out = Vec::new();
+            for (ci, f) in left.schema.fields[..base_left].iter().enumerate() {
+                if keeps(&f.name) {
+                    left_out.push(ci);
+                    fields.push(f.clone());
+                }
+            }
             let mut right_cols = Vec::new();
             for (ci, f) in self.right.schema.fields.iter().enumerate() {
                 if self.rk.contains(&ci) {
@@ -491,11 +518,34 @@ impl Operator for BroadcastProbe {
                 } else {
                     f.name.clone()
                 };
-                fields.push(Field::new(name, f.dtype));
-                right_cols.push(ci);
+                if keeps(&name) {
+                    fields.push(Field::new(name, f.dtype));
+                    right_cols.push(ci);
+                }
+            }
+            // An empty pruned schema would lose the row count entirely —
+            // impossible when the driver collected the group keys, but guard
+            // by falling back to the unpruned shape (never wrong, just wide).
+            if fields.is_empty() {
+                left_out = (0..base_left).collect();
+                fields = left.schema.fields[..base_left].to_vec();
+                right_cols.clear();
+                for (ci, f) in self.right.schema.fields.iter().enumerate() {
+                    if self.rk.contains(&ci) {
+                        continue;
+                    }
+                    let name = if left.schema.index_of(&f.name).is_some() {
+                        format!("{}_r", f.name)
+                    } else {
+                        f.name.clone()
+                    };
+                    fields.push(Field::new(name, f.dtype));
+                    right_cols.push(ci);
+                }
             }
             self.lk = Some(lk);
             self.out_schema = Some(Arc::new(Schema::new(fields)));
+            self.left_out = left_out;
             self.right_cols = right_cols;
         } else {
             // Later chunks: re-materialize any derived nested-key columns.
@@ -531,8 +581,9 @@ impl Operator for BroadcastProbe {
         if lidx.is_empty() {
             return Vec::new();
         }
-        let mut out: Vec<Column> = Vec::with_capacity(base_left + self.right_cols.len());
-        for (ci, col) in left.columns[..base_left].iter().enumerate() {
+        let mut out: Vec<Column> = Vec::with_capacity(self.left_out.len() + self.right_cols.len());
+        for &ci in &self.left_out {
+            let col = &left.columns[ci];
             match lk.iter().position(|&k| k == ci) {
                 Some(kpos) => out.push(join_key_column(
                     col,

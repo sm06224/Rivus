@@ -1363,6 +1363,121 @@ type SegmentResult = (Vec<ErrorEvent>, u64, Option<String>);
 /// and right-key column indices — built once, shared by every worker.
 type BroadcastRight = operators::BuiltRight;
 
+/// The column names the ops between the read and the group actually consume
+/// (probe projection pushdown, design/41 Stage A-1): the broadcast probe then
+/// gathers ONLY these output columns instead of every column of every output
+/// row. `None` disables pruning — a positional `$_[i]` reference, an op
+/// outside the modeled set, or any expression whose column reads can't be
+/// enumerated keeps the old keep-everything shape. Over-approximation is
+/// always safe: a kept-but-unused column costs exactly what it did before.
+fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<String>> {
+    fn add(name: &str, out: &mut Vec<String>) {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    /// Every column `e` reads, by name; `false` = not enumerable → disable.
+    fn expr_cols(e: &rivus_ir::Expr, out: &mut Vec<String>) -> bool {
+        use rivus_ir::Expr as E;
+        match e {
+            E::Field { name, access } => {
+                if access.is_column() {
+                    add(name, out);
+                }
+                true
+            }
+            // Positions shift when columns are pruned — never prune under one.
+            E::FieldAt(_) => false,
+            E::SubView { base, .. } => {
+                add(base, out);
+                true
+            }
+            E::Path(p) => {
+                add(&p.root, out);
+                true
+            }
+            E::Literal(_) | E::Hole(_) => true,
+            E::Compare { left, right, .. } | E::Arith { left, right, .. } => {
+                expr_cols(left, out) && expr_cols(right, out)
+            }
+            E::And(a, b) | E::Or(a, b) => expr_cols(a, out) && expr_cols(b, out),
+            E::Cast { expr, .. } => expr_cols(expr, out),
+            E::Func { args, .. } => args.iter().all(|a| expr_cols(a, out)),
+            E::Case { branches, default } => {
+                branches
+                    .iter()
+                    .all(|(c, v)| expr_cols(c, out) && expr_cols(v, out))
+                    && default.as_deref().is_none_or(|d| expr_cols(d, out))
+            }
+        }
+    }
+    let mut used = Vec::new();
+    for step in &shape.path {
+        let nid = match step {
+            ReadPathStep::Stateless(n) => *n,
+            ReadPathStep::Broadcast { join_id, .. } => *join_id,
+        };
+        match &graph.nodes[nid].op {
+            // A LATER probe reads its left keys from THIS probe's (possibly
+            // pruned) output — keep them. (The probe's own left keys are read
+            // from its input chunk, so collecting them over-approximates for
+            // the first join; over-approximation is safe.)
+            Op::Join { left_keys, .. } => {
+                for k in left_keys {
+                    add(&k.root, &mut used);
+                }
+            }
+            Op::Cast { casts } => {
+                for (n, _) in casts {
+                    add(n, &mut used);
+                }
+            }
+            Op::Filter { pred } => {
+                if !expr_cols(pred, &mut used) {
+                    return None;
+                }
+            }
+            Op::FilterProject { preds, fields } => {
+                for p in preds {
+                    if !expr_cols(p, &mut used) {
+                        return None;
+                    }
+                }
+                if let Some(fs) = fields {
+                    for f in fs {
+                        add(f, &mut used);
+                    }
+                }
+            }
+            Op::Project { fields } => {
+                for f in fields {
+                    add(f, &mut used);
+                }
+            }
+            Op::ProjectExpr { items, .. } => {
+                for (e, _) in items {
+                    if !expr_cols(e, &mut used) {
+                        return None;
+                    }
+                }
+            }
+            // Rename remaps names (the set would go stale); DropNa/Reorder/…
+            // read or reorder every column — outside the modeled set.
+            _ => return None,
+        }
+    }
+    let Op::GroupBy { keys, aggs } = &graph.nodes[shape.group_id].op else {
+        return None;
+    };
+    for k in keys {
+        add(&k.root, &mut used);
+    }
+    for (_, c) in aggs {
+        add(c, &mut used);
+    }
+    Some(used)
+}
+
 fn try_parallel_read_group(
     graph: &PlanGraph,
     opts: &RunOptions,
@@ -1499,6 +1614,9 @@ fn try_parallel_read_group(
         Op::GroupBy { aggs, .. } => aggs.clone(),
         _ => return None,
     };
+    // Probe projection pushdown (design/41 Stage A-1): the downstream column
+    // set, proved from the path's expressions; `None` keeps every column.
+    let used = fused_used_columns(graph, shape);
     // The sample chunk comes from the ALREADY-OPENED first file's decoder —
     // the old form re-opened the file, which re-ran its whole inference pass
     // (a full serial scan) just to type-check one chunk. The columns are
@@ -1557,6 +1675,7 @@ fn try_parallel_read_group(
                         right.clone(),
                         table.clone(),
                         rk.clone(),
+                        used.clone(),
                     ));
                     ops.push((*join_id, prev, op));
                     prev = *join_id;
@@ -1619,11 +1738,12 @@ fn try_parallel_read_group(
                     .drain(..)
                     .map(|(idx, (uri, schema, dec))| {
                         let preface = if idx == 0 { preface0.take() } else { None };
+                        let keep = &used;
                         s.spawn(move || {
                             (
                                 idx,
                                 worker_read_partial_group(
-                                    graph, opts, shape, &uri, &schema, dec, preface, union,
+                                    graph, opts, shape, &uri, &schema, dec, preface, keep, union,
                                     uschema, fname, provenance, rights, read_label,
                                 ),
                             )
@@ -1841,6 +1961,8 @@ fn worker_read_to_segment(
                     right.clone(),
                     table.clone(),
                     rk.clone(),
+                    // Sink shape: the saved file needs every column — no pruning.
+                    None,
                 ));
                 ops.push((*join_id, prev, op));
                 prev = *join_id;
@@ -2534,6 +2656,8 @@ fn worker_read_partial_group(
     // Columns already decoded from this file (the parallel-safety sample
     // chunk): processed FIRST, so the stream is the whole file in order.
     preface: Option<Vec<rivus_core::Column>>,
+    // Probe projection pushdown set (design/41 Stage A-1); `None` = keep all.
+    keep: &Option<Vec<String>>,
     union: &[rivus_core::Field],
     uschema: &std::sync::Arc<rivus_core::Schema>,
     fname: Option<&str>,
@@ -2581,6 +2705,7 @@ fn worker_read_partial_group(
                     right.clone(),
                     table.clone(),
                     rk.clone(),
+                    keep.clone(),
                 ));
                 ops.push((*join_id, prev, op));
                 prev = *join_id;
