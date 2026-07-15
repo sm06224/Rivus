@@ -1987,3 +1987,30 @@ JSONL group: 1984 → **1898–1905 ms** (interleaved control), open
 (`scan_row`/`scan_line_infer` byte-walking every object twice) — the next
 JSONL lever is SWAR inside the scanner (delimiter/quote scanning), not
 loop structure.
+
+### Probe projection pushdown (design/41 Stage A-1, #239)
+
+The broadcast probe gathered EVERY column of every output row; a later
+project then dropped most of them. The driver now proves the downstream
+column set (filter predicates, projections, casts, later joins' left keys,
+group keys/aggs) and the probe gathers only those. Conservative by
+construction: a positional `$_[i]`, an op outside the modeled set
+(Rename/DropNa/Reorder/…), or a non-enumerable expression disables pruning
+entirely; over-approximation only costs what the old shape already paid.
+Output names (incl. the `_r` collision suffix, still judged against the
+full left schema) are unchanged, so downstream name resolution — and the
+output bytes — are identical (verified by `cmp` against the pre-pushdown
+binary, parallel and serial).
+
+Measured (WPROF per file):
+
+| shape | probe | filter | feed total |
+|---|---|---|---|
+| 10M standard (3 of 4 cols used) | 51 → 48 ms | — | ~165 → ~161 ms |
+| wide (3 of 16 cols used, 1M×2 files) | 79–88 → **24–25 ms** | 47–54 → **10–11 ms** | 176–189 → **84–86 ms (halved)** |
+
+Research verdict: the effect is proportional to the UNUSED width — near
+zero on the narrow standard fixture, structural on wide schemas (the
+common real-ETL case). Kept: ~60 lines, composes with the Stage A fused
+loop, whose target (killing the gather entirely plus project/group
+materialization) is unchanged.
