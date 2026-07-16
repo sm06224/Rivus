@@ -3028,10 +3028,8 @@ fn fused_feed_chunk(
                     }
                 }
             }
-            None if plan.keeps_left => {
-                if passes(&mut predf) {
-                    emit(None, group, rows, sc);
-                }
+            None if plan.keeps_left && passes(&mut predf) => {
+                emit(None, group, rows, sc);
             }
             None => {}
         }
