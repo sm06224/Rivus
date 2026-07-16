@@ -1617,6 +1617,9 @@ fn try_parallel_read_group(
     // Probe projection pushdown (design/41 Stage A-1): the downstream column
     // set, proved from the path's expressions; `None` keeps every column.
     let used = fused_used_columns(graph, shape);
+    // Fused row loop (design/41 Stage A): graph-level eligibility; the
+    // schema-level half resolves per worker on the first join-input chunk.
+    let fused_sp = fused_shape_plan(graph, shape);
     // The sample chunk comes from the ALREADY-OPENED first file's decoder —
     // the old form re-opened the file, which re-ran its whole inference pass
     // (a full serial scan) just to type-check one chunk. The columns are
@@ -1739,12 +1742,13 @@ fn try_parallel_read_group(
                     .map(|(idx, (uri, schema, dec))| {
                         let preface = if idx == 0 { preface0.take() } else { None };
                         let keep = &used;
+                        let fsp = &fused_sp;
                         s.spawn(move || {
                             (
                                 idx,
                                 worker_read_partial_group(
-                                    graph, opts, shape, &uri, &schema, dec, preface, keep, union,
-                                    uschema, fname, provenance, rights, read_label,
+                                    graph, opts, shape, &uri, &schema, dec, preface, keep, fsp,
+                                    union, uschema, fname, provenance, rights, read_label,
                                 ),
                             )
                         })
@@ -2642,9 +2646,511 @@ fn uris_of_chunk(chunk: &Chunk, out: &mut Vec<String>) {
     }
 }
 
+// ------------- design/41 Stage A: fused read->join->group worker loop -------------
+
+/// One projected cell in the fused loop, resolved once per worker. `Coalesce*`
+/// is restricted to **Str-lane** columns (checked at resolution), so the
+/// coalesced cell is exactly "the borrowed str, or the literal" — the same
+/// bytes the columnar `eval_column(coalesce(col, "lit"))` produces.
+enum FusedCell {
+    Left(usize),
+    Right(usize),
+    CoalesceLeft(usize, String),
+    CoalesceRight(usize, String),
+    LitStr(String),
+}
+
+/// The graph-level half of fused eligibility (design/41 Stage A): exactly one
+/// broadcast join; after it only predicate-only filters and at most one
+/// TRAILING `ProjectExpr`. Predicates are `Compare`/`And` over bare column
+/// refs and literals only — no `Cast`/`Arith`/`Func` — so the interpreter's
+/// cast-fail counter provably stays 0 and evaluating a pred once per LEFT row
+/// (instead of once per joined row) is unobservable. Group keys must be bare.
+/// Everything before the join stays on the generic per-op path.
+struct FusedShapePlan {
+    /// Index of the broadcast step in `shape.path` (ops before it run generic).
+    split: usize,
+    join_id: NodeId,
+    right_src: NodeId,
+    preds: Vec<rivus_ir::Expr>,
+    items: Option<Vec<(rivus_ir::Expr, String)>>,
+}
+
+fn fused_shape_plan(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<FusedShapePlan> {
+    use rivus_ir::Expr as E;
+    let mut split = None;
+    for (i, step) in shape.path.iter().enumerate() {
+        if matches!(step, ReadPathStep::Broadcast { .. }) {
+            if split.is_some() {
+                return None; // one join only in this slice
+            }
+            split = Some(i);
+        }
+    }
+    let split = split?;
+    let ReadPathStep::Broadcast { join_id, right_src } = shape.path[split] else {
+        unreachable!("split indexes a broadcast step");
+    };
+    let mut preds: Vec<E> = Vec::new();
+    let mut items = None;
+    let last = shape.path.len() - 1;
+    for (i, step) in shape.path.iter().enumerate().skip(split + 1) {
+        let ReadPathStep::Stateless(nid) = step else {
+            return None;
+        };
+        match &graph.nodes[*nid].op {
+            Op::Filter { pred } if items.is_none() => preds.push(pred.clone()),
+            Op::FilterProject {
+                preds: ps,
+                fields: None,
+            } if items.is_none() => preds.extend(ps.iter().cloned()),
+            Op::ProjectExpr { items: it, .. } if items.is_none() && i == last => {
+                items = Some(it.clone());
+            }
+            _ => return None,
+        }
+    }
+    fn leaf_ok(e: &E) -> bool {
+        matches!(e, E::Field { .. } | E::Literal(_))
+    }
+    fn pred_ok(e: &E) -> bool {
+        match e {
+            E::Compare { left, right, .. } => leaf_ok(left) && leaf_ok(right),
+            E::And(a, b) => pred_ok(a) && pred_ok(b),
+            _ => false,
+        }
+    }
+    if !preds.iter().all(pred_ok) {
+        return None;
+    }
+    let Op::GroupBy { keys, .. } = &graph.nodes[shape.group_id].op else {
+        return None;
+    };
+    if keys.iter().any(|k| !k.segs.is_empty()) {
+        return None;
+    }
+    Some(FusedShapePlan {
+        split,
+        join_id,
+        right_src,
+        preds,
+        items,
+    })
+}
+
+/// The per-worker half, resolved on the first chunk that reaches the join
+/// (schema-dependent). `None` -> this worker falls back to the generic ops.
+struct FusedPlan {
+    lk: Vec<usize>,
+    keeps_left: bool,
+    preds: Vec<rivus_ir::Expr>,
+    key_cells: Vec<FusedCell>,
+    agg_cells: Vec<FusedCell>,
+}
+
+fn resolve_fused_plan(
+    sp: &FusedShapePlan,
+    graph: &PlanGraph,
+    shape: &ReadGroupShape,
+    left: &rivus_core::Schema,
+    right: &Chunk,
+    rk: &[usize],
+) -> Option<FusedPlan> {
+    use rivus_core::{DataType, Value};
+    use rivus_ir::Expr as E;
+    let Op::Join {
+        left_keys, kind, ..
+    } = &graph.nodes[sp.join_id].op
+    else {
+        return None;
+    };
+    if left_keys.iter().any(|k| !k.segs.is_empty()) {
+        return None;
+    }
+    let mut lk = Vec::with_capacity(left_keys.len());
+    for k in left_keys {
+        lk.push(left.index_of(&k.root)?);
+    }
+    // Every predicate column must be a LEFT column: the pred is then evaluated
+    // on the left chunk with the SHARED interpreter (zero semantics
+    // duplication) and its result is identical for every match of that row.
+    fn pred_left_only(e: &E, left: &rivus_core::Schema) -> bool {
+        match e {
+            E::Field { name, access } => !access.is_column() || left.index_of(name).is_some(),
+            E::Literal(_) => true,
+            E::Compare {
+                left: l, right: r, ..
+            } => pred_left_only(l, left) && pred_left_only(r, left),
+            E::And(a, b) => pred_left_only(a, left) && pred_left_only(b, left),
+            _ => false,
+        }
+    }
+    if !sp.preds.iter().all(|p| pred_left_only(p, left)) {
+        return None;
+    }
+    // name -> cell over the joined-output naming: left columns first, then
+    // right non-key columns with the `_r` collision suffix judged against the
+    // FULL left schema — exactly `BroadcastProbe`'s schema construction.
+    let resolve_name = |name: &str| -> Option<FusedCell> {
+        if let Some(ci) = left.index_of(name) {
+            return Some(FusedCell::Left(ci));
+        }
+        for (ci, f) in right.schema.fields.iter().enumerate() {
+            if rk.contains(&ci) {
+                continue;
+            }
+            let is_r = left.index_of(&f.name).is_some();
+            let matches_out =
+                (is_r && name == format!("{}_r", f.name)) || (!is_r && name == f.name);
+            if matches_out {
+                return Some(FusedCell::Right(ci));
+            }
+        }
+        None
+    };
+    let cell_of = |e: &E| -> Option<FusedCell> {
+        match e {
+            E::Field { name, access } if access.is_column() => resolve_name(name),
+            E::Literal(Value::Str(s)) => Some(FusedCell::LitStr(s.clone())),
+            E::Func {
+                func: rivus_ir::Func::Coalesce,
+                args,
+            } if args.len() == 2 => {
+                let E::Field { name, access } = &args[0] else {
+                    return None;
+                };
+                if !access.is_column() {
+                    return None;
+                }
+                let E::Literal(Value::Str(lit)) = &args[1] else {
+                    return None;
+                };
+                match resolve_name(name)? {
+                    FusedCell::Left(ci) if left.fields[ci].dtype == DataType::Str => {
+                        Some(FusedCell::CoalesceLeft(ci, lit.clone()))
+                    }
+                    FusedCell::Right(ci) if right.schema.fields[ci].dtype == DataType::Str => {
+                        Some(FusedCell::CoalesceRight(ci, lit.clone()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
+    // Group keys / aggs resolve through the projection (alias -> item expr)
+    // when one exists, else directly against the joined names.
+    let lookup = |name: &str| -> Option<FusedCell> {
+        match &sp.items {
+            Some(items) => {
+                let (e, _) = items.iter().find(|(_, a)| a == name)?;
+                cell_of(e)
+            }
+            None => resolve_name(name),
+        }
+    };
+    let Op::GroupBy { keys, aggs } = &graph.nodes[shape.group_id].op else {
+        return None;
+    };
+    let key_cells: Vec<FusedCell> = keys
+        .iter()
+        .map(|k| lookup(&k.root))
+        .collect::<Option<_>>()?;
+    let agg_cells: Vec<FusedCell> = aggs.iter().map(|(_, c)| lookup(c)).collect::<Option<_>>()?;
+    Some(FusedPlan {
+        lk,
+        keeps_left: kind.keeps_left(),
+        preds: sp.preds.clone(),
+        key_cells,
+        agg_cells,
+    })
+}
+
+/// Append one projected key cell to the composite grouping key — the exact
+/// encoding of `push_group_key_field` (`\x00` = null, `\x01` + text = present;
+/// Str lanes borrow, other lanes render via the same `Value` `Display`).
+fn fused_push_key(
+    cell: &FusedCell,
+    l: &Chunk,
+    li: usize,
+    r: &Chunk,
+    ri: Option<usize>,
+    key: &mut String,
+) {
+    use rivus_core::ColumnData;
+    use std::fmt::Write as _;
+    let push_col = |c: &Chunk, ci: usize, row: usize, key: &mut String| {
+        if c.columns[ci].is_null(row) {
+            key.push('\u{0}');
+        } else {
+            key.push('\u{1}');
+            match c.columns[ci].data() {
+                ColumnData::Str(s) => key.push_str(s.get(row)),
+                _ => {
+                    let _ = write!(key, "{}", c.value(row, ci));
+                }
+            }
+        }
+    };
+    match cell {
+        FusedCell::Left(ci) => push_col(l, *ci, li, key),
+        FusedCell::Right(ci) => match ri {
+            Some(r_) => push_col(r, *ci, r_, key),
+            None => key.push('\u{0}'), // left join: null-padded right cell
+        },
+        FusedCell::CoalesceLeft(ci, lit) => {
+            key.push('\u{1}');
+            match l.columns[*ci].data() {
+                ColumnData::Str(s) if !l.columns[*ci].is_null(li) => key.push_str(s.get(li)),
+                _ => key.push_str(lit),
+            }
+        }
+        FusedCell::CoalesceRight(ci, lit) => {
+            key.push('\u{1}');
+            match ri {
+                Some(r_) if !r.columns[*ci].is_null(r_) => match r.columns[*ci].data() {
+                    ColumnData::Str(s) => key.push_str(s.get(r_)),
+                    _ => key.push_str(lit),
+                },
+                _ => key.push_str(lit),
+            }
+        }
+        FusedCell::LitStr(sv) => {
+            key.push('\u{1}');
+            key.push_str(sv);
+        }
+    }
+}
+
+/// The projected cell as a `Value` (null-aware) — feeds `AggAcc::observe` and
+/// the first-seen group's key-parts rendering, matching what the generic path
+/// reads off the projected chunk.
+fn fused_value(
+    cell: &FusedCell,
+    l: &Chunk,
+    li: usize,
+    r: &Chunk,
+    ri: Option<usize>,
+) -> rivus_core::Value {
+    use rivus_core::Value;
+    match cell {
+        FusedCell::Left(ci) => l.value(li, *ci),
+        FusedCell::Right(ci) => match ri {
+            Some(r_) => r.value(r_, *ci),
+            None => Value::Null,
+        },
+        FusedCell::CoalesceLeft(ci, lit) => {
+            if l.columns[*ci].is_null(li) {
+                Value::Str(lit.clone())
+            } else {
+                l.value(li, *ci)
+            }
+        }
+        FusedCell::CoalesceRight(ci, lit) => match ri {
+            Some(r_) if !r.columns[*ci].is_null(r_) => r.value(r_, *ci),
+            _ => Value::Str(lit.clone()),
+        },
+        FusedCell::LitStr(sv) => Value::Str(sv.clone()),
+    }
+}
+
+/// Reused per-row buffers for the fused loop (no per-row heap).
+#[derive(Default)]
+struct FusedScratch {
+    keybuf: String,
+    comp: String,
+    vals: Vec<Option<rivus_core::Value>>,
+}
+
+/// The fused row loop for one post-prefix chunk: join-key probe -> (left-only)
+/// filter -> composite group key + agg values straight off the source lanes ->
+/// `GroupBy::observe_row`. No intermediate `Chunk` is ever built; the group
+/// state machinery is `GroupBy::process`'s own, so a fused stream is
+/// byte-identical to the generic op chain (proven by the fused-vs-generic
+/// tests and the standard-fixture `cmp`s).
+#[allow(clippy::too_many_arguments)]
+fn fused_feed_chunk(
+    ch: &Chunk,
+    plan: &FusedPlan,
+    right: &Chunk,
+    table: &operators::JoinTable,
+    group: &mut operators::GroupBy,
+    rows: &mut u64,
+    sc: &mut FusedScratch,
+) {
+    debug_assert_eq!(plan.agg_cells.len(), group.agg_count());
+    let mut predf = 0u64;
+    for li in 0..ch.len {
+        sc.keybuf.clear();
+        let matched = if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
+            table.get(sc.keybuf.as_str())
+        } else {
+            None
+        };
+        // Left-only predicates: one evaluation per left row covers every
+        // match (the joined row's left cells are this row's cells). The
+        // eligibility gate excludes cast-capable predicate shapes, so the
+        // fail counter provably stays 0 (asserted in debug).
+        let passes = |predf: &mut u64| {
+            plan.preds
+                .iter()
+                .all(|p| crate::eval::eval_predicate_acc(p, ch, li, predf))
+        };
+        let emit = |ri: Option<usize>,
+                    group: &mut operators::GroupBy,
+                    rows: &mut u64,
+                    sc: &mut FusedScratch| {
+            *rows += 1;
+            sc.comp.clear();
+            for (j, cell) in plan.key_cells.iter().enumerate() {
+                if j > 0 {
+                    sc.comp.push('\u{1f}');
+                }
+                fused_push_key(cell, ch, li, right, ri, &mut sc.comp);
+            }
+            sc.vals.clear();
+            for cell in &plan.agg_cells {
+                sc.vals.push(Some(fused_value(cell, ch, li, right, ri)));
+            }
+            let parts = || {
+                plan.key_cells
+                    .iter()
+                    .map(|c| fused_value(c, ch, li, right, ri).to_string())
+                    .collect::<Vec<String>>()
+            };
+            group.observe_row(&sc.comp, parts, &sc.vals);
+        };
+        match matched {
+            Some(rs) => {
+                if passes(&mut predf) {
+                    for &ri in rs {
+                        emit(Some(ri), group, rows, sc);
+                    }
+                }
+            }
+            None if plan.keeps_left => {
+                if passes(&mut predf) {
+                    emit(None, group, rows, sc);
+                }
+            }
+            None => {}
+        }
+    }
+    debug_assert_eq!(predf, 0, "eligibility excludes cast-capable predicates");
+}
+
+/// Per-worker fused-mode state (design/41 Stage A). `plan` resolves on the
+/// first chunk that reaches the join; `off` latches a failed resolution so
+/// every later chunk takes the generic ops unchanged.
+struct FusedState<'a> {
+    sp: Option<&'a FusedShapePlan>,
+    /// (right chunk, hash table, right key indices) of the fused join.
+    ctx: Option<(&'a Chunk, &'a operators::JoinTable, &'a [usize])>,
+    plan: Option<FusedPlan>,
+    off: bool,
+    scratch: FusedScratch,
+    t_fused: std::time::Duration,
+}
+
+/// Push chunks from `start_idx` onward; the group consumes the survivors.
+/// In fused mode the ops from the join onward are BYPASSED: rows go straight
+/// from the join probe into `GroupBy::observe_row` (see `fused_feed_chunk`).
+/// A worker whose first join-input chunk fails plan resolution latches
+/// `off` and runs the generic chain — including that same chunk — so the
+/// fallback is never lossy.
+#[allow(clippy::too_many_arguments)]
+fn worker_feed(
+    graph: &PlanGraph,
+    shape: &ReadGroupShape,
+    ops: &mut [(NodeId, NodeId, Box<dyn Operator>)],
+    start_idx: usize,
+    start: Vec<Chunk>,
+    group: &mut operators::GroupBy,
+    errors: &mut Vec<ErrorEvent>,
+    next_id: &mut u64,
+    rows: &mut u64,
+    t_ops: &mut [std::time::Duration],
+    fu: &mut FusedState<'_>,
+) {
+    let mut level = start;
+    let mut i = start_idx;
+    let fused_at = match (&fu.sp, fu.off) {
+        (Some(sp), false) => sp.split,
+        _ => usize::MAX,
+    };
+    while i < ops.len() && i < fused_at {
+        let (nid, from, op) = &mut ops[i];
+        let t = Instant::now();
+        let mut out = Vec::new();
+        let mut ctx = OpCtx {
+            label: label_of(graph, *nid),
+            errors,
+            next_chunk_id: next_id,
+        };
+        for c in level {
+            out.extend(op.process(*from, c, &mut ctx));
+        }
+        level = out;
+        t_ops[i] += t.elapsed();
+        i += 1;
+    }
+    if i == fused_at && i < ops.len() {
+        let (right, table, rk) = fu.ctx.expect("fused ctx present when sp is");
+        let sp = fu.sp.expect("checked above");
+        let mut fallback: Vec<Chunk> = Vec::new();
+        for c in level {
+            if fu.plan.is_none() && !fu.off {
+                match resolve_fused_plan(sp, graph, shape, &c.schema, right, rk) {
+                    Some(p) => fu.plan = Some(p),
+                    None => fu.off = true,
+                }
+            }
+            if let (Some(plan), false) = (&fu.plan, fu.off) {
+                let t = Instant::now();
+                fused_feed_chunk(&c, plan, right, table, group, rows, &mut fu.scratch);
+                fu.t_fused += t.elapsed();
+            } else {
+                fallback.push(c);
+            }
+        }
+        if fallback.is_empty() {
+            return;
+        }
+        level = fallback;
+        while i < ops.len() {
+            let (nid, from, op) = &mut ops[i];
+            let t = Instant::now();
+            let mut out = Vec::new();
+            let mut ctx = OpCtx {
+                label: label_of(graph, *nid),
+                errors,
+                next_chunk_id: next_id,
+            };
+            for c in level {
+                out.extend(op.process(*from, c, &mut ctx));
+            }
+            level = out;
+            t_ops[i] += t.elapsed();
+            i += 1;
+        }
+    }
+    let t = Instant::now();
+    let mut ctx = OpCtx {
+        label: label_of(graph, shape.group_id),
+        errors,
+        next_chunk_id: next_id,
+    };
+    for c in level {
+        *rows += c.len as u64;
+        group.process(shape.group_id, c, &mut ctx);
+    }
+    *t_ops.last_mut().expect("group slot") += t.elapsed();
+}
+
 /// One worker: stream one file (lazy decoder) through reconcile → the path ops
 /// (a broadcast join is pre-fed its materialized right side) into a partial
-/// `GroupBy`. Holds one chunk + the join buffer of this file + group state.
+/// `GroupBy` — or, when the fused plan resolves, straight from the join probe
+/// into `GroupBy::observe_row` with no intermediate chunk (design/41 Stage A).
 #[allow(clippy::too_many_arguments)]
 fn worker_read_partial_group(
     graph: &PlanGraph,
@@ -2658,6 +3164,8 @@ fn worker_read_partial_group(
     preface: Option<Vec<rivus_core::Column>>,
     // Probe projection pushdown set (design/41 Stage A-1); `None` = keep all.
     keep: &Option<Vec<String>>,
+    // Fused-loop shape plan (design/41 Stage A); `None` = generic ops only.
+    fused_sp: &Option<FusedShapePlan>,
     union: &[rivus_core::Field],
     uschema: &std::sync::Arc<rivus_core::Schema>,
     fname: Option<&str>,
@@ -2721,41 +3229,24 @@ fn worker_read_partial_group(
     // group) for the WPROF breakdown — a handful of `Instant` reads per chunk,
     // free at chunk granularity.
     let mut t_ops: Vec<std::time::Duration> = vec![std::time::Duration::ZERO; ops.len() + 1];
-    let feed = |ops: &mut [(NodeId, NodeId, Box<dyn Operator>)],
-                start_idx: usize,
-                start: Vec<Chunk>,
-                group: &mut operators::GroupBy,
-                errors: &mut Vec<ErrorEvent>,
-                next_id: &mut u64,
-                rows: &mut u64,
-                t_ops: &mut [std::time::Duration]| {
-        let mut level = start;
-        for (i, (nid, from, op)) in ops.iter_mut().enumerate().skip(start_idx) {
-            let t = Instant::now();
-            let mut out = Vec::new();
-            let mut ctx = OpCtx {
-                label: label_of(graph, *nid),
-                errors,
-                next_chunk_id: next_id,
-            };
-            for c in level {
-                out.extend(op.process(*from, c, &mut ctx));
-            }
-            level = out;
-            t_ops[i] += t.elapsed();
-        }
-        let t = Instant::now();
-        let mut ctx = OpCtx {
-            label: label_of(graph, shape.group_id),
-            errors,
-            next_chunk_id: next_id,
-        };
-        for c in level {
-            *rows += c.len as u64;
-            group.process(shape.group_id, c, &mut ctx);
-        }
-        *t_ops.last_mut().expect("group slot") += t.elapsed();
+    // Fused-mode state: present only when the graph-level gate passed AND the
+    // right side of the fused join was prebuilt.
+    let mut fu = FusedState {
+        sp: fused_sp.as_ref(),
+        ctx: fused_sp.as_ref().and_then(|sp| {
+            rights
+                .iter()
+                .find(|(id, _)| *id == sp.right_src)
+                .map(|(_, (r, t, rk))| (r.as_ref(), t.as_ref(), rk.as_slice()))
+        }),
+        plan: None,
+        off: fused_sp.is_none(),
+        scratch: FusedScratch::default(),
+        t_fused: std::time::Duration::ZERO,
     };
+    if fu.ctx.is_none() {
+        fu.off = true;
+    }
 
     let mut t_dec = std::time::Duration::ZERO;
     let mut t_rec = std::time::Duration::ZERO;
@@ -2769,7 +3260,9 @@ fn worker_read_partial_group(
             operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, cols, id);
         t_rec += t1.elapsed();
         let t2 = Instant::now();
-        feed(
+        worker_feed(
+            graph,
+            shape,
             &mut ops,
             0,
             vec![ch],
@@ -2778,6 +3271,7 @@ fn worker_read_partial_group(
             &mut next_id,
             &mut rows,
             &mut t_ops,
+            &mut fu,
         );
         t_feed += t2.elapsed();
     }
@@ -2792,7 +3286,9 @@ fn worker_read_partial_group(
             operators::reconcile_chunk(union, uschema, fname, &handle, uri, file_schema, cols, id);
         t_rec += t1.elapsed();
         let t2 = Instant::now();
-        feed(
+        worker_feed(
+            graph,
+            shape,
             &mut ops,
             0,
             vec![ch],
@@ -2801,6 +3297,7 @@ fn worker_read_partial_group(
             &mut next_id,
             &mut rows,
             &mut t_ops,
+            &mut fu,
         );
         t_feed += t2.elapsed();
     }
@@ -2813,11 +3310,13 @@ fn worker_read_partial_group(
             .map(|(l, d)| format!("{l}={}ms", d.as_millis()))
             .collect();
         eprintln!(
-            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms [{}]",
+            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms [{} fused={}ms{}]",
             t_dec.as_millis(),
             t_rec.as_millis(),
             t_feed.as_millis(),
-            per_op.join(" ")
+            per_op.join(" "),
+            fu.t_fused.as_millis(),
+            if fu.plan.is_some() { " (active)" } else { "" }
         );
     }
     // Drain: cascade each op's finish through the rest of the pipeline (a
@@ -2834,7 +3333,9 @@ fn worker_read_partial_group(
             op.finish(&mut ctx)
         };
         if !fin.is_empty() {
-            feed(
+            worker_feed(
+                graph,
+                shape,
                 &mut ops,
                 i + 1,
                 fin,
@@ -2843,6 +3344,7 @@ fn worker_read_partial_group(
                 &mut next_id,
                 &mut rows,
                 &mut t_ops,
+                &mut fu,
             );
         }
     }

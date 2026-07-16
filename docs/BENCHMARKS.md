@@ -2014,3 +2014,37 @@ zero on the narrow standard fixture, structural on wide schemas (the
 common real-ETL case). Kept: ~60 lines, composes with the Stage A fused
 loop, whose target (killing the gather entirely plus project/group
 materialization) is unchanged.
+
+### The fused worker row loop (design/41 Stage A-2, #239)
+
+For the detected `read → cast? → (⋈ broadcast) → filter? → project? → group`
+shape (one join; predicates = `Compare`/`And` over bare columns and
+literals; projections = bare columns, string literals, or
+`coalesce(<Str col>, "lit")`; bare group keys), the worker now runs ONE
+row loop from the join onward: reused-buffer join key → Fx table lookup →
+left-only predicate via the SHARED interpreter (`eval_predicate_acc`, zero
+semantics duplication) → composite group key encoded straight off the
+source lanes (`push_group_key_field`'s exact `\x00`/`\x01` form) →
+`GroupBy::observe_row` (the generic path's own scratch/`AggAcc`, exposed
+row-wise). **No chunk exists between the join and the group** — the probe
+gather, the projection rebuild, and the group's second key walk are gone.
+Anything outside the modeled set latches the worker back to the generic
+op chain (including the chunk that failed resolution — the fallback is
+never lossy).
+
+Measured (interleaved best-of, quiet box; all four formats `cmp`-identical
+to the pre-change binary, parallel AND serial, plus the 189-test stress
+suite with the R1/R2 guards — R1's parallel leg now exercises the fused
+loop against the generic serial oracle directly):
+
+| shape | before (A-1) | fused | DuckDB | ratio |
+|---|---|---|---|---|
+| CSV group 10M | 908–911 ms / 14 MB | **754–771 ms / 14 MB** | 808 ms / 236 MB | **0.93× — beaten** |
+| JSONL group 10M | 1905 ms | **1709 ms** | 1418 ms | 1.21× |
+
+Per-file worker profile: the fused segment runs in ~98 ms where the
+generic ops it replaces cost ~142 ms (probe 48 + filter 1 + project 28 +
+group 65). With this, **every 10M standard shape now beats DuckDB on
+wall** (ETL 0.96×, csv.gz 0.86×, jsonl.gz 0.90×, CSV group 0.93×) at
+1/16th–1/53rd of its memory; plain JSONL (1.21×) remains the one gap —
+the scanner SWAR lever, not pipeline structure.

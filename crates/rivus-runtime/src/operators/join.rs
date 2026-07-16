@@ -71,7 +71,7 @@ fn join_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> Option<String> {
 /// [`join_key_at`]'s string for the same row (a str part borrows the column
 /// directly; any other lane falls back to the same `Value::to_string` form), so
 /// the key — and therefore every match — is byte-for-byte unchanged.
-fn fill_join_key(chunk: &Chunk, idxs: &[usize], row: usize, buf: &mut String) -> bool {
+pub(crate) fn fill_join_key(chunk: &Chunk, idxs: &[usize], row: usize, buf: &mut String) -> bool {
     use std::fmt::Write;
     for (n, &ci) in idxs.iter().enumerate() {
         if chunk.columns[ci].is_null(row) {
