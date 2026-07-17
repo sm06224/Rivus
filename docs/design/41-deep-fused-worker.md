@@ -127,3 +127,50 @@ combined effect on the group standard: CSV 939 → ~600 ms class (vs DuckDB
 Ratification: stages A and B are engine-internal (no syntax, no IR change)
 and ride the standing perf mandate; stage C changes pass structure but not
 observable output — flagged to 統括/指揮 in #237 before landing regardless.
+
+## 5. Stage C refined（2026-07-18 の設計検証 — 実装前に固定）
+
+素朴な投機（sample 推論→投機 decode→矛盾で file 再走）は**汚れデータ標準で
+敗北する**: 矛盾ファイルの full スキーマが union を拡幅すると、他ファイルの
+投機 partial は「狭い union」前提で無効化され全体再走 — 標準 fixture は
+設計上汚れを含むため、常に「今日のコスト＋投機の無駄」になる。
+
+### 生き残る形: 局所再走の等価条件
+
+矛盾ファイル F だけを正準二パスで再走し、**他ファイルの投機 partial を保持**
+できる条件（C-eq）:
+
+union が列 c を W に拡幅したとき、非矛盾ファイルの partial が正準実行と
+byte-identical であるのは、c が次のいずれかを満たす場合に限る:
+
+1. **c は group キーとしてのみ消費**: キー符号化は Display 経由なので、
+   狭レーン直接（I64 の桁）と W 経由（Str の同桁文字列）は**同一バイト**。
+   key_parts も同様。
+2. **c は集約前に明示 cast で正規化**: 狭レーンに適合したセルに限り、
+   narrow-direct == widen-then-cast が成立（int 往復・f64 Display 往復の
+   正確性）。#239 第14弾の「押し下げ不可」と矛盾しない — あちらは全セル、
+   こちらは**狭レーン適合済みセルのみ**が対象なので切り捨てフォールバックの
+   差分が発生しない。
+3. 上記以外（cast 無しで集約に入る等）→ C-eq 不成立 → **全体を正準二パスへ
+   フォールバック**（正しさは常に保持、速度だけ今日並み）。
+
+### 検出器の完全性
+
+投機の妥当性 = 「sample スキーマで decode して非空 parse 失敗ゼロ」。
+証明: 無矛盾 ⇒ 全セルが sample レーンに適合 ⇒ full 推論も同型に解決
+（格子の上限一致）。**例外は Bool レーン**（`t=="true"` は失敗を発しない
+ため "maybe" を無音で偽に折る）— sample に Bool 列を含むファイルは投機
+不適格（二パスへ）。Str はレーン頂点なので常に安全。
+
+### 期待値（10M標準）
+
+sample 開 ~2ms/file×9 ＋ 投機 decode（今日の decode と同額）＋ 汚れ2ファイル
+の局所再走（~2×110ms CPU）で、open の全走査 210ms（CSV）/320ms（JSONL）
+wall がほぼ消える。C-eq は標準 flow（amount は cast:int 済み・キーは
+country/region/category）で成立する。
+
+### 実装順
+
+C-1: CSV group driver に C-eq 判定＋sample 開＋矛盾検出＋局所再走。
+C-2: sink driver・JSONL。C-3: 統括へ実測報告（本節が事前提示を兼ねる —
+統括の「最終段まで一気に」指示 2026-07-18 に基づき着手）。
