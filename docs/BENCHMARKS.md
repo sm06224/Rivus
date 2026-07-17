@@ -2088,3 +2088,27 @@ Measured (quiet box, same window): JSONL open phase 540 → **320 ms**
 0.93×, ETL 0.96×, csv.gz 0.86×, jsonl.gz 0.90×, **JSONL 0.97×** — at
 1/16th–1/53rd of its memory, under the never-silent dirty-data contract,
 all byte-identity-proven serial == parallel == chunk-size.
+
+### Negative result: sink-side fusion does not pay (#239, destroyed)
+
+A `FusedReadSink` (filter+project+emit as one row loop, mirroring the
+group-side fusion) was built, verified byte-identical, measured — and
+**destroyed**. Two findings, recorded so the next profiler doesn't rebuild
+it:
+
+1. Row-wise predicate evaluation loses to `FilterProject`'s **vectorized
+   kernel**: the first cut ran the shared interpreter per row and was
+   ~100 ms/run SLOWER than generic (fused segment 102–112 ms vs the
+   ops+emit 84 ms it replaced).
+2. With the kernel restored for predicates (fusing only the write), the
+   result is a statistical wash (1007–1041 vs 1000–1066 ms interleaved):
+   the eliminated gather is small (3 columns, ~half the rows), and writing
+   from the wide unfiltered chunk loses the cache locality that the
+   compact gathered chunk gave the emit loop.
+
+Rule of thumb this pins down: **fusion pays where it removes LARGE
+materializations** (the group side's full-width probe gather, projection
+rebuild, and per-row `Value`s) — not where the generic pipeline is already
+"vectorized filter + one compact gather". The ETL gap to Polars (~1010 vs
+583 ms eager) lives in decode (~80 ms/file vs the ~55 ms replica floor)
+and the pass-1 scan (Stage C territory), not in the sink pipeline.
