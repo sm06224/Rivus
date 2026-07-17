@@ -76,6 +76,13 @@ and `explain` (Observable First — never a silent engine swap).
 
 ## 2. Fusion stage B — transport windows (mmap, bounded)
 
+> **判定（2026-07-17・実測で不採用）**: 本節の設計どおり実装・計測した結果、
+> CSV group で **mmap が全 reclaim 設定（DONTNEED 無効含む）で ~8% 負け** —
+> 敗因は madvise ではなく soft page fault 経路そのもの（4KiB 粒度、cgroup 箱）
+> が 256KiB buffered copy（L2 常駐の再利用バッファ）より高いこと。Stage C で
+> 全経路が 1 パスになった今、ページ再利用が無く zero-copy の勝ち筋が消えた。
+> 詳細と再訪条件は BENCHMARKS.md「Negative result: mmap windows」。
+
 The reader still pays one kernel→user copy per byte per pass (fill_buf).
 A `MmapTransport` (behind the same `FileTransport` seam) hands the block
 walk **windows of a private read-only mapping** instead:

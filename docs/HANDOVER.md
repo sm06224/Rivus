@@ -75,12 +75,14 @@ R1/R2 並列 identity ガード（`tests/stress/parallel_read_identity.rs`）。
   不適格→正準）、JSONL は構文型なので lane_mismatches が完全検出器（Bool 例外なし）。
   group driver＋sink driver 両方、発動は strategy 接尾辞 "…, speculative open"。
   ガード: 単体 8 本＋R3/R3j/R3b/R4/R4b（矛盾あり/なし×byte-identity×bail×発動 assert）。
-- **Stage B: mmap 窓トランスポート（未着手・次のレバー）** — madvise(DONTNEED) で
-  RSS 予算維持が必須条件（8-16MB の memory story は brand）。依存は SUPPLY-CHAIN
-  チェックリストで決定。ETL の残差（Polars 583ms との差）は decode バイトコピーが主。
+- **Stage B: mmap 窓トランスポート（実装→計測→不採用・破壊済み 2026-07-17）** —
+  全 reclaim 設定（DONTNEED 無効含む）で CSV group ~8% 負け。敗因は soft page
+  fault 経路 > 256KiB buffered copy（cgroup 箱・1 パス化済みでページ再利用なし）。
+  再訪条件は BENCHMARKS の負の結果節。ETL の Polars 残差は decode の**計算**
+  （field split＋lane parse）であってカーネル→ユーザコピーではない。
 - 負の結果（BENCHMARKS 台帳）: sink 側融合は不採用・セル原語チューニング枯渇・
   StreamJsonlReader（read_line）を投機に転用すると open の勝ち分を decode で返上
-  （投機デコーダは正準と同じ block-walk であること）。
+  （投機デコーダは正準と同じ block-walk であること）・mmap 窓は上記。
 
 ## 4. 計測済みの知見（BENCHMARKS.md が台帳）
 
@@ -106,7 +108,8 @@ R1/R2 並列 identity ガード（`tests/stress/parallel_read_identity.rs`）。
 
 ## 6. 次のレバー候補（優先順）
 
-1. **design/41 Stage B**（mmap 窓 — ETL/decode の残差、Polars 583ms への道）
+1. **decode 計算の残差**（field split＋lane parse の SIMD/SWAR 深掘り — Polars
+   583ms への道はここ。mmap は不採用済みなので純粋に CPU 側）
 2. fused 対応集合の拡張（Or 述語・数値 coalesce・複数 join）
 3. 圧縮標準（csv.gz/jsonl.gz）の decode 側最適化（Stage C は非対象だった）
 4. Track C 残り: resample/gap-fill（#62 の agg 側）・rolling（#63）

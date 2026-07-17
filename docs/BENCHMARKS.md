@@ -2221,3 +2221,31 @@ record 0.96×). Peak RSS **9.7 MB**. Byte-identity: ETL
 parallel+serial, CSV/JSONL/gz group standards all `cmp`-identical.
 Polars' contract-violating eager 583 ms remains the open target — the
 gap is now decode-bound, Stage B (mmap windows) territory.
+
+### Negative result: mmap windows (Stage B) do not pay here (destroyed)
+
+design/41 Stage B was built end-to-end and measured — `MmapFile`
+(private read-only map, `MADV_SEQUENTIAL`, ≤256 KiB in-place `BufRead`
+windows, `MADV_DONTNEED` behind the cursor at a tunable stride) behind
+a `SeqReader` enum at the `FileTransport::open` seam, `libc` vetted
+per the SUPPLY-CHAIN checklist, full suite green, all three plain
+standards byte-identical. Destroyed on the numbers:
+
+- **CSV group (same-binary A/B via `RIVUS_NO_MMAP`, 5 interleaved
+  rounds)**: buf best 1141 ms vs mmap 1244–1345 ms (~+8%) at EVERY
+  reclaim stride — 1 MiB, 8 MiB, and **reclaim disabled entirely** —
+  so the loss is NOT `madvise` TLB shootdown; it is the soft
+  page-fault path itself (4 KiB granularity, containerized cgroup
+  box) costing more than the 256 KiB buffered copies into an
+  L2-resident reused buffer. JSONL group was a wash; ETL a ~5% win —
+  not enough to carry a new dependency, `unsafe`, and +2 MB peak RSS
+  (11.4 vs 9.4 MB).
+- Rule pinned: **for one-pass streaming decode, `read()` into a hot
+  reused buffer beats a faulting mapping** unless pages are reused
+  across passes (they are not — Stage C made every path one-pass) or
+  the copy itself dominates (it does not: decode compute does). Any
+  future mmap revisit must first show a fault-side win on THIS
+  environment (e.g. hugepage-backed maps), not assume zero-copy wins.
+
+The remaining ETL/decode residual vs Polars is compute in the block
+walk (field split + lane parse), not the kernel→user copy.
