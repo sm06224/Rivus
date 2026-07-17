@@ -2112,3 +2112,18 @@ rebuild, and per-row `Value`s) — not where the generic pipeline is already
 "vectorized filter + one compact gather". The ETL gap to Polars (~1010 vs
 583 ms eager) lives in decode (~80 ms/file vs the ~55 ms replica floor)
 and the pass-1 scan (Stage C territory), not in the sink pipeline.
+
+### Negative result: cell-primitive tuning is exhausted (#239, destroyed)
+
+Batch-lazy validity (a single `len` register while all-valid) plus
+raw-parse-first (skip `fast_trim` when the untrimmed parse succeeds — the
+all-digit case where trim is provably the identity) was built,
+byte-identical, and measured: decode ~80 → ~76 ms/file, **wall-neutral**
+(1015–1037 both sides, interleaved). The synthetic replica had attributed
+~20 ms/file to these primitives; the real delta is 3–4 ms — replica
+attribution at this granularity is confounded by branch-predictor and
+code-layout noise. Destroyed (complexity unpaid). Rungs S1–S3 of the
+small-to-large ladder are closed: the real decode floor is ~75 ms/file
+against the ~55 ms synthetic floor, with the gap spread thin across bounds
+checks and per-block setup. The remaining decode lever is structural —
+**S4: fusing pass 1 into the decode (design/41 Stage C)**.
