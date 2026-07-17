@@ -317,6 +317,57 @@ fn stage_c_speculative_group_serial_parallel_byte_identical() {
     }
 }
 
+/// R3j (Stage C, design/41 §5 C-2): the JSONL twin of R3 — plain JSONL group
+/// flows speculate too (lane mismatches ARE the contradiction signal, no Bool
+/// blind spot). File 01 carries a malformed line (in-stream bad counting) AND
+/// a string `amount` beyond the cs=7 sample window (contradiction → local
+/// canonical re-run, union widened I64→Str); file 02 lacks `amount` entirely.
+#[test]
+fn stage_c_speculative_jsonl_group_serial_parallel_byte_identical() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagecj");
+    let mut texts = r1_jsonl_texts();
+    // A late type surprise in file 01 (row index ~1200 of 2000, far past any
+    // 7-row sample): a STRING amount under an int-sampled lane.
+    texts[1].push_str(
+        "{\"order_id\":9000,\"region\":\"r1\",\"amount\":\"oops\",\"category\":\"c1\"}\n",
+    );
+    for (i, text) in texts.iter().enumerate() {
+        std::fs::write(dir.file(&format!("part_0{i}.jsonl")), text).unwrap();
+    }
+    let rp = gendata::write_temp("stagecj_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.jsonl\" read as jsonl cast amount :int ;\n\
+         J: S &left R on region\n\
+            |# country region sum:amount count:order_id ;",
+        rp.display(),
+        dir.0.display(),
+    );
+    for cs in [7usize, 4096] {
+        let (oracle, s_strat) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Low, cs);
+        assert!(!oracle.is_empty(), "oracle must have groups");
+        assert!(
+            s_strat.is_none_or(|s| !s.contains("parallel read group-by")),
+            "Low must stay serial"
+        );
+        let (par, p_strat) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Unbounded, cs);
+        assert_eq!(
+            p_strat.as_deref(),
+            Some("parallel read group-by (per-file workers, speculative open)"),
+            "Stage C must actually engage on JSONL (else this guard tests nothing)"
+        );
+        assert_eq!(par, oracle, "serial == parallel (in order) @cs={cs}");
+    }
+}
+
 /// R3b (Stage C, design/41 §5): a contradiction that widens a column between
 /// NUMERIC lanes (i64→f64 here, via a `1.5` beyond the sample window) is not
 /// Display-exact above 2^53, so the driver must bail to the serial canonical

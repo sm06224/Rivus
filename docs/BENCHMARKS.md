@@ -2160,3 +2160,35 @@ window 943 ms → **0.85×** (previous record 0.93×). Peak RSS **9.5 MB**
 standard re-runs **0 files** (arity dirt is not a contradiction — it is
 counted in-stream by `count_stream_bad`). Byte-identity: plain parallel,
 serial, csv.gz, jsonl, ETL all `cmp`-identical to pre-change references.
+
+### Stage C-2a — JSONL joins the speculative open (#239)
+
+Same driver, same C-eq gate — the JSONL branch of the sampled open. Two
+findings worth the record:
+
+1. **The first cut lost most of the win to decode speed.** Reusing
+   `StreamJsonlReader` (the compressed/net path's `read_line`-per-line
+   reader) for plain-file speculation made `open` 320→16 ms but pushed
+   the worker decode from the block walk to the line loop: wall only
+   1342→1284 ms. The speculative decoder must be **the same block-walk
+   chunker the canonical path uses** — `JsonlChunker::open_speculative`
+   (whole-file range, sample-inferred lanes) — or the open win is paid
+   back with interest in the stream.
+2. **JSONL needs no Bool exception.** JSON is syntax-typed: a stray
+   `"true"` (string) or `1` in a Bool-sampled lane is a counted
+   `lane_mismatches` contradiction (`ColBuilder::push` now reports the
+   foreign-lane fold; a JSON `null` and int→float stay legal). The CSV
+   blind spot simply does not exist here, so Bool-sampled JSONL files
+   may speculate. Nested/`>128`-key samples fall back to the canonical
+   two-pass (the general decode path does not count mismatches).
+
+Guards: 4 JSONL unit tests (detector completeness incl. malformed lines
+in and beyond the sample, late-float contradiction, Bool-lane string
+mismatch, nested fallback) + R3j integration (contradiction → 1-file
+local re-run at cs=7, zero at cs=4096, byte-identity + engagement).
+
+Measured (10M JSONL group standard, same-day interleave, best-of-3):
+open **320 → 13 ms**; wall 1381 → **1080 ms** (−300 ms, −22% vs the
+pre-change binary in the same window); DuckDB same window 1534 ms →
+**0.70×** (previous record 0.97×). Peak RSS **8.2 MB**. Byte-identity:
+JSONL parallel+serial, CSV, jsonl.gz, ETL all `cmp`-identical.

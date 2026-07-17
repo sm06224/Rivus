@@ -832,7 +832,7 @@ fn infer_global(path: &str) -> Result<(Vec<String>, Vec<JType>, usize), String> 
 }
 
 /// Build a [`Schema`] from inferred column names + types (nested detail carried).
-fn schema_from(names: &[String], jtypes: &[JType]) -> Schema {
+pub(crate) fn schema_from(names: &[String], jtypes: &[JType]) -> Schema {
     Schema::new(
         names
             .iter()
@@ -861,6 +861,71 @@ pub struct JsonlChunker {
     pos: u64,
     limit: Option<u64>,
     pub bad_rows: usize,
+    /// Count malformed lines DURING the stream (Stage C speculative open,
+    /// #239): the sampled open never ran pass 1, so the malformed-line total
+    /// must accrue here or the never-silent report would go missing. Canonical
+    /// opens leave this `false` (pass 1 already counted).
+    count_stream_bad: bool,
+    /// Stage C (#239): non-null values whose SYNTAX class fell outside their
+    /// lane (an int lane seeing a float/string/bool/nested, …) — each was
+    /// folded to null, so a nonzero count means the sampled schema contradicts
+    /// the file and a speculative run must be discarded. JSON is syntax-typed,
+    /// so this detector is complete with NO Bool exception (unlike CSV, where
+    /// `"maybe"` folds into a Bool lane without a parse failure): a stray
+    /// `"true"` string or `1` in a Bool lane is a counted mismatch here.
+    /// Canonical opens decode with the file's own full inference, so this
+    /// stays 0 there by construction.
+    pub lane_mismatches: u64,
+}
+
+/// A sampled flat-scalar schema: column names and their (all-`Scalar`) types.
+pub type SampledSchema = (Vec<String>, Vec<JType>);
+
+/// Stage C (#239): infer a schema from the first `n` objects of a plain JSONL
+/// file — the speculative substitute for `infer_global`'s whole-file pass.
+/// Returns `Ok(None)` when the sample is unusable for speculation (no valid
+/// object, a nested/list value, or more than 128 keys — the fused block walk
+/// is the only path that counts lane mismatches, and it is flat-only).
+pub fn sample_infer_flat(path: &str, n: usize) -> Result<Option<SampledSchema>, String> {
+    let mut reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let mut names: Vec<String> = Vec::new();
+    let mut infers: Vec<Infer> = Vec::new();
+    let mut started = false;
+    let mut seen = 0usize;
+    let mut l = String::new();
+    while seen < n.max(1) {
+        l.clear();
+        if reader.read_line(&mut l).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        let t = l.trim_end_matches(['\n', '\r']);
+        if t.trim().is_empty() {
+            continue;
+        }
+        if let Some(obj) = parse_object(t) {
+            if !started {
+                names = obj.iter().map(|(k, _)| k.clone()).collect();
+                infers = names.iter().map(|_| Infer::new()).collect();
+                started = true;
+            }
+            for (k, v) in &obj {
+                if let Some(i) = names.iter().position(|n| n == k) {
+                    infers[i].observe(v);
+                }
+            }
+            seen += 1;
+        }
+        // Malformed sample lines are NOT counted here: the speculative chunker
+        // re-decodes from byte 0 and counts every one exactly once in-stream.
+    }
+    if !started {
+        return Ok(None);
+    }
+    let jtypes: Vec<JType> = infers.iter().map(|f| f.resolve()).collect();
+    if names.len() > 128 || jtypes.iter().any(|t| !matches!(t, JType::Scalar(_))) {
+        return Ok(None);
+    }
+    Ok(Some((names, jtypes)))
 }
 
 impl JsonlChunker {
@@ -883,8 +948,38 @@ impl JsonlChunker {
                 pos: 0,
                 limit: None,
                 bad_rows,
+                count_stream_bad: false,
+                lane_mismatches: 0,
             },
         ))
+    }
+
+    /// Stage C (#239): open `path` for a **speculative** whole-file stream —
+    /// the caller sampled `names`/`jtypes` via [`sample_infer_flat`] (flat
+    /// all-scalar guaranteed) and skipped pass 1 entirely. Malformed lines
+    /// count in-stream; lane mismatches accrue as the contradiction signal.
+    pub fn open_speculative(
+        path: &str,
+        names: Vec<String>,
+        jtypes: Vec<JType>,
+        chunk_size: usize,
+    ) -> Result<JsonlChunker, String> {
+        let reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        Ok(JsonlChunker {
+            tmpl: RowTemplate::new(&names),
+            reader,
+            names,
+            jtypes,
+            chunk_size: chunk_size.max(1),
+            line: String::new(),
+            carry: Vec::new(),
+            eof: false,
+            pos: 0,
+            limit: None,
+            bad_rows: 0,
+            count_stream_bad: true,
+            lane_mismatches: 0,
+        })
     }
 
     /// Open `path` for streaming one newline-aligned byte range `[start, end)`
@@ -914,6 +1009,8 @@ impl JsonlChunker {
             pos: start,
             limit: Some(end),
             bad_rows: 0,
+            count_stream_bad: false,
+            lane_mismatches: 0,
         })
     }
 
@@ -964,9 +1061,11 @@ impl JsonlChunker {
                             let l = s.trim_end_matches(['\n', '\r']);
                             if !l.trim().is_empty() {
                                 let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-                                if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                                if !scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                                    self.bad_rows += usize::from(self.count_stream_bad);
+                                } else {
                                     for (b, v) in builders.iter_mut().zip(&scratch) {
-                                        b.push(v);
+                                        self.lane_mismatches += u64::from(b.push(v));
                                     }
                                     got += 1;
                                 }
@@ -1009,9 +1108,11 @@ impl JsonlChunker {
                                 if !l.trim().is_empty() {
                                     let mut scratch: Vec<ScVal> =
                                         Vec::with_capacity(self.names.len());
-                                    if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                                    if !scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                                        self.bad_rows += usize::from(self.count_stream_bad);
+                                    } else {
                                         for (b, v) in builders.iter_mut().zip(&scratch) {
-                                            b.push(v);
+                                            self.lane_mismatches += u64::from(b.push(v));
                                         }
                                         got += 1;
                                     }
@@ -1076,10 +1177,13 @@ impl JsonlChunker {
                     if l.trim().is_empty() {
                         continue;
                     }
-                    // Malformed lines are skipped (already counted in pass 1).
-                    if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                    // Malformed lines are skipped — counted in pass 1 for
+                    // canonical opens, in-stream for speculative ones (#239).
+                    if !scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                        self.bad_rows += usize::from(self.count_stream_bad);
+                    } else {
                         for (b, v) in builders.iter_mut().zip(&scratch) {
-                            b.push(v);
+                            self.lane_mismatches += u64::from(b.push(v));
                         }
                         got += 1;
                     }
@@ -1191,7 +1295,11 @@ impl crate::codec::Decoder for JsonlChunker {
 /// two-pass [`infer_global`], so the schema (incl. nested shape, §32 s3b) is
 /// inferred from a buffered sample of the first `chunk_size` objects, then the
 /// rest is streamed. Same trade-off as the compressed CSV path: a key/type that
-/// only appears (or widens) past the sample is missed (documented, §33).
+/// only appears (or widens) past the sample is missed (documented, §33). The
+/// Stage C speculative path (#239) closes exactly that hole for PLAIN files —
+/// via [`JsonlChunker::open_speculative`], which re-decodes from byte 0 with
+/// the block walk and counts `lane_mismatches`; this read_line-based stream
+/// stays what it is: the non-seekable transport's reader.
 #[cfg(any(feature = "net", feature = "gzip", feature = "zstd"))]
 pub struct StreamJsonlReader {
     /// Key-order template for the fused fast scan (see [`RowTemplate`]).
@@ -1936,73 +2044,105 @@ impl ColBuilder {
             ),
         }
     }
-    fn push(&mut self, v: &ScVal<'_>) {
+    /// Push one scanned value into the lane. Returns `true` when a NON-NULL
+    /// value's syntax class fell outside the lane and was folded to null — the
+    /// Stage C contradiction signal (#239). A `Null` is a legitimate null
+    /// (`false`); an int into a float lane is a legal coercion (`false`).
+    fn push(&mut self, v: &ScVal<'_>) -> bool {
         match self {
             // Mirrors `build_scalar`'s I64 arm: Int valid, anything else null.
             ColBuilder::I64(out, valid) => match v {
                 ScVal::I(i) => {
                     out.push(*i);
                     valid.push(true);
+                    false
+                }
+                ScVal::Null => {
+                    out.push(0);
+                    valid.push(false);
+                    false
                 }
                 _ => {
                     out.push(0);
                     valid.push(false);
+                    true
                 }
             },
             ColBuilder::F64(out, valid) => match v {
                 ScVal::I(i) => {
                     out.push(*i as f64);
                     valid.push(true);
+                    false
                 }
                 ScVal::F(f) => {
                     out.push(*f);
                     valid.push(true);
+                    false
+                }
+                ScVal::Null => {
+                    out.push(0.0);
+                    valid.push(false);
+                    false
                 }
                 _ => {
                     out.push(0.0);
                     valid.push(false);
+                    true
                 }
             },
             ColBuilder::Bool(out, valid) => match v {
                 ScVal::B(b) => {
                     out.push(*b);
                     valid.push(true);
+                    false
+                }
+                ScVal::Null => {
+                    out.push(false);
+                    valid.push(false);
+                    false
                 }
                 _ => {
                     out.push(false);
                     valid.push(false);
+                    true
                 }
             },
-            ColBuilder::Str(out, valid) => match v {
-                ScVal::Null => {
-                    out.push("");
-                    valid.push(false);
+            // Str is the lattice top: everything folds in losslessly enough
+            // for inference to agree (sample Str ⇒ full Str) — never a
+            // contradiction.
+            ColBuilder::Str(out, valid) => {
+                match v {
+                    ScVal::Null => {
+                        out.push("");
+                        valid.push(false);
+                    }
+                    ScVal::B(b) => {
+                        out.push(if *b { "true" } else { "false" });
+                        valid.push(true);
+                    }
+                    ScVal::I(i) => {
+                        out.push(&i.to_string());
+                        valid.push(true);
+                    }
+                    ScVal::F(f) => {
+                        out.push(&f.to_string());
+                        valid.push(true);
+                    }
+                    ScVal::S(x) => {
+                        out.push(x);
+                        valid.push(true);
+                    }
+                    ScVal::SOwned(x) => {
+                        out.push(x);
+                        valid.push(true);
+                    }
+                    ScVal::NestedJson(t) => {
+                        out.push(t);
+                        valid.push(true);
+                    }
                 }
-                ScVal::B(b) => {
-                    out.push(if *b { "true" } else { "false" });
-                    valid.push(true);
-                }
-                ScVal::I(i) => {
-                    out.push(&i.to_string());
-                    valid.push(true);
-                }
-                ScVal::F(f) => {
-                    out.push(&f.to_string());
-                    valid.push(true);
-                }
-                ScVal::S(x) => {
-                    out.push(x);
-                    valid.push(true);
-                }
-                ScVal::SOwned(x) => {
-                    out.push(x);
-                    valid.push(true);
-                }
-                ScVal::NestedJson(t) => {
-                    out.push(t);
-                    valid.push(true);
-                }
-            },
+                false
+            }
         }
     }
     fn finish(self) -> Column {
