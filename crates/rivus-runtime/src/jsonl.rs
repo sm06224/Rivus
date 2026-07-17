@@ -819,6 +819,8 @@ pub struct JsonlChunker {
     reader: BufReader<File>,
     names: Vec<String>,
     jtypes: Vec<JType>,
+    /// Key-order template for the fused fast scan (see [`RowTemplate`]).
+    tmpl: RowTemplate,
     chunk_size: usize,
     line: String,
     /// Partial-line carry for the fused block-based reader (raw bytes — a
@@ -839,6 +841,7 @@ impl JsonlChunker {
         Ok((
             schema,
             JsonlChunker {
+                tmpl: RowTemplate::new(&names),
                 reader,
                 names,
                 jtypes,
@@ -869,6 +872,7 @@ impl JsonlChunker {
             .seek(SeekFrom::Start(start))
             .map_err(|e| e.to_string())?;
         Ok(JsonlChunker {
+            tmpl: RowTemplate::new(&names),
             reader,
             names,
             jtypes,
@@ -929,7 +933,7 @@ impl JsonlChunker {
                             let l = s.trim_end_matches(['\n', '\r']);
                             if !l.trim().is_empty() {
                                 let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-                                if scan_row(l, &self.names, &mut scratch) {
+                                if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
                                     for (b, v) in builders.iter_mut().zip(&scratch) {
                                         b.push(v);
                                     }
@@ -974,7 +978,7 @@ impl JsonlChunker {
                                 if !l.trim().is_empty() {
                                     let mut scratch: Vec<ScVal> =
                                         Vec::with_capacity(self.names.len());
-                                    if scan_row(l, &self.names, &mut scratch) {
+                                    if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
                                         for (b, v) in builders.iter_mut().zip(&scratch) {
                                             b.push(v);
                                         }
@@ -1042,7 +1046,7 @@ impl JsonlChunker {
                         continue;
                     }
                     // Malformed lines are skipped (already counted in pass 1).
-                    if scan_row(l, &self.names, &mut scratch) {
+                    if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
                         for (b, v) in builders.iter_mut().zip(&scratch) {
                             b.push(v);
                         }
@@ -1159,6 +1163,8 @@ impl crate::codec::Decoder for JsonlChunker {
 /// only appears (or widens) past the sample is missed (documented, §33).
 #[cfg(any(feature = "net", feature = "gzip", feature = "zstd"))]
 pub struct StreamJsonlReader {
+    /// Key-order template for the fused fast scan (see [`RowTemplate`]).
+    tmpl: RowTemplate,
     reader: Box<dyn BufRead + Send>,
     names: Vec<String>,
     jtypes: Vec<JType>,
@@ -1218,6 +1224,7 @@ impl StreamJsonlReader {
         Ok((
             schema,
             StreamJsonlReader {
+                tmpl: RowTemplate::new(&names),
                 reader,
                 names,
                 jtypes,
@@ -1254,7 +1261,7 @@ impl StreamJsonlReader {
             let line = std::mem::take(&mut self.pending[self.pending_pos]);
             self.pending_pos += 1;
             let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-            if scan_row(&line, &self.names, &mut scratch) {
+            if scan_row_fast(&line, &self.tmpl, &self.names, &mut scratch) {
                 for (b, v) in builders.iter_mut().zip(&scratch) {
                     b.push(v);
                 }
@@ -1279,7 +1286,7 @@ impl StreamJsonlReader {
                 continue;
             }
             let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-            if scan_row(l, &self.names, &mut scratch) {
+            if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
                 for (b, v) in builders.iter_mut().zip(&scratch) {
                     b.push(v);
                 }
@@ -1956,6 +1963,57 @@ impl ColBuilder {
 /// Scan one line into the reused row `scratch` (one slot per column,
 /// first-occurrence-wins, missing → Null). `false` = malformed line (same
 /// acceptance as `parse_object`); nothing is committed for it.
+/// A literal key-segment template for the overwhelmingly common line shape:
+/// keys in exact schema order with no interior whitespace —
+/// `{"k0":<v>,"k1":<v>,…}`. One `memcmp` per key replaces the generic
+/// key-scan + name-position lookup. ANY deviation (reordered/missing/extra
+/// keys, whitespace, an escaped key, a scan failure, trailing bytes) falls
+/// back to [`scan_row`] for that line, so the accepted language — and every
+/// scanned value (`scan_cell` is shared) — is exactly the generic scanner's.
+pub(crate) struct RowTemplate {
+    segs: Vec<Vec<u8>>,
+}
+
+impl RowTemplate {
+    pub(crate) fn new(names: &[String]) -> Self {
+        let mut segs = Vec::with_capacity(names.len());
+        for (k, n) in names.iter().enumerate() {
+            let mut seg = Vec::with_capacity(n.len() + 4);
+            seg.extend_from_slice(if k == 0 { b"{\"" } else { b",\"" });
+            seg.extend_from_slice(n.as_bytes());
+            seg.extend_from_slice(b"\":");
+            segs.push(seg);
+        }
+        RowTemplate { segs }
+    }
+}
+
+/// [`scan_row`] with the template fast path (see [`RowTemplate`]).
+fn scan_row_fast<'a>(
+    line: &'a str,
+    tmpl: &RowTemplate,
+    names: &[String],
+    scratch: &mut Vec<ScVal<'a>>,
+) -> bool {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    scratch.clear();
+    for seg in &tmpl.segs {
+        if b.len() < i + seg.len() || &b[i..i + seg.len()] != seg.as_slice() {
+            return scan_row(line, names, scratch);
+        }
+        i += seg.len();
+        let Some(v) = scan_cell(b, &mut i) else {
+            return scan_row(line, names, scratch);
+        };
+        scratch.push(v);
+    }
+    if i + 1 == b.len() && b[i] == b'}' && !tmpl.segs.is_empty() {
+        return true;
+    }
+    scan_row(line, names, scratch)
+}
+
 fn scan_row<'a>(line: &'a str, names: &[String], scratch: &mut Vec<ScVal<'a>>) -> bool {
     let b = line.as_bytes();
     let mut i = 0usize;
