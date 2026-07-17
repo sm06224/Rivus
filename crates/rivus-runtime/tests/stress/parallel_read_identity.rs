@@ -521,11 +521,149 @@ fn parallel_sink_join_emits_left_row_order_without_sort() {
     let (parallel, p_strat) = run_once(rivus_runtime::MemoryPref::Unbounded);
     assert_eq!(
         p_strat.as_deref(),
-        Some("parallel read sink (per-file segments)"),
+        // Plain-CSV fixtures are Stage C sink-eligible (no preds, bare join
+        // keys), so the driver engages WITH the speculative open (C-2b).
+        Some("parallel read sink (per-file segments, speculative open)"),
         "the parallel sink driver must actually engage (else this guard tests nothing)"
     );
     assert_eq!(
         parallel, expected,
         "parallel sink must be byte-identical, in left-row order, without sort"
     );
+}
+
+/// R4 (Stage C, design/41 §5 C-2b): the SINK driver speculates too. File 01
+/// contradicts beyond the cs=7 sample (`notanumber` in an int-sampled
+/// `amount`) → its segment re-writes canonically under the widened union while
+/// every other segment's bytes are kept (written cells are Display-safe under
+/// →Str widening — `write_cell`'s numeric lanes are `Display` by
+/// construction). The whole output file must equal the serial oracle's bytes.
+#[test]
+fn stage_c_speculative_sink_serial_parallel_byte_identical() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagec_sink");
+    for (i, text) in r1_csv_texts().iter().enumerate() {
+        std::fs::write(dir.file(&format!("part_0{i}.csv")), text).unwrap();
+    }
+    let rp = gendata::write_temp("stagec_sink_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let out = dir.file("etl_out.csv");
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.csv\" read as csv cast amount :int\n\
+            |? amount > 100\n\
+            |> order_id region amount ;\n\
+         J: S &left R on region save {} ;",
+        rp.display(),
+        dir.0.display(),
+        out.display()
+    );
+    let run_once = |pref: rivus_runtime::MemoryPref| -> (String, Option<String>) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 7,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let bytes = std::fs::read_to_string(&out).expect("sink file");
+        let _ = std::fs::remove_file(&out);
+        (bytes, res.strategy)
+    };
+    let (serial, s_strat) = run_once(rivus_runtime::MemoryPref::Low);
+    assert!(
+        s_strat.is_none_or(|s| !s.contains("parallel read sink")),
+        "Low must stay serial"
+    );
+    assert!(!serial.is_empty(), "oracle must have rows");
+    let (parallel, p_strat) = run_once(rivus_runtime::MemoryPref::Unbounded);
+    assert_eq!(
+        p_strat.as_deref(),
+        Some("parallel read sink (per-file segments, speculative open)"),
+        "Stage C must actually engage on the sink driver"
+    );
+    assert_eq!(
+        parallel, serial,
+        "sink bytes must survive the contradiction → segment re-write"
+    );
+}
+
+/// R4b: a numeric (i64→f64) widening contradiction on the sink driver must
+/// drop the temp segments and bail to the serial canonical path — and the
+/// output file still equals the oracle.
+#[test]
+fn stage_c_sink_numeric_widening_bails_to_serial() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagec_sinkf64");
+    let mut f0 = String::from("order_id,region,amount\n");
+    for i in 0..500 {
+        f0.push_str(&format!("{i},r{},{}\n", i % 3, i * 3 % 100));
+    }
+    let mut f1 = String::from("order_id,region,amount\n");
+    for i in 500..1000 {
+        f1.push_str(&format!("{i},r{},{}\n", i % 3, i * 3 % 100));
+    }
+    f1.push_str("1000,r1,1.5\n"); // beyond the 7-row sample: i64 → f64 widening
+    std::fs::write(dir.file("part_00.csv"), &f0).unwrap();
+    std::fs::write(dir.file("part_01.csv"), &f1).unwrap();
+    let rp = gendata::write_temp("stagec_sinkf64_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let out = dir.file("out.csv");
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.csv\" read as csv cast amount :float ;\n\
+         J: S &left R on region save {} ;",
+        rp.display(),
+        dir.0.display(),
+        out.display()
+    );
+    let run_once = |pref: rivus_runtime::MemoryPref| -> (String, Option<String>) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 7,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let bytes = std::fs::read_to_string(&out).expect("sink file");
+        let _ = std::fs::remove_file(&out);
+        (bytes, res.strategy)
+    };
+    let (serial, _) = run_once(rivus_runtime::MemoryPref::Low);
+    let (parallel, p_strat) = run_once(rivus_runtime::MemoryPref::Unbounded);
+    assert!(
+        p_strat
+            .as_deref()
+            .is_none_or(|s| !s.contains("parallel read sink")),
+        "numeric widening must abandon the parallel sink driver (got {p_strat:?})"
+    );
+    assert_eq!(
+        parallel, serial,
+        "the serial fallback must match the oracle"
+    );
+    // No stray temp segments may survive the bail.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains("rivus-part"))
+        .collect();
+    assert!(leftovers.is_empty(), "bail must clean its temp segments");
 }

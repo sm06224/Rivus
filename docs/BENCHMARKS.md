@@ -2192,3 +2192,32 @@ open **320 → 13 ms**; wall 1381 → **1080 ms** (−300 ms, −22% vs the
 pre-change binary in the same window); DuckDB same window 1534 ms →
 **0.70×** (previous record 0.97×). Peak RSS **8.2 MB**. Byte-identity:
 JSONL parallel+serial, CSV, jsonl.gz, ETL all `cmp`-identical.
+
+### Stage C-2b — the sink driver speculates (#239)
+
+The read→sink driver gets its own C-eq gate, `stage_c_sink_eligible`:
+the consumption classes shift because every surviving cell is WRITTEN.
+The proof leans on an already-pinned property: `write_cell`'s numeric/
+bool lanes are byte-identical to `Display` by construction
+(`rivus_core::numfmt`), which is exactly what `reconcile_chunk`'s
+widen-to-Str produces — and digit strings never trigger CSV quoting —
+so written cells are Display-safe under a →Str widening, like group
+keys. Predicates must be cast-normalized (i64/f64/str, cast before
+use); computed projections must be Display-safe cells or expressions
+over cast-normalized columns; join keys bare. A contradicted file
+re-writes its OWN temp segment canonically under the recomputed union′
+(kept segments' bytes stay valid); a numeric widening deletes the
+segments and bails to serial.
+
+Guards: R4 (contradiction → segment re-write, whole-file bytes ==
+serial oracle), R4b (numeric-widening bail + no leftover temp
+segments), R2 updated (plain-CSV sink fixtures now engage the
+speculative strategy string).
+
+Measured (10M ETL standard `read→cast→filter→project→join→save`,
+same-day interleave, best-of-3): wall 1059 → **914 ms** (−14% vs the
+pre-change binary); DuckDB same window 1459 ms → **0.63×** (previous
+record 0.96×). Peak RSS **9.7 MB**. Byte-identity: ETL
+parallel+serial, CSV/JSONL/gz group standards all `cmp`-identical.
+Polars' contract-violating eager 583 ms remains the open target — the
+gap is now decode-bound, Stage B (mmap windows) territory.

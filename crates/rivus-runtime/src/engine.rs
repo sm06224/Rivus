@@ -1358,8 +1358,11 @@ fn pre_group_op_allowed(op: &Op) -> bool {
 /// file then re-runs canonically; always `false` on canonical decoders).
 type PartialGroup = (operators::GroupBy, Vec<ErrorEvent>, u64, bool);
 
-/// One read→sink segment worker's result: errors, rows written, header line.
-type SegmentResult = (Vec<ErrorEvent>, u64, Option<String>);
+/// One read→sink segment worker's result: errors, rows written, header line,
+/// and whether a Stage C speculative stream contradicted its sampled schema
+/// (the file's segment is then re-written canonically; `false` on canonical
+/// decoders).
+type SegmentResult = (Vec<ErrorEvent>, u64, Option<String>, bool);
 
 /// A broadcast join's prebuilt right side: concatenated chunk, hash table,
 /// and right-key column indices — built once, shared by every worker.
@@ -2065,7 +2068,7 @@ fn worker_read_to_segment(
     read_label: &str,
     seg: &str,
     delim: u8,
-) -> (Vec<ErrorEvent>, u64, Option<String>) {
+) -> SegmentResult {
     use std::io::Write as _;
     let mut errors = Vec::new();
     let mut next_id = 0u64;
@@ -2123,7 +2126,7 @@ fn worker_read_to_segment(
                 )
                 .at_node(read_label.to_string()),
             );
-            return (errors, 0, None);
+            return (errors, 0, None, false);
         }
     };
     let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
@@ -2242,7 +2245,7 @@ fn worker_read_to_segment(
             .at_node(read_label.to_string()),
         );
     }
-    (errors, rows, header)
+    (errors, rows, header, dec.spec_contradicted())
 }
 
 fn try_parallel_read_sink(
@@ -2333,6 +2336,10 @@ fn try_parallel_read_sink(
     if pre_errors.iter().any(ErrorEvent::is_fatal) {
         return None;
     }
+    // Stage C (design/41 §5, C-2b): speculative sample-schema opens are sound
+    // for this sink flow — a contradicted file's segment re-writes canonically
+    // after the worker wave.
+    let speculate = stage_c_sink_eligible(graph, shape);
     let planner = operators::Read::new(fmt, provenance, opts.chunk_size);
     let mut opened: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
     let mut quarantined: Vec<ErrorEvent> = Vec::new();
@@ -2348,7 +2355,15 @@ fn try_parallel_read_sink(
             let wave_results: Vec<_> = std::thread::scope(|s| {
                 let handles: Vec<_> = wave
                     .iter()
-                    .map(|uri| s.spawn(move || planner.open_file_stream(uri)))
+                    .map(|uri| {
+                        s.spawn(move || {
+                            if speculate {
+                                planner.open_file_stream_sampled(uri)
+                            } else {
+                                planner.open_file_stream(uri)
+                            }
+                        })
+                    })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
@@ -2373,6 +2388,16 @@ fn try_parallel_read_sink(
     if opened.is_empty() {
         return None;
     }
+    let spec_files = opened.iter().filter(|(_, _, d)| d.is_speculative()).count();
+    // Stage C bookkeeping for the segment re-write, index-aligned with results.
+    let (opened_uris, mut opened_schemas): (Vec<String>, Vec<rivus_core::Schema>) = if speculate {
+        opened
+            .iter()
+            .map(|(u, s, _)| (u.clone(), s.clone()))
+            .unzip()
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let (union, fname) = operators::union_by_name(opened.iter().map(|(_, s, _)| s), provenance);
     let uschema = std::sync::Arc::new(rivus_core::Schema::new(union.clone()));
 
@@ -2435,6 +2460,110 @@ fn try_parallel_read_sink(
         }
     }
 
+    // Stage C segment re-write (design/41 §5, C-2b): every speculatively-
+    // opened file whose stream contradicted its sampled schema re-runs through
+    // the canonical two-pass open against a recomputed union′, overwriting its
+    // OWN temp segment; every kept segment's bytes are valid by the
+    // `stage_c_sink_eligible` gate (written cells are Display-safe under →Str
+    // widening). A numeric widening is not Display-exact → drop the segments
+    // and bail to the serial canonical path.
+    let mut worker_results: Vec<SegmentResult> = worker_results
+        .into_iter()
+        .map(|r| r.expect("worker ran"))
+        .collect();
+    if speculate && worker_results.iter().any(|r| r.3) {
+        let redo: Vec<usize> = worker_results
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.3)
+            .map(|(i, _)| i)
+            .collect();
+        let mut reopened: Vec<(usize, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
+        for &i in &redo {
+            match planner.open_file_stream(&opened_uris[i]) {
+                Ok((schema, dec)) => {
+                    opened_schemas[i] = schema.clone();
+                    reopened.push((i, schema, dec));
+                }
+                Err(e) => {
+                    // The file vanished between passes: quarantine it, drop
+                    // its result, and blank its segment (a canonical run of a
+                    // vanished file contributes no rows).
+                    let _ = std::fs::remove_file(seg_path(i));
+                    worker_results[i] = (
+                        vec![ErrorEvent::new(
+                            Severity::Recoverable,
+                            ErrorScope::Item,
+                            format!("read: skipped '{}': {e}", opened_uris[i]),
+                        )
+                        .at_node(read_label.clone())],
+                        0,
+                        None,
+                        false,
+                    );
+                }
+            }
+        }
+        let (union2, _) = operators::union_by_name(opened_schemas.iter(), provenance);
+        let widen_safe = union.len() == union2.len()
+            && union.iter().zip(&union2).all(|(a, b)| {
+                a.name == b.name && (a.dtype == b.dtype || b.dtype == rivus_core::DataType::Str)
+            });
+        if !widen_safe {
+            for i in 0..worker_results.len() {
+                let _ = std::fs::remove_file(seg_path(i));
+            }
+            return None; // serial canonical path; correctness over speed
+        }
+        let uschema2 = std::sync::Arc::new(rivus_core::Schema::new(union2.clone()));
+        let mut it = reopened.into_iter();
+        loop {
+            let wave: Vec<_> = it.by_ref().take(threads).collect();
+            if wave.is_empty() {
+                break;
+            }
+            let results: Vec<(usize, SegmentResult)> = std::thread::scope(|s| {
+                let union2 = &union2;
+                let uschema2 = &uschema2;
+                let fname = fname.as_deref();
+                let rights = &rights;
+                let read_label = read_label.as_str();
+                let uris = &opened_uris;
+                let seg_path = &seg_path;
+                let handles: Vec<_> = wave
+                    .into_iter()
+                    .map(|(idx, schema, dec)| {
+                        s.spawn(move || {
+                            (
+                                idx,
+                                worker_read_to_segment(
+                                    graph,
+                                    opts,
+                                    shape,
+                                    &uris[idx],
+                                    &schema,
+                                    dec,
+                                    union2,
+                                    uschema2,
+                                    fname,
+                                    provenance,
+                                    rights,
+                                    read_label,
+                                    &seg_path(idx),
+                                    delim,
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (idx, r) in results {
+                worker_results[idx] = r;
+            }
+        }
+    }
+
     // Finalize: header + segments in uri order → the target (byte-identical to
     // the serial writer: same formatter, same row order).
     let mut errors = pre_errors;
@@ -2442,8 +2571,7 @@ fn try_parallel_read_sink(
     let mut total_rows = 0u64;
     let mut header: Option<String> = None;
     let nseg = worker_results.len();
-    for r in worker_results.into_iter() {
-        let (errs, rows, hdr) = r.expect("worker ran");
+    for (errs, rows, hdr, _) in worker_results.into_iter() {
         errors.extend(errs);
         total_rows += rows;
         if header.is_none() {
@@ -2511,7 +2639,12 @@ fn try_parallel_read_sink(
         inference: Vec::new(),
         strategy: None,
     };
-    res.strategy = Some("parallel read sink (per-file segments)".to_string());
+    res.strategy = Some(if spec_files > 0 {
+        // Stage C engaged for at least one file (design/41 §5, C-2b).
+        "parallel read sink (per-file segments, speculative open)".to_string()
+    } else {
+        "parallel read sink (per-file segments)".to_string()
+    });
     if let Some(h) = hook.as_mut() {
         h(&final_snapshot(&res, shape.discovery_id, t0.elapsed()));
     }
@@ -3001,6 +3134,125 @@ fn stage_c_eligible(graph: &PlanGraph, shape: &ReadGroupShape, sp: &FusedShapePl
             Some(true) => {}
             Some(false) if matches!(func, rivus_ir::AggFunc::Count) => {}
             _ => return false,
+        }
+    }
+    true
+}
+
+/// Stage C static gate for the SINK driver (design/41 §5, C-2b). The
+/// consumption classes shift versus the group gate: every surviving cell is
+/// written through `write_cell`, whose numeric/bool lanes are byte-identical
+/// to `Display` by construction (`rivus_core::numfmt`) — exactly the bytes
+/// `reconcile_chunk`'s widen-to-Str produces (and digit strings never trigger
+/// CSV quoting) — so WRITTEN cells are Display-safe under a →Str widening,
+/// like group keys. That leaves:
+/// - predicates: columns cast-normalized (i64/f64/str, cast before use);
+/// - computed projections: Display-safe cells (bare field / literal /
+///   `coalesce(col, "lit")`) or expressions reading cast-normalized columns
+///   only (identical inputs ⇒ identical outputs);
+/// - join keys: bare fields (the probe encodes via `Display`);
+/// - anything else (renames, fills, expr-level casts, non-scalar cast
+///   targets) → not eligible → canonical opens.
+///
+/// Numeric (non-Str) widening still bails at re-run time, same as the group
+/// driver.
+fn stage_c_sink_eligible(graph: &PlanGraph, shape: &ReadGroupShape) -> bool {
+    use rivus_core::DataType as DT;
+    use rivus_ir::Expr as E;
+    /// Columns `e` reads, with `false` for shapes outside the modeled set.
+    /// `E::Cast` is excluded on purpose: a temporal target parses raw cells,
+    /// and proving the scalar targets here buys nothing the op-level cast
+    /// (which the standard flows use) doesn't already cover.
+    fn cols_ok<'a>(e: &'a E, out: &mut Vec<&'a str>) -> bool {
+        match e {
+            E::Field { name, access } => {
+                if access.is_column() {
+                    out.push(name.as_str());
+                    true
+                } else {
+                    false
+                }
+            }
+            E::Literal(_) | E::Hole(_) => true,
+            E::Compare { left, right, .. } | E::Arith { left, right, .. } => {
+                cols_ok(left, out) && cols_ok(right, out)
+            }
+            E::And(a, b) | E::Or(a, b) => cols_ok(a, out) && cols_ok(b, out),
+            E::Func { args, .. } => args.iter().all(|a| cols_ok(a, out)),
+            E::Case { branches, default } => {
+                branches
+                    .iter()
+                    .all(|(c, v)| cols_ok(c, out) && cols_ok(v, out))
+                    && default.as_deref().is_none_or(|d| cols_ok(d, out))
+            }
+            _ => false,
+        }
+    }
+    /// A projection cell that is Display/null-safe regardless of casts.
+    fn cell_display_safe(e: &E) -> bool {
+        match e {
+            E::Field { access, .. } => access.is_column(),
+            E::Literal(_) => true,
+            E::Func {
+                func: rivus_ir::Func::Coalesce,
+                args,
+            } if args.len() == 2 => {
+                matches!(&args[0], E::Field { access, .. } if access.is_column())
+                    && matches!(&args[1], E::Literal(rivus_core::Value::Str(_)))
+            }
+            _ => false,
+        }
+    }
+    let mut casted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let preds_ok = |preds: &[&E], casted: &std::collections::HashSet<&str>| -> bool {
+        preds.iter().all(|p| {
+            let mut cols = Vec::new();
+            cols_ok(p, &mut cols) && cols.iter().all(|c| casted.contains(c))
+        })
+    };
+    for step in &shape.path {
+        match step {
+            ReadPathStep::Broadcast { join_id, .. } => {
+                let Op::Join { left_keys, .. } = &graph.nodes[*join_id].op else {
+                    return false;
+                };
+                if left_keys.iter().any(|k| !k.segs.is_empty()) {
+                    return false;
+                }
+            }
+            ReadPathStep::Stateless(nid) => match &graph.nodes[*nid].op {
+                Op::Cast { casts } => {
+                    for (name, dt) in casts {
+                        if !matches!(dt, DT::I64 | DT::F64 | DT::Str) {
+                            return false;
+                        }
+                        casted.insert(name.as_str());
+                    }
+                }
+                Op::Filter { pred } => {
+                    if !preds_ok(&[pred], &casted) {
+                        return false;
+                    }
+                }
+                Op::FilterProject { preds, .. } => {
+                    if !preds_ok(&preds.iter().collect::<Vec<_>>(), &casted) {
+                        return false;
+                    }
+                }
+                Op::Project { .. } | Op::Drop { .. } | Op::Reorder { .. } | Op::DropNa { .. } => {}
+                Op::ProjectExpr { items, .. } => {
+                    for (e, _) in items {
+                        if cell_display_safe(e) {
+                            continue;
+                        }
+                        let mut cols = Vec::new();
+                        if !cols_ok(e, &mut cols) || cols.iter().any(|c| !casted.contains(c)) {
+                            return false;
+                        }
+                    }
+                }
+                _ => return false,
+            },
         }
     }
     true
