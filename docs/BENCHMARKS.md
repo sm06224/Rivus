@@ -2048,3 +2048,22 @@ group 65). With this, **every 10M standard shape now beats DuckDB on
 wall** (ETL 0.96×, csv.gz 0.86×, jsonl.gz 0.90×, CSV group 0.93×) at
 1/16th–1/53rd of its memory; plain JSONL (1.21×) remains the one gap —
 the scanner SWAR lever, not pipeline structure.
+
+### JSONL row-template scan (#239)
+
+The overwhelming majority of JSONL lines carry their keys in exact schema
+order with no interior whitespace. `RowTemplate` precomputes the expected
+key fragments (`{"k0":`, `,"k1":`, …) and matches them with one `memcmp`
+each — the generic key-scan and name-position lookup vanish; values still
+go through the shared `scan_cell`. ANY deviation (reordered/missing/extra
+keys, whitespace, escaped keys, a failed value scan, trailing bytes) falls
+back to `scan_row` for that line, so the accepted language and every
+produced value are exactly the generic scanner's. Wired into both the
+plain (`JsonlChunker`) and compressed (`StreamJsonlReader`) fused paths.
+
+Measured (same-window interleaved, 3 rounds, loaded box — ratios are
+window-internal): JSONL group 2526–2582 → **2214–2277 ms** (−12%);
+DuckDB in the same window 1928 ms, so 1.31× → **1.15×**. JSONL × parallel/
+serial and jsonl.gz all `cmp`-identical to the pre-change binary. The
+remaining gap is the value scan + per-row commit — and the open phase's
+second full scan (the infer-side template is the natural next increment).
