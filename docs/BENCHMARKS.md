@@ -2067,3 +2067,24 @@ DuckDB in the same window 1928 ms, so 1.31× → **1.15×**. JSONL × parallel/
 serial and jsonl.gz all `cmp`-identical to the pre-change binary. The
 remaining gap is the value scan + per-row commit — and the open phase's
 second full scan (the infer-side template is the natural next increment).
+
+### JSONL infer-side template — the full sweep completes (#239)
+
+The same `RowTemplate` now drives pass 1: `infer_range` builds the
+template lazily from the range's first valid object (`map[k]` = the `seen`
+index of template key `k`, so a range that started on a deviant line stays
+correct) and matching lines skip the generic key scan. The mid-line
+fallback re-observes the already-observed prefix — exactly equivalent
+because `Infer` is a monotone class lattice (re-observing an identical
+value is a state no-op). Both properties are pinned by new unit tests:
+`infer_template_matches_generic` (template vs generic over every deviation
+class, at every corpus rotation) and `infer_double_observe_is_idempotent`.
+
+Measured (quiet box, same window): JSONL open phase 540 → **320 ms**
+(−40%); JSONL group 1682–1688 → **1452–1475 ms**; DuckDB same-window
+**1516 ms** → **0.97× — beaten**. JSONL × parallel/serial `cmp`-identical.
+
+**With this, every 10M-standard shape beats DuckDB on wall**: CSV group
+0.93×, ETL 0.96×, csv.gz 0.86×, jsonl.gz 0.90×, **JSONL 0.97×** — at
+1/16th–1/53rd of its memory, under the never-silent dirty-data contract,
+all byte-identity-proven serial == parallel == chunk-size.

@@ -655,12 +655,43 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
     // Allocation-free scan (pass 1): observes classes directly into `seen`
     // without building a `JVal` — pinned byte-identical to the parser path
     // by `scanner_matches_parser_inference`.
+    // Lazy key-order template (see `RowTemplate`): built once the range's
+    // first valid object fixes the expected key sequence; matching lines skip
+    // the generic key scan entirely. `map[k]` = `seen` index of template key
+    // `k` (identity for a range whose first line defined `seen`, but built by
+    // lookup so a range that STARTED on a deviant line stays correct).
+    let mut tmpl: Option<(RowTemplate, Vec<usize>)> = None;
     let observe = |l: &str,
                    seen: &mut Vec<(String, Infer)>,
                    first_names: &mut Option<Vec<String>>,
-                   bad_rows: &mut usize| {
-        if !l.trim().is_empty() && !scan_line_infer(l, seen, first_names) {
+                   bad_rows: &mut usize,
+                   tmpl: &mut Option<(RowTemplate, Vec<usize>)>| {
+        if l.trim().is_empty() {
+            return;
+        }
+        let ok = match tmpl.as_ref() {
+            Some((t, map)) => scan_line_infer_fast(l, t, map, seen, first_names),
+            None => scan_line_infer(l, seen, first_names),
+        };
+        if !ok {
             *bad_rows += 1;
+        }
+        if tmpl.is_none() {
+            if let Some(names) = first_names.as_ref() {
+                if !names.is_empty() && names.len() <= 128 {
+                    let map: Vec<usize> = names
+                        .iter()
+                        .map(|n| match seen.iter().position(|(sn, _)| sn == n) {
+                            Some(ix) => ix,
+                            None => {
+                                seen.push((n.clone(), Infer::new()));
+                                seen.len() - 1
+                            }
+                        })
+                        .collect();
+                    *tmpl = Some((RowTemplate::new(names), map));
+                }
+            }
         }
     };
     loop {
@@ -677,7 +708,7 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
                     let bytes = std::mem::take(&mut carry);
                     if let Ok(s) = std::str::from_utf8(&bytes) {
                         let l = s.trim_end_matches(['\n', '\r']);
-                        observe(l, &mut seen, &mut first_names, &mut bad_rows);
+                        observe(l, &mut seen, &mut first_names, &mut bad_rows, &mut tmpl);
                     }
                 }
                 break;
@@ -704,7 +735,7 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
                     match std::str::from_utf8(&bytes) {
                         Ok(s) => {
                             let l = s.trim_end_matches(['\n', '\r']);
-                            observe(l, &mut seen, &mut first_names, &mut bad_rows);
+                            observe(l, &mut seen, &mut first_names, &mut bad_rows, &mut tmpl);
                         }
                         Err(_) => break, // read_line would have errored here
                     }
@@ -744,7 +775,7 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
             let raw = &rest[..nl];
             cur += nl + 1;
             let l = raw.trim_end_matches(['\n', '\r']);
-            observe(l, &mut seen, &mut first_names, &mut bad_rows);
+            observe(l, &mut seen, &mut first_names, &mut bad_rows, &mut tmpl);
         }
         let walked = text.len();
         r.consume(walked);
@@ -1505,6 +1536,38 @@ fn snap_ranges(path: &str, nparts: usize) -> Option<Vec<(u64, u64)>> {
 /// (per-key [`Infer`]s, first-seen order) and capturing `first_names` from the
 /// first valid object. `false` = malformed (counted by the caller), with the
 /// same acceptance as [`parse_object`].
+/// [`scan_line_infer`] with the [`RowTemplate`] fast path. `map[k]` is the
+/// `seen` index of template key `k`. A deviating line falls back to the
+/// generic scan MID-LINE: the prefix values the template already observed
+/// are then observed again by the generic pass — harmless, because `Infer`
+/// state is a monotone class lattice (re-observing an identical value is a
+/// state no-op; pinned by `infer_double_observe_is_idempotent`), so the
+/// final inference is exactly the generic scanner's.
+fn scan_line_infer_fast(
+    line: &str,
+    tmpl: &RowTemplate,
+    map: &[usize],
+    seen: &mut Vec<(String, Infer)>,
+    first_names: &mut Option<Vec<String>>,
+) -> bool {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    for (k, seg) in tmpl.segs.iter().enumerate() {
+        if b.len() < i + seg.len() || &b[i..i + seg.len()] != seg.as_slice() {
+            return scan_line_infer(line, seen, first_names);
+        }
+        i += seg.len();
+        let ix = map[k];
+        if !scan_value_into(b, &mut i, &mut seen[ix].1) {
+            return scan_line_infer(line, seen, first_names);
+        }
+    }
+    if i + 1 == b.len() && b[i] == b'}' && !tmpl.segs.is_empty() {
+        return true;
+    }
+    scan_line_infer(line, seen, first_names)
+}
+
 fn scan_line_infer(
     line: &str,
     seen: &mut Vec<(String, Infer)>,
@@ -2393,6 +2456,138 @@ mod tests {
     /// edges (i64 overflow → float, bare `-`, `1e5`), duplicate keys (top and
     /// nested — the first-object name-order rule), heterogeneous columns,
     /// nested obj/arr recursion, empty objects, truncated lines.
+    /// The template fast path must infer exactly what the generic scanner
+    /// infers — over template-matching lines AND every deviation class
+    /// (reorder, missing/extra key, whitespace, duplicate keys, malformed,
+    /// empty object, escaped key), in both orders of appearance.
+    #[test]
+    fn infer_template_matches_generic() {
+        let corpus: &[&str] = &[
+            r#"{"a":1,"b":"x","c":true}"#,
+            r#"{"a":2,"b":"y","c":false}"#,
+            r#"{"b":"z","a":3,"c":true}"#,              // reordered
+            r#"{"a":4,"b":"w"}"#,                       // missing key
+            r#"{"a":5,"b":"v","c":true,"d":9}"#,        // extra key
+            r#"{ "a" : 6 , "b" : "u" , "c" : false }"#, // whitespace
+            r#"{"a":7,"a":8,"b":"t","c":true}"#,        // duplicate key
+            r#"{"a":not json"#,                         // malformed
+            r#"{}"#,                                    // empty object
+            r#"{"a":1.5,"b":"s","c":true}"#,            // widening value
+            r#"{"\u0061":9,"b":"r","c":false}"#,        // escaped key (deviates)
+        ];
+        let run_generic = |lines: &[&str]| {
+            let mut seen: Vec<(String, Infer)> = Vec::new();
+            let mut first: Option<Vec<String>> = None;
+            let mut bad = 0usize;
+            for l in lines {
+                if !l.trim().is_empty() && !scan_line_infer(l, &mut seen, &mut first) {
+                    bad += 1;
+                }
+            }
+            (
+                seen.iter()
+                    .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                    .collect::<Vec<_>>(),
+                first,
+                bad,
+            )
+        };
+        let run_template = |lines: &[&str]| {
+            let mut seen: Vec<(String, Infer)> = Vec::new();
+            let mut first: Option<Vec<String>> = None;
+            let mut bad = 0usize;
+            let mut tmpl: Option<(RowTemplate, Vec<usize>)> = None;
+            for l in lines {
+                if l.trim().is_empty() {
+                    continue;
+                }
+                let ok = match tmpl.as_ref() {
+                    Some((t, map)) => scan_line_infer_fast(l, t, map, &mut seen, &mut first),
+                    None => scan_line_infer(l, &mut seen, &mut first),
+                };
+                if !ok {
+                    bad += 1;
+                }
+                if tmpl.is_none() {
+                    if let Some(names) = first.as_ref() {
+                        if !names.is_empty() {
+                            let map: Vec<usize> = names
+                                .iter()
+                                .map(|n| match seen.iter().position(|(sn, _)| sn == n) {
+                                    Some(ix) => ix,
+                                    None => {
+                                        seen.push((n.clone(), Infer::new()));
+                                        seen.len() - 1
+                                    }
+                                })
+                                .collect();
+                            tmpl = Some((RowTemplate::new(names), map));
+                        }
+                    }
+                }
+            }
+            (
+                seen.iter()
+                    .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                    .collect::<Vec<_>>(),
+                first,
+                bad,
+            )
+        };
+        // Whole corpus, plus every rotation (so deviants also appear FIRST,
+        // exercising template-built-after-a-deviant-start).
+        for rot in 0..corpus.len() {
+            let lines: Vec<&str> = corpus
+                .iter()
+                .cycle()
+                .skip(rot)
+                .take(corpus.len())
+                .copied()
+                .collect();
+            assert_eq!(
+                run_template(&lines),
+                run_generic(&lines),
+                "template != generic at rotation {rot}"
+            );
+        }
+    }
+
+    /// Re-observing an identical value is a state no-op (`Infer` is a
+    /// monotone class lattice) — the property that makes the template's
+    /// mid-line fallback (which re-observes the already-observed prefix)
+    /// exactly equivalent to a pure generic scan.
+    #[test]
+    fn infer_double_observe_is_idempotent() {
+        let lines: &[&str] = &[
+            r#"{"a":1,"b":"x","c":true}"#,
+            r#"{"a":1.5,"b":"","c":false}"#,
+            r#"{"a":[1,2],"b":{"k":3},"c":null}"#,
+        ];
+        for l in lines {
+            let mut once: Vec<(String, Infer)> = Vec::new();
+            let mut f1 = None;
+            assert!(scan_line_infer(l, &mut once, &mut f1));
+            let mut twice: Vec<(String, Infer)> = Vec::new();
+            let mut f2 = None;
+            assert!(scan_line_infer(l, &mut twice, &mut f2));
+            let snap: Vec<String> = twice
+                .iter()
+                .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                .collect();
+            assert!(scan_line_infer(l, &mut twice, &mut f2));
+            let snap2: Vec<String> = twice
+                .iter()
+                .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                .collect();
+            assert_eq!(snap, snap2, "double observe changed state: {l}");
+            let base: Vec<String> = once
+                .iter()
+                .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                .collect();
+            assert_eq!(base, snap, "observe count changed resolution: {l}");
+        }
+    }
+
     #[test]
     fn scanner_matches_parser_inference() {
         let corpus: &[&str] = &[
