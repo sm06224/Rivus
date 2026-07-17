@@ -174,3 +174,29 @@ country/region/category）で成立する。
 C-1: CSV group driver に C-eq 判定＋sample 開＋矛盾検出＋局所再走。
 C-2: sink driver・JSONL。C-3: 統括へ実測報告（本節が事前提示を兼ねる —
 統括の「最終段まで一気に」指示 2026-07-18 に基づき着手）。
+
+### C-1 実装で確定した精密化（2026-07-17 着地）
+
+- **数値レーン間の拡幅（i64→f64）は C-eq 不成立**: 2^53 超の i64 は f64
+  経由で Display が変わるため、条件1（Display 同一）も条件2（narrow-fit
+  cell の cast 等価）も破れる。再走時に union′ が **Str 以外**へ拡幅した
+  列を検出したら並列 driver ごと放棄して正準直列へ（R3b で恒久固定）。
+  →Str 拡幅のみ局所再走で partial 保持。
+- **C-eq 静的ゲート `stage_c_eligible`**: fused shape 前提で、(a) cast 対象
+  は I64/F64/Str のみ（temporal/decimal cast は生セルを消費するため不適格）、
+  (b) filter 述語の列は**cast 済みのみ**（cast は述語より前）、(c) 集約入力
+  は cast 済み or `count`（null 性はレーン非依存）、(d) キーは bare /
+  coalesce(col,"lit") / StrLit。右起源列の静的判別は不可能なので全列を
+  左起源とみなす（保守的・常に安全、外れても正準に落ちるだけ）。
+- **arity 不正行の在流カウント**: sample 開は pass 1 を走らせないため
+  `CsvChunker::count_stream_bad` が stream 中に計数（preview 窓の再デコード
+  分はリセットして二重計数を防ぐ）。pass 1 と同一基準（空行スキップ後の
+  列数不一致のみ）— 単体テストで pass 1 の計数と一致を固定。
+- **Observable First**: 投機が 1 ファイルでも発動したら strategy が
+  `parallel read group-by (per-file workers, speculative open)` になる。
+  圧縮/JSONL/Bool-sample はファイル単位で正準へフォールバック（suffix 無し）。
+- **実測（10M CSV group 標準・4 コア箱・同日 interleave）**: open 210ms→
+  2-3ms、wall 945ms→**799ms**（旧バイナリ比 −146ms）、DuckDB 同条件 943ms
+  → **0.85×**（初の明確な DuckDB 超え）。peak RSS 9.5MB（従来 11-16MB より
+  低下 — pass 1 バッファ消滅）。全 4 経路（plain/serial/gz/jsonl/ETL）
+  byte-identical、汚れ標準の再走 0 件（arity 汚れは矛盾ではない）。

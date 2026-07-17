@@ -1353,8 +1353,10 @@ fn pre_group_op_allowed(op: &Op) -> bool {
 /// serially (they are small bounded sources), then one worker per file (waves
 /// of ≤ core count) streaming into partial `GroupBy`s, merged like #41; the
 /// post-group tail (sorts, sink) runs serially on the merged output.
-/// One worker's partial result: its `GroupBy` state, errors, and rows grouped.
-type PartialGroup = (operators::GroupBy, Vec<ErrorEvent>, u64);
+/// One worker's partial result: its `GroupBy` state, errors, rows grouped, and
+/// whether a Stage C speculative stream contradicted its sampled schema (the
+/// file then re-runs canonically; always `false` on canonical decoders).
+type PartialGroup = (operators::GroupBy, Vec<ErrorEvent>, u64, bool);
 
 /// One read→sink segment worker's result: errors, rows written, header line.
 type SegmentResult = (Vec<ErrorEvent>, u64, Option<String>);
@@ -1560,7 +1562,21 @@ fn try_parallel_read_group(
         return None;
     }
 
+    // Probe projection pushdown (design/41 Stage A-1): the downstream column
+    // set, proved from the path's expressions; `None` keeps every column.
+    let used = fused_used_columns(graph, shape);
+    // Fused row loop (design/41 Stage A): graph-level eligibility; the
+    // schema-level half resolves per worker on the first join-input chunk.
+    let fused_sp = fused_shape_plan(graph, shape);
+    // Stage C (design/41 §5): speculative sample-schema opens are sound for
+    // this flow — a contradicted file re-runs locally after the worker wave.
+    let speculate = fused_sp
+        .as_ref()
+        .is_some_and(|sp| stage_c_eligible(graph, shape, sp));
+
     // 3) Phase 1 — open every file lazily (schema now, rows later), in waves.
+    //    Under Stage C the open skips the full pass-1 scan for plain CSV
+    //    (sample inference + in-stream contradiction check).
     let planner = operators::Read::new(fmt, provenance, opts.chunk_size);
     let mut opened: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
     let mut quarantined: Vec<ErrorEvent> = Vec::new();
@@ -1576,7 +1592,15 @@ fn try_parallel_read_group(
             let wave_results: Vec<_> = std::thread::scope(|s| {
                 let handles: Vec<_> = wave
                     .iter()
-                    .map(|uri| s.spawn(move || planner.open_file_stream(uri)))
+                    .map(|uri| {
+                        s.spawn(move || {
+                            if speculate {
+                                planner.open_file_stream_sampled(uri)
+                            } else {
+                                planner.open_file_stream(uri)
+                            }
+                        })
+                    })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
@@ -1602,6 +1626,19 @@ fn try_parallel_read_group(
         return None;
     }
     let t_open = t0.elapsed();
+    // Files that actually opened speculatively (compressed/JSONL/Bool-sampled
+    // inputs fall back inside the sampled open) — surfaced in the strategy.
+    let spec_files = opened.iter().filter(|(_, _, d)| d.is_speculative()).count();
+    // Stage C bookkeeping for the local re-run: uri + (possibly sampled)
+    // schema per opened file, index-aligned with the worker partials.
+    let (opened_uris, mut opened_schemas): (Vec<String>, Vec<rivus_core::Schema>) = if speculate {
+        opened
+            .iter()
+            .map(|(u, s, _)| (u.clone(), s.clone()))
+            .unzip()
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     // 4) The union schema every worker reconciles to (single source of truth).
     let (union, fname) = operators::union_by_name(opened.iter().map(|(_, s, _)| s), provenance);
@@ -1614,12 +1651,6 @@ fn try_parallel_read_group(
         Op::GroupBy { aggs, .. } => aggs.clone(),
         _ => return None,
     };
-    // Probe projection pushdown (design/41 Stage A-1): the downstream column
-    // set, proved from the path's expressions; `None` keeps every column.
-    let used = fused_used_columns(graph, shape);
-    // Fused row loop (design/41 Stage A): graph-level eligibility; the
-    // schema-level half resolves per worker on the first join-input chunk.
-    let fused_sp = fused_shape_plan(graph, shape);
     // The sample chunk comes from the ALREADY-OPENED first file's decoder —
     // the old form re-opened the file, which re-ran its whole inference pass
     // (a full serial scan) just to type-check one chunk. The columns are
@@ -1764,15 +1795,110 @@ fn try_parallel_read_group(
 
     let t_workers = t0.elapsed();
 
+    // 6.5) Stage C local re-run (design/41 §5): every speculatively-opened
+    // file whose stream contradicted its sampled schema re-runs through the
+    // canonical two-pass open against a RECOMPUTED union (never-silent: the
+    // canonical run's cast-failure accounting must see the true lanes). The
+    // kept partials stay valid by the `stage_c_eligible` C-eq gate — except
+    // under a numeric (non-Str) widening, which is not Display-exact, so that
+    // case bails to the serial canonical path instead.
+    let mut partials: Vec<PartialGroup> = partials
+        .into_iter()
+        .map(|p| p.expect("worker ran"))
+        .collect();
+    let mut rerun_files = 0usize;
+    if speculate && partials.iter().any(|p| p.3) {
+        let redo: Vec<usize> = partials
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.3)
+            .map(|(i, _)| i)
+            .collect();
+        rerun_files = redo.len();
+        let mut reopened: Vec<(usize, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
+        for &i in &redo {
+            match planner.open_file_stream(&opened_uris[i]) {
+                Ok((schema, dec)) => {
+                    opened_schemas[i] = schema.clone();
+                    reopened.push((i, schema, dec));
+                }
+                Err(e) => {
+                    // The file vanished between passes: quarantine it exactly
+                    // like a phase-1 open failure and drop its partial.
+                    partials[i] = (
+                        operators::new_group(&graph.nodes[shape.group_id].op).expect("group op"),
+                        vec![ErrorEvent::new(
+                            Severity::Recoverable,
+                            ErrorScope::Item,
+                            format!("read: skipped '{}': {e}", opened_uris[i]),
+                        )
+                        .at_node(read_label.clone())],
+                        0,
+                        false,
+                    );
+                }
+            }
+        }
+        // union′ over the FULL schemas (a kept file's sample is proven equal
+        // to its full inference by the zero-contradiction detector).
+        let (union2, _) = operators::union_by_name(opened_schemas.iter(), provenance);
+        let widen_safe = union.len() == union2.len()
+            && union.iter().zip(&union2).all(|(a, b)| {
+                a.name == b.name && (a.dtype == b.dtype || b.dtype == rivus_core::DataType::Str)
+            });
+        if !widen_safe {
+            return None; // serial canonical path; correctness over speed
+        }
+        let uschema2 = std::sync::Arc::new(rivus_core::Schema::new(union2.clone()));
+        // Re-run the contradicted files in waves, replacing their partials
+        // (the speculative attempt's events reflected the wrong lanes).
+        let mut it = reopened.into_iter();
+        loop {
+            let wave: Vec<_> = it.by_ref().take(threads).collect();
+            if wave.is_empty() {
+                break;
+            }
+            let results: Vec<(usize, PartialGroup)> = std::thread::scope(|s| {
+                let union2 = &union2;
+                let uschema2 = &uschema2;
+                let fname = fname.as_deref();
+                let rights = &rights;
+                let read_label = read_label.as_str();
+                let keep = &used;
+                let fsp = &fused_sp;
+                let uris = &opened_uris;
+                let handles: Vec<_> = wave
+                    .into_iter()
+                    .map(|(idx, schema, dec)| {
+                        s.spawn(move || {
+                            (
+                                idx,
+                                worker_read_partial_group(
+                                    graph, opts, shape, &uris[idx], &schema, dec, None, keep, fsp,
+                                    union2, uschema2, fname, provenance, rights, read_label,
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (idx, r) in results {
+                partials[idx] = r;
+            }
+        }
+    }
+    let t_rerun = t0.elapsed();
+
     // 7) Merge partials in uri order; then the serial tail on the tiny result.
-    let mut partials_iter = partials.into_iter().map(|p| p.expect("worker ran"));
-    let (mut merged, mut errors, mut total_rows) = partials_iter.next()?;
+    let mut partials_iter = partials.into_iter();
+    let (mut merged, mut errors, mut total_rows, _) = partials_iter.next()?;
     let mut workers = vec![WorkerTelemetry {
         worker: 0,
         rows_out: total_rows,
         busy: Duration::ZERO,
     }];
-    for (i, (g, errs, rows)) in partials_iter.enumerate() {
+    for (i, (g, errs, rows, _)) in partials_iter.enumerate() {
         merged.merge_from(g);
         errors.extend(errs);
         total_rows += rows;
@@ -1882,16 +2008,26 @@ fn try_parallel_read_group(
         inference: Vec::new(),
         strategy: None,
     };
-    res.strategy = Some("parallel read group-by (per-file workers)".to_string());
+    res.strategy = Some(if spec_files > 0 {
+        // Stage C engaged for at least one file (design/41 §5): the open
+        // phase skipped its full pass-1 scan — never a silent engine swap.
+        "parallel read group-by (per-file workers, speculative open)".to_string()
+    } else {
+        "parallel read group-by (per-file workers)".to_string()
+    });
     if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
         // Wall between phase boundaries: discovery+rights+open / the one
-        // scratch safety chunk / worker waves / merge+serial tail.
+        // scratch safety chunk / worker waves / Stage C local re-run /
+        // merge+serial tail.
         eprintln!(
-            "[WPROF-PHASE] open={}ms scratch={}ms workers={}ms merge+tail={}ms",
+            "[WPROF-PHASE] open={}ms{} scratch={}ms workers={}ms rerun={}ms({} files) merge+tail={}ms",
             t_open.as_millis(),
+            if speculate { " (spec)" } else { "" },
             (t_scratch - t_open).as_millis(),
             (t_workers - t_scratch).as_millis(),
-            (t0.elapsed() - t_workers).as_millis()
+            (t_rerun - t_workers).as_millis(),
+            rerun_files,
+            (t0.elapsed() - t_rerun).as_millis()
         );
     }
     if let Some(h) = hook.as_mut() {
@@ -2738,6 +2874,138 @@ fn fused_shape_plan(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<FusedSh
     })
 }
 
+/// Stage C static gate (design/41 §5): may phase 1 open files **speculatively**
+/// (schema from a row sample, contradiction-checked while streaming)? True only
+/// when every schema widening a contradicted file could force on the union is
+/// provably invisible to the kept partials (C-eq):
+///
+/// - a column consumed **only as a key** (join key, bare group key, or a
+///   `coalesce(col, "lit")` key cell) encodes via `Display`, and a narrow
+///   lane's `Display` equals the Str-widened lane's bytes (`reconcile_chunk`
+///   widens through the same `cast_column` Display); null-ness is
+///   lane-independent, which covers the coalesce branch choice;
+/// - a column **cast to int/float/str before every value consumption**
+///   (predicate, aggregate) yields identical post-cast values on narrow-fit
+///   cells — i64/f64 `Display` round-trips exactly, so narrow-direct ==
+///   widen-then-cast;
+/// - `count` consumes null-ness only, so any input class is safe;
+/// - anything else (raw aggregation, non-scalar cast targets, renames, fills)
+///   → not eligible → phase 1 stays canonical (today's cost, today's output).
+///
+/// Widening **between numeric lanes** (i64→f64) is NOT Display-exact above
+/// 2^53, so the driver additionally bails to the serial path at re-run time if
+/// the recomputed union widens any column to a non-Str type.
+fn stage_c_eligible(graph: &PlanGraph, shape: &ReadGroupShape, sp: &FusedShapePlan) -> bool {
+    use rivus_core::DataType as DT;
+    use rivus_ir::Expr as E;
+    /// Column reads of a fused-gate predicate; `false` = outside the modeled set.
+    fn pred_cols<'a>(e: &'a E, out: &mut Vec<&'a str>) -> bool {
+        match e {
+            E::Field { name, access } => {
+                if access.is_column() {
+                    out.push(name.as_str());
+                    true
+                } else {
+                    false
+                }
+            }
+            E::Literal(_) => true,
+            E::Compare { left, right, .. } => pred_cols(left, out) && pred_cols(right, out),
+            E::And(a, b) => pred_cols(a, out) && pred_cols(b, out),
+            _ => false,
+        }
+    }
+    // Casts to round-trip-exact scalar targets seen so far, walked in path
+    // order: a value consumption is safe only if the cast PRECEDES it.
+    let mut casted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let preds_ok = |preds: &[&E], casted: &std::collections::HashSet<&str>| -> bool {
+        preds.iter().all(|p| {
+            let mut cols = Vec::new();
+            pred_cols(p, &mut cols) && cols.iter().all(|c| casted.contains(c))
+        })
+    };
+    for step in &shape.path[..sp.split] {
+        let ReadPathStep::Stateless(nid) = step else {
+            return false;
+        };
+        match &graph.nodes[*nid].op {
+            Op::Cast { casts } => {
+                for (name, dt) in casts {
+                    if !matches!(dt, DT::I64 | DT::F64 | DT::Str) {
+                        // A temporal/decimal cast parses raw cells — narrow vs
+                        // widened inputs are not provably equivalent.
+                        return false;
+                    }
+                    casted.insert(name.as_str());
+                }
+            }
+            Op::Filter { pred } => {
+                if !preds_ok(&[pred], &casted) {
+                    return false;
+                }
+            }
+            Op::FilterProject { preds, .. } => {
+                if !preds_ok(&preds.iter().collect::<Vec<_>>(), &casted) {
+                    return false;
+                }
+            }
+            // Pure column selection / reorder / null-row drops consume no cell
+            // values (null-ness is lane-independent under widening).
+            Op::Project { .. } | Op::Drop { .. } | Op::Reorder { .. } | Op::DropNa { .. } => {}
+            _ => return false,
+        }
+    }
+    // Post-join predicates (Compare/And over bare fields by the fused gate). A
+    // right-origin column fails the `casted` test and simply keeps the flow
+    // canonical — conservative, never wrong.
+    if !preds_ok(&sp.preds.iter().collect::<Vec<_>>(), &casted) {
+        return false;
+    }
+    // Classify each group-input column: value-safe (cast-normalized or a
+    // literal) vs key-only-safe (the Display/null-ness arguments above).
+    let Op::GroupBy { aggs, .. } = &graph.nodes[shape.group_id].op else {
+        return false;
+    };
+    let val_safe = |col: &str| -> Option<bool> {
+        // Some(true)=value-safe, Some(false)=key-only-safe, None=not modeled.
+        match &sp.items {
+            None => Some(casted.contains(col)),
+            Some(items) => {
+                let (expr, _) = items.iter().find(|(_, out)| out == col)?;
+                match expr {
+                    E::Field { name, access } if access.is_column() => {
+                        Some(casted.contains(name.as_str()))
+                    }
+                    E::Literal(rivus_core::Value::Str(_)) => Some(true),
+                    E::Func {
+                        func: rivus_ir::Func::Coalesce,
+                        args,
+                    } if args.len() == 2 => match (&args[0], &args[1]) {
+                        (E::Field { name, access }, E::Literal(rivus_core::Value::Str(_)))
+                            if access.is_column() =>
+                        {
+                            Some(casted.contains(name.as_str()))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+        }
+    };
+    // Group keys are bare (fused gate) and encode via Display → always safe.
+    // Aggregates consume values: require value-safe, except `count`, which
+    // consumes null-ness only.
+    for (func, col) in aggs {
+        match val_safe(col) {
+            Some(true) => {}
+            Some(false) if matches!(func, rivus_ir::AggFunc::Count) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// The per-worker half, resolved on the first chunk that reaches the join
 /// (schema-dependent). `None` -> this worker falls back to the generic ops.
 struct FusedPlan {
@@ -3170,7 +3438,7 @@ fn worker_read_partial_group(
     provenance: rivus_ir::Provenance,
     rights: &[(NodeId, BroadcastRight)],
     read_label: &str,
-) -> (operators::GroupBy, Vec<ErrorEvent>, u64) {
+) -> PartialGroup {
     let mut errors = Vec::new();
     let mut next_id = 0u64;
     // Per-worker op instances, with each broadcast join pre-fed its right side.
@@ -3362,7 +3630,7 @@ fn worker_read_partial_group(
             .at_node(read_label.to_string()),
         );
     }
-    (group, errors, rows)
+    (group, errors, rows, dec.spec_contradicted())
 }
 
 fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<NodeId>)> {

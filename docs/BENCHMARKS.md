@@ -2127,3 +2127,36 @@ small-to-large ladder are closed: the real decode floor is ~75 ms/file
 against the ~55 ms synthetic floor, with the gap spread thin across bounds
 checks and per-block setup. The remaining decode lever is structural —
 **S4: fusing pass 1 into the decode (design/41 Stage C)**.
+
+### Stage C-1 — speculative sampled open for the CSV group driver (#239)
+
+S4, first rung (design/41 §5). When the flow passes the static C-eq gate
+(`stage_c_eligible`: aggregate/predicate columns cast-normalized to
+i64/f64/str, keys bare/coalesce — the standard flow qualifies), phase 1
+opens plain-CSV files **speculatively**: schema from a `chunk_size`-row
+sample (one short read), decode streamed against it, contradiction =
+any non-empty parse failure. Contradicted files re-run through the
+canonical two-pass open against a **recomputed union′** after the worker
+wave (never-silent: the canonical run's cast-failure accounting sees the
+true lanes); every kept partial is valid by C-eq. A union widening to a
+non-Str lane (i64→f64, not Display-exact above 2^53) abandons the
+parallel driver entirely — serial canonical, correctness over speed.
+Bool-sampled, compressed and JSONL files fall back per-file inside the
+sampled open (C-2 territory). Engagement is surfaced: strategy becomes
+`parallel read group-by (per-file workers, speculative open)`.
+
+Guards added: 4 unit tests (detector completeness on clean files,
+late-surprise contradiction, Bool fallback, in-stream arity count ==
+pass 1's count) and R3/R3b integration tests (byte-identity with and
+without a mid-stream contradiction at cs=7/4096, malformed-report
+parity, numeric-widening bail — each asserting engagement so the guard
+can't rot silent).
+
+Measured (10M CSV group standard, 4-core box, same-day interleave,
+best-of-3): open phase **210 ms → 2–3 ms**; wall 945 → **799 ms**
+(−146 ms vs the pre-change binary in the same window); DuckDB same
+window 943 ms → **0.85×** (previous record 0.93×). Peak RSS **9.5 MB**
+(below the previous 11–16 MB — the pass-1 buffers are gone). Dirty
+standard re-runs **0 files** (arity dirt is not a contradiction — it is
+counted in-stream by `count_stream_bad`). Byte-identity: plain parallel,
+serial, csv.gz, jsonl, ETL all `cmp`-identical to pre-change references.
