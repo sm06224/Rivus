@@ -1,7 +1,7 @@
 # セッション・ハンドオーバー（次セッションの担当者へ）
 
-最終更新: **2026-07-15**（性能戦争バッチ全着地を受けた刷新。過去の詳細は git 履歴の
-本ファイル参照）。
+最終更新: **2026-07-17**（design/41 Stage A＋Stage C 全段が #239 ブランチに着地。
+過去の詳細は git 履歴の本ファイル参照）。
 
 ---
 
@@ -39,15 +39,19 @@
 統合 main の独立ゲート実測 = fmt clean・clippy 0/0 両 feature・test **487/518** 全 pass・
 deny ok。
 
-**10M×9ファイル標準（汚れ入り・等価契約）の現在地（wall / peak RSS）**:
+**10M×9ファイル標準（汚れ入り・等価契約）の現在地（wall / peak RSS、
+2026-07-17 の同日 interleave — #239 ブランチ Stage C 込み）**:
 
-| 形状 | rivus | DuckDB | 比 |
+| 形状 | rivus | DuckDB 同窓 | 比 |
 |---|---|---|---|
-| CSV ETL | 1177ms / 13MB | 1221ms / 692MB | **0.96× 勝ち** |
-| CSV.gz group | 1021ms / 11MB | 1184ms / 262MB | **0.86× 勝ち** |
-| JSONL.gz group | 1550ms / 12MB | 1719ms / 405MB | **0.90× 勝ち** |
-| CSV group | 939ms / 15MB | 881ms / 241MB | 1.07× |
-| JSONL group | 1905ms / 13MB | 1418ms / 404MB | 1.34×（次弾対象） |
+| CSV ETL | 914ms / 9.7MB | 1459ms | **0.63× 勝ち** |
+| CSV group | 799ms / 9.5MB | 943ms | **0.85× 勝ち** |
+| JSONL group | 1080ms / 8.2MB | 1534ms | **0.70× 勝ち** |
+| CSV.gz group | （C 対象外・従来 0.86× 勝ち） | | |
+| JSONL.gz group | （C 対象外・従来 0.90× 勝ち） | | |
+
+**全 5 形状で DuckDB に勝利**（byte-identity 証明付き・1/25〜1/70 のメモリ）。
+残る未踏峰は Polars eager ETL 583ms（契約違反実装）のみ。
 
 **#237 で入った主要機構**（詳細は BENCHMARKS.md 第1-18弾の各節）:
 ファイル毎 worker 並列（read→group / read→sink）・BroadcastProbe・ブロック歩行
@@ -57,20 +61,26 @@ reconcile/Cast のムーブ意味論・Str↔数値の列指向変換・in-tree 
 preface（安全性サンプルの推論二周目排除）・WPROF（worker/op/phase 分解、env-gated）・
 R1/R2 並列 identity ガード（`tests/stress/parallel_read_identity.rs`）。
 
-## 3. 進行中の主計画: design/41 深層融合ワーカー（統括指示 2026-07-11・実装未着手）
+## 3. 主計画 design/41 の現在地（Stage A・C 着地済み／B 未着手）
 
-「トランスポート・リーダー・演算子連鎖を shape 選択式のモノリシック実装に融合してよい」
-という統括指示の3段計画（docs/design/41-deep-fused-worker.md が設計固定済み）:
+`docs/design/41-deep-fused-worker.md` の3段計画のうち、#239 ブランチ
+（`claude/perf-join-groupkey`、レビュー再ゲート待ち）に着地済み:
 
-- **Stage A: FusedReadGroup** — 検出済み shape（read→cast?→⋈*→filter?→project?→group、
-  flat スカラ限定）に対する手書き単一行ループ。probe の gather（51ms/file）・project の
-  実体化（28ms）・group の Value/row（65ms の一部）を全廃。式が対応集合外なら汎用経路へ
-  フォールバック、選択は strategy/explain に記録。証明義務 = fixture cmp＋fused vs 汎用の
-  プロパティテスト＋エラーストリーム同一
-- **Stage B: mmap 窓トランスポート** — madvise(DONTNEED) で RSS 予算維持が必須条件
-  （11-16MB の memory story は brand）。依存は SUPPLY-CHAIN チェックリストで決定
-- **Stage C: 1パス投機 scan+decode** — pass1/pass2 の同一バイト2回歩行を融合。
-  file 単位 discard-and-rerun の安全網。**着地前に指揮へ提示（批准事項）**
+- **Stage A（着地）**: A-1 probe projection pushdown（`fused_used_columns`）＋
+  A-2 FusedReadGroup（join→pred→キー符号化→observe_row の単一行ループ、
+  worker 毎 lossless フォールバック）。JSONL RowTemplate（decode 側＋infer 側）も同梱。
+- **Stage C（着地・3 コミット 5df2b7e/fe621f7/cb01f7b）**: 投機 sample 開＋矛盾検出＋
+  局所再走。§5 の C-eq が理論核（キーと書き出しセルは Display-safe、値消費は cast 正規化、
+  →Str 拡幅のみ保持可・数値拡幅は直列 bail）。CSV は parse 失敗が検出器（Bool sample は
+  不適格→正準）、JSONL は構文型なので lane_mismatches が完全検出器（Bool 例外なし）。
+  group driver＋sink driver 両方、発動は strategy 接尾辞 "…, speculative open"。
+  ガード: 単体 8 本＋R3/R3j/R3b/R4/R4b（矛盾あり/なし×byte-identity×bail×発動 assert）。
+- **Stage B: mmap 窓トランスポート（未着手・次のレバー）** — madvise(DONTNEED) で
+  RSS 予算維持が必須条件（8-16MB の memory story は brand）。依存は SUPPLY-CHAIN
+  チェックリストで決定。ETL の残差（Polars 583ms との差）は decode バイトコピーが主。
+- 負の結果（BENCHMARKS 台帳）: sink 側融合は不採用・セル原語チューニング枯渇・
+  StreamJsonlReader（read_line）を投機に転用すると open の勝ち分を decode で返上
+  （投機デコーダは正準と同じ block-walk であること）。
 
 ## 4. 計測済みの知見（BENCHMARKS.md が台帳）
 
@@ -96,11 +106,12 @@ R1/R2 並列 identity ガード（`tests/stress/parallel_read_identity.rs`）。
 
 ## 6. 次のレバー候補（優先順）
 
-1. **design/41 Stage A**（上記 §3 — 着手中の本丸）
-2. JSONL スキャナ SWAR（1.34×→1× の鍵）
-3. Track C 残り: resample/gap-fill（#62 の agg 側）・rolling（#63）
-4. #45 正準縮約木の実装スライス（Q1 許容済み）
-5. sort-shape 並列化（read→sort→save）・Ryū/Dragonbox テール
+1. **design/41 Stage B**（mmap 窓 — ETL/decode の残差、Polars 583ms への道）
+2. fused 対応集合の拡張（Or 述語・数値 coalesce・複数 join）
+3. 圧縮標準（csv.gz/jsonl.gz）の decode 側最適化（Stage C は非対象だった）
+4. Track C 残り: resample/gap-fill（#62 の agg 側）・rolling（#63）
+5. #45 正準縮約木の実装スライス（Q1 許容済み）
+6. sort-shape 並列化（read→sort→save）・Ryū/Dragonbox テール
 
 ## 7. 落とし穴（実際に踏んだもの）
 
