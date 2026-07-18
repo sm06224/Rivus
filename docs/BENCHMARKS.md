@@ -2305,3 +2305,24 @@ group 1105 → **1003 ms** (−9%), ETL 896 → **800 ms** (−11%). Peak RSS
 stress suite (incl. R3/R3j/R4 contradiction paths, which exercise
 narrow-keep directly — `amount` is the widened, cast column there)
 194/0 green.
+
+### Fused loop: vectorized predicate mask (landed)
+
+The sink-fusion negative result's lesson, applied where it DOES pay:
+`fused_feed_chunk` evaluated its (left-only) predicates through the
+row-wise interpreter — per row, per file. Now the predicates compile
+once per chunk into the existing `kernel::NumCmp` conjunction (pinned
+byte-identical to the interpreter, null semantics included) and the
+row loop iterates the branch-free selection vector; dropped rows skip
+the join probe too (pure, so unobservable). Non-kernel shapes (string
+compares, Str lanes on the canonical worker) keep the interpreter row
+path — same results either way. Note the composition: narrow-keep is
+what makes the standard's `amount > 0` kernel-compilable in the first
+place (the lane arrives as i64, not Str).
+
+Measured (same-binary interleave, best-of, on a QUIET box — absolute
+numbers below are the new reference class): CSV group 541 → **440–478
+ms** (−12%; DuckDB same window 653–660 ms → **0.69×**), JSONL group
+745 → **611–720 ms** (−13%; DuckDB same window 1257 ms → **~0.50×**),
+ETL unaffected (its FilterProject was already vectorized). Peak RSS
+**9.4 MB**. Identity: parallel + serial `cmp`-identical, stress 194/0.

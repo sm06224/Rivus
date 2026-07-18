@@ -3612,8 +3612,21 @@ fn fused_feed_chunk(
     sc: &mut FusedScratch,
 ) {
     debug_assert_eq!(plan.agg_cells.len(), group.agg_count());
+    // Left-only predicates, evaluated ONCE per chunk through the vectorized
+    // kernel when they compile (the sink-fusion negative result measured the
+    // row-wise interpreter losing to the columnar kernel; kernel and
+    // interpreter are pinned byte-identical incl. null semantics). Rows the
+    // mask drops skip the join probe too — the probe is pure, so the only
+    // effect is fewer wasted lookups. Non-kernel shapes (string compares,
+    // Str-lane columns on the canonical worker) keep the interpreter row loop.
+    let sel: Option<Vec<usize>> = if plan.preds.is_empty() {
+        None
+    } else {
+        let refs: Vec<&rivus_ir::Expr> = plan.preds.iter().collect();
+        crate::kernel::compile(&refs, ch).map(|cs| crate::kernel::run(&cs, ch))
+    };
     let mut predf = 0u64;
-    for li in 0..ch.len {
+    let mut row = |li: usize, pre_passed: bool, predf: &mut u64, sc: &mut FusedScratch| {
         sc.keybuf.clear();
         let matched = if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
             table.get(sc.keybuf.as_str())
@@ -3625,46 +3638,58 @@ fn fused_feed_chunk(
         // eligibility gate excludes cast-capable predicate shapes, so the
         // fail counter provably stays 0 (asserted in debug).
         let passes = |predf: &mut u64| {
-            plan.preds
-                .iter()
-                .all(|p| crate::eval::eval_predicate_acc(p, ch, li, predf))
-        };
-        let emit = |ri: Option<usize>,
-                    group: &mut operators::GroupBy,
-                    rows: &mut u64,
-                    sc: &mut FusedScratch| {
-            *rows += 1;
-            sc.comp.clear();
-            for (j, cell) in plan.key_cells.iter().enumerate() {
-                if j > 0 {
-                    sc.comp.push('\u{1f}');
-                }
-                fused_push_key(cell, ch, li, right, ri, &mut sc.comp);
-            }
-            sc.vals.clear();
-            for cell in &plan.agg_cells {
-                sc.vals.push(Some(fused_value(cell, ch, li, right, ri)));
-            }
-            let parts = || {
-                plan.key_cells
+            pre_passed
+                || plan
+                    .preds
                     .iter()
-                    .map(|c| fused_value(c, ch, li, right, ri).to_string())
-                    .collect::<Vec<String>>()
-            };
-            group.observe_row(&sc.comp, parts, &sc.vals);
+                    .all(|p| crate::eval::eval_predicate_acc(p, ch, li, predf))
         };
+        let mut emit =
+            |ri: Option<usize>, group: &mut operators::GroupBy, sc: &mut FusedScratch| {
+                *rows += 1;
+                sc.comp.clear();
+                for (j, cell) in plan.key_cells.iter().enumerate() {
+                    if j > 0 {
+                        sc.comp.push('\u{1f}');
+                    }
+                    fused_push_key(cell, ch, li, right, ri, &mut sc.comp);
+                }
+                sc.vals.clear();
+                for cell in &plan.agg_cells {
+                    sc.vals.push(Some(fused_value(cell, ch, li, right, ri)));
+                }
+                let parts = || {
+                    plan.key_cells
+                        .iter()
+                        .map(|c| fused_value(c, ch, li, right, ri).to_string())
+                        .collect::<Vec<String>>()
+                };
+                group.observe_row(&sc.comp, parts, &sc.vals);
+            };
         match matched {
             Some(rs) => {
-                if passes(&mut predf) {
+                if passes(predf) {
                     for &ri in rs {
-                        emit(Some(ri), group, rows, sc);
+                        emit(Some(ri), group, sc);
                     }
                 }
             }
-            None if plan.keeps_left && passes(&mut predf) => {
-                emit(None, group, rows, sc);
+            None if plan.keeps_left && passes(predf) => {
+                emit(None, group, sc);
             }
             None => {}
+        }
+    };
+    match &sel {
+        Some(keep) => {
+            for &li in keep {
+                row(li, true, &mut predf, sc);
+            }
+        }
+        None => {
+            for li in 0..ch.len {
+                row(li, false, &mut predf, sc);
+            }
         }
     }
     debug_assert_eq!(predf, 0, "eligibility excludes cast-capable predicates");
