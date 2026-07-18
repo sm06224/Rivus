@@ -1747,6 +1747,14 @@ fn try_parallel_read_group(
 
     // 6) Workers: one file each, in waves of ≤ core count. Worker 0 receives
     // the safety-check chunk's columns as a preface (decoded once, above).
+    // Under the Stage C gate, each worker reconciles to a NARROW-KEEP target
+    // (cast-normalized →Str-widened columns stay on the file's own lane —
+    // the widen and the cast's re-parse both vanish; see `narrow_keep_target`).
+    let cast_set = if speculate {
+        stage_c_cast_set(graph, shape)
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut partials: Vec<Option<PartialGroup>> = (0..opened.len()).map(|_| None).collect();
     let opened_files: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = opened;
     {
@@ -1771,18 +1779,28 @@ fn try_parallel_read_group(
                 let fname = fname.as_deref();
                 let rights = &rights;
                 let read_label = read_label.as_str();
+                let cast_set = &cast_set;
                 let handles: Vec<_> = wave
                     .drain(..)
                     .map(|(idx, (uri, schema, dec))| {
                         let preface = if idx == 0 { preface0.take() } else { None };
                         let keep = &used;
                         let fsp = &fused_sp;
+                        let tgt = if speculate {
+                            narrow_keep_target(union, &schema, cast_set)
+                        } else {
+                            None
+                        };
                         s.spawn(move || {
+                            let (u, us): (&[rivus_core::Field], &std::sync::Arc<_>) = match &tgt {
+                                Some((f, a)) => (f, a),
+                                None => (union, uschema),
+                            };
                             (
                                 idx,
                                 worker_read_partial_group(
-                                    graph, opts, shape, &uri, &schema, dec, preface, keep, fsp,
-                                    union, uschema, fname, provenance, rights, read_label,
+                                    graph, opts, shape, &uri, &schema, dec, preface, keep, fsp, u,
+                                    us, fname, provenance, rights, read_label,
                                 ),
                             )
                         })
@@ -1870,15 +1888,21 @@ fn try_parallel_read_group(
                 let keep = &used;
                 let fsp = &fused_sp;
                 let uris = &opened_uris;
+                let cast_set = &cast_set;
                 let handles: Vec<_> = wave
                     .into_iter()
                     .map(|(idx, schema, dec)| {
+                        let tgt = narrow_keep_target(union2, &schema, cast_set);
                         s.spawn(move || {
+                            let (u, us): (&[rivus_core::Field], &std::sync::Arc<_>) = match &tgt {
+                                Some((f, a)) => (f, a),
+                                None => (union2, uschema2),
+                            };
                             (
                                 idx,
                                 worker_read_partial_group(
                                     graph, opts, shape, &uris[idx], &schema, dec, None, keep, fsp,
-                                    union2, uschema2, fname, provenance, rights, read_label,
+                                    u, us, fname, provenance, rights, read_label,
                                 ),
                             )
                         })
@@ -2401,7 +2425,14 @@ fn try_parallel_read_sink(
     let (union, fname) = operators::union_by_name(opened.iter().map(|(_, s, _)| s), provenance);
     let uschema = std::sync::Arc::new(rivus_core::Schema::new(union.clone()));
 
-    // Workers: stream file → ops → encode rows into a temp segment.
+    // Workers: stream file → ops → encode rows into a temp segment. Under the
+    // Stage C gate each worker reconciles to a NARROW-KEEP target (see
+    // `narrow_keep_target` — the widen and the cast's re-parse both vanish).
+    let cast_set = if speculate {
+        stage_c_cast_set(graph, shape)
+    } else {
+        std::collections::HashSet::new()
+    };
     let seg_path = |i: usize| format!("{out_path}.rivus-part-{i:04}");
     let mut worker_results: Vec<Option<SegmentResult>> = (0..opened.len()).map(|_| None).collect();
     {
@@ -2426,10 +2457,20 @@ fn try_parallel_read_sink(
                 let rights = &rights;
                 let read_label = read_label.as_str();
                 let seg_path = &seg_path;
+                let cast_set = &cast_set;
                 let handles: Vec<_> = wave
                     .drain(..)
                     .map(|(idx, (uri, schema, dec))| {
+                        let tgt = if speculate {
+                            narrow_keep_target(union, &schema, cast_set)
+                        } else {
+                            None
+                        };
                         s.spawn(move || {
+                            let (u, us): (&[rivus_core::Field], &std::sync::Arc<_>) = match &tgt {
+                                Some((f, a)) => (f, a),
+                                None => (union, uschema),
+                            };
                             (
                                 idx,
                                 worker_read_to_segment(
@@ -2439,8 +2480,8 @@ fn try_parallel_read_sink(
                                     &uri,
                                     &schema,
                                     dec,
-                                    union,
-                                    uschema,
+                                    u,
+                                    us,
                                     fname,
                                     provenance,
                                     rights,
@@ -2530,10 +2571,16 @@ fn try_parallel_read_sink(
                 let read_label = read_label.as_str();
                 let uris = &opened_uris;
                 let seg_path = &seg_path;
+                let cast_set = &cast_set;
                 let handles: Vec<_> = wave
                     .into_iter()
                     .map(|(idx, schema, dec)| {
+                        let tgt = narrow_keep_target(union2, &schema, cast_set);
                         s.spawn(move || {
+                            let (u, us): (&[rivus_core::Field], &std::sync::Arc<_>) = match &tgt {
+                                Some((f, a)) => (f, a),
+                                None => (union2, uschema2),
+                            };
                             (
                                 idx,
                                 worker_read_to_segment(
@@ -2543,8 +2590,8 @@ fn try_parallel_read_sink(
                                     &uris[idx],
                                     &schema,
                                     dec,
-                                    union2,
-                                    uschema2,
+                                    u,
+                                    us,
                                     fname,
                                     provenance,
                                     rights,
@@ -3137,6 +3184,72 @@ fn stage_c_eligible(graph: &PlanGraph, shape: &ReadGroupShape, sp: &FusedShapePl
         }
     }
     true
+}
+
+/// The columns the path cast-normalizes to a round-trip-exact scalar target
+/// (i64/f64/str) — the set the Stage C gates treat as value-safe, reused by
+/// the narrow-keep optimization below.
+fn stage_c_cast_set(
+    graph: &PlanGraph,
+    shape: &ReadGroupShape,
+) -> std::collections::HashSet<String> {
+    use rivus_core::DataType as DT;
+    let mut casted = std::collections::HashSet::new();
+    for step in &shape.path {
+        if let ReadPathStep::Stateless(nid) = step {
+            if let Op::Cast { casts } = &graph.nodes[*nid].op {
+                for (name, dt) in casts {
+                    if matches!(dt, DT::I64 | DT::F64 | DT::Str) {
+                        casted.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    casted
+}
+
+/// Stage C narrow-keep (design/41 §5, the C-eq argument applied to the widen
+/// itself): the per-worker reconcile target for one file. When the union
+/// widened a column to Str but THIS file's own lane is scalar (i64/f64/bool)
+/// and the column is cast-normalized downstream, the file may keep its narrow
+/// lane — skipping BOTH the widen (a parse→`Display` column rebuild, 23–28 ms
+/// per clean file on the dirty standard) and the downstream cast's re-parse
+/// (`cast_column` narrow→narrow is the identity fast path). Provably
+/// byte-identical: the cast output is equal on narrow-fit cells (C-eq
+/// condition 2 — i64/f64 `Display` round-trips exactly, `Str→I64`'s truncate
+/// fallback equals the f64 truncate), and every OTHER consumer permitted by
+/// the eligibility gates is Display-encoded, where narrow and widened lanes
+/// already produce the same bytes. Returns `None` when the target equals the
+/// union (the common case — callers reuse the shared `Arc`).
+fn narrow_keep_target(
+    union: &[rivus_core::Field],
+    file_schema: &rivus_core::Schema,
+    casts: &std::collections::HashSet<String>,
+) -> Option<(Vec<rivus_core::Field>, std::sync::Arc<rivus_core::Schema>)> {
+    use rivus_core::DataType as DT;
+    let mut changed = false;
+    let fields: Vec<rivus_core::Field> = union
+        .iter()
+        .map(|f| {
+            if f.dtype == DT::Str && casts.contains(&f.name) {
+                if let Some(i) = file_schema.index_of(&f.name) {
+                    let fd = file_schema.fields[i].dtype;
+                    if matches!(fd, DT::I64 | DT::F64 | DT::Bool) {
+                        changed = true;
+                        return rivus_core::Field::new(f.name.clone(), fd);
+                    }
+                }
+            }
+            f.clone()
+        })
+        .collect();
+    if changed {
+        let arc = std::sync::Arc::new(rivus_core::Schema::new(fields.clone()));
+        Some((fields, arc))
+    } else {
+        None
+    }
 }
 
 /// Stage C static gate for the SINK driver (design/41 §5, C-2b). The

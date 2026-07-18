@@ -2275,3 +2275,33 @@ dirty standard — every clean file pays parse-i64-then-Display to widen
 decode-to-union for →Str-widened columns (raw-bytes Str build with a
 canonical-form check, killing both the wasted i64 parse and the
 Display rebuild).
+
+### Narrow-keep — the C-eq gate pays a second time (landed)
+
+The widen itself is the waste: on the dirty standard every clean file
+parses `amount` to i64, `Display`s it back to Str for the union lane
+(`reconcile`, 23–28 ms/file), and the downstream `cast :int`
+re-parses the string. Under the Stage C eligibility gates this whole
+round trip is provably removable: each worker now reconciles to a
+per-file **narrow-keep target** — a →Str-widened column stays on the
+file's own scalar lane (i64/f64/bool) when it is cast-normalized
+downstream (`narrow_keep_target`, driven by `stage_c_cast_set`).
+Byte-identity is C-eq itself: the cast output is equal on narrow-fit
+cells (condition 2), and every other gate-permitted consumer is
+Display-encoded, where both lanes already produce the same bytes. The
+raw-bytes/canonical-form idea above became unnecessary — values, not
+bytes, flow onward, so no per-cell form check exists at all. Being a
+reconcile-level change it is **format-agnostic** (CSV and JSONL both
+win), and `cast_column` narrow→narrow is the identity fast path, so
+the cast cost vanishes too. Applied in all four worker paths (group/
+sink × first-wave/re-run); the dirty file itself still widens (its
+full schema IS Str) — `reconcile` now shows 0 ms on all 8 clean
+files, 22 ms on the dirty one.
+
+Measured (10M standards, same-binary interleave, best-of): CSV group
+781 → **667 ms** (−15%; DuckDB same window 944 ms → **0.71×**), JSONL
+group 1105 → **1003 ms** (−9%), ETL 896 → **800 ms** (−11%). Peak RSS
+**9.3 MB**. All three parallel outputs + CSV serial `cmp`-identical;
+stress suite (incl. R3/R3j/R4 contradiction paths, which exercise
+narrow-keep directly — `amount` is the widened, cast column there)
+194/0 green.
