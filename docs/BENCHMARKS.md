@@ -2249,3 +2249,29 @@ standards byte-identical. Destroyed on the numbers:
 
 The remaining ETL/decode residual vs Polars is compute in the block
 walk (field split + lane parse), not the kernel→user copy.
+
+### Negative result: block structural-mark scan is a wash (destroyed)
+
+The "one SIMD pass per block indexes every delim/newline/quote, the
+line walk consumes marks from a cursor" rewrite (#71 step 4 candidate)
+was built (AVX2+SWAR `scan_marks`, mark-cursor walk in
+`next_columns`, scalar-equivalence unit test), verified byte-identical
+on CSV group + ETL + serial, and measured DEAD EVEN: wall 780–856 vs
+772–794 ms interleaved on a quiet box, per-file decode median ~85 ms
+both sides. Why it cannot win here: `split_offsets` already does
+simdjson-style movemask+trailing_zeros extraction per line, so the
+only removable work was the per-line newline pre-scan (LLVM already
+auto-vectorizes it) — and the mark stream's ~4 `Vec` pushes per line
+cost exactly what that saved. Destroyed. Rule: a structural index only
+pays when stage 2 re-branches per byte; our stage 2 already consumes
+bitmasks.
+
+With cell primitives (S1–S3), mmap (Stage B) and the structural index
+all measured out, the decode floor (~85 ms/file real) is effectively
+reached for this architecture. The remaining measurable slack is NOT
+in decode: it is `reconcile` (23–28 ms/file × 8 clean files on the
+dirty standard — every clean file pays parse-i64-then-Display to widen
+`amount` into the union's Str lane) and the fused feed. Next lever:
+decode-to-union for →Str-widened columns (raw-bytes Str build with a
+canonical-form check, killing both the wasted i64 parse and the
+Display rebuild).
