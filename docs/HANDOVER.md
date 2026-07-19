@@ -40,18 +40,21 @@
 deny ok。
 
 **10M×9ファイル標準（汚れ入り・等価契約）の現在地（wall / peak RSS、
-2026-07-17 の同日 interleave — #239 ブランチ Stage C 込み）**:
+2026-07-17〜18 の同窓 interleave — #239 ブランチ、Stage C＋narrow-keep＋
+kernel マスク＋キー・プレフィクス込み）**:
 
-| 形状 | rivus | DuckDB 同窓 | 比 |
+| 形状 | rivus（静箱） | DuckDB 同窓 | 比 |
 |---|---|---|---|
-| CSV ETL | 914ms / 9.7MB | 1459ms | **0.63× 勝ち** |
-| CSV group | 799ms / 9.5MB | 943ms | **0.85× 勝ち** |
-| JSONL group | 1080ms / 8.2MB | 1534ms | **0.70× 勝ち** |
+| CSV group | **440-478ms** / 9.4MB | 653-660ms | **0.69× 勝ち** |
+| JSONL group | **611-720ms** / 8.2MB | 1257ms | **~0.50× 勝ち** |
+| CSV ETL | ~712-754ms / 9.7MB | 1459ms（前日窓） | **~0.5× 勝ち** |
 | CSV.gz group | （C 対象外・従来 0.86× 勝ち） | | |
 | JSONL.gz group | （C 対象外・従来 0.90× 勝ち） | | |
 
 **全 5 形状で DuckDB に勝利**（byte-identity 証明付き・1/25〜1/70 のメモリ）。
-残る未踏峰は Polars eager ETL 583ms（契約違反実装）のみ。
+残る未踏峰は Polars eager ETL 583ms（契約違反実装）— 現在 ~730ms 級で射程内。
+箱ノイズが大きい（同一バイナリで日内 ±40% 変動）ため、比較は必ず同窓
+interleave で（絶対値の日跨ぎ比較は無意味）。
 
 **#237 で入った主要機構**（詳細は BENCHMARKS.md 第1-18弾の各節）:
 ファイル毎 worker 並列（read→group / read→sink）・BroadcastProbe・ブロック歩行
@@ -106,15 +109,22 @@ R1/R2 並列 identity ガード（`tests/stress/parallel_read_identity.rs`）。
 5. FxHash は「性能ツールであり防御境界ではない」で指揮承認済み（SipHash 復帰は
    JoinTable/scratch の型1行）
 
-## 6. 次のレバー候補（優先順）
+## 6. 次のレバー候補（優先順・2026-07-18 改）
 
-1. **decode 計算の残差**（field split＋lane parse の SIMD/SWAR 深掘り — Polars
-   583ms への道はここ。mmap は不採用済みなので純粋に CPU 側）
-2. fused 対応集合の拡張（Or 述語・数値 coalesce・複数 join）
-3. 圧縮標準（csv.gz/jsonl.gz）の decode 側最適化（Stage C は非対象だった）
-4. Track C 残り: resample/gap-fill（#62 の agg 側）・rolling（#63）
-5. #45 正準縮約木の実装スライス（Q1 許容済み）
-6. sort-shape 並列化（read→sort→save）・Ryū/Dragonbox テール
+残レバーは全て ≤30ms 級（decode floor 実質到達・reconcile 0 化・述語 kernel 化・
+キー prefix 事前計算まで完了）。次の 2 倍は構造変更から:
+
+1. **辞書化 group-by（次の研究アーク）**: Str レーンの dictionary encode →
+   group キーを整数 ID 組へ（composite String＋hash probe ~40-50ns/row の根治）。
+   join probe の右表引きも ID 化で無料化しうる。IR/Chunk 層の設計判断を伴う
+   ため design doc → 批准 → 実装の順。
+2. fused 対応集合の拡張（Or 述語・数値 coalesce・複数 join — 適用面を広げる）
+3. ETL 残差（Polars 583ms vs ~730ms）: prefilter の行毎 f64 parse を SWAR
+   数字列比較へ（保守的意味論は維持）／typed agg リーダ（Value 往復除去、
+   各 ~10-30ms 級）
+4. 圧縮標準（csv.gz/jsonl.gz）の decode 側最適化（Stage C 非対象だった）
+5. Track C 残り: resample/gap-fill（#62 の agg 側）・rolling（#63）
+6. #45 正準縮約木の実装スライス（Q1 許容済み）
 
 ## 7. 落とし穴（実際に踏んだもの）
 
