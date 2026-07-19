@@ -2364,6 +2364,32 @@ still rejected `or`; both halves are now aligned and activation was
 verified `(active)` on every worker. Guard: R5 (or-predicate flow,
 speculative strategy asserted + serial==parallel at cs=7/4096).
 
+### Prefilter fast lane: SWAR digits instead of std f64 parse (landed)
+
+`row_passes_prefilter` paid a `str::parse::<f64>` per row per pushed
+predicate. Cells of 1–15 pure ASCII digits now ride `parse_i64_fast`
++ `as f64` — exact in f64 at that length, so the value is bit-equal to
+the std parse and every skip decision (and the exactness-pinned skip
+count) is unchanged; anything else (signs, dots, exponents, padding,
+longer runs) takes the std parse as before. Measured (6-round paired
+interleave): CSV group paired-median **−18 ms** (5/6 rounds, ~−4% —
+`amount > 0` runs on every row there), ETL mean −16 ms (4/6). Small
+but strictly-nonnegative and six lines. Outputs `cmp`-identical.
+
+### Decode-column pruning: designed, NOT started (contract question)
+
+The sink driver still decodes every column (`allow = None`) — ETL
+builds `category` cells 10M times for nothing; a `used`-set allow-list
+(plus every right-side name, to keep the probe's `_r` collision naming
+identical) would kill that. Shelved before implementation on a
+CONTRACT question: a pruned parallel run cannot count parse failures
+in never-consumed columns, so its error stream would diverge from the
+serial oracle's (the reader-prefilter precedent doesn't apply — it
+skips identically on BOTH paths). Options: prune the serial multi-file
+path with the same set, or rule the divergence acceptable for
+never-consumed columns. Needs a 統括/指揮 ruling; est. −30-60 ms on
+ETL when unblocked.
+
 ### Compressed standards: the cycle's wins were already banked (measured)
 
 The `.gz` group standards had not been re-measured since the

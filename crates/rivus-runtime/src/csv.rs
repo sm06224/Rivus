@@ -80,7 +80,19 @@ fn cmp_num(value: f64, op: CmpOp, rhs: f64) -> bool {
 fn row_passes_prefilter(pf: &[PreCmp], line: &str, offsets: &[(usize, usize)]) -> bool {
     for &(idx, op, rhs) in pf {
         let (s, e) = offsets[idx];
-        if let Ok(v) = line[s..e].trim().parse::<f64>() {
+        let cell = &line[s..e];
+        // Fast lane: 1..=15 pure ASCII digits — the SWAR int parse is exact,
+        // ≤15 digits are exactly representable in f64, so `v as f64` equals
+        // `cell.parse::<f64>()` bit-for-bit and every decision below is
+        // unchanged. Anything else (signs, dots, exponents, padding, longer
+        // digit runs) takes the std parse exactly as before.
+        let b = cell.as_bytes();
+        let v: Option<f64> = if !b.is_empty() && b.len() <= 15 && b.iter().all(u8::is_ascii_digit) {
+            parse_i64_fast(cell).map(|v| v as f64)
+        } else {
+            cell.trim().parse::<f64>().ok()
+        };
+        if let Some(v) = v {
             if !cmp_num(v, op, rhs) {
                 return false;
             }
