@@ -2327,6 +2327,27 @@ ms** (−12%; DuckDB same window 653–660 ms → **0.69×**), JSONL group
 ETL unaffected (its FilterProject was already vectorized). Peak RSS
 **9.4 MB**. Identity: parallel + serial `cmp`-identical, stress 194/0.
 
+### Negative result: fixed-width packed group key is a wash (destroyed)
+
+The next rung after the prefix precompute — replace the composite
+String probe entirely with a 16-byte packed key `(right-row id | cell
+len | null flag, ≤8-byte left cell)` into a second `GroupBy` scratch
+(`HashMap<(u64,u64), (String, GroupState)>`, composite built only on
+first insert; seal folds both maps, disjointness + the associative-
+lane gate covering the duplicate-frag merge case) — was built,
+verified (stress 194/0, all standards + serial `cmp`-identical,
+engagement probed on all 9 workers) and measured a WASH: 8-round
+paired interleave medians 555 vs 552 ms, mean paired diff +5 ms.
+Destroyed. Why there was nothing to win: after the prefix precompute
+the composite path is a single memcpy + a ~3-byte push + one FxHash of
+12–18 bytes (~15 ns); fixed-width packing saves a few ns of hashing
+but pays them back in per-row branching and a fatter emit body. The
+row-hot floor of this loop is NOT the key probe — it is the residual
+per-row work (join-key build + `Value` round trip + `AggAcc` moment
+updates + loop overhead), which no key representation changes. A
+future 2× on feed needs decode-time dictionary lanes (a Chunk-level
+design decision, ratification territory), not a smarter map.
+
 ### Fused loop: right-only key-prefix precompute (landed)
 
 The composite key's leading cells that read only the RIGHT side (or
