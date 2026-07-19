@@ -2348,6 +2348,20 @@ updates + loop overhead), which no key representation changes. A
 future 2× on feed needs decode-time dictionary lanes (a Chunk-level
 design decision, ratification territory), not a smarter map.
 
+### Compressed standards: the cycle's wins were already banked (measured)
+
+The `.gz` group standards had not been re-measured since the
+narrow-keep / kernel-mask / prefix slices — all of which apply to the
+compressed workers too (the fused loop is decoder-agnostic; gz opens
+were already sample-typed, so Stage C changed nothing there). Current
+binary, same-window interleave: **csv.gz 711–903 ms vs DuckDB
+1177 ms → 0.60×** (previous record 0.86×), **jsonl.gz 999–1119 ms vs
+DuckDB 1777–1922 ms → 0.56×** (previous 0.90×). Both `cmp`-identical
+to references; gz worker profile decode 131–139 ms/file (decompress +
+parse), feed 87–93 ms (fused active). With these, every one of the
+five 10M standards now sits at **0.50×–0.70× of DuckDB** under the
+never-silent contract at single-digit-MB RSS.
+
 ### Fused loop: right-only key-prefix precompute (landed)
 
 The composite key's leading cells that read only the RIGHT side (or

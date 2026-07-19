@@ -43,15 +43,17 @@ deny ok。
 2026-07-17〜18 の同窓 interleave — #239 ブランチ、Stage C＋narrow-keep＋
 kernel マスク＋キー・プレフィクス込み）**:
 
-| 形状 | rivus（静箱） | DuckDB 同窓 | 比 |
+| 形状 | rivus | DuckDB 同窓 | 比 |
 |---|---|---|---|
 | CSV group | **440-478ms** / 9.4MB | 653-660ms | **0.69× 勝ち** |
 | JSONL group | **611-720ms** / 8.2MB | 1257ms | **~0.50× 勝ち** |
 | CSV ETL | ~712-754ms / 9.7MB | 1459ms（前日窓） | **~0.5× 勝ち** |
-| CSV.gz group | （C 対象外・従来 0.86× 勝ち） | | |
-| JSONL.gz group | （C 対象外・従来 0.90× 勝ち） | | |
+| CSV.gz group | **711-903ms** | 1177ms | **0.60× 勝ち**（旧 0.86×） |
+| JSONL.gz group | **999-1119ms** | 1777-1922ms | **0.56× 勝ち**（旧 0.90×） |
 
-**全 5 形状で DuckDB に勝利**（byte-identity 証明付き・1/25〜1/70 のメモリ）。
+**全 5 形状で DuckDB の 0.50-0.70×**（byte-identity 証明付き・一桁 MB RSS）。
+gz 2 形状は個別最適化なしで narrow-keep/kernel マスク/prefix の恩恵が
+自動適用された結果（fused loop はデコーダ非依存 — 計測 2026-07-18）。
 残る未踏峰は Polars eager ETL 583ms（契約違反実装）— 現在 ~730ms 級で射程内。
 箱ノイズが大きい（同一バイナリで日内 ±40% 変動）ため、比較は必ず同窓
 interleave で（絶対値の日跨ぎ比較は無意味）。
