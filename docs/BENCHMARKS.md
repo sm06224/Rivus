@@ -2348,6 +2348,22 @@ updates + loop overhead), which no key representation changes. A
 future 2× on feed needs decode-time dictionary lanes (a Chunk-level
 design decision, ratification territory), not a smarter map.
 
+### Fused set expansion: `or` predicates (landed)
+
+勝ちやすいパターンだけではダメ — a filter containing `or` used to knock
+the whole flow off BOTH the fused loop and the speculative open (three
+gates each accepted conjunctions only). All three now take any and/or
+tree over bare fields/literals: the shared interpreter evaluates it
+exactly (same leaves ⇒ the cast-fail counter still provably 0), the
+kernel mask simply stays off for non-conjunctions (interpreter row
+path), and C-eq only cares WHICH columns a predicate reads, not its
+boolean shape. Found-by-verification note: the graph-level gate alone
+made the identity test pass via silent generic fallback — only the
+WPROF engagement check exposed that the WORKER-level `pred_left_only`
+still rejected `or`; both halves are now aligned and activation was
+verified `(active)` on every worker. Guard: R5 (or-predicate flow,
+speculative strategy asserted + serial==parallel at cs=7/4096).
+
 ### Compressed standards: the cycle's wins were already banked (measured)
 
 The `.gz` group standards had not been re-measured since the

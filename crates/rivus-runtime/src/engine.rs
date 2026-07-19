@@ -3029,10 +3029,15 @@ fn fused_shape_plan(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<FusedSh
     fn leaf_ok(e: &E) -> bool {
         matches!(e, E::Field { .. } | E::Literal(_))
     }
+    // `Or` joined the accepted set once measured worthwhile (勝ちやすい
+    // パターンだけではダメ): the shared interpreter evaluates it exactly, its
+    // leaves are the same bare fields/literals (no cast can fail), and a
+    // non-conjunction simply keeps the interpreter row path (the kernel mask
+    // only compiles pure conjunctions — `sel` stays `None`).
     fn pred_ok(e: &E) -> bool {
         match e {
             E::Compare { left, right, .. } => leaf_ok(left) && leaf_ok(right),
-            E::And(a, b) => pred_ok(a) && pred_ok(b),
+            E::And(a, b) | E::Or(a, b) => pred_ok(a) && pred_ok(b),
             _ => false,
         }
     }
@@ -3078,7 +3083,10 @@ fn fused_shape_plan(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<FusedSh
 fn stage_c_eligible(graph: &PlanGraph, shape: &ReadGroupShape, sp: &FusedShapePlan) -> bool {
     use rivus_core::DataType as DT;
     use rivus_ir::Expr as E;
-    /// Column reads of a fused-gate predicate; `false` = outside the modeled set.
+    /// Column reads of a fused-gate predicate; `false` = outside the modeled
+    /// set. `Or` is C-eq-neutral like `And`: only WHICH columns a predicate
+    /// reads matters (cast-normalized inputs ⇒ identical outputs, whatever
+    /// the boolean shape).
     fn pred_cols<'a>(e: &'a E, out: &mut Vec<&'a str>) -> bool {
         match e {
             E::Field { name, access } => {
@@ -3091,7 +3099,7 @@ fn stage_c_eligible(graph: &PlanGraph, shape: &ReadGroupShape, sp: &FusedShapePl
             }
             E::Literal(_) => true,
             E::Compare { left, right, .. } => pred_cols(left, out) && pred_cols(right, out),
-            E::And(a, b) => pred_cols(a, out) && pred_cols(b, out),
+            E::And(a, b) | E::Or(a, b) => pred_cols(a, out) && pred_cols(b, out),
             _ => false,
         }
     }
@@ -3422,7 +3430,7 @@ fn resolve_fused_plan(
             E::Compare {
                 left: l, right: r, ..
             } => pred_left_only(l, left) && pred_left_only(r, left),
-            E::And(a, b) => pred_left_only(a, left) && pred_left_only(b, left),
+            E::And(a, b) | E::Or(a, b) => pred_left_only(a, left) && pred_left_only(b, left),
             _ => false,
         }
     }

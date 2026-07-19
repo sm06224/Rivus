@@ -368,6 +368,48 @@ fn stage_c_speculative_jsonl_group_serial_parallel_byte_identical() {
     }
 }
 
+/// R5: an `or` predicate rides the fused loop and the speculative open (the
+/// gates accept any and/or shape over bare fields/literals — the shared
+/// interpreter evaluates it, the kernel mask simply stays off for
+/// non-conjunctions). Serial oracle == parallel, with the speculative
+/// strategy asserted so gate acceptance can't silently rot.
+#[test]
+fn stage_c_or_predicate_group_serial_parallel_byte_identical() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagec_or");
+    for (i, text) in r1_csv_texts().iter().enumerate() {
+        std::fs::write(dir.file(&format!("part_0{i}.csv")), text).unwrap();
+    }
+    let rp = gendata::write_temp("stagec_or_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.csv\" read as csv cast amount :int ;\n\
+         J: S &left R on region\n\
+            |? amount < 100 or amount > 800\n\
+            |# country region sum:amount count:order_id ;",
+        rp.display(),
+        dir.0.display(),
+    );
+    for cs in [7usize, 4096] {
+        let (oracle, _) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Low, cs);
+        assert!(!oracle.is_empty(), "oracle must have groups");
+        let (par, p_strat) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Unbounded, cs);
+        assert_eq!(
+            p_strat.as_deref(),
+            Some("parallel read group-by (per-file workers, speculative open)"),
+            "an `or` predicate must not knock the flow off Stage C"
+        );
+        assert_eq!(par, oracle, "serial == parallel (in order) @cs={cs}");
+    }
+}
+
 /// R3b (Stage C, design/41 §5): a contradiction that widens a column between
 /// NUMERIC lanes (i64→f64 here, via a `1.5` beyond the sample window) is not
 /// Display-exact above 2^53, so the driver must bail to the serial canonical
