@@ -2326,3 +2326,16 @@ ms** (−12%; DuckDB same window 653–660 ms → **0.69×**), JSONL group
 745 → **611–720 ms** (−13%; DuckDB same window 1257 ms → **~0.50×**),
 ETL unaffected (its FilterProject was already vectorized). Peak RSS
 **9.4 MB**. Identity: parallel + serial `cmp`-identical, stress 194/0.
+
+### Fused loop: right-only key-prefix precompute (landed)
+
+The composite key's leading cells that read only the RIGHT side (or
+literals) — `coalesce(country, "@")` in the standard — depend on the
+matched right row alone, so their encoded bytes (internal separators
+included, plus the `ri = None` variant) are now built once per worker
+at plan resolution (`FusedPlan::right_prefix`, capped at 4096 right
+rows) and each emit `push_str`s one precomputed fragment instead of
+running per-cell null checks and pushes. Measured (8-round paired
+interleave, noisy box): CSV group median 567 → **540 ms** (7/8 rounds
+won, ~−5%); JSONL group 883–952 → ~850 ms class. Parallel + serial
+`cmp`-identical, stress 194/0.

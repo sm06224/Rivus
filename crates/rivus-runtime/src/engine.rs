@@ -3379,6 +3379,14 @@ struct FusedPlan {
     preds: Vec<rivus_ir::Expr>,
     key_cells: Vec<FusedCell>,
     agg_cells: Vec<FusedCell>,
+    /// Precomputed composite-key PREFIX per right row (design/41 Stage A
+    /// follow-up): the longest leading run of `key_cells` that read only the
+    /// right side (or literals) depends on `ri` alone, so its encoded bytes —
+    /// internal separators included — are built ONCE per worker instead of
+    /// per emitted row. `(prefix_len, frags)` with `frags[right.len()]` the
+    /// unmatched-left (`ri = None`) variant; `None` = no right-only prefix
+    /// (or an unusually large right side, capped to bound the precompute).
+    right_prefix: Option<(usize, Vec<String>)>,
 }
 
 fn resolve_fused_plan(
@@ -3490,12 +3498,41 @@ fn resolve_fused_plan(
         .map(|k| lookup(&k.root))
         .collect::<Option<_>>()?;
     let agg_cells: Vec<FusedCell> = aggs.iter().map(|(_, c)| lookup(c)).collect::<Option<_>>()?;
+    // Precompute the right-only composite-key prefix per right row (bounded:
+    // a broadcast right side is small by construction; skip past 4096 rows).
+    let plen = key_cells
+        .iter()
+        .take_while(|c| {
+            matches!(
+                c,
+                FusedCell::Right(_) | FusedCell::CoalesceRight(_, _) | FusedCell::LitStr(_)
+            )
+        })
+        .count();
+    let right_prefix = if plen > 0 && right.len <= 4096 {
+        let dummy = right; // Left cells never occur in the prefix; `li` unused.
+        let mut frags = Vec::with_capacity(right.len + 1);
+        for ri in (0..right.len).map(Some).chain(std::iter::once(None)) {
+            let mut s = String::new();
+            for (j, cell) in key_cells[..plen].iter().enumerate() {
+                if j > 0 {
+                    s.push('\u{1f}');
+                }
+                fused_push_key(cell, dummy, 0, right, ri, &mut s);
+            }
+            frags.push(s);
+        }
+        Some((plen, frags))
+    } else {
+        None
+    };
     Some(FusedPlan {
         lk,
         keeps_left: kind.keeps_left(),
         preds: sp.preds.clone(),
         key_cells,
         agg_cells,
+        right_prefix,
     })
 }
 
@@ -3648,7 +3685,15 @@ fn fused_feed_chunk(
             |ri: Option<usize>, group: &mut operators::GroupBy, sc: &mut FusedScratch| {
                 *rows += 1;
                 sc.comp.clear();
-                for (j, cell) in plan.key_cells.iter().enumerate() {
+                // Right-only prefix: one precomputed memcpy instead of
+                // per-cell null checks + pushes (`FusedPlan::right_prefix`).
+                let mut j0 = 0usize;
+                if let Some((plen, frags)) = &plan.right_prefix {
+                    sc.comp
+                        .push_str(&frags[ri.map_or(frags.len() - 1, |r_| r_)]);
+                    j0 = *plen;
+                }
+                for (j, cell) in plan.key_cells.iter().enumerate().skip(j0) {
                     if j > 0 {
                         sc.comp.push('\u{1f}');
                     }
