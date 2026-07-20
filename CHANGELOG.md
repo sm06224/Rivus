@@ -19,6 +19,23 @@ All notable changes to Rivus. Format loosely follows
   `rivus explain` surfaces the decision as a `decode prune` section listing
   the kept columns. JSONL decodes fully (its readers take no allow-list), and
   any join/group/rename in the chain disables pruning entirely.
+- **design/38 P1+P2 — the syntax surface has ONE spelling per operation
+  (migration release, breaking next release).** The alias families
+  (`readcsv`/`readjson`→`open [as jsonl]`, `gci`/`dir`→`ls`,
+  `limit`/`head`→`take`, `unnest`→`explode`, `writecsv`/`writejson`→`save
+  [as jsonl]`, `where`→`|?`), the `name as alias` / `(name:type) as alias`
+  project forms (→ the `:` chain; `as` stays for computed columns only), and
+  the top-level `and` between filter predicates (→ the comma; `and`/`or`
+  survive inside boolean expressions) are **deprecated**: this release they
+  still parse and `rivus fmt` rewrites them to the canonical spelling
+  (auto-migration, pinned by round-trip tests); **next release the deleted
+  spellings become never-silent errors** with a did-you-mean pointing at the
+  survivor. `readbin` is deferred to that flip (its binary schema has no
+  `open` equivalent yet). Also fixed while auditing the migration: a codec
+  that disagrees with the path extension now round-trips explicitly —
+  `readjson d.weird` renders `open d.weird as jsonl` (it used to render bare
+  and re-parse as CSV, a silent semantic flip), and a CSV `save` onto a
+  `.jsonl`/`.json` path keeps `as csv`.
 - **Expression `cast` to a temporal lane now parses a string source (BUG-D) —
   behavior change.** `cast ts:datetime` / `(ts:datetime) as t` (and `date`/`time`)
   previously reinterpreted a string as raw epoch ticks (`"2026-06-01"` → epoch-0,

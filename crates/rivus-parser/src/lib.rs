@@ -4967,4 +4967,90 @@ Import:
             .unwrap();
         assert_eq!(sink, "-");
     }
+
+    /// design/38 P1+P2 移行リリース (#236 acceptance ②): every deleted
+    /// spelling still parses, and `to_source` (the engine `rivus fmt` runs)
+    /// rewrites it to the ONE canonical form. Each canonical output is
+    /// fmt-stable (idempotent), pinning the pre/post-migration round-trip.
+    /// The did-you-mean hard error replaces the alias parse in the NEXT
+    /// release (CHANGELOG).
+    #[test]
+    fn p1_p2_migration_rewrites_deleted_spellings() {
+        let canon = |src: &str| parse(src).unwrap().to_source();
+        let cases: &[(&str, &str)] = &[
+            // P1 alias families -> the surviving spelling
+            ("F:\n readcsv d.weird\n;", "open d.weird"),
+            ("F:\n readjson d.weird\n;", "open d.weird as jsonl"),
+            ("F:\n gci \"in/*.csv\"\n;", "ls \"in/*.csv\""),
+            ("F:\n dir \"in/*.csv\"\n;", "ls \"in/*.csv\""),
+            ("F:\n open d.csv\n limit 5\n;", "take 5"),
+            ("F:\n open d.csv\n head 5\n;", "take 5"),
+            ("F:\n open d.jsonl\n unnest items\n;", "explode items"),
+            ("F:\n open d.csv\n writecsv o.any\n;", "save o.any"),
+            (
+                "F:\n open d.csv\n writejson o.any\n;",
+                "save o.any as jsonl",
+            ),
+            ("F:\n open d.csv\n where x > 1\n;", "|? $_.x > 1"),
+            // P2: one project spelling (the `:` chain) …
+            ("F:\n open d.csv\n |> a as b\n;", "a :b"),
+            ("F:\n open d.csv\n |> (c:int) as d\n;", "c :d :i64"),
+            // … and one top-level conjunction (the comma)
+            (
+                "F:\n open d.csv\n |? x > 1 and y < 2\n;",
+                "|? $_.x > 1, $_.y < 2",
+            ),
+        ];
+        for (old, want) in cases {
+            let out = canon(old);
+            assert!(
+                out.contains(want),
+                "{old:?} must canonicalize to {want:?}, got:\n{out}"
+            );
+            assert_eq!(out, canon(&out), "canonical form not fmt-stable: {old:?}");
+        }
+        // `and`/`or` survive INSIDE a boolean expression where precedence
+        // matters: `a and b or c` roots at `Or`, so nothing is flattened.
+        let keep = canon("F:\n open d.csv\n |? x > 1 and y < 2 or z > 3\n;");
+        assert!(
+            keep.contains(" and ") && keep.contains(" or "),
+            "or-rooted expr keeps its inner and: {keep}"
+        );
+        // Comma and `and` parse to the IDENTICAL IR (the rewrite is pure
+        // canonicalization, not a semantic change).
+        let a = parse("F:\n open d.csv\n |? x > 1, y < 2\n;").unwrap();
+        let b = parse("F:\n open d.csv\n |? x > 1 and y < 2\n;").unwrap();
+        assert_eq!(
+            format!("{:?}", a.nodes[1].op),
+            format!("{:?}", b.nodes[1].op),
+            "comma and top-level `and` must build the same predicate"
+        );
+    }
+
+    /// The codec must survive the round-trip even when the path extension
+    /// implies another format — found by the P1 migration audit: `readjson
+    /// d.weird` used to render as a bare `open d.weird`, which re-parses as
+    /// CSV (a silent semantic flip fmt would have baked into user files).
+    #[test]
+    fn codec_disagreeing_with_extension_stays_explicit() {
+        let rt = |src: &str| {
+            let g1 = parse(src).unwrap();
+            let s1 = g1.to_source();
+            let g2 = parse(&s1).unwrap();
+            assert_eq!(
+                format!("{:?}", g1.nodes[0].op),
+                format!("{:?}", g2.nodes[0].op),
+                "source op must survive the round-trip: {src}"
+            );
+            assert_eq!(s1, parse(&s1).unwrap().to_source(), "unstable: {src}");
+            s1
+        };
+        assert!(rt("F:\n readjson d.weird\n;").contains("as jsonl"));
+        assert!(rt("F:\n open d.jsonl as csv\n;").contains("as csv"));
+        // Sink side: a CSV save onto a jsonl-implying path stays explicit.
+        let g = parse("F:\n open d.csv\n save o.jsonl as csv\n;").unwrap();
+        let s = g.to_source();
+        assert!(s.contains("save o.jsonl as csv"), "sink flip: {s}");
+        assert_eq!(s, parse(&s).unwrap().to_source(), "sink unstable: {s}");
+    }
 }

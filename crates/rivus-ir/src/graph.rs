@@ -433,6 +433,42 @@ pub fn is_http_url(p: &str) -> bool {
         || b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://")
 }
 
+/// Flatten a filter predicate's ROOT `And` chain into its conjunct parts —
+/// the canonical `|?` spelling joins them with commas (design/38 P2: the
+/// comma is the one top-level conjunction; `and`/`or` remain inside
+/// sub-expressions). An `Or` (or any non-`And`) root is a single part.
+fn flatten_and_chain(pred: &Expr) -> Vec<String> {
+    fn walk(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::And(a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            other => out.push(other.to_string()),
+        }
+    }
+    let mut parts = Vec::new();
+    walk(pred, &mut parts);
+    parts
+}
+
+/// The codec family the parser would infer for `path` from its extension
+/// alone (the mirror of the parser's `resolve_format` fallback: unknown →
+/// csv). `to_source` consults this so a codec that DISAGREES with the
+/// extension keeps an explicit `as FMT` — without it, `readjson d.weird`
+/// would render as a bare `open d.weird` and re-parse as CSV (a silent
+/// semantic flip; found by the design/38 P1 migration audit).
+fn ext_codec_of(path: &str) -> &'static str {
+    let l = path.to_ascii_lowercase();
+    if l.ends_with(".parquet") {
+        "parquet"
+    } else if l.ends_with(".jsonl") || l.ends_with(".ndjson") || l.ends_with(".json") {
+        "jsonl"
+    } else {
+        "csv"
+    }
+}
+
 impl Discovery {
     /// The discovery's path/pattern string: the fixed path (`Fixed`), the glob
     /// pattern (`Glob`/`Watch`) or the endpoint (`Subscribe`). Used for
@@ -1178,6 +1214,11 @@ impl Op {
                             _ if is_http_url(path) => format!("open {path:?}"),
                             _ => format!("open {path}"),
                         };
+                        // The CSV codec over a jsonl/parquet-implying extension
+                        // must stay explicit or the round-trip flips the codec.
+                        if ext_codec_of(path) != "csv" {
+                            s.push_str(" as csv");
+                        }
                         if !header {
                             s.push_str(" noheader");
                         }
@@ -1264,6 +1305,13 @@ impl Op {
                     Codec::Jsonl if is_http_url(path) => {
                         format!("open {path:?} as json{}", provenance.modifier())
                     }
+                    // A file `open` keeps the bare path only when the extension
+                    // already implies jsonl (`.jsonl`/`.ndjson`/`.json` — all
+                    // three lower to this codec); anything else must carry
+                    // `as jsonl` so `readjson d.weird` survives the round-trip.
+                    Codec::Jsonl if ext_codec_of(path) != "jsonl" => {
+                        format!("open {path} as jsonl{}", provenance.modifier())
+                    }
                     Codec::Jsonl => format!("open {path}{}", provenance.modifier()),
                     // `ls "glob"` / `watch "glob"` — the path is the glob
                     // pattern; quote it so it re-lexes as one string token
@@ -1293,7 +1341,13 @@ impl Op {
                 s
             }
             Op::StreamRef { name } => format!("stream {name}"),
-            Op::Filter { pred } => format!("|? {pred}"),
+            // P2 (design/38): the comma IS the top-level conjunction — the
+            // root `And` chain renders as `a, b, c` (one spelling). `and`/`or`
+            // survive only inside sub-expressions where precedence matters
+            // (`a and b or c` roots at `Or` and is untouched). `a, b` and
+            // `a and b` parse to the identical `Expr::And`, so this is pure
+            // canonicalization — same IR either way.
+            Op::Filter { pred } => format!("|? {}", flatten_and_chain(pred).join(", ")),
             Op::Validate { pred, disposition } => format!("|! {pred} {}", disposition.as_str()),
             Op::Project { fields } => format!("|> {}", fields.join(" ")),
             Op::ProjectExpr { items, views } => {
@@ -1457,7 +1511,10 @@ impl Op {
             }
             Op::Reorder { cols } => format!("reorder {}", cols.join(" ")),
             Op::FilterProject { preds, fields } => {
-                let mut s: String = preds.iter().map(|p| format!("|? {p} ")).collect();
+                let mut s: String = preds
+                    .iter()
+                    .map(|p| format!("|? {} ", flatten_and_chain(p).join(", ")))
+                    .collect();
                 if let Some(f) = fields {
                     s.push_str(&format!("|> {}", f.join(" ")));
                 }
@@ -1509,7 +1566,13 @@ impl Op {
             } => {
                 let mut s = format!("save \"{template}\"");
                 let modifier = match codec {
-                    SinkCodec::Csv { delim } => delim_modifier_for(template, *delim),
+                    // A comma-CSV sink over a jsonl-implying template must stay
+                    // explicit (`as csv`) or re-parsing flips it to jsonl.
+                    SinkCodec::Csv { delim } => {
+                        delim_modifier_for(template, *delim).or_else(|| {
+                            (ext_codec_of(template) != "csv").then(|| "as csv".to_string())
+                        })
+                    }
                     SinkCodec::Jsonl => {
                         let lower = template.to_ascii_lowercase();
                         (!lower.ends_with(".jsonl") && !lower.ends_with(".ndjson"))
@@ -1545,7 +1608,10 @@ impl Op {
                 ..
             } => {
                 match codec {
-                    SinkCodec::Csv { delim } => match delim_modifier_for(path, *delim) {
+                    // Same explicit-`as csv` rule as the template route above.
+                    SinkCodec::Csv { delim } => match delim_modifier_for(path, *delim)
+                        .or_else(|| (ext_codec_of(path) != "csv").then(|| "as csv".to_string()))
+                    {
                         Some(m) => format!("save {path} {m}"),
                         None => format!("save {path}"),
                     },
