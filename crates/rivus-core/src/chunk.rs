@@ -349,6 +349,15 @@ pub enum ColumnData {
     /// Time-of-day lane (i64 ticks since midnight; #58, MVP `Sec`).
     Time(Vec<i64>),
     Str(StrColumn),
+    /// **Dictionary-encoded** Str lane (design/42, 批准 2026-07-19): a small
+    /// distinct-value dictionary plus per-row codes. Strictly a REPRESENTATION,
+    /// never a type — the schema dtype stays `Str`, `value(row)` returns the
+    /// same `Value::Str`, and every byte that leaves the engine (keys, casts,
+    /// `write_cell`) is identical to the plain lane's (pinned by the
+    /// dict-vs-plain property tests). Produced selectively by readers for
+    /// low-cardinality columns (stage b); consumers that don't know about it
+    /// fall through the same accessors and stay correct.
+    StrDict(DictColumn),
     /// I/O resource handle lane (design §28.1): uri-backed, like [`StrColumn`].
     /// The uri is the in-contract identity; `size`/`mtime` (out of the
     /// determinism contract, §00 0.14) ride on the scalar [`Value::Resource`]
@@ -365,7 +374,40 @@ pub enum ColumnData {
     List(ListColumn),
 }
 
-/// Backing for [`ColumnData::Struct`]: named child columns (Arrow struct).
+/// Backing for [`ColumnData::StrDict`] (design/42): distinct values in
+/// `dict`, one `u32` code per row. The dictionary is chunk-owned and small by
+/// construction (the reader's escape hatch caps distinct counts), so `Clone`
+/// is a bounded copy. Row nullability rides the column's `Validity` exactly
+/// like the plain Str lane — a null row's code is 0 and never read.
+#[derive(Debug, Clone)]
+pub struct DictColumn {
+    pub dict: StrColumn,
+    pub codes: Vec<u32>,
+}
+
+impl DictColumn {
+    /// The row's string — the dictionary entry its code points at.
+    #[inline]
+    pub fn get(&self, row: usize) -> &str {
+        self.dict.get(self.codes[row] as usize)
+    }
+    pub fn len(&self) -> usize {
+        self.codes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.codes.is_empty()
+    }
+    /// Decode into the plain lane — row-for-row the same bytes.
+    pub fn materialize(&self) -> StrColumn {
+        let mut out = StrColumn::with_capacity(self.len(), 0);
+        for &c in &self.codes {
+            out.push(self.dict.get(c as usize));
+        }
+        out
+    }
+}
+
+// Backing for [`ColumnData::Struct`]: named child columns (Arrow struct).
 #[derive(Debug, Clone)]
 pub struct StructColumn {
     /// Child field names, parallel to `columns`.
@@ -397,6 +439,7 @@ impl ColumnData {
             ColumnData::Date(v) => v.len(),
             ColumnData::Time(v) => v.len(),
             ColumnData::Str(v) => v.len(),
+            ColumnData::StrDict(v) => v.len(),
             ColumnData::Resource(v) => v.len(),
             ColumnData::Struct(s) => s.len,
             ColumnData::List(l) => l.offsets.len().saturating_sub(1),
@@ -417,7 +460,8 @@ impl ColumnData {
             ColumnData::Duration(v) => DataType::Duration { unit: v.unit },
             ColumnData::Date(_) => DataType::Date,
             ColumnData::Time(_) => DataType::Time,
-            ColumnData::Str(_) => DataType::Str,
+            // Representation, not a type (design/42 §2): a dict lane IS Str.
+            ColumnData::Str(_) | ColumnData::StrDict(_) => DataType::Str,
             ColumnData::Resource(_) => DataType::Resource,
             ColumnData::Struct(_) => DataType::Struct,
             ColumnData::List(_) => DataType::List,
@@ -442,6 +486,7 @@ impl ColumnData {
                 crate::value::TimeUnit::Sec,
             )),
             ColumnData::Str(v) => Value::Str(v.get(row).to_string()),
+            ColumnData::StrDict(v) => Value::Str(v.get(row).to_string()),
             ColumnData::Resource(v) => Value::Resource(crate::value::Resource::new(v.get(row))),
             // Nested (§32 s3): recurse, honoring each child's validity. A struct
             // row is its named children at `row`; a list row is its child slice
@@ -464,6 +509,14 @@ impl ColumnData {
     /// chunks before a blocking sort). Mismatched variants are ignored — within
     /// one stream every chunk shares the schema, so this never happens there.
     pub fn append(&mut self, other: &ColumnData) {
+        // A dict lane materializes before concatenation: chunks of one stream
+        // may mix representations once readers emit dicts per file, and the
+        // `_ => {}` fallthrough below would silently truncate (design/42 §2).
+        if let ColumnData::StrDict(d) = self {
+            if matches!(other, ColumnData::Str(_) | ColumnData::StrDict(_)) {
+                *self = ColumnData::Str(d.materialize());
+            }
+        }
         match (self, other) {
             (ColumnData::Bool(a), ColumnData::Bool(b)) => a.extend_from_slice(b),
             (ColumnData::I64(a), ColumnData::I64(b)) => a.extend_from_slice(b),
@@ -478,6 +531,11 @@ impl ColumnData {
             (ColumnData::Date(a), ColumnData::Date(b)) => a.extend_from_slice(b),
             (ColumnData::Time(a), ColumnData::Time(b)) => a.extend_from_slice(b),
             (ColumnData::Str(a), ColumnData::Str(b)) => a.append(b),
+            (ColumnData::Str(a), ColumnData::StrDict(b)) => {
+                for i in 0..b.len() {
+                    a.push(b.get(i));
+                }
+            }
             (ColumnData::Resource(a), ColumnData::Resource(b)) => a.append(b),
             // Nested (§32 s3): concatenate child-wise. A buffering operator (sort,
             // group, distinct, unbounded merge) relies on this — a no-op here
@@ -549,6 +607,16 @@ impl ColumnData {
                 }
                 ColumnData::Str(out)
             }
+            // An outer-join gather materializes the dict lane (the `None`
+            // default `""` need not be a dictionary entry); output bytes are
+            // exactly the plain arm's.
+            ColumnData::StrDict(v) => {
+                let mut out = StrColumn::with_capacity(indices.len(), 0);
+                for o in indices {
+                    out.push(o.map_or("", |i| v.get(i)));
+                }
+                ColumnData::Str(out)
+            }
             ColumnData::Resource(v) => {
                 let mut out = StrColumn::with_capacity(indices.len(), 0);
                 for o in indices {
@@ -607,6 +675,12 @@ impl ColumnData {
             ColumnData::Date(v) => ColumnData::Date(indices.iter().map(|&i| v[i]).collect()),
             ColumnData::Time(v) => ColumnData::Time(indices.iter().map(|&i| v[i]).collect()),
             ColumnData::Str(v) => ColumnData::Str(v.gather(indices)),
+            // A filter/join gather keeps the representation: codes gather,
+            // dictionary (small by the reader's escape hatch) is cloned.
+            ColumnData::StrDict(v) => ColumnData::StrDict(DictColumn {
+                dict: v.dict.clone(),
+                codes: indices.iter().map(|&i| v.codes[i]).collect(),
+            }),
             ColumnData::Resource(v) => ColumnData::Resource(v.gather(indices)),
             // Nested (§32 s3): recurse on each child Column; for a list, rebuild
             // offsets over the selected sub-lists.
@@ -663,6 +737,18 @@ fn list_gather_opt(offsets: &[i32], indices: &[Option<usize>]) -> (Vec<i32>, Vec
 pub struct Column {
     data: ColumnData,
     validity: Validity,
+}
+
+impl Column {
+    /// design/42: decode a dict lane in place to the plain Str lane (no-op on
+    /// every other representation). Operators that REWRITE string cells (the
+    /// fill family) call this first, so their `Str`-shaped logic applies
+    /// unchanged and behavior can never diverge by representation.
+    pub fn undict(&mut self) {
+        if let ColumnData::StrDict(d) = &self.data {
+            self.data = ColumnData::Str(d.materialize());
+        }
+    }
 }
 
 impl std::ops::Deref for Column {

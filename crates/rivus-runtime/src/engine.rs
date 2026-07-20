@@ -3564,6 +3564,7 @@ fn fused_push_key(
             key.push('\u{1}');
             match c.columns[ci].data() {
                 ColumnData::Str(s) => key.push_str(s.get(row)),
+                ColumnData::StrDict(d) => key.push_str(d.get(row)),
                 _ => {
                     let _ = write!(key, "{}", c.value(row, ci));
                 }
@@ -3580,6 +3581,8 @@ fn fused_push_key(
             key.push('\u{1}');
             match l.columns[*ci].data() {
                 ColumnData::Str(s) if !l.columns[*ci].is_null(li) => key.push_str(s.get(li)),
+                // Dict lane is the same Str lane (design/42): cell, not literal.
+                ColumnData::StrDict(d) if !l.columns[*ci].is_null(li) => key.push_str(d.get(li)),
                 _ => key.push_str(lit),
             }
         }
@@ -3588,6 +3591,7 @@ fn fused_push_key(
             match ri {
                 Some(r_) if !r.columns[*ci].is_null(r_) => match r.columns[*ci].data() {
                     ColumnData::Str(s) => key.push_str(s.get(r_)),
+                    ColumnData::StrDict(d) => key.push_str(d.get(r_)),
                     _ => key.push_str(lit),
                 },
                 _ => key.push_str(lit),

@@ -1,7 +1,9 @@
 # 42 — Dictionary-encoded Str lanes（提案・批准待ち）
 
-Status: **設計メモ（実装未着手）**。Chunk 層の表現追加を伴うため、着手前に
-統括／指揮の批准を求める（FxHash・decimal レーンと同じ手順）。
+Status: **批准済み（2026-07-19、#180 記録 → 現運用は #240）・第 (a) 段実装中**。
+批准条件 4 点＝①§2 不変条件の property test（dict vs plain の value()/gather/
+write_cell バイト一致）②高カード escape hatch 必須 ③(a)→(b)→(c) の段階ごとに
+既存ガード＋計測 ④発動可観測性を最初から（WPROF/strategy）。
 
 ## 1. なぜ今これか（実測の帰結）
 

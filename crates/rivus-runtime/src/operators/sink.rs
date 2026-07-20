@@ -190,6 +190,28 @@ pub(crate) fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8)
             }
         }
         // A resource handle renders its uri (text), with the same CSV quoting.
+        // The dict lane writes the same bytes as the plain Str arm below —
+        // only the cell lookup differs (design/42 §2, pinned by property test).
+        ColumnData::StrDict(d) => {
+            let cell = d.get(row);
+            if cell.is_empty()
+                || cell.bytes().any(|b| b == delim)
+                || cell.contains('"')
+                || cell.contains('\n')
+            {
+                line.push('"');
+                for ch in cell.chars() {
+                    if ch == '"' {
+                        line.push_str("\"\"");
+                    } else {
+                        line.push(ch);
+                    }
+                }
+                line.push('"');
+            } else {
+                line.push_str(cell);
+            }
+        }
         ColumnData::Str(s) | ColumnData::Resource(s) => {
             let cell = s.get(row);
             // A real empty string is written **quoted** (`""`) so it round-trips
@@ -452,7 +474,7 @@ pub fn write_json_file(path: &str, chunks: &[Chunk]) -> std::io::Result<()> {
 /// Append one JSON value formatted **straight from its typed column lane** into
 /// `out` — no per-cell `Value` materialization (cloning string cells) and no temp
 /// `to_string` allocation, but identical output to the per-`Value` formatter.
-fn write_json_cell(out: &mut String, col: &Column, row: usize) {
+pub(crate) fn write_json_cell(out: &mut String, col: &Column, row: usize) {
     use std::fmt::Write as _;
     // Null → a bare JSON `null` (design 26 §26.5); a real empty string is a
     // quoted `""` and falls through to the `Str` lane below.
@@ -517,6 +539,7 @@ fn write_json_cell(out: &mut String, col: &Column, row: usize) {
         }
         // A resource handle → its uri as a quoted JSON string.
         ColumnData::Str(s) | ColumnData::Resource(s) => json_string(out, s.get(row)),
+        ColumnData::StrDict(d) => json_string(out, d.get(row)),
         // §32 s3a: a nested lane renders as a real JSON object/array, recursing
         // into the child columns (so a struct/list round-trips to JSON). No flow
         // yields a nested column today; this keeps the sink faithful for s3b.

@@ -296,6 +296,10 @@ fn make_cmp(col: &Column) -> RowCmp<'_> {
         ColumnData::Time(v) => wrap(col, v, |v: &Vec<i64>, a, b| v[a].cmp(&v[b])),
         // Resource sorts by uri (the in-contract identity; §00 0.14) — byte order,
         // matching discovery's deterministic uri ordering (§28.3).
+        // The dict lane compares the same bytes the plain arm compares.
+        ColumnData::StrDict(v) => wrap(col, v, |v: &rivus_core::DictColumn, a, b| {
+            v.get(a).cmp(v.get(b))
+        }),
         ColumnData::Str(v) | ColumnData::Resource(v) => {
             wrap(col, v, |v: &StrColumn, a, b| v.get(a).cmp(v.get(b)))
         }
@@ -399,6 +403,14 @@ fn argsort_single(col: &Column, desc: bool) -> Vec<usize> {
         ColumnData::Str(v) | ColumnData::Resource(v) => argsort_one(
             n,
             |i| v.get(i),
+            nulls,
+            |i| col.is_null(i),
+            desc,
+            |a: &&str, b: &&str| a.cmp(b),
+        ),
+        ColumnData::StrDict(d) => argsort_one(
+            n,
+            |i| d.get(i),
             nulls,
             |i| col.is_null(i),
             desc,
@@ -1023,12 +1035,16 @@ impl FillDirectional {
             }
             return None;
         };
-        matches!(chunk.columns[ci].data(), ColumnData::Str(_)).then_some(ci)
+        matches!(
+            chunk.columns[ci].data(),
+            ColumnData::Str(_) | ColumnData::StrDict(_)
+        )
+        .then_some(ci)
     }
 }
 
 impl Operator for FillDirectional {
-    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+    fn process(&mut self, _from: NodeId, mut chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
         if !self.forward {
             // bfill: buffer; the next non-empty value may be in a later chunk.
             self.buf.push(chunk);
@@ -1037,6 +1053,10 @@ impl Operator for FillDirectional {
         let Some(ci) = self.target(&chunk, ctx) else {
             return vec![chunk];
         };
+        // A dict lane decodes in place first (design/42): the fill REWRITES
+        // cells, so the Str-shaped logic below must see the plain lane —
+        // behavior identical by construction, representation dropped.
+        chunk.columns[ci].undict();
         let ColumnData::Str(s) = chunk.columns[ci].data() else {
             return vec![chunk];
         };
@@ -1074,6 +1094,7 @@ impl Operator for FillDirectional {
         let mut next: Option<String> = None;
         let mut out = chunks;
         for chunk in out.iter_mut().rev() {
+            chunk.columns[ci].undict();
             let ColumnData::Str(s) = chunk.columns[ci].data() else {
                 continue;
             };
@@ -1283,7 +1304,7 @@ impl Operator for FillStat {
         // (The old pass-through assumed blanks had parsed to 0; that premise
         // died with BUG-A, which made `fill … mean` a silent no-op here.)
         match chunks[0].columns[ci].data() {
-            ColumnData::Str(_) => {}
+            ColumnData::Str(_) | ColumnData::StrDict(_) => {}
             ColumnData::I64(_) | ColumnData::F64(_) | ColumnData::Dec(_) => {
                 return self.fill_numeric(chunks, ci, ctx);
             }
@@ -1313,6 +1334,20 @@ impl Operator for FillStat {
         let mut count = 0f64;
         let mut sum = 0f64;
         for c in &chunks {
+            if let ColumnData::StrDict(d) = c.columns[ci].data() {
+                // Read-only pass: peek through the dict without rewriting.
+                for r in 0..c.len {
+                    let cell = d.get(r).trim();
+                    if cell.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = cell.parse::<f64>() {
+                        count += 1.0;
+                        sum += v;
+                    }
+                }
+                continue;
+            }
             if let ColumnData::Str(s) = c.columns[ci].data() {
                 for r in 0..c.len {
                     let cell = s.get(r).trim();
@@ -1354,6 +1389,7 @@ impl Operator for FillStat {
 
         // Pass 2: rewrite blank cells with the formatted statistic.
         for c in chunks.iter_mut() {
+            c.columns[ci].undict();
             let ColumnData::Str(s) = c.columns[ci].data() else {
                 continue;
             };
