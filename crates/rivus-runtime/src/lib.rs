@@ -49,7 +49,8 @@ pub mod gendata;
 
 pub use analytics::{choose_strategy, Analytics, MemoryPref, Strategy};
 pub use engine::{
-    plan_validate, run, run_with_progress, Output, ProgressHook, RunOptions, RunResult,
+    fused_id_rows_total, plan_validate, run, run_with_progress, Output, ProgressHook, RunOptions,
+    RunResult,
 };
 pub use telemetry::{NodeSnapshot, NodeTelemetry, RuntimeSnapshot, WorkerTelemetry};
 

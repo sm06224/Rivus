@@ -674,3 +674,101 @@ fn live_hook_stays_parallel() {
         );
     }
 }
+
+/// design/42 stage (c): the fused integer-id group fast path ACTIVATES on
+/// dictionary-eligible chunks (発動 assert — a guard with no activation assert
+/// rots), and the parallel output is byte-identical to the forced-serial run.
+/// The serial oracle never dictionary-encodes, so this one comparison pins
+/// dict-vs-plain AND id-vs-string end to end.
+#[test]
+fn fused_id_path_activates_and_matches_serial() {
+    let dir = std::env::temp_dir().join(format!("rivus_idloop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let right = dir.join("regions.csv");
+    let mut rtext = String::from("region,country\n");
+    for r in 0..5 {
+        rtext.push_str(&format!("r{r},C{}\n", r % 3));
+    }
+    std::fs::write(&right, rtext).unwrap();
+    // 3 files → 3 workers; low-cardinality `region` (join key) and `category`
+    // (group key) sample as dictionary candidates; `amount` mixes signs so the
+    // filter does real work.
+    for f in 0..3usize {
+        let mut t = String::from("order_id,region,category,amount\n");
+        for i in 0..20_000usize {
+            t.push_str(&format!(
+                "{i},r{},c{},{}\n",
+                (i + f) % 5,
+                i % 7,
+                (i % 100) as i64 - 5
+            ));
+        }
+        std::fs::write(dir.join(format!("part_{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("part_*.csv");
+    let out_par = dir.join("par.csv");
+    let out_ser = dir.join("ser.csv");
+    let src = |out: &std::path::Path| {
+        format!(
+            "R: open {} (region:str country:str) ;\n\
+             S: ls \"{}\" read as csv cast amount :int ;\n\
+             J: S &left R on region\n \
+             |? amount > 0\n \
+             |> (coalesce(country, \"@\")) as country (coalesce(category, \"@\")) as category amount\n \
+             |# country category sum:amount count:amount\n \
+             sort country category\n \
+             save {} ;\n",
+            right.display(),
+            glob.display(),
+            out.display()
+        )
+    };
+    let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
+    let gp = parse_opt(&src(&out_par));
+    let gs = parse_opt(&src(&out_ser));
+
+    let _env = env_guard();
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let before = rivus_runtime::fused_id_rows_total();
+    run(
+        &gp,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("parallel run");
+    let id_delta = rivus_runtime::fused_id_rows_total() - before;
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    run(
+        &gs,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("serial run");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    let a = std::fs::read_to_string(&out_par).unwrap();
+    let b = std::fs::read_to_string(&out_ser).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(a.lines().count() > 1, "expected real grouped output");
+    assert_eq!(a, b, "fused id path must be byte-identical to serial");
+    // Same guard as the worker-telemetry test: a 1-CPU host correctly stays
+    // serial, where demanding activation would assert the wrong thing.
+    if std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        < 2
+    {
+        eprintln!("skipping activation assert: <2 CPUs available");
+        return;
+    }
+    assert!(
+        id_delta > 0,
+        "dictionary chunks must engage the fused id fast path (0 rows took it)"
+    );
+}

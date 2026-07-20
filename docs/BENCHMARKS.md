@@ -2456,3 +2456,55 @@ Two measured findings that shaped the slice:
   id group probe / join pre-resolution, the actual prize: probe
   ~25 ns → ~3 ns/row) is what converts this investment; **recommend
   holding the merge until (c) lands on the same PR**.
+
+## design/42 stage (c): fused integer-id group/join over dictionary chunks (landed — net win)
+
+The fused loop now rides the chunk-local dictionaries stage (b) built,
+converting that stage's interning investment:
+
+- **join-probe memo**: a single-column dict join key resolves each
+  DISTINCT code once per chunk (dict-size hash probes replace row-count
+  probes); rows then match by array index.
+- **group-slot memo**: when every key cell past the right-only prefix
+  is right/literal-determined or a LEFT dict cell, a non-null row's
+  composite key is fully determined by the tuple (right row, codes…) —
+  the `GroupBy` slot returned on first sight is memoized per tuple
+  (bounded direct-index cache, ≤128K u32 entries) and repeat groups
+  update by index: no key rebuild, no string hash. `GroupBy`'s scratch
+  became slot-indexed (`HashMap<String, u32>` + `Vec<GroupState>`) to
+  give the fast path a stable integer handle; seal/merge fold the same
+  states as before.
+- **Byte-identity by construction**: every cache miss runs the existing
+  string path (the byte-authority) and the fast path only replays its
+  results. Pinned by the serial==parallel R guards plus a new
+  activation test (`fused_id_path_activates_and_matches_serial`) that
+  asserts the id path actually engaged (発動 assert) AND the output
+  equals the forced-serial run byte-for-byte. #241 の producer 契約 2 点
+  (empty-dict×non-empty-codes impossible by construction — every code
+  is interned through the dict; fused consumption happens before any
+  `append` materialization) hold.
+
+Measured (10M standards, same-window interleave vs main `7aef9e2`
+binary, all outputs bit-identical, RSS 10.2 MB unchanged):
+
+| fixture | base (min/median) | (b)+(c) (min/median) | pairs won |
+|---|---|---|---|
+| CSV group | 560 / 574 ms | **491 / 516 ms (−10-12%)** | 9/10 |
+| ETL | 814 / 829 ms | 814 / 846 ms (floor equal) | 2/4 |
+| JSONL group | 894 / 915 ms | 894 / 912 ms (floor equal) | 2/4 |
+| CSV group .gz | 813 / 833 ms | 814 / 875 ms (floor equal) | 0/4 |
+
+`[WPROF]` attribution (CSV group): feed 63-73 → **51-72 ms/file** with
+`idloop≈1.106M/1.111M` rows/file (~99.5% of emitted rows on the id
+path); decode keeps stage (b)'s +5-8 ms interning — now paid for.
+JSONL/gz never dictionary-encode (their readers are unpatched), so
+their fused loops see plain Str and skip both caches; their pairwise
+tails sit inside this box's noise (outliers to +50 ms appear in BOTH
+directions across windows — the mins are the honest floor, and they
+are equal). The only mechanism the shared code adds is one slot
+indirection in `observe_row`, common to all group flows.
+
+Stage (b) alone measured +25-45 ms (previous entry); (b)+(c) together
+land **−58 ms median** on the flagship standard — the dictionary-lane
+bet paid where design/42 §3 predicted (probe ~25ns → array index),
+just not where it assumed decode would be free.
