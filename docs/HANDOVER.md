@@ -107,7 +107,8 @@ R1/R2 並列 identity ガード（`tests/stress/parallel_read_identity.rs`）。
 
 ## 5. 開いている判断（勝手に決めない）
 
-1. **#236 構文簡素化**（P1-P5、項目別裁可待ち）— 裁可されれば P1+P2 から実装
+1. **#236 構文簡素化 — 批准済み（2026-07-19 マージ、67fdc78「破壊的変更許可」）**:
+   §38 P1-P5 の実装が解禁。P1+P2 から着手可（次アーク候補・design/42 裁定待ちと並行可）
 2. **design/40 Q1-Q4**（OTel T1 / QUIC B2）・**design/41 Stage C**（批准事項）
 3. **#45 f64 並列 byte-identity**: Q1（一度きり ~1 ULP シフト）は統括許容済み —
    実装 PR は CHANGELOG 明記＋decimal/`--exact` 無影響が条件
