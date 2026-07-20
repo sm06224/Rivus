@@ -1,7 +1,11 @@
 # Design 38 — Syntax simplification (restoring "one obvious way")
 
-**Status:** proposal (breaking changes authorized by 統括, 2026-07-08).
-**Author:** 先行研究担当. **Decision:** レビュー兼統括指揮 (ratify per-item on #180).
+**Status:** P1+P2 GO 済（#236 issuecomment-5017506345）・**P1+P2 移行リリース実装済み**
+（削除綴りは本リリースは parse 可＋`fmt` が正典へ自動書換、次リリースで
+did-you-mean エラー化。`readbin` は `open … as bin` 文法の裁可待ちでエラー化
+リリースへ繰延べ）。P3（`over` 窓統一）・P4（`&asof`）は独立スライスで GO 済・
+未着手。P5 は使用調査待ちで保留。
+**Author:** 先行研究担当. **Decision:** レビュー兼統括指揮 (ratify per-item; 現運用 #240).
 
 > 統括の指摘：「構文が難しくなってきている。シンプルさが損なわれている。」
 > 正当な批判です。窓・時系列スライス（sessionize / shift / asof / date_bin …）を
