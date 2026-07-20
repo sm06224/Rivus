@@ -540,6 +540,8 @@ pub(crate) fn push_group_key_field(key: &mut String, chunk: &Chunk, ci: usize, r
             // Bare string key: borrow the column's `&str` (zero allocation;
             // identical bytes to `Value::Str(_).to_string()`).
             ColumnData::Str(s) => key.push_str(s.get(row)),
+            // Dict lane is the same Str lane (design/42) — id→bytes borrow.
+            ColumnData::StrDict(d) => key.push_str(d.get(row)),
             _ => {
                 use std::fmt::Write;
                 let _ = write!(key, "{}", chunk.value(row, ci));

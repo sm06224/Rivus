@@ -84,6 +84,9 @@ pub(crate) fn fill_join_key(chunk: &Chunk, idxs: &[usize], row: usize, buf: &mut
             // Bare string key: borrow the column's `&str` (zero allocation,
             // identical bytes to `Value::Str(_).to_string()`).
             ColumnData::Str(s) => buf.push_str(s.get(row)),
+            // Dict lane is the same Str lane (design/42) — id→bytes borrow,
+            // never the allocating `Value` fallback (the probe runs per row).
+            ColumnData::StrDict(d) => buf.push_str(d.get(row)),
             // Any other lane keeps the exact `Value::to_string` form (still into
             // the reused buffer) so the key bytes are unchanged.
             _ => {

@@ -19,6 +19,18 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// design/42 stage (c): process-global count of rows that took the fused
+/// integer-id group fast path. Observability/test hook only — the activation
+/// test asserts this moves when dictionary chunks reach the fused loop
+/// (発動 assert 無しのガードは腐る), and `[WPROF] … idloop=` reports the
+/// per-file share. Monotonic; never read by the engine itself.
+static FUSED_ID_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// The current [`FUSED_ID_ROWS`] total (see its doc).
+pub fn fused_id_rows_total() -> u64 {
+    FUSED_ID_ROWS.load(Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     /// Maximum rows per chunk emitted by sources.
@@ -1579,8 +1591,20 @@ fn try_parallel_read_group(
 
     // 3) Phase 1 — open every file lazily (schema now, rows later), in waves.
     //    Under Stage C the open skips the full pass-1 scan for plain CSV
-    //    (sample inference + in-stream contradiction check).
-    let planner = operators::Read::new(fmt, provenance, opts.chunk_size);
+    //    (sample inference + in-stream contradiction check). Speculative opens
+    //    also carry the fused key-column names: low-cardinality key columns
+    //    dictionary-encode at decode (design/42 stage b), and the serial
+    //    oracle never speculates, so every parallel identity guard pins the
+    //    dict lane against the plain one.
+    let dict_keys = speculate
+        .then(|| {
+            fused_sp
+                .as_ref()
+                .map(|sp| fused_dict_key_names(graph, shape, sp))
+        })
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let planner = operators::Read::new(fmt, provenance, opts.chunk_size).with_dict_keys(dict_keys);
     let mut opened: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
     let mut quarantined: Vec<ErrorEvent> = Vec::new();
     {
@@ -3059,6 +3083,58 @@ fn fused_shape_plan(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<FusedSh
     })
 }
 
+/// design/42 stage (b): the column names the fused path consumes as join or
+/// group keys — the reader's dictionary-encoding candidates. Only the two
+/// shapes the fused key path accepts contribute (a bare field, or the field
+/// inside `coalesce(col, "lit")`); a name that actually resolves to the right
+/// side simply never matches a left file's header (harmless).
+fn fused_dict_key_names(
+    graph: &PlanGraph,
+    shape: &ReadGroupShape,
+    sp: &FusedShapePlan,
+) -> std::collections::HashSet<String> {
+    use rivus_ir::Expr as E;
+    fn key_src(e: &E, out: &mut std::collections::HashSet<String>) {
+        match e {
+            E::Field { name, access } if access.is_column() => {
+                out.insert(name.clone());
+            }
+            E::Func {
+                func: rivus_ir::Func::Coalesce,
+                args,
+            } if args.len() == 2 => {
+                if let E::Field { name, access } = &args[0] {
+                    if access.is_column() {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut set = std::collections::HashSet::new();
+    if let Op::Join { left_keys, .. } = &graph.nodes[sp.join_id].op {
+        for k in left_keys.iter().filter(|k| k.segs.is_empty()) {
+            set.insert(k.root.clone());
+        }
+    }
+    if let Op::GroupBy { keys, .. } = &graph.nodes[shape.group_id].op {
+        for k in keys {
+            match &sp.items {
+                Some(items) => {
+                    if let Some((e, _)) = items.iter().find(|(_, a)| a == &k.root) {
+                        key_src(e, &mut set);
+                    }
+                }
+                None => {
+                    set.insert(k.root.clone());
+                }
+            }
+        }
+    }
+    set
+}
+
 /// Stage C static gate (design/41 §5): may phase 1 open files **speculatively**
 /// (schema from a row sample, contradiction-checked while streaming)? True only
 /// when every schema widening a contradicted file could force on the union is
@@ -3659,7 +3735,9 @@ fn fused_feed_chunk(
     group: &mut operators::GroupBy,
     rows: &mut u64,
     sc: &mut FusedScratch,
+    id_rows: &mut u64,
 ) {
+    use rivus_core::ColumnData;
     debug_assert_eq!(plan.agg_cells.len(), group.agg_count());
     // Left-only predicates, evaluated ONCE per chunk through the vectorized
     // kernel when they compile (the sink-fusion negative result measured the
@@ -3674,13 +3752,98 @@ fn fused_feed_chunk(
         let refs: Vec<&rivus_ir::Expr> = plan.preds.iter().collect();
         crate::kernel::compile(&refs, ch).map(|cs| crate::kernel::run(&cs, ch))
     };
+    // design/42 stage (c): integer-id fast paths over the chunk-local
+    // dictionaries. Both caches live for THIS chunk only (so does the dict),
+    // and every miss runs the existing string path, which stays the
+    // byte-authority — the fast path only replays results the string path
+    // produced, so byte-identity holds by construction (pinned end to end by
+    // the serial==parallel R guards plus the activation test).
+    //
+    // (1) join-probe memo: a single-column dict join key resolves each
+    //     DISTINCT code once — dict-size hash probes replace row-count ones.
+    let jdict: Option<(usize, &rivus_core::DictColumn)> = match plan.lk.as_slice() {
+        [ci] => match ch.columns[*ci].data() {
+            ColumnData::StrDict(d) => Some((*ci, d)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut jmemo: Vec<Option<Option<&Vec<usize>>>> =
+        vec![None; jdict.map_or(0, |(_, d)| d.dict.len())];
+    // (2) group-slot cache: when every key cell past the right-only prefix is
+    //     right/literal-determined (a function of `ri` alone) or a LEFT dict
+    //     cell (a function of its code), a non-null row's composite key is
+    //     determined by the tuple (ri, codes…); the GroupBy slot is memoized
+    //     per tuple, so a repeat group is a direct index — no key rebuild, no
+    //     string hash. Null dict cells and oversized products fall back.
+    let mut gdicts: Vec<(usize, &rivus_core::DictColumn)> = Vec::new();
+    let mut cache_len: usize = 0;
+    {
+        let j0 = plan.right_prefix.as_ref().map_or(0, |(plen, _)| *plen);
+        let mut ok = true;
+        for cell in plan.key_cells.iter().skip(j0) {
+            match cell {
+                FusedCell::Left(ci) | FusedCell::CoalesceLeft(ci, _) => {
+                    match ch.columns[*ci].data() {
+                        ColumnData::StrDict(d) => gdicts.push((*ci, d)),
+                        _ => ok = false,
+                    }
+                }
+                FusedCell::Right(_) | FusedCell::CoalesceRight(_, _) | FusedCell::LitStr(_) => {}
+            }
+            if !ok {
+                break;
+            }
+        }
+        if ok && !gdicts.is_empty() {
+            // (right rows + 1) × Π dict sizes u32 entries, capped at 128K
+            // (512 KiB transient) — typical products are tiny (broadcast
+            // right sides are small, DICT_CAP bounds each dict).
+            let mut total = right.len + 1;
+            for (_, d) in &gdicts {
+                total = total.saturating_mul(d.dict.len().max(1));
+            }
+            if total <= (1 << 17) {
+                cache_len = total;
+            } else {
+                gdicts.clear();
+            }
+        } else {
+            gdicts.clear();
+        }
+    }
+    let mut gcache: Vec<u32> = vec![0; cache_len];
+
     let mut predf = 0u64;
     let mut row = |li: usize, pre_passed: bool, predf: &mut u64, sc: &mut FusedScratch| {
-        sc.keybuf.clear();
-        let matched = if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
-            table.get(sc.keybuf.as_str())
-        } else {
-            None
+        let matched = match jdict {
+            // A null key matches nothing — the same branch `fill_join_key`
+            // takes (its bytes are never built for a null part).
+            Some((jci, _)) if ch.columns[jci].is_null(li) => None,
+            Some((_, jd)) => {
+                let code = jd.codes[li] as usize;
+                match jmemo[code] {
+                    Some(m) => m,
+                    None => {
+                        sc.keybuf.clear();
+                        let m = if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
+                            table.get(sc.keybuf.as_str())
+                        } else {
+                            None
+                        };
+                        jmemo[code] = Some(m);
+                        m
+                    }
+                }
+            }
+            None => {
+                sc.keybuf.clear();
+                if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
+                    table.get(sc.keybuf.as_str())
+                } else {
+                    None
+                }
+            }
         };
         // Left-only predicates: one evaluation per left row covers every
         // match (the joined row's left cells are this row's cells). The
@@ -3696,6 +3859,34 @@ fn fused_feed_chunk(
         let mut emit =
             |ri: Option<usize>, group: &mut operators::GroupBy, sc: &mut FusedScratch| {
                 *rows += 1;
+                // id fast path (design/42 stage c): the slot memoized for
+                // this (ri, codes…) tuple replays exactly what the string
+                // path below inserted for the identical composite key.
+                let mut memo_at: Option<usize> = None;
+                if !gcache.is_empty() {
+                    let mut idx = ri.map_or(right.len, |r_| r_);
+                    let mut ok = true;
+                    for &(ci, d) in &gdicts {
+                        if ch.columns[ci].is_null(li) {
+                            ok = false;
+                            break;
+                        }
+                        idx = idx * d.dict.len() + d.codes[li] as usize;
+                    }
+                    if ok {
+                        let slot = gcache[idx];
+                        if slot != 0 {
+                            sc.vals.clear();
+                            for cell in &plan.agg_cells {
+                                sc.vals.push(Some(fused_value(cell, ch, li, right, ri)));
+                            }
+                            group.observe_slot(slot - 1, &sc.vals);
+                            *id_rows += 1;
+                            return;
+                        }
+                        memo_at = Some(idx);
+                    }
+                }
                 sc.comp.clear();
                 // Right-only prefix: one precomputed memcpy instead of
                 // per-cell null checks + pushes (`FusedPlan::right_prefix`).
@@ -3721,7 +3912,10 @@ fn fused_feed_chunk(
                         .map(|c| fused_value(c, ch, li, right, ri).to_string())
                         .collect::<Vec<String>>()
                 };
-                group.observe_row(&sc.comp, parts, &sc.vals);
+                let slot = group.observe_row(&sc.comp, parts, &sc.vals);
+                if let Some(idx) = memo_at {
+                    gcache[idx] = slot + 1;
+                }
             };
         match matched {
             Some(rs) => {
@@ -3763,6 +3957,10 @@ struct FusedState<'a> {
     off: bool,
     scratch: FusedScratch,
     t_fused: std::time::Duration,
+    /// design/42 stage (c) activation: rows that took the integer-id group
+    /// fast path (surfaced per file in `[WPROF] … idloop=`, summed into the
+    /// process-global counter the activation test reads).
+    id_rows: u64,
 }
 
 /// Push chunks from `start_idx` onward; the group consumes the survivors.
@@ -3820,7 +4018,16 @@ fn worker_feed(
             }
             if let (Some(plan), false) = (&fu.plan, fu.off) {
                 let t = Instant::now();
-                fused_feed_chunk(&c, plan, right, table, group, rows, &mut fu.scratch);
+                fused_feed_chunk(
+                    &c,
+                    plan,
+                    right,
+                    table,
+                    group,
+                    rows,
+                    &mut fu.scratch,
+                    &mut fu.id_rows,
+                );
                 fu.t_fused += t.elapsed();
             } else {
                 fallback.push(c);
@@ -3956,6 +4163,7 @@ fn worker_read_partial_group(
         off: fused_sp.is_none(),
         scratch: FusedScratch::default(),
         t_fused: std::time::Duration::ZERO,
+        id_rows: 0,
     };
     if fu.ctx.is_none() {
         fu.off = true;
@@ -4014,6 +4222,10 @@ fn worker_read_partial_group(
         );
         t_feed += t2.elapsed();
     }
+    // design/42 stage (c) activation observability: fold this worker's
+    // id-fast-path row count into the process-global counter (the activation
+    // test pins that dictionary chunks actually engage the id loop).
+    FUSED_ID_ROWS.fetch_add(fu.id_rows, std::sync::atomic::Ordering::Relaxed);
     if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
         let per_op: Vec<String> = ops
             .iter()
@@ -4022,8 +4234,17 @@ fn worker_read_partial_group(
             .zip(t_ops.iter())
             .map(|(l, d)| format!("{l}={}ms", d.as_millis()))
             .collect();
+        let dict = match dec.dict_status() {
+            Some((n, esc)) => format!(" dict={n}cols(esc={esc})"),
+            None => String::new(),
+        };
+        let idloop = if fu.id_rows > 0 {
+            format!(" idloop={}rows", fu.id_rows)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms [{} fused={}ms{}]",
+            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms [{} fused={}ms{}]{dict}{idloop}",
             t_dec.as_millis(),
             t_rec.as_millis(),
             t_feed.as_millis(),

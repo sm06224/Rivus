@@ -571,7 +571,15 @@ pub(crate) struct GroupBy {
     /// (~93ms/file on the 10M group standard). [`GroupBy::seal`] drains it
     /// into `groups` before anything is observed, so hash-map iteration order
     /// never reaches the output — byte-identical by construction.
-    scratch: std::collections::HashMap<String, GroupState, crate::fxhash::FxBuild>,
+    ///
+    /// The map holds a **slot** into `slot_states` instead of the state
+    /// itself (design/42 stage c): the slot is a stable integer handle the
+    /// fused id fast path memoizes per (right row, dict codes) tuple, so a
+    /// repeat group updates by index without rebuilding or hashing the
+    /// composite key.
+    scratch: std::collections::HashMap<String, u32, crate::fxhash::FxBuild>,
+    /// Group states in first-seen order, indexed by `scratch`'s slots.
+    slot_states: Vec<GroupState>,
     emitted: bool,
     /// Nested key-path structural misses (§32.8③), accumulated across chunks and
     /// surfaced once on finish (never-silent, not per-chunk spam).
@@ -585,6 +593,7 @@ impl GroupBy {
             aggs,
             groups: BTreeMap::new(),
             scratch: std::collections::HashMap::default(),
+            slot_states: Vec::new(),
             emitted: false,
             key_fails: 0,
         }
@@ -598,20 +607,25 @@ impl GroupBy {
     /// State handling is [`GroupBy::process`]'s inner loop verbatim — same
     /// scratch map, same `GroupState`, same `AggAcc::observe` — so a fused
     /// stream is byte-identical to feeding whole chunks.
+    /// Returns the group's **slot** — a stable integer handle valid until the
+    /// next `seal` (finish/merge), which the fused id fast path (design/42
+    /// stage c) memoizes to call [`GroupBy::observe_slot`] on repeats.
     pub(crate) fn observe_row(
         &mut self,
         composite: &str,
         parts: impl FnOnce() -> Vec<String>,
         vals: &[Option<Value>],
-    ) {
-        match self.scratch.get_mut(composite) {
-            Some(state) => {
+    ) -> u32 {
+        match self.scratch.get(composite) {
+            Some(&slot) => {
+                let state = &mut self.slot_states[slot as usize];
                 state.count += 1;
                 for (j, v) in vals.iter().enumerate() {
                     if let Some(v) = v {
                         state.accs[j].observe(v);
                     }
                 }
+                slot
             }
             None => {
                 let mut state = GroupState {
@@ -624,7 +638,24 @@ impl GroupBy {
                         state.accs[j].observe(v);
                     }
                 }
-                self.scratch.insert(composite.to_string(), state);
+                let slot = u32::try_from(self.slot_states.len()).expect("group count < 2^32");
+                self.slot_states.push(state);
+                self.scratch.insert(composite.to_string(), slot);
+                slot
+            }
+        }
+    }
+
+    /// Direct-slot observation (design/42 stage c): the caller memoized the
+    /// slot [`GroupBy::observe_row`] returned for this exact composite key,
+    /// so the update is an index instead of a key rebuild + string hash.
+    /// Identical to `observe_row`'s existing-group arm by construction.
+    pub(crate) fn observe_slot(&mut self, slot: u32, vals: &[Option<Value>]) {
+        let state = &mut self.slot_states[slot as usize];
+        state.count += 1;
+        for (j, v) in vals.iter().enumerate() {
+            if let Some(v) = v {
+                state.accs[j].observe(v);
             }
         }
     }
@@ -640,7 +671,14 @@ impl GroupBy {
     /// but if a group somehow exists on both sides, fold scratch (the later
     /// observations) into it in stream order rather than silently replacing.
     fn seal(&mut self) {
-        for (key, state) in self.scratch.drain() {
+        let mut states: Vec<Option<GroupState>> = std::mem::take(&mut self.slot_states)
+            .into_iter()
+            .map(Some)
+            .collect();
+        for (key, slot) in self.scratch.drain() {
+            let state = states[slot as usize]
+                .take()
+                .expect("each slot pairs with exactly one scratch key");
             match self.groups.get_mut(&key) {
                 Some(s) => {
                     s.count += state.count;
@@ -792,8 +830,9 @@ impl Operator for GroupBy {
             // (`String: Borrow<str>` looks the buffer up directly). Only a new
             // group allocates: its output key parts, its owned map key, and
             // the accumulators.
-            match self.scratch.get_mut(composite.as_str()) {
-                Some(state) => {
+            match self.scratch.get(composite.as_str()) {
+                Some(&slot) => {
+                    let state = &mut self.slot_states[slot as usize];
                     state.count += 1;
                     for (j, idx) in agg_idx.iter().enumerate() {
                         if let Some(ci) = idx {
@@ -818,7 +857,9 @@ impl Operator for GroupBy {
                             state.accs[j].observe(&v);
                         }
                     }
-                    self.scratch.insert(composite.clone(), state);
+                    let slot = u32::try_from(self.slot_states.len()).expect("group count < 2^32");
+                    self.slot_states.push(state);
+                    self.scratch.insert(composite.clone(), slot);
                 }
             }
         }
