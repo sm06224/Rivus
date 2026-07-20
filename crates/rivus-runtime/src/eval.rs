@@ -1440,6 +1440,13 @@ fn col_num_lane(col: Column) -> (Vec<f64>, bool) {
                 .collect();
             (lane, false)
         }
+        // Dict lane: same bytes per row as the plain Str arm → same lane.
+        ColumnData::StrDict(d) => {
+            let lane = (0..d.len())
+                .map(|i| d.get(i).trim().parse::<f64>().unwrap_or(f64::NAN))
+                .collect();
+            (lane, false)
+        }
         // A resource handle is a uri, not a number → NaN lane (like text).
         ColumnData::Resource(s) => {
             let lane = (0..s.len())
@@ -2143,7 +2150,7 @@ fn as_num(e: &Expr, chunk: &Chunk, row: usize) -> Option<f64> {
             // Time-of-day routes to the exact Value path too (#58).
             ColumnData::Time(_) => None,
             ColumnData::Bool(v) => Some(if v[row] { 1.0 } else { 0.0 }),
-            ColumnData::Str(_) => None,
+            ColumnData::Str(_) | ColumnData::StrDict(_) => None,
             // A resource handle is a uri, not a number.
             ColumnData::Resource(_) => None,
             // §32 s3a: a nested lane is not a numeric column.

@@ -18,8 +18,8 @@ pub mod suggest;
 pub mod value;
 
 pub use chunk::{
-    Chunk, ChunkMeta, Column, ColumnData, DecColumn, DtColumn, DurColumn, ListColumn, Mode,
-    StrColumn, StructColumn, Validity,
+    Chunk, ChunkMeta, Column, ColumnData, DecColumn, DictColumn, DtColumn, DurColumn, ListColumn,
+    Mode, StrColumn, StructColumn, Validity,
 };
 pub use error::{ErrorEvent, ErrorScope, Result, RivusError, Severity};
 pub use schema::{Field, Nested, Schema};

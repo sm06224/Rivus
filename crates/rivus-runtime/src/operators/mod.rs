@@ -499,7 +499,7 @@ pub fn jsonl_sink(path: String) -> Box<dyn Operator> {
 mod aggregate;
 mod join;
 mod read;
-mod sink;
+pub(crate) mod sink;
 mod source;
 // §33 unbounded network `subscribe` source (feature `net`).
 #[cfg(feature = "net")]

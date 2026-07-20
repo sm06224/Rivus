@@ -8,6 +8,8 @@
 mod analytics;
 mod codec;
 mod csv;
+#[cfg(test)]
+mod dict_prop_tests;
 mod discovery;
 mod engine;
 mod eval;

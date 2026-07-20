@@ -12,7 +12,8 @@
 2. 本ファイル（現在地・運用体制・開いている判断）。
 3. `docs/BENCHMARKS.md`（計測済み事実の台帳 — 「速い」はここに数字がある時だけ）・
    `docs/SUPPLY-CHAIN.md`（依存の審査台帳）。
-4. issue **#180**（着地トラッカー）— 裁可・マージ判断のスレッド。**#217**（棚卸し）。
+4. issue **#240**（統合トラッカー v2 — #180 後継）— 裁可・GO・着地記録・申し送りの
+   一元スレッド。冒頭の体制・ゲート・フロー・投稿規律が正典。**#217**（棚卸し）。
 
 ## 1. 運用体制（2026-07 現在）
 
@@ -23,25 +24,24 @@
   マージ後は `git fetch origin main` して次ブランチを新 main から。force-push 不可
   （recover forward）。CLAUDE.md の「単一 dev ブランチ」節は実装主担当向けの旧運用で、
   研究員は branch-per-PR が現行の合意。
-- **裁可フロー**：PR 作成 → #180 に裁可依頼コメント（実測・破壊的変更・ゲート数値を明記）
-  → 指揮が squash-merge → **マージ毎にタグ提案**（`v1.4.0-dev.N`、カットは統括専権）。
+- **裁可フロー**：PR 作成 → **#240** に裁可依頼 1 コメント（実測・破壊的変更・ゲート数値を
+  明記）→ 指揮の独立 gate → GO → 実装担当が着地。**タグ提案は不要**（cut 保留・
+  未タグ蓄積は指揮管理）。1 イベント 1 コメント。
 - **ゲート（push 前・毎回・数値で確認）**：fmt --check clean／clippy default **と**
   `--all-features -D warnings` = 0／test 両 feature セット 0 failed／依存樹は
   **policy v2 基準「documented, not zero」**（default は gzip/zstd の pure-Rust 8 crate
   常時搭載・SUPPLY-CHAIN.md が台帳）。gitleaks / cargo-deny はコンテナに無ければ
   CI に委ねる（CI は `cargo deny check --all-features`）。
 - **GitHub API は希少資源**：CI をポーリングしない（webhook 購読）、コメントは束ねて1回。
-- **裁可スレッド移行予定（統括発言 2026-07-19）**: #180 が長大化したため、統括が
-  **新しい裁可用イシューを起こす予定**。次セッション開始時、統括がこの件に触れて
-  いなければ**こちらから確認・想起させること**（統括依頼: 「わたしが指示を忘れたら
-  教えてください」）。新イシューが立つまでは #180 を継続使用。
+- **裁可スレッドは #240 へ移行済み（2026-07-20）**: #180 は close（履歴保存）。
+  想起義務は果たされた — 以後この注記は履歴。
 
-## 2. main の現在地（`6d36543`・v1.4.0-dev.9 提案中 = 統括の cut 待ち）
+## 2. main の現在地（`67fdc78`・v1.4.0-dev.9 まで cut 済み・以降のタグは指揮管理で保留）
 
-**性能戦争バッチ（2026-07-12〜15 に全着地）**: #237（perf 第1-18弾＋R1/R2 ガード）→
-#232 shift/diff → #234 date_bin → #233 as-of join。#235 は #237 包摂でクローズ。
-統合 main の独立ゲート実測 = fmt clean・clippy 0/0 両 feature・test **487/518** 全 pass・
-deny ok。
+**着地済み（dev.8 以降）**: #237（perf 第1-18弾＋R1/R2）→ #232 shift → #234 date_bin →
+#233 as-of → **#239（design/41 Stage A〜C・投機オープン・C-eq・narrow-keep・kernel
+マスク 他）** → #236（§38 構文簡素化 docs・破壊的変更許可）。#235 は #237 包摂 close。
+指揮の独立ゲート直近値 = test **503/0・534/0**・clippy 0/0・依存樹 documented 8 crate。
 
 **10M×9ファイル標準（汚れ入り・等価契約）の現在地（wall / peak RSS、
 2026-07-17〜18 の同窓 interleave — #239 ブランチ、Stage C＋narrow-keep＋
@@ -107,10 +107,15 @@ R1/R2 並列 identity ガード（`tests/stress/parallel_read_identity.rs`）。
 
 ## 5. 開いている判断（勝手に決めない）
 
-1. **#236 構文簡素化**（P1-P5、項目別裁可待ち）— 裁可されれば P1+P2 から実装
-2. **design/40 Q1-Q4**（OTel T1 / QUIC B2）・**design/41 Stage C**（批准事項）
-3. **#45 f64 並列 byte-identity**: Q1（一度きり ~1 ULP シフト）は統括許容済み —
+1. **#236 構文簡素化 P1+P2 — GO 済み**（受入条件は #236 コメント: 各スライス単独
+   フル gate・fmt 自動移行 round-trip pin・CHANGELOG・既存テスト資産の変換維持）
+2. **design/42 辞書レーン — 批准済み・条件 4 点**（①§2 不変条件の property test
+   ②高カード escape hatch ③段階ごとガード＋計測 ④発動可観測性）→ 第 (a) 段実装中
+3. **decode 列プルーニング — 対称方式で承認済み**（serial にも同一 used-set・
+   契約変更を CHANGELOG＋docs 明記・explain surface）
+4. **#45 f64 並列 byte-identity**: Q1（一度きり ~1 ULP シフト）は統括許容済み —
    実装 PR は CHANGELOG 明記＋decimal/`--exact` 無影響が条件
+5. **design/40 Q1-Q4**（OTel T1 / QUIC B2）は引き続き裁可待ち
 4. #229 Parquet の `full` 搭載可否（配布判断）・`unbounded` の full 搭載
 5. FxHash は「性能ツールであり防御境界ではない」で指揮承認済み（SipHash 復帰は
    JoinTable/scratch の型1行）
