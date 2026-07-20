@@ -7,6 +7,18 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **Decode-column pruning on join-free `read`→…→`save` chains — contract
+  narrowing.** When a flow's downstream is a linear filter/cast/projection
+  chain into a sink (no join, no group), the CSV readers now decode only the
+  columns the chain consumes — on BOTH the serial and parallel paths
+  (対称方式: one shared analysis feeds both, so their error streams stay in
+  parity). Consequence: **parse failures in never-consumed columns are no
+  longer counted or reported** (they were "… set to null" notes for cells the
+  flow provably never reads; structural malformed-*row* counting is
+  width-based and unchanged). Output bytes are identical to an unpruned run.
+  `rivus explain` surfaces the decision as a `decode prune` section listing
+  the kept columns. JSONL decodes fully (its readers take no allow-list), and
+  any join/group/rename in the chain disables pruning entirely.
 - **Expression `cast` to a temporal lane now parses a string source (BUG-D) —
   behavior change.** `cast ts:datetime` / `(ts:datetime) as t` (and `date`/`time`)
   previously reinterpreted a string as raw epoch ticks (`"2026-06-01"` → epoch-0,
