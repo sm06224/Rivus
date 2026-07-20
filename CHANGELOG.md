@@ -7,6 +7,22 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **design/38 P3 — the window / time-series family has ONE grammar (migration
+  release, breaking next release).** `session` / `lag` / `diff` / `pct_change`
+  are now **window items inside `|>`** with the uniform `over` partition
+  clause: `|> sym (lag(price, 1) over sym) as prev` (narrowing selection), or
+  `|> * (session(ts, "30m") over user) as s` where the new `*` marker keeps
+  every column and appends the window outputs — exactly the retired verbs'
+  keep-all semantics, so `rivus fmt` migrates `sessionize ts gap "30m" by u`
+  and `shift col lag 1 by u as p` mechanically (`|> *` accepts window items
+  only; a plain computed column under `*` is a never-silent error). The
+  `sessionize` and `shift` **verbs are deprecated**: this release they still
+  parse and `fmt` rewrites them to the canonical form (pinned by round-trip
+  and IR-equality tests); **next release they become never-silent errors**.
+  Execution is unchanged — both spellings build the identical `Sessionize` /
+  `Shift` ops (serial, order-dependent, chunk-size independent), and
+  `Sessionize` gained an output-name field so the alias names the appended
+  column (`session` remains the default). `lead` stays a follow-up (#65).
 - **Decode-column pruning on join-free `read`→…→`save` chains — contract
   narrowing.** When a flow's downstream is a linear filter/cast/projection
   chain into a sink (no join, no group), the CSV readers now decode only the

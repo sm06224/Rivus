@@ -1793,6 +1793,8 @@ pub(crate) struct Sessionize {
     pub(crate) ts: String,
     pub(crate) gap: String,
     pub(crate) by: Vec<String>,
+    /// The appended column's name (design/38 P3 alias; `session` by default).
+    pub(crate) out: String,
     /// Composite `by` key (0x1F-joined, like GroupBy) → (last ts, session start).
     pub(crate) state: std::collections::BTreeMap<String, (i64, i64)>,
     pub(crate) regressions: u64,
@@ -1908,11 +1910,12 @@ impl Operator for Sessionize {
             valid.push(true);
         }
 
-        // Append the `session` column (suffix `_r` on collision, §27.1 rule).
-        let name = if chunk.schema.index_of("session").is_some() {
-            "session_r"
+        // Append the window column (suffix `_r` on collision, §27.1 rule) —
+        // named by the item alias (design/38 P3; `session` by default).
+        let name = if chunk.schema.index_of(&self.out).is_some() {
+            format!("{}_r", self.out)
         } else {
-            "session"
+            self.out.clone()
         };
         let mut fields = chunk.schema.fields.clone();
         fields.push(rivus_core::Field::new(name, chunk.schema.fields[ci].dtype));

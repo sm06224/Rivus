@@ -300,7 +300,12 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     Tok::Word("-".to_string())
                 }
-                b'*' if self.depth > 0 => {
+                // `*` is Star everywhere: arithmetic inside parens, and the
+                // keep-all projection marker `|> *` (design/38 P3) at depth 0
+                // — previously a lex error there, so this is purely additive
+                // (`*` is neither a word start nor a word part; bare glob
+                // paths were always quoted).
+                b'*' => {
                     self.bump();
                     Tok::Star
                 }

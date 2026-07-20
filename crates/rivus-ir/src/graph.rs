@@ -433,6 +433,16 @@ pub fn is_http_url(p: &str) -> bool {
         || b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://")
 }
 
+/// The ` over a b` window-partition suffix (design/38 P3); empty for an
+/// unpartitioned window.
+fn over_clause(by: &[String]) -> String {
+    if by.is_empty() {
+        String::new()
+    } else {
+        format!(" over {}", by.join(" "))
+    }
+}
+
 /// Flatten a filter predicate's ROOT `And` chain into its conjunct parts —
 /// the canonical `|?` spelling joins them with commas (design/38 P2: the
 /// comma is the one top-level conjunction; `and`/`or` remain inside
@@ -845,6 +855,10 @@ pub enum Op {
         ts: String,
         gap: String,
         by: Vec<String>,
+        /// The appended column's name (design/38 P3: the canonical spelling
+        /// is `|> * (session(ts, "gap") over by…) as OUT`; the retired
+        /// `sessionize` verb always produced `session`).
+        out: String,
     },
     /// `shift COL lag|diff|pct_change [N] [by COL ...] as ALIAS` — time-series
     /// shift/difference primitives (#65): append `out` carrying a value derived
@@ -1468,12 +1482,16 @@ impl Op {
                 }
             }
             Op::Explode { col } => format!("explode {col}"),
-            Op::Sessionize { ts, gap, by } => {
-                let mut s = format!("sessionize {ts} gap \"{gap}\"");
-                if !by.is_empty() {
-                    s.push_str(&format!(" by {}", by.join(" ")));
-                }
-                s
+            // design/38 P3: the window verbs render in their canonical
+            // function form — `|> *` keeps every column and appends the
+            // window output (the verbs' keep-all semantics, so the retired
+            // `sessionize`/`shift` spellings migrate mechanically through
+            // `rivus fmt`); `over` is the uniform partition clause.
+            Op::Sessionize { ts, gap, by, out } => {
+                format!(
+                    "|> * (session({ts}, \"{gap}\"){}) as {out}",
+                    over_clause(by)
+                )
             }
             Op::Shift {
                 col,
@@ -1483,15 +1501,16 @@ impl Op {
                 out,
             } => {
                 // `lag`/`pct_change` always print N; `diff` omits the default 1.
-                let mut s = format!("shift {col} {}", kind.as_str());
-                if *kind != ShiftKind::Diff || *n != 1 {
-                    s.push_str(&format!(" {n}"));
-                }
-                if !by.is_empty() {
-                    s.push_str(&format!(" by {}", by.join(" ")));
-                }
-                s.push_str(&format!(" as {out}"));
-                s
+                let arg = if *kind == ShiftKind::Diff && *n == 1 {
+                    col.clone()
+                } else {
+                    format!("{col}, {n}")
+                };
+                format!(
+                    "|> * ({}({arg}){}) as {out}",
+                    kind.as_str(),
+                    over_clause(by)
+                )
             }
             Op::Fill { col, method } => match method {
                 FillMethod::Value(v) => format!("fill {col} \"{v}\""),
