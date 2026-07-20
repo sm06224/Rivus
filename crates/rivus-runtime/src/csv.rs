@@ -125,6 +125,13 @@ pub struct CsvChunker {
     /// character may itself straddle the block, so the fragment alone can be
     /// invalid UTF-8; validation happens when the line completes.
     carry: Vec<u8>,
+    /// design/42 stage (b): per-`keep`-column dictionary candidacy, decided by
+    /// the speculative sample (`SAMPLE_DICT_MAX` distinct). Empty = no column
+    /// builds dictionaries (canonical opens, non-sampled paths).
+    dict_cols: Vec<bool>,
+    /// Chunks whose candidate column crossed `DICT_CAP` and escaped to the
+    /// plain lane — surfaced for the activation-observability WPROF line.
+    dict_escapes: u32,
     /// Count wrong-arity rows DURING streaming (Stage C speculative open,
     /// #239): the sampled open never ran pass 1, so the malformed-row total
     /// must accrue here or the never-silent report would go missing. Full
@@ -205,6 +212,7 @@ impl CsvChunker {
         allow: Option<&[String]>,
         chunk_size: usize,
         preview: bool,
+        dict_keys: Option<&std::collections::HashSet<String>>,
         prefilter: &[(String, CmpOp, f64)],
         str_prefilter: &[String],
         header: bool,
@@ -217,6 +225,7 @@ impl CsvChunker {
                 path,
                 allow,
                 chunk_size,
+                dict_keys,
                 prefilter,
                 str_prefilter,
                 header,
@@ -294,6 +303,8 @@ impl CsvChunker {
                 dt_specs,
                 chunk_size: chunk_size.max(1),
                 carry: Vec::new(),
+                dict_cols: Vec::new(),
+                dict_escapes: 0,
                 count_stream_bad: false,
                 bad_rows: bad,
                 rows_prefiltered: 0,
@@ -316,6 +327,7 @@ impl CsvChunker {
         path: &str,
         allow: Option<&[String]>,
         chunk_size: usize,
+        dict_keys: Option<&std::collections::HashSet<String>>,
         prefilter: &[(String, CmpOp, f64)],
         str_prefilter: &[String],
         header: bool,
@@ -342,6 +354,23 @@ impl CsvChunker {
         let mut bad = 0usize;
         let mut line = String::new();
         let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(ncols);
+        // design/42 stage (b): per-column distinct tracking over the sample —
+        // `None` = disqualified (not a requested key column, or crossed
+        // SAMPLE_DICT_MAX). Only columns the plan consumes as join/group keys
+        // (`dict_keys`) are candidates: interning is pure cost on a column
+        // that only flows to a writer (measured +5% on the ETL fixture), the
+        // key paths are where id→bytes borrowing pays. Quoted rows are
+        // skipped (an undercount only risks a false candidate, and the runtime
+        // DICT_CAP escape covers that).
+        let mut d_sets: Vec<Option<std::collections::HashSet<Box<str>>>> = keep
+            .iter()
+            .map(|&ci| {
+                dict_keys
+                    .is_some_and(|dk| dk.contains(&names[ci]))
+                    .then(Default::default)
+            })
+            .collect();
+        let mut d_rows = 0usize;
         for _ in 0..chunk_size {
             line.clear();
             if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
@@ -353,10 +382,48 @@ impl CsvChunker {
             }
             if !observe_line(l, ncols, &keep, &mut flags, &mut offsets, delim) {
                 bad += 1;
+                continue;
+            }
+            if split_offsets(l, &mut offsets, delim) && offsets.len() == ncols {
+                d_rows += 1;
+                for (k, &ci) in keep.iter().enumerate() {
+                    let over = {
+                        let Some(set) = d_sets[k].as_mut() else {
+                            continue;
+                        };
+                        let (cs, ce) = offsets[ci];
+                        let cell = &l[cs..ce];
+                        if set.contains(cell) {
+                            false
+                        } else if set.len() >= SAMPLE_DICT_MAX {
+                            true
+                        } else {
+                            set.insert(cell.into());
+                            false
+                        }
+                    };
+                    if over {
+                        d_sets[k] = None;
+                    }
+                }
             }
         }
         let mut dtypes: Vec<DataType> = flags.iter().map(Flags::resolve).collect();
         apply_declared_types(&mut dtypes, &keep, declared);
+        // A Str column whose sample stayed low-cardinality builds dictionary
+        // chunks (design/42 stage b). Canonical opens never set this, so the
+        // serial oracle keeps the plain lane — every parallel identity guard
+        // then pins dict vs plain end to end.
+        let dict_cols: Vec<bool> = keep
+            .iter()
+            .enumerate()
+            .map(|(k, _)| {
+                dtypes[k] == DataType::Str
+                    && d_sets[k]
+                        .as_ref()
+                        .is_some_and(|s| !s.is_empty() && s.len() < d_rows)
+            })
+            .collect();
         let dt_specs = build_dt_specs(&names, &keep, &dtypes, dt_formats);
         let mut fields = Vec::with_capacity(keep.len());
         for (k, &ci) in keep.iter().enumerate() {
@@ -381,6 +448,8 @@ impl CsvChunker {
                 dt_specs,
                 chunk_size: chunk_size.max(1),
                 carry: Vec::new(),
+                dict_cols,
+                dict_escapes: 0,
                 count_stream_bad: false,
                 bad_rows: bad,
                 rows_prefiltered: 0,
@@ -427,6 +496,8 @@ impl CsvChunker {
             dt_specs,
             chunk_size: chunk_size.max(1),
             carry: Vec::new(),
+            dict_cols: Vec::new(),
+            dict_escapes: 0,
             count_stream_bad: false,
             bad_rows: 0,
             rows_prefiltered: 0,
@@ -464,7 +535,13 @@ impl CsvChunker {
             .iter()
             .enumerate()
             .map(|(k, d)| {
-                ColBuilder::with_capacity_dt(*d, self.chunk_size, self.dt_specs[k].clone())
+                // design/42 stage (b): sample-flagged low-cardinality Str
+                // columns build chunk-local dictionaries (DICT_CAP escapes).
+                if self.dict_cols.get(k).copied().unwrap_or(false) {
+                    ColBuilder::dict_str(self.chunk_size)
+                } else {
+                    ColBuilder::with_capacity_dt(*d, self.chunk_size, self.dt_specs[k].clone())
+                }
             })
             .collect();
         // Reused field byte-ranges (no per-row allocation on the unquoted fast
@@ -672,7 +749,29 @@ impl CsvChunker {
         if got == 0 {
             return None;
         }
-        Some(builders.iter_mut().map(ColBuilder::finish).collect())
+        // Activation observability (design/42 条件④): a candidate that comes
+        // back on the plain lane crossed DICT_CAP mid-chunk — count the escape.
+        let cols: Vec<Column> = builders
+            .iter_mut()
+            .enumerate()
+            .map(|(k, b)| {
+                let c = b.finish();
+                if self.dict_cols.get(k).copied().unwrap_or(false)
+                    && matches!(c.data(), ColumnData::Str(_))
+                {
+                    self.dict_escapes += 1;
+                }
+                c
+            })
+            .collect();
+        Some(cols)
+    }
+
+    /// design/42 発動可観測性: `(dictionary-candidate columns, chunk escapes)`
+    /// — `None` when no column was flagged (canonical opens).
+    pub fn dict_status(&self) -> Option<(usize, u32)> {
+        let n = self.dict_cols.iter().filter(|&&b| b).count();
+        (n > 0).then_some((n, self.dict_escapes))
     }
 
     /// Row-at-a-time push — the pre-batch path, kept for the rare lines that
@@ -1643,7 +1742,25 @@ enum Lane {
     /// (#58, MVP `Sec`).
     Time(Vec<i64>),
     Str(StrColumn),
+    /// Dictionary-building Str lane (design/42 stage b): each cell interns
+    /// into a CHUNK-LOCAL dictionary (`map` mirrors `dict` by cell bytes).
+    /// Crossing `DICT_CAP` distinct values escapes in place to the plain lane
+    /// (the ratified high-cardinality hatch) — output bytes are unchanged
+    /// either way, only the representation differs.
+    StrDict {
+        dict: StrColumn,
+        codes: Vec<u32>,
+        map: std::collections::HashMap<Box<str>, u32, crate::fxhash::FxBuild>,
+    },
 }
+
+/// Runtime dictionary cap (design/42 ratified default): a chunk whose column
+/// exceeds this many distinct values escapes to the plain lane mid-build.
+const DICT_CAP: usize = 4096;
+/// Sample-side candidate threshold: a column qualifies for dictionary builds
+/// only when the speculative sample saw at most this many distinct values
+/// (comfortably under `DICT_CAP`, so escapes stay rare by construction).
+const SAMPLE_DICT_MAX: usize = 256;
 
 /// A typed, pre-sized column accumulator that also tracks **per-row validity**
 /// (the null model; design 26 §26.3). A null row keeps a type-default backing
@@ -1665,6 +1782,31 @@ struct ColBuilder {
 impl ColBuilder {
     fn with_capacity(dtype: DataType, cap: usize) -> Self {
         Self::with_capacity_dt(dtype, cap, None)
+    }
+
+    /// A dictionary-building Str accumulator (design/42 stage b) — used only
+    /// for columns the speculative sample marked low-cardinality.
+    fn dict_str(cap: usize) -> Self {
+        ColBuilder {
+            lane: Lane::StrDict {
+                dict: StrColumn::with_capacity(0, 0),
+                codes: Vec::with_capacity(cap),
+                map: std::collections::HashMap::default(),
+            },
+            valid: Vec::new(),
+            len: 0,
+        }
+    }
+
+    /// Decode a dict lane in place to the plain lane (the escape hatch).
+    fn dict_escape_lane(lane: &mut Lane, extra: usize) {
+        if let Lane::StrDict { dict, codes, .. } = lane {
+            let mut v = StrColumn::with_capacity(codes.len() + extra, 0);
+            for &c in codes.iter() {
+                v.push(dict.get(c as usize));
+            }
+            *lane = Lane::Str(v);
+        }
     }
 
     /// Like [`with_capacity`], but a `:datetime` column may carry an explicit
@@ -1716,6 +1858,32 @@ impl ColBuilder {
     ///   (`a,"",b`); an unquoted empty (`a,,b`) is `null`, like every other lane.
     #[inline]
     fn push(&mut self, cell: &str, quoted: bool) -> bool {
+        // Dict pre-pass (design/42 stage b): intern, or escape to the plain
+        // lane and fall through to its arm below — same validity rule as Str.
+        if matches!(self.lane, Lane::StrDict { .. }) {
+            let interned = match &mut self.lane {
+                Lane::StrDict { dict, codes, map } => {
+                    if let Some(&c) = map.get(cell) {
+                        codes.push(c);
+                        true
+                    } else if map.len() < DICT_CAP {
+                        let c = map.len() as u32;
+                        map.insert(cell.into(), c);
+                        dict.push(cell);
+                        codes.push(c);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => unreachable!(),
+            };
+            if interned {
+                self.record(!cell.is_empty() || quoted);
+                return false;
+            }
+            Self::dict_escape_lane(&mut self.lane, 1);
+        }
         let t = fast_trim(cell);
         let (valid, fail) = match &mut self.lane {
             Lane::Bool(v) => {
@@ -1811,6 +1979,9 @@ impl ColBuilder {
                 v.push(cell);
                 (!cell.is_empty() || quoted, false)
             }
+            // The dict pre-pass above either interned (early return) or
+            // escaped this lane to `Str` before the match.
+            Lane::StrDict { .. } => unreachable!("dict pre-pass handles or escapes"),
         };
         self.record(valid);
         fail
@@ -1828,6 +1999,38 @@ impl ColBuilder {
     fn push_many(&mut self, text: &str, cells: &[(usize, usize)]) -> u64 {
         let mut fails = 0u64;
         let ColBuilder { lane, valid, len } = self;
+        // Dict pre-pass (design/42 stage b): batch-intern; on crossing the cap
+        // escape once and finish the batch on the plain lane. Validity rule is
+        // the Str arm's (this path is never quoted).
+        if let Lane::StrDict { dict, codes, map } = lane {
+            let mut esc = cells.len();
+            for (i, &(cs, ce)) in cells.iter().enumerate() {
+                let cell = &text[cs..ce];
+                if let Some(&c) = map.get(cell) {
+                    codes.push(c);
+                } else if map.len() < DICT_CAP {
+                    let c = map.len() as u32;
+                    map.insert(cell.into(), c);
+                    dict.push(cell);
+                    codes.push(c);
+                } else {
+                    esc = i;
+                    break;
+                }
+                record_into(valid, len, !cell.is_empty());
+            }
+            if esc < cells.len() {
+                Self::dict_escape_lane(lane, cells.len() - esc);
+                if let Lane::Str(v) = lane {
+                    for &(cs, ce) in &cells[esc..] {
+                        let cell = &text[cs..ce];
+                        v.push(cell);
+                        record_into(valid, len, !cell.is_empty());
+                    }
+                }
+            }
+            return 0;
+        }
         match lane {
             Lane::Bool(v) => {
                 for &(s, e) in cells {
@@ -1955,6 +2158,8 @@ impl ColBuilder {
                     record_into(valid, len, !cell.is_empty());
                 }
             }
+            // The dict pre-pass above returns before this match.
+            Lane::StrDict { .. } => unreachable!("dict pre-pass returns early"),
         }
         fails
     }
@@ -1979,6 +2184,10 @@ impl ColBuilder {
             Lane::Date(v) => ColumnData::Date(std::mem::take(v)),
             Lane::Time(v) => ColumnData::Time(std::mem::take(v)),
             Lane::Str(v) => ColumnData::Str(std::mem::take(v)),
+            Lane::StrDict { dict, codes, .. } => ColumnData::StrDict(rivus_core::DictColumn {
+                dict: std::mem::take(dict),
+                codes: std::mem::take(codes),
+            }),
         };
         // Empty `valid` ⇒ no null ever occurred ⇒ the zero-cost all-valid form.
         let validity = if self.valid.is_empty() {

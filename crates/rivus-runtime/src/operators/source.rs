@@ -172,6 +172,7 @@ impl SourceCsv {
                 self.projection.as_deref(),
                 self.chunk_size,
                 self.preview,
+                None,
                 &self.prefilter,
                 &self.str_prefilter,
                 self.header,

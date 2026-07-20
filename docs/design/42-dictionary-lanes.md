@@ -1,6 +1,9 @@
 # 42 — Dictionary-encoded Str lanes（提案・批准待ち）
 
-Status: **批准済み（2026-07-19、#180 記録 → 現運用は #240）・第 (a) 段実装中**。
+Status: **批准済み（2026-07-19、#180 記録 → 現運用は #240）・第 (a) 段着地
+（#241）・第 (b) 段実装済み（reader 低カード検出＋escape hatch＋発動可観測性
+— 計測は BENCHMARKS「design/42 stage (b)」節、単体では wall +25-45ms の
+投資段で、回収は第 (c) 段）**。
 批准条件 4 点＝①§2 不変条件の property test（dict vs plain の value()/gather/
 write_cell バイト一致）②高カード escape hatch 必須 ③(a)→(b)→(c) の段階ごとに
 既存ガード＋計測 ④発動可観測性を最初から（WPROF/strategy）。

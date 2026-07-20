@@ -1579,8 +1579,20 @@ fn try_parallel_read_group(
 
     // 3) Phase 1 — open every file lazily (schema now, rows later), in waves.
     //    Under Stage C the open skips the full pass-1 scan for plain CSV
-    //    (sample inference + in-stream contradiction check).
-    let planner = operators::Read::new(fmt, provenance, opts.chunk_size);
+    //    (sample inference + in-stream contradiction check). Speculative opens
+    //    also carry the fused key-column names: low-cardinality key columns
+    //    dictionary-encode at decode (design/42 stage b), and the serial
+    //    oracle never speculates, so every parallel identity guard pins the
+    //    dict lane against the plain one.
+    let dict_keys = speculate
+        .then(|| {
+            fused_sp
+                .as_ref()
+                .map(|sp| fused_dict_key_names(graph, shape, sp))
+        })
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let planner = operators::Read::new(fmt, provenance, opts.chunk_size).with_dict_keys(dict_keys);
     let mut opened: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
     let mut quarantined: Vec<ErrorEvent> = Vec::new();
     {
@@ -3059,6 +3071,58 @@ fn fused_shape_plan(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<FusedSh
     })
 }
 
+/// design/42 stage (b): the column names the fused path consumes as join or
+/// group keys — the reader's dictionary-encoding candidates. Only the two
+/// shapes the fused key path accepts contribute (a bare field, or the field
+/// inside `coalesce(col, "lit")`); a name that actually resolves to the right
+/// side simply never matches a left file's header (harmless).
+fn fused_dict_key_names(
+    graph: &PlanGraph,
+    shape: &ReadGroupShape,
+    sp: &FusedShapePlan,
+) -> std::collections::HashSet<String> {
+    use rivus_ir::Expr as E;
+    fn key_src(e: &E, out: &mut std::collections::HashSet<String>) {
+        match e {
+            E::Field { name, access } if access.is_column() => {
+                out.insert(name.clone());
+            }
+            E::Func {
+                func: rivus_ir::Func::Coalesce,
+                args,
+            } if args.len() == 2 => {
+                if let E::Field { name, access } = &args[0] {
+                    if access.is_column() {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut set = std::collections::HashSet::new();
+    if let Op::Join { left_keys, .. } = &graph.nodes[sp.join_id].op {
+        for k in left_keys.iter().filter(|k| k.segs.is_empty()) {
+            set.insert(k.root.clone());
+        }
+    }
+    if let Op::GroupBy { keys, .. } = &graph.nodes[shape.group_id].op {
+        for k in keys {
+            match &sp.items {
+                Some(items) => {
+                    if let Some((e, _)) = items.iter().find(|(_, a)| a == &k.root) {
+                        key_src(e, &mut set);
+                    }
+                }
+                None => {
+                    set.insert(k.root.clone());
+                }
+            }
+        }
+    }
+    set
+}
+
 /// Stage C static gate (design/41 §5): may phase 1 open files **speculatively**
 /// (schema from a row sample, contradiction-checked while streaming)? True only
 /// when every schema widening a contradicted file could force on the union is
@@ -4022,8 +4086,12 @@ fn worker_read_partial_group(
             .zip(t_ops.iter())
             .map(|(l, d)| format!("{l}={}ms", d.as_millis()))
             .collect();
+        let dict = match dec.dict_status() {
+            Some((n, esc)) => format!(" dict={n}cols(esc={esc})"),
+            None => String::new(),
+        };
         eprintln!(
-            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms [{} fused={}ms{}]",
+            "[WPROF] {uri}: decode={}ms reconcile={}ms feed={}ms [{} fused={}ms{}]{dict}",
             t_dec.as_millis(),
             t_rec.as_millis(),
             t_feed.as_millis(),

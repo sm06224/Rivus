@@ -2416,3 +2416,43 @@ running per-cell null checks and pushes. Measured (8-round paired
 interleave, noisy box): CSV group median 567 → **540 ms** (7/8 rounds
 won, ~−5%); JSONL group 883–952 → ~850 ms class. Parallel + serial
 `cmp`-identical, stress 194/0.
+
+## design/42 stage (b): dictionary lanes at the CSV reader (landed; cost measured, win deferred to (c))
+
+Speculative CSV opens now carry the fused plan's join/group key-column
+names; a key column whose `chunk_size`-row sample shows repetition
+evidence (distinct < sampled rows, ≤ 256) builds **chunk-local
+dictionaries** (`Lane::StrDict`: FxHashMap intern → `u32` codes).
+Crossing `DICT_CAP = 4096` distincts mid-chunk escapes: the built
+prefix materializes to the plain lane and the chunk finishes plain
+(condition ②); activation is observable end to end as
+`dict=Ncols(esc=M)` in `[WPROF]` via `CsvChunker::dict_status()`
+(condition ④). Canonical opens and the serial oracle never
+dictionary-encode, so every serial==parallel identity guard pins the
+dict lane against the plain one automatically (condition ①+③);
+`fill_join_key` / `push_group_key_field` / `fused_push_key` gained
+id→bytes borrow arms so no key path falls into the allocating `Value`
+fallback.
+
+Two measured findings that shaped the slice:
+
+- **Candidacy must be plan-aware.** A first cut dictionary-encoded any
+  low-cardinality sampled Str column; the ETL standard (no keys, all
+  columns → writer) paid the interning with zero payback: **+5%
+  consistent** (720→764 ms class, same-window interleave). Candidacy
+  is therefore restricted to the fused key set (`Read::with_dict_keys`
+  — engine-computed from the IR join `on` + group keys through the
+  projection). ETL now shows **zero candidates and noise-level delta**
+  (mins 707 vs 675 ms), output bit-identical.
+- **Stage (b) alone is net cost on the group standard: wall +25-45 ms
+  (+5-8%)** (10M CSV group, 8-pair interleave; base mins 466-479 ms vs
+  dict mins 492-524 ms; RSS unchanged 10.2 MB; outputs bit-identical).
+  WPROF attribution: decode +5-8 ms/file (the intern hash probe is
+  NOT free relative to a plain byte push — 2 candidate cols × 10M rows
+  ≈ 20M probes) and feed +4-10 ms/file (`codes[row]` → `dict.get(id)`
+  is one extra dereference per key cell). The design §3 expectation
+  that interning rides "the push already paid" was wrong by ~40 ms —
+  recorded so the next reader doesn't re-assume it. Stage (c) (integer
+  id group probe / join pre-resolution, the actual prize: probe
+  ~25 ns → ~3 ns/row) is what converts this investment; **recommend
+  holding the merge until (c) lands on the same PR**.
