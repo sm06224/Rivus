@@ -224,6 +224,12 @@ pub(crate) struct Read {
     /// — the only dictionary-encoding candidates (speculative opens only).
     /// `None` (the default) disables dictionary lanes entirely.
     dict_keys: Option<std::collections::HashSet<String>>,
+    /// Decode-column pruning (#240 キュー3): keep only these columns while
+    /// decoding CSV (`None` = keep all). Set from `engine::read_prune_allow`
+    /// on BOTH the serial chain and the parallel sink driver (対称方式), so
+    /// the decode sets — and the error streams — never diverge between paths.
+    /// JSONL decoders take no allow-list and always decode fully.
+    allow: Option<Vec<String>>,
 }
 
 impl Read {
@@ -235,6 +241,7 @@ impl Read {
             uris: Vec::new(),
             rescol_missing: false,
             dict_keys: None,
+            allow: None,
         }
     }
 
@@ -246,6 +253,14 @@ impl Read {
         keys: Option<std::collections::HashSet<String>>,
     ) -> Self {
         self.dict_keys = keys;
+        self
+    }
+
+    /// Restrict CSV decoding to these columns (decode-column pruning, #240
+    /// キュー3). MUST come from `engine::read_prune_allow` so serial and
+    /// parallel decode the same set (対称方式).
+    pub(crate) fn with_allow(mut self, allow: Option<Vec<String>>) -> Self {
+        self.allow = allow;
         self
     }
 
@@ -294,7 +309,7 @@ impl Read {
             FileFmt::Csv(delim) => {
                 let Ok((schema, mut ch)) = crate::csv::CsvChunker::open(
                     uri,
-                    None,
+                    self.allow.as_deref(),
                     self.chunk_size,
                     true, // preview: sample-based inference, no pass-1 scan
                     self.dict_keys.as_ref(),
@@ -359,7 +374,7 @@ impl Read {
                     {
                         let (schema, ch) = crate::csv::CompressedCsvReader::open(
                             uri,
-                            None,
+                            self.allow.as_deref(),
                             self.chunk_size,
                             true,
                             None,
@@ -396,7 +411,7 @@ impl Read {
             FileFmt::Csv(delim) => {
                 match crate::csv::plan_parallel(
                     uri,
-                    None,
+                    self.allow.as_deref(),
                     threads,
                     &[],
                     &[],
@@ -419,7 +434,7 @@ impl Read {
                     Err(_) => {
                         let (schema, mut ch) = crate::csv::CsvChunker::open(
                             uri,
-                            None,
+                            self.allow.as_deref(),
                             self.chunk_size,
                             false,
                             None,
@@ -491,7 +506,7 @@ impl Read {
                     {
                         let (schema, mut ch) = crate::csv::CompressedCsvReader::open(
                             uri,
-                            None,
+                            self.allow.as_deref(),
                             self.chunk_size,
                             true,
                             None,
@@ -547,7 +562,7 @@ impl Read {
                     .min(8);
                 match crate::csv::plan_parallel(
                     uri,
-                    None,
+                    self.allow.as_deref(),
                     threads,
                     &[],
                     &[],
@@ -593,7 +608,7 @@ impl Read {
                     Err(_) => {
                         let (schema, mut ch) = crate::csv::CsvChunker::open(
                             uri,
-                            None,
+                            self.allow.as_deref(),
                             self.chunk_size,
                             false,
                             None,
@@ -1392,6 +1407,22 @@ mod dict_stage_b_tests {
         let (n, esc) = d_spec.dict_status().expect("cat was a candidate");
         assert_eq!(n, 1);
         assert!(esc > 0, "crossing DICT_CAP must count an escape");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Decode-column pruning (#240 キュー3): an allow-listed reader decodes —
+    /// and schemas — only the listed columns, on the canonical open (the same
+    /// list reaches the sampled/compressed opens through the same field).
+    #[test]
+    fn allow_prunes_decoded_columns() {
+        let p = write_tmp("prune", "a,b,junk\n1,x,zz\n2,y,ww\n");
+        let uri = p.to_str().unwrap();
+        let r = reader(64).with_allow(Some(vec!["a".into(), "b".into()]));
+        let (schema, mut d) = r.open_file_stream(uri).expect("open");
+        let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"], "junk must be pruned from the schema");
+        let cols = d.next_chunk().expect("chunk");
+        assert_eq!(cols.len(), 2, "junk must not be decoded");
         let _ = std::fs::remove_file(&p);
     }
 

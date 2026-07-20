@@ -2508,3 +2508,27 @@ Stage (b) alone measured +25-45 ms (previous entry); (b)+(c) together
 land **−58 ms median** on the flagship standard — the dictionary-lane
 bet paid where design/42 §3 predicted (probe ~25ns → array index),
 just not where it assumed decode would be free.
+
+## decode-column pruning — join-free sink chains, symmetric (#240 キュー3, landed)
+
+The contract question that shelved this is resolved by ruling (対称方式):
+ONE analysis (`engine::read_prune_allow`) computes the used-column set of a
+join-free `read → filter/cast/projection → save` chain and feeds BOTH the
+serial operator chain (`build_ops`) and the parallel read→sink driver — the
+two paths decode the same columns, so their error streams stay in parity by
+construction. Parse failures in never-consumed columns are no longer counted
+(contract narrowing, CHANGELOG + design/13 §appendix); malformed-ROW counting
+is width-based and unchanged (pinned by `decode_prune_is_symmetric_and_
+identical`, which runs dirty data through both paths and compares output
+bytes AND error messages). Joins are excluded from this slice — pruning a
+left column could flip the probe's `_r` collision naming — as are groups
+(their driver has its own probe pushdown) and JSONL (no allow-list support).
+`rivus explain` surfaces the decision (`decode prune` section, kept columns).
+
+Measured (10M ETL standard, same-window interleave vs main `d48bda3`,
+outputs bit-identical, RSS 10.2 MB unchanged): **5/6 pairs won,
+min 723 → 690 ms, median ~780 → ~726 ms (−5〜7%)** — inside the −30-60 ms
+estimate from the design note. `category` (10M cells) is no longer decoded.
+CSV group standard: analysis returns `None` (shape has a join+group), runs
+bit-identical, 3/3 interleaved pairs show no regression (quiet box, both
+binaries now carry the dict-lane win: base 425-451 ms class).

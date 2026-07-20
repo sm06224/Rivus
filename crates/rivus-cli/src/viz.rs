@@ -584,6 +584,16 @@ pub fn render_explain(graph: &PlanGraph) -> String {
     } else {
         s.push_str("\u{2592} topo order\n  (cycle detected)\n");
     }
+    // Decode-column pruning surface (#240 キュー3): the execution-time decode
+    // allow-list, computed by the same analysis the engine applies on BOTH the
+    // serial and parallel paths — explain shows what `read` will actually
+    // decode (CSV; parse failures in unlisted columns are not counted).
+    if let Some(cols) = rivus_runtime::read_prune_allow(graph) {
+        s.push_str(&format!(
+            "\u{2592} decode prune (read decodes only these columns)\n  {}\n",
+            cols.join(", ")
+        ));
+    }
     s.push_str("\u{2592} regenerated source (IR -> source, reversibility)\n");
     for line in graph.to_source().lines() {
         s.push_str(&format!("  {line}\n"));

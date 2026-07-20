@@ -394,6 +394,10 @@ fn build_ops(
         Some((id, op)) => (Some(id), Some(op)),
         None => (None, None),
     };
+    // Decode-column pruning (対称方式): the SERIAL chain applies the same
+    // allow-list as the parallel read→sink driver — one shared analysis, so
+    // the two paths' decode sets (and error streams) never diverge.
+    let prune = read_prune_allow(graph);
     graph
         .nodes
         .iter()
@@ -402,6 +406,11 @@ fn build_ops(
                 ov_op.take().expect("source override used once")
             } else if ov_id.is_some() && matches!(node.op, Op::Sink { .. }) {
                 operators::collector()
+            } else if let (Op::Read { fmt, provenance }, Some(allow)) = (&node.op, &prune) {
+                Box::new(
+                    operators::Read::new(*fmt, *provenance, opts.chunk_size)
+                        .with_allow(Some(allow.clone())),
+                )
             } else {
                 operators::build(
                     &node.op,
@@ -1387,47 +1396,54 @@ type BroadcastRight = operators::BuiltRight;
 /// outside the modeled set, or any expression whose column reads can't be
 /// enumerated keeps the old keep-everything shape. Over-approximation is
 /// always safe: a kept-but-unused column costs exactly what it did before.
+/// Name-dedup push for the used-column collectors.
+fn add_used(name: &str, out: &mut Vec<String>) {
+    if !out.iter().any(|n| n == name) {
+        out.push(name.to_string());
+    }
+}
+
+/// Every column `e` reads, by name; `false` = not enumerable → disable the
+/// caller's pruning. Shared by the probe projection pushdown
+/// (`fused_used_columns`) and decode-column pruning (`read_prune_allow`).
+fn expr_used_cols(e: &rivus_ir::Expr, out: &mut Vec<String>) -> bool {
+    use rivus_ir::Expr as E;
+    match e {
+        E::Field { name, access } => {
+            if access.is_column() {
+                add_used(name, out);
+            }
+            true
+        }
+        // Positions shift when columns are pruned — never prune under one.
+        E::FieldAt(_) => false,
+        E::SubView { base, .. } => {
+            add_used(base, out);
+            true
+        }
+        E::Path(p) => {
+            add_used(&p.root, out);
+            true
+        }
+        E::Literal(_) | E::Hole(_) => true,
+        E::Compare { left, right, .. } | E::Arith { left, right, .. } => {
+            expr_used_cols(left, out) && expr_used_cols(right, out)
+        }
+        E::And(a, b) | E::Or(a, b) => expr_used_cols(a, out) && expr_used_cols(b, out),
+        E::Cast { expr, .. } => expr_used_cols(expr, out),
+        E::Func { args, .. } => args.iter().all(|a| expr_used_cols(a, out)),
+        E::Case { branches, default } => {
+            branches
+                .iter()
+                .all(|(c, v)| expr_used_cols(c, out) && expr_used_cols(v, out))
+                && default.as_deref().is_none_or(|d| expr_used_cols(d, out))
+        }
+    }
+}
+
 fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<String>> {
-    fn add(name: &str, out: &mut Vec<String>) {
-        if !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
-        }
-    }
-    /// Every column `e` reads, by name; `false` = not enumerable → disable.
-    fn expr_cols(e: &rivus_ir::Expr, out: &mut Vec<String>) -> bool {
-        use rivus_ir::Expr as E;
-        match e {
-            E::Field { name, access } => {
-                if access.is_column() {
-                    add(name, out);
-                }
-                true
-            }
-            // Positions shift when columns are pruned — never prune under one.
-            E::FieldAt(_) => false,
-            E::SubView { base, .. } => {
-                add(base, out);
-                true
-            }
-            E::Path(p) => {
-                add(&p.root, out);
-                true
-            }
-            E::Literal(_) | E::Hole(_) => true,
-            E::Compare { left, right, .. } | E::Arith { left, right, .. } => {
-                expr_cols(left, out) && expr_cols(right, out)
-            }
-            E::And(a, b) | E::Or(a, b) => expr_cols(a, out) && expr_cols(b, out),
-            E::Cast { expr, .. } => expr_cols(expr, out),
-            E::Func { args, .. } => args.iter().all(|a| expr_cols(a, out)),
-            E::Case { branches, default } => {
-                branches
-                    .iter()
-                    .all(|(c, v)| expr_cols(c, out) && expr_cols(v, out))
-                    && default.as_deref().is_none_or(|d| expr_cols(d, out))
-            }
-        }
-    }
+    let add = add_used;
+    let expr_cols = expr_used_cols;
     let mut used = Vec::new();
     for step in &shape.path {
         let nid = match step {
@@ -1493,6 +1509,93 @@ fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<S
         add(c, &mut used);
     }
     Some(used)
+}
+
+/// Decode-column pruning (#240 キュー3, 対称方式): the allow-list the `read`
+/// node's decoders should keep, or `None` = decode everything.
+///
+/// `Some` only for the modeled shape — a single `read` whose downstream is a
+/// linear chain of Filter / FilterProject / Project / ProjectExpr / Cast ops
+/// ending in a sink, containing at least one projection (which bounds the
+/// surviving column set; without one the sink writes every column and nothing
+/// may be pruned). Joins, group-bys, renames, views, or any other op disable
+/// pruning entirely — in particular a broadcast join is excluded because
+/// pruning a left column could flip the probe's `_r` collision naming.
+///
+/// SYMMETRY IS THE CONTRACT: this one function feeds BOTH the serial operator
+/// chain (`build_ops`) and the parallel read→sink driver, so the two paths
+/// always decode the same column set and their error streams stay in parity.
+/// The narrowing itself — parse failures in never-consumed columns are no
+/// longer counted — is a documented contract change (CHANGELOG / docs).
+/// Applied by the CSV decoders only (`allow`-capable); JSONL decodes fully on
+/// both paths.
+pub fn read_prune_allow(graph: &PlanGraph) -> Option<Vec<String>> {
+    let mut read = None;
+    for n in &graph.nodes {
+        if matches!(n.op, Op::Read { .. }) {
+            if read.is_some() {
+                return None;
+            }
+            read = Some(n.id);
+        }
+    }
+    let mut used = Vec::new();
+    let mut bounded = false;
+    let mut cur = read?;
+    loop {
+        let outs = graph.outputs_of(cur);
+        let [next] = outs.as_slice() else { return None };
+        match &graph.nodes[*next].op {
+            Op::Filter { pred } => {
+                if !expr_used_cols(pred, &mut used) {
+                    return None;
+                }
+            }
+            Op::FilterProject { preds, fields } => {
+                for p in preds {
+                    if !expr_used_cols(p, &mut used) {
+                        return None;
+                    }
+                }
+                if let Some(fs) = fields {
+                    for f in fs {
+                        add_used(f, &mut used);
+                    }
+                    bounded = true;
+                }
+            }
+            Op::Project { fields } => {
+                for f in fields {
+                    add_used(f, &mut used);
+                }
+                bounded = true;
+            }
+            Op::ProjectExpr { items, views } => {
+                if !views.is_empty() {
+                    return None;
+                }
+                for (e, _) in items {
+                    if !expr_used_cols(e, &mut used) {
+                        return None;
+                    }
+                }
+                bounded = true;
+            }
+            Op::Cast { casts } => {
+                for (n, _) in casts {
+                    add_used(n, &mut used);
+                }
+            }
+            Op::Sink { .. } => {
+                if !graph.outputs_of(*next).is_empty() {
+                    return None;
+                }
+                return (bounded && !used.is_empty()).then_some(used);
+            }
+            _ => return None,
+        }
+        cur = *next;
+    }
 }
 
 fn try_parallel_read_group(
@@ -2388,7 +2491,10 @@ fn try_parallel_read_sink(
     // for this sink flow — a contradicted file's segment re-writes canonically
     // after the worker wave.
     let speculate = stage_c_sink_eligible(graph, shape);
-    let planner = operators::Read::new(fmt, provenance, opts.chunk_size);
+    // Decode-column pruning (対称方式): the same `read_prune_allow` set the
+    // serial chain applies (`build_ops`), so both paths decode identically.
+    let planner =
+        operators::Read::new(fmt, provenance, opts.chunk_size).with_allow(read_prune_allow(graph));
     let mut opened: Vec<(String, rivus_core::Schema, operators::FileDecoder)> = Vec::new();
     let mut quarantined: Vec<ErrorEvent> = Vec::new();
     {
@@ -5644,6 +5750,30 @@ fn label_of(graph: &PlanGraph, id: NodeId) -> String {
 mod tests {
     use super::*;
     use crate::gendata;
+
+    /// Decode-column pruning (#240 キュー3): the allow-list analysis models
+    /// exactly the join-free read→…→sink chain WITH a projection; anything
+    /// else (no projection = the sink writes every column, a group, a join)
+    /// must return `None` so both paths keep decoding everything.
+    #[test]
+    fn read_prune_allow_models_sink_chain_only() {
+        let g = |src: &str| rivus_optimizer::optimize(rivus_parser::parse(src).unwrap()).0;
+        let etl = g("S: ls \"x/*.csv\" read as csv cast amount :int \
+                     |? amount > 500 |> order_id region amount save o.csv ;");
+        let mut cols = read_prune_allow(&etl).expect("ETL chain is prunable");
+        cols.sort();
+        assert_eq!(cols, ["amount", "order_id", "region"]);
+        let no_proj = g("S: ls \"x/*.csv\" read as csv |? a > 1 save o.csv ;");
+        assert!(
+            read_prune_allow(&no_proj).is_none(),
+            "no projection -> sink writes every column -> no pruning"
+        );
+        let grp = g("S: ls \"x/*.csv\" read as csv |# a count:a save o.csv ;");
+        assert!(
+            read_prune_allow(&grp).is_none(),
+            "group shapes are outside the modeled chain"
+        );
+    }
 
     #[test]
     fn thousands_separator() {

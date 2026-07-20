@@ -772,3 +772,77 @@ fn fused_id_path_activates_and_matches_serial() {
         "dictionary chunks must engage the fused id fast path (0 rows took it)"
     );
 }
+
+/// Decode-column pruning (#240 キュー3, 対称方式): parallel and forced-serial
+/// runs of a prunable read→sink chain — dirty data included — produce
+/// byte-identical output AND identical error streams, because the SAME
+/// `read_prune_allow` set feeds both paths. Structural malformed-row counting
+/// is width-based, so it is unaffected by pruning and must survive on both.
+#[test]
+fn decode_prune_is_symmetric_and_identical() {
+    let dir = std::env::temp_dir().join(format!("rivus_prune_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in 0..2usize {
+        let mut t = String::from("order_id,region,amount,junk\n");
+        for i in 0..8_000usize {
+            t.push_str(&format!(
+                "{i},r{},{},garbage-{i}\n",
+                i % 5,
+                (i % 1000) as i64
+            ));
+        }
+        if f == 0 {
+            t.push_str("only,three,fields\n"); // malformed (width) row
+        }
+        std::fs::write(dir.join(format!("p{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("p*.csv");
+    // NOT `p*.csv`-matching names — the sink outputs must never re-enter
+    // the input glob on the second run.
+    let out_par = dir.join("out_par.csv");
+    let out_ser = dir.join("out_ser.csv");
+    let src = |out: &std::path::Path| {
+        format!(
+            "S: ls \"{}\" read as csv cast amount :int |? amount > 500 \
+             |> order_id region amount save {} ;",
+            glob.display(),
+            out.display()
+        )
+    };
+    let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
+    let gp = parse_opt(&src(&out_par));
+    let gs = parse_opt(&src(&out_ser));
+    // The chain is prunable and `junk` is outside the set.
+    let allow = rivus_runtime::read_prune_allow(&gp).expect("prunable chain");
+    assert!(!allow.iter().any(|c| c == "junk"), "junk must be pruned");
+
+    let _env = env_guard();
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let rp = run(&gp, RunOptions::default()).expect("parallel run");
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    let rs = run(&gs, RunOptions::default()).expect("serial run");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    let a = std::fs::read_to_string(&out_par).unwrap();
+    let b = std::fs::read_to_string(&out_ser).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(a.lines().count() > 1, "expected real output");
+    assert_eq!(a, b, "pruned parallel output must equal pruned serial");
+    // Error-stream parity: the malformed row is structural (field-count) and
+    // must surface identically on both paths.
+    let msgs = |r: &rivus_runtime::RunResult| {
+        let mut v: Vec<String> = r.errors.iter().map(|e| e.message.clone()).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(msgs(&rp), msgs(&rs), "error streams must be in parity");
+    assert!(
+        rp.errors
+            .iter()
+            .any(|e| e.message.contains("malformed") || e.message.contains("row")),
+        "the malformed row must still be reported: {:?}",
+        rp.errors
+    );
+}

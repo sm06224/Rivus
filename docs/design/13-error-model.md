@@ -112,3 +112,19 @@ Phase 1）。
 | MVP | error stream / severity / scope / `on error`→`transition`（graph-level）/ Halted |
 | 次 | error→`Errors` routing 実体 / recovery・isolation の実行 / control plane API |
 | 将来 | 分散時の部分障害隔離 / checkpoint からの replay 回復 / SLA 連動 escalation |
+
+### Decode-column pruning と never-silent の範囲（#240 キュー3・契約変更）
+
+join も group も含まない線形な `read → filter/cast/projection → save` 連鎖
+では、CSV reader は**連鎖が消費する列だけ**を decode する（decode 列
+プルーニング）。このとき **決して消費されない列のセル単位 parse 失敗
+（「… set to null」類）は計数・報告されない** — never-silent 契約の適用
+範囲を「フローが読む列」に絞る契約変更である。行単位の構造検査
+（malformed row = 列数不一致）は列プルーニングと独立（行幅で判定）で、
+従来どおり全行に対して計数される。
+
+対称性が契約の要：同一の解析（`engine::read_prune_allow`）が直列経路と
+並列経路の両方に同じ used-set を供給するため、**2 経路の error stream は
+一致し続ける**（serial oracle との parity が保存される）。`rivus explain`
+は `decode prune` 節で保持列を表示する。JSONL reader は allow-list を
+持たず常に全列 decode（プルーニング非適用）。
