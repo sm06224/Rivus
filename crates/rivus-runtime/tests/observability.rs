@@ -14,6 +14,19 @@ impl Drop for TempCsv {
     }
 }
 
+/// The engine reads `RIVUS_NO_PARALLEL` / `RIVUS_PARALLEL_MIN_BYTES` /
+/// `RIVUS_CPUS` from the PROCESS environment, and the test harness runs tests
+/// on threads — two tests mutating these concurrently race. Measured flake
+/// (CI, 2026-07-19): `parallel_run_records_per_worker_telemetry` saw another
+/// test's `RIVUS_NO_PARALLEL=1` land between its own `remove_var` and the
+/// engine's check, fell back to serial, and asserted `workers == 0`. Every
+/// env-touching test serializes its whole set→run→remove span through this
+/// lock; a poisoned lock (a panicked test) just yields the guard.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn run_src(src: &str, chunk_size: usize) -> rivus_runtime::RunResult {
     let graph = rivus_parser::parse(src).expect("parse");
     // The reader-side prefilter is produced by the optimizer's filter_pushdown,
@@ -21,6 +34,7 @@ fn run_src(src: &str, chunk_size: usize) -> rivus_runtime::RunResult {
     let (graph, _report) = rivus_optimizer::optimize(graph);
     // Force serial so the prefilter count is reported by a single reader (the
     // parallel path sums per-worker counts, also valid but harder to assert).
+    let _env = env_guard();
     std::env::set_var("RIVUS_NO_PARALLEL", "1");
     let r = run(
         &graph,
@@ -165,6 +179,7 @@ fn no_prefilter_means_no_skip_telemetry() {
 /// the node aggregate are unchanged. The serial path leaves `workers` empty.
 #[test]
 fn parallel_run_records_per_worker_telemetry() {
+    let _env = env_guard();
     // A file large enough to split into ≥2 byte ranges; a `save` sink to a real
     // file makes it eligible for the streaming-parallel path.
     let rows = 200_000usize;
@@ -328,6 +343,7 @@ fn first_row_latency_is_recorded() {
 /// not a hook is attached.
 #[test]
 fn progress_hook_publishes_live_snapshots() {
+    let _env = env_guard();
     let rows = 60_000usize; // enough chunks to trigger several snapshots
     let csv = TempCsv(gendata::write_temp(
         "obs_snapshot",
@@ -431,6 +447,7 @@ fn inference_widening_is_surfaced_off_the_error_stream() {
 /// `Low` must always report a serial decision.
 #[test]
 fn memory_strategy_is_result_invariant_and_surfaced() {
+    let _env = env_guard();
     use rivus_runtime::MemoryPref;
 
     let csv = TempCsv(gendata::write_temp(
@@ -497,6 +514,7 @@ fn memory_strategy_is_result_invariant_and_surfaced() {
 /// exact across workers.
 #[test]
 fn string_prefilter_engages_on_parallel_path() {
+    let _env = env_guard();
     // gendata::clean's country column cycles a fixed 5-country alphabet; pick a
     // needle that lands in some rows so the prescan really skips the rest.
     let rows = 120_000usize;
@@ -596,6 +614,7 @@ fn string_prefilter_engages_on_parallel_path() {
 /// observation → serial". (Supersedes the old #36 force-serial contract.)
 #[test]
 fn live_hook_stays_parallel() {
+    let _env = env_guard();
     let rows = 200_000usize;
     let csv = TempCsv(gendata::write_temp(
         "obs_live_parallel",

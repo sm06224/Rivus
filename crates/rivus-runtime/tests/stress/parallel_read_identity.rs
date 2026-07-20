@@ -220,6 +220,247 @@ fn gz_jsonl_group_serial_parallel_byte_identical() {
     assert_gz_group_identity(&dir, "*.jsonl.gz", "jsonl");
 }
 
+/// R3 (Stage C, design/41 §5): plain-CSV group flows open **speculatively**
+/// (schema from a row sample, no pass-1 scan). This guard pins, against the
+/// serial canonical oracle:
+/// - byte-identity in emit order when a file **contradicts** its sample (an
+///   unparsable `amount` beyond the sample window at cs=7 → local canonical
+///   re-run of that file while every other partial is kept, union widened
+///   I64→Str), and when nothing contradicts (cs=4096 samples whole files);
+/// - the malformed-row reports (in-stream arity counting must equal pass 1's
+///   count per file — never-silent survives the skipped scan);
+/// - that speculation actually engages (strategy suffix), else this tests
+///   nothing.
+#[test]
+fn stage_c_speculative_group_serial_parallel_byte_identical() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagec");
+    for (i, text) in r1_csv_texts().iter().enumerate() {
+        std::fs::write(dir.file(&format!("part_0{i}.csv")), text).unwrap();
+    }
+    let rp = gendata::write_temp("stagec_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.csv\" read as csv cast amount :int ;\n\
+         J: S &left R on region\n\
+            |# country region sum:amount count:order_id ;",
+        rp.display(),
+        dir.0.display(),
+    );
+    let run_once = |pref: rivus_runtime::MemoryPref,
+                    cs: usize|
+     -> (Vec<String>, Option<String>, Vec<String>) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: cs,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let o = res
+            .outputs
+            .iter()
+            .find(|o| o.label.as_deref() == Some("J"))
+            .expect("captured output");
+        let rows = o
+            .chunks
+            .iter()
+            .flat_map(|c| {
+                (0..c.len).map(move |r| {
+                    (0..c.columns.len())
+                        .map(|i| c.value(r, i).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                })
+            })
+            .collect();
+        let mut bad: Vec<String> = res
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("malformed"))
+            .map(|e| e.message.clone())
+            .collect();
+        bad.sort();
+        (rows, res.strategy, bad)
+    };
+    // cs=7: the sample window is 7 rows, so file 01's `notanumber` cell
+    // contradicts mid-stream (local re-run). cs=4096: every file fits the
+    // sample, zero contradictions (pure speculation win).
+    for cs in [7usize, 4096] {
+        let (oracle, s_strat, s_bad) = run_once(rivus_runtime::MemoryPref::Low, cs);
+        assert!(!oracle.is_empty(), "oracle must have groups");
+        assert!(
+            s_strat.is_none_or(|s| !s.contains("parallel read group-by")),
+            "Low must stay serial"
+        );
+        let (par, p_strat, p_bad) = run_once(rivus_runtime::MemoryPref::Unbounded, cs);
+        assert_eq!(
+            p_strat.as_deref(),
+            Some("parallel read group-by (per-file workers, speculative open)"),
+            "Stage C must actually engage (else this guard tests nothing)"
+        );
+        assert_eq!(par, oracle, "serial == parallel (in order) @cs={cs}");
+        assert_eq!(
+            p_bad, s_bad,
+            "malformed-row reports must survive the skipped pass-1 scan @cs={cs}"
+        );
+    }
+}
+
+/// R3j (Stage C, design/41 §5 C-2): the JSONL twin of R3 — plain JSONL group
+/// flows speculate too (lane mismatches ARE the contradiction signal, no Bool
+/// blind spot). File 01 carries a malformed line (in-stream bad counting) AND
+/// a string `amount` beyond the cs=7 sample window (contradiction → local
+/// canonical re-run, union widened I64→Str); file 02 lacks `amount` entirely.
+#[test]
+fn stage_c_speculative_jsonl_group_serial_parallel_byte_identical() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagecj");
+    let mut texts = r1_jsonl_texts();
+    // A late type surprise in file 01 (row index ~1200 of 2000, far past any
+    // 7-row sample): a STRING amount under an int-sampled lane.
+    texts[1].push_str(
+        "{\"order_id\":9000,\"region\":\"r1\",\"amount\":\"oops\",\"category\":\"c1\"}\n",
+    );
+    for (i, text) in texts.iter().enumerate() {
+        std::fs::write(dir.file(&format!("part_0{i}.jsonl")), text).unwrap();
+    }
+    let rp = gendata::write_temp("stagecj_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.jsonl\" read as jsonl cast amount :int ;\n\
+         J: S &left R on region\n\
+            |# country region sum:amount count:order_id ;",
+        rp.display(),
+        dir.0.display(),
+    );
+    for cs in [7usize, 4096] {
+        let (oracle, s_strat) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Low, cs);
+        assert!(!oracle.is_empty(), "oracle must have groups");
+        assert!(
+            s_strat.is_none_or(|s| !s.contains("parallel read group-by")),
+            "Low must stay serial"
+        );
+        let (par, p_strat) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Unbounded, cs);
+        assert_eq!(
+            p_strat.as_deref(),
+            Some("parallel read group-by (per-file workers, speculative open)"),
+            "Stage C must actually engage on JSONL (else this guard tests nothing)"
+        );
+        assert_eq!(par, oracle, "serial == parallel (in order) @cs={cs}");
+    }
+}
+
+/// R5: an `or` predicate rides the fused loop and the speculative open (the
+/// gates accept any and/or shape over bare fields/literals — the shared
+/// interpreter evaluates it, the kernel mask simply stays off for
+/// non-conjunctions). Serial oracle == parallel, with the speculative
+/// strategy asserted so gate acceptance can't silently rot.
+#[test]
+fn stage_c_or_predicate_group_serial_parallel_byte_identical() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagec_or");
+    for (i, text) in r1_csv_texts().iter().enumerate() {
+        std::fs::write(dir.file(&format!("part_0{i}.csv")), text).unwrap();
+    }
+    let rp = gendata::write_temp("stagec_or_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.csv\" read as csv cast amount :int ;\n\
+         J: S &left R on region\n\
+            |? amount < 100 or amount > 800\n\
+            |# country region sum:amount count:order_id ;",
+        rp.display(),
+        dir.0.display(),
+    );
+    for cs in [7usize, 4096] {
+        let (oracle, _) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Low, cs);
+        assert!(!oracle.is_empty(), "oracle must have groups");
+        let (par, p_strat) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Unbounded, cs);
+        assert_eq!(
+            p_strat.as_deref(),
+            Some("parallel read group-by (per-file workers, speculative open)"),
+            "an `or` predicate must not knock the flow off Stage C"
+        );
+        assert_eq!(par, oracle, "serial == parallel (in order) @cs={cs}");
+    }
+}
+
+/// R3b (Stage C, design/41 §5): a contradiction that widens a column between
+/// NUMERIC lanes (i64→f64 here, via a `1.5` beyond the sample window) is not
+/// Display-exact above 2^53, so the driver must bail to the serial canonical
+/// path instead of keeping partials — correctness over speed, and the output
+/// still matches the oracle exactly.
+#[test]
+fn stage_c_numeric_widening_bails_to_serial() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagec_f64");
+    let mut f0 = String::from("order_id,region,amount\n");
+    for i in 0..500 {
+        f0.push_str(&format!("{i},r{},{}\n", i % 3, i * 3 % 100));
+    }
+    let mut f1 = String::from("order_id,region,amount\n");
+    for i in 500..1000 {
+        f1.push_str(&format!("{i},r{},{}\n", i % 3, i * 3 % 100));
+    }
+    f1.push_str("1000,r1,1.5\n"); // beyond the 7-row sample: i64 → f64 widening
+    std::fs::write(dir.file("part_00.csv"), &f0).unwrap();
+    std::fs::write(dir.file("part_01.csv"), &f1).unwrap();
+    let rp = gendata::write_temp("stagec_f64_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    // No cast on amount: `sum:amount` alone would already fail the C-eq gate,
+    // so cast to :float — value-safe — and let the union widening trigger the
+    // re-run-time bail instead (the case this guard is about).
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.csv\" read as csv cast amount :float ;\n\
+         J: S &left R on region\n\
+            |# country region count:order_id ;",
+        rp.display(),
+        dir.0.display(),
+    );
+    let (oracle, _) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Low, 7);
+    assert!(!oracle.is_empty(), "oracle must have groups");
+    let (par, p_strat) = collect_rows(&flow, "J", rivus_runtime::MemoryPref::Unbounded, 7);
+    assert!(
+        p_strat
+            .as_deref()
+            .is_none_or(|s| !s.contains("parallel read group-by")),
+        "numeric widening must abandon the parallel driver (got {p_strat:?})"
+    );
+    assert_eq!(par, oracle, "the serial fallback must match the oracle");
+}
+
 /// R2: the parallel read→join→sink path writes **left-row order** — file uri
 /// order, then row order within each file, then right-match (build insertion)
 /// order for a duplicated right key. The expected bytes are hand-computed with
@@ -322,11 +563,149 @@ fn parallel_sink_join_emits_left_row_order_without_sort() {
     let (parallel, p_strat) = run_once(rivus_runtime::MemoryPref::Unbounded);
     assert_eq!(
         p_strat.as_deref(),
-        Some("parallel read sink (per-file segments)"),
+        // Plain-CSV fixtures are Stage C sink-eligible (no preds, bare join
+        // keys), so the driver engages WITH the speculative open (C-2b).
+        Some("parallel read sink (per-file segments, speculative open)"),
         "the parallel sink driver must actually engage (else this guard tests nothing)"
     );
     assert_eq!(
         parallel, expected,
         "parallel sink must be byte-identical, in left-row order, without sort"
     );
+}
+
+/// R4 (Stage C, design/41 §5 C-2b): the SINK driver speculates too. File 01
+/// contradicts beyond the cs=7 sample (`notanumber` in an int-sampled
+/// `amount`) → its segment re-writes canonically under the widened union while
+/// every other segment's bytes are kept (written cells are Display-safe under
+/// →Str widening — `write_cell`'s numeric lanes are `Display` by
+/// construction). The whole output file must equal the serial oracle's bytes.
+#[test]
+fn stage_c_speculative_sink_serial_parallel_byte_identical() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagec_sink");
+    for (i, text) in r1_csv_texts().iter().enumerate() {
+        std::fs::write(dir.file(&format!("part_0{i}.csv")), text).unwrap();
+    }
+    let rp = gendata::write_temp("stagec_sink_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let out = dir.file("etl_out.csv");
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.csv\" read as csv cast amount :int\n\
+            |? amount > 100\n\
+            |> order_id region amount ;\n\
+         J: S &left R on region save {} ;",
+        rp.display(),
+        dir.0.display(),
+        out.display()
+    );
+    let run_once = |pref: rivus_runtime::MemoryPref| -> (String, Option<String>) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 7,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let bytes = std::fs::read_to_string(&out).expect("sink file");
+        let _ = std::fs::remove_file(&out);
+        (bytes, res.strategy)
+    };
+    let (serial, s_strat) = run_once(rivus_runtime::MemoryPref::Low);
+    assert!(
+        s_strat.is_none_or(|s| !s.contains("parallel read sink")),
+        "Low must stay serial"
+    );
+    assert!(!serial.is_empty(), "oracle must have rows");
+    let (parallel, p_strat) = run_once(rivus_runtime::MemoryPref::Unbounded);
+    assert_eq!(
+        p_strat.as_deref(),
+        Some("parallel read sink (per-file segments, speculative open)"),
+        "Stage C must actually engage on the sink driver"
+    );
+    assert_eq!(
+        parallel, serial,
+        "sink bytes must survive the contradiction → segment re-write"
+    );
+}
+
+/// R4b: a numeric (i64→f64) widening contradiction on the sink driver must
+/// drop the temp segments and bail to the serial canonical path — and the
+/// output file still equals the oracle.
+#[test]
+fn stage_c_sink_numeric_widening_bails_to_serial() {
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1);
+    if threads < 2 {
+        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+        return;
+    }
+    let dir = TempDir::new("stagec_sinkf64");
+    let mut f0 = String::from("order_id,region,amount\n");
+    for i in 0..500 {
+        f0.push_str(&format!("{i},r{},{}\n", i % 3, i * 3 % 100));
+    }
+    let mut f1 = String::from("order_id,region,amount\n");
+    for i in 500..1000 {
+        f1.push_str(&format!("{i},r{},{}\n", i % 3, i * 3 % 100));
+    }
+    f1.push_str("1000,r1,1.5\n"); // beyond the 7-row sample: i64 → f64 widening
+    std::fs::write(dir.file("part_00.csv"), &f0).unwrap();
+    std::fs::write(dir.file("part_01.csv"), &f1).unwrap();
+    let rp = gendata::write_temp("stagec_sinkf64_regions", &regions_csv());
+    let _rguard = TempCsv(rp.clone());
+    let out = dir.file("out.csv");
+    let flow = format!(
+        "R: open {} (region:str country:str) ;\n\
+         S: ls \"{}/*.csv\" read as csv cast amount :float ;\n\
+         J: S &left R on region save {} ;",
+        rp.display(),
+        dir.0.display(),
+        out.display()
+    );
+    let run_once = |pref: rivus_runtime::MemoryPref| -> (String, Option<String>) {
+        let g = rivus_parser::parse(&flow).expect("parse");
+        let res = run(
+            &g,
+            RunOptions {
+                chunk_size: 7,
+                memory: pref,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        let bytes = std::fs::read_to_string(&out).expect("sink file");
+        let _ = std::fs::remove_file(&out);
+        (bytes, res.strategy)
+    };
+    let (serial, _) = run_once(rivus_runtime::MemoryPref::Low);
+    let (parallel, p_strat) = run_once(rivus_runtime::MemoryPref::Unbounded);
+    assert!(
+        p_strat
+            .as_deref()
+            .is_none_or(|s| !s.contains("parallel read sink")),
+        "numeric widening must abandon the parallel sink driver (got {p_strat:?})"
+    );
+    assert_eq!(
+        parallel, serial,
+        "the serial fallback must match the oracle"
+    );
+    // No stray temp segments may survive the bail.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains("rivus-part"))
+        .collect();
+    assert!(leftovers.is_empty(), "bail must clean its temp segments");
 }

@@ -655,12 +655,43 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
     // Allocation-free scan (pass 1): observes classes directly into `seen`
     // without building a `JVal` — pinned byte-identical to the parser path
     // by `scanner_matches_parser_inference`.
+    // Lazy key-order template (see `RowTemplate`): built once the range's
+    // first valid object fixes the expected key sequence; matching lines skip
+    // the generic key scan entirely. `map[k]` = `seen` index of template key
+    // `k` (identity for a range whose first line defined `seen`, but built by
+    // lookup so a range that STARTED on a deviant line stays correct).
+    let mut tmpl: Option<(RowTemplate, Vec<usize>)> = None;
     let observe = |l: &str,
                    seen: &mut Vec<(String, Infer)>,
                    first_names: &mut Option<Vec<String>>,
-                   bad_rows: &mut usize| {
-        if !l.trim().is_empty() && !scan_line_infer(l, seen, first_names) {
+                   bad_rows: &mut usize,
+                   tmpl: &mut Option<(RowTemplate, Vec<usize>)>| {
+        if l.trim().is_empty() {
+            return;
+        }
+        let ok = match tmpl.as_ref() {
+            Some((t, map)) => scan_line_infer_fast(l, t, map, seen, first_names),
+            None => scan_line_infer(l, seen, first_names),
+        };
+        if !ok {
             *bad_rows += 1;
+        }
+        if tmpl.is_none() {
+            if let Some(names) = first_names.as_ref() {
+                if !names.is_empty() && names.len() <= 128 {
+                    let map: Vec<usize> = names
+                        .iter()
+                        .map(|n| match seen.iter().position(|(sn, _)| sn == n) {
+                            Some(ix) => ix,
+                            None => {
+                                seen.push((n.clone(), Infer::new()));
+                                seen.len() - 1
+                            }
+                        })
+                        .collect();
+                    *tmpl = Some((RowTemplate::new(names), map));
+                }
+            }
         }
     };
     loop {
@@ -677,7 +708,7 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
                     let bytes = std::mem::take(&mut carry);
                     if let Ok(s) = std::str::from_utf8(&bytes) {
                         let l = s.trim_end_matches(['\n', '\r']);
-                        observe(l, &mut seen, &mut first_names, &mut bad_rows);
+                        observe(l, &mut seen, &mut first_names, &mut bad_rows, &mut tmpl);
                     }
                 }
                 break;
@@ -704,7 +735,7 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
                     match std::str::from_utf8(&bytes) {
                         Ok(s) => {
                             let l = s.trim_end_matches(['\n', '\r']);
-                            observe(l, &mut seen, &mut first_names, &mut bad_rows);
+                            observe(l, &mut seen, &mut first_names, &mut bad_rows, &mut tmpl);
                         }
                         Err(_) => break, // read_line would have errored here
                     }
@@ -744,7 +775,7 @@ fn infer_range(path: &str, start: u64, end: u64) -> Result<RangeInfer, String> {
             let raw = &rest[..nl];
             cur += nl + 1;
             let l = raw.trim_end_matches(['\n', '\r']);
-            observe(l, &mut seen, &mut first_names, &mut bad_rows);
+            observe(l, &mut seen, &mut first_names, &mut bad_rows, &mut tmpl);
         }
         let walked = text.len();
         r.consume(walked);
@@ -801,7 +832,7 @@ fn infer_global(path: &str) -> Result<(Vec<String>, Vec<JType>, usize), String> 
 }
 
 /// Build a [`Schema`] from inferred column names + types (nested detail carried).
-fn schema_from(names: &[String], jtypes: &[JType]) -> Schema {
+pub(crate) fn schema_from(names: &[String], jtypes: &[JType]) -> Schema {
     Schema::new(
         names
             .iter()
@@ -819,6 +850,8 @@ pub struct JsonlChunker {
     reader: BufReader<File>,
     names: Vec<String>,
     jtypes: Vec<JType>,
+    /// Key-order template for the fused fast scan (see [`RowTemplate`]).
+    tmpl: RowTemplate,
     chunk_size: usize,
     line: String,
     /// Partial-line carry for the fused block-based reader (raw bytes — a
@@ -828,6 +861,71 @@ pub struct JsonlChunker {
     pos: u64,
     limit: Option<u64>,
     pub bad_rows: usize,
+    /// Count malformed lines DURING the stream (Stage C speculative open,
+    /// #239): the sampled open never ran pass 1, so the malformed-line total
+    /// must accrue here or the never-silent report would go missing. Canonical
+    /// opens leave this `false` (pass 1 already counted).
+    count_stream_bad: bool,
+    /// Stage C (#239): non-null values whose SYNTAX class fell outside their
+    /// lane (an int lane seeing a float/string/bool/nested, …) — each was
+    /// folded to null, so a nonzero count means the sampled schema contradicts
+    /// the file and a speculative run must be discarded. JSON is syntax-typed,
+    /// so this detector is complete with NO Bool exception (unlike CSV, where
+    /// `"maybe"` folds into a Bool lane without a parse failure): a stray
+    /// `"true"` string or `1` in a Bool lane is a counted mismatch here.
+    /// Canonical opens decode with the file's own full inference, so this
+    /// stays 0 there by construction.
+    pub lane_mismatches: u64,
+}
+
+/// A sampled flat-scalar schema: column names and their (all-`Scalar`) types.
+pub type SampledSchema = (Vec<String>, Vec<JType>);
+
+/// Stage C (#239): infer a schema from the first `n` objects of a plain JSONL
+/// file — the speculative substitute for `infer_global`'s whole-file pass.
+/// Returns `Ok(None)` when the sample is unusable for speculation (no valid
+/// object, a nested/list value, or more than 128 keys — the fused block walk
+/// is the only path that counts lane mismatches, and it is flat-only).
+pub fn sample_infer_flat(path: &str, n: usize) -> Result<Option<SampledSchema>, String> {
+    let mut reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let mut names: Vec<String> = Vec::new();
+    let mut infers: Vec<Infer> = Vec::new();
+    let mut started = false;
+    let mut seen = 0usize;
+    let mut l = String::new();
+    while seen < n.max(1) {
+        l.clear();
+        if reader.read_line(&mut l).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        let t = l.trim_end_matches(['\n', '\r']);
+        if t.trim().is_empty() {
+            continue;
+        }
+        if let Some(obj) = parse_object(t) {
+            if !started {
+                names = obj.iter().map(|(k, _)| k.clone()).collect();
+                infers = names.iter().map(|_| Infer::new()).collect();
+                started = true;
+            }
+            for (k, v) in &obj {
+                if let Some(i) = names.iter().position(|n| n == k) {
+                    infers[i].observe(v);
+                }
+            }
+            seen += 1;
+        }
+        // Malformed sample lines are NOT counted here: the speculative chunker
+        // re-decodes from byte 0 and counts every one exactly once in-stream.
+    }
+    if !started {
+        return Ok(None);
+    }
+    let jtypes: Vec<JType> = infers.iter().map(|f| f.resolve()).collect();
+    if names.len() > 128 || jtypes.iter().any(|t| !matches!(t, JType::Scalar(_))) {
+        return Ok(None);
+    }
+    Ok(Some((names, jtypes)))
 }
 
 impl JsonlChunker {
@@ -839,6 +937,7 @@ impl JsonlChunker {
         Ok((
             schema,
             JsonlChunker {
+                tmpl: RowTemplate::new(&names),
                 reader,
                 names,
                 jtypes,
@@ -849,8 +948,38 @@ impl JsonlChunker {
                 pos: 0,
                 limit: None,
                 bad_rows,
+                count_stream_bad: false,
+                lane_mismatches: 0,
             },
         ))
+    }
+
+    /// Stage C (#239): open `path` for a **speculative** whole-file stream —
+    /// the caller sampled `names`/`jtypes` via [`sample_infer_flat`] (flat
+    /// all-scalar guaranteed) and skipped pass 1 entirely. Malformed lines
+    /// count in-stream; lane mismatches accrue as the contradiction signal.
+    pub fn open_speculative(
+        path: &str,
+        names: Vec<String>,
+        jtypes: Vec<JType>,
+        chunk_size: usize,
+    ) -> Result<JsonlChunker, String> {
+        let reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+        Ok(JsonlChunker {
+            tmpl: RowTemplate::new(&names),
+            reader,
+            names,
+            jtypes,
+            chunk_size: chunk_size.max(1),
+            line: String::new(),
+            carry: Vec::new(),
+            eof: false,
+            pos: 0,
+            limit: None,
+            bad_rows: 0,
+            count_stream_bad: true,
+            lane_mismatches: 0,
+        })
     }
 
     /// Open `path` for streaming one newline-aligned byte range `[start, end)`
@@ -869,6 +998,7 @@ impl JsonlChunker {
             .seek(SeekFrom::Start(start))
             .map_err(|e| e.to_string())?;
         Ok(JsonlChunker {
+            tmpl: RowTemplate::new(&names),
             reader,
             names,
             jtypes,
@@ -879,6 +1009,8 @@ impl JsonlChunker {
             pos: start,
             limit: Some(end),
             bad_rows: 0,
+            count_stream_bad: false,
+            lane_mismatches: 0,
         })
     }
 
@@ -929,9 +1061,11 @@ impl JsonlChunker {
                             let l = s.trim_end_matches(['\n', '\r']);
                             if !l.trim().is_empty() {
                                 let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-                                if scan_row(l, &self.names, &mut scratch) {
+                                if !scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                                    self.bad_rows += usize::from(self.count_stream_bad);
+                                } else {
                                     for (b, v) in builders.iter_mut().zip(&scratch) {
-                                        b.push(v);
+                                        self.lane_mismatches += u64::from(b.push(v));
                                     }
                                     got += 1;
                                 }
@@ -974,9 +1108,11 @@ impl JsonlChunker {
                                 if !l.trim().is_empty() {
                                     let mut scratch: Vec<ScVal> =
                                         Vec::with_capacity(self.names.len());
-                                    if scan_row(l, &self.names, &mut scratch) {
+                                    if !scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                                        self.bad_rows += usize::from(self.count_stream_bad);
+                                    } else {
                                         for (b, v) in builders.iter_mut().zip(&scratch) {
-                                            b.push(v);
+                                            self.lane_mismatches += u64::from(b.push(v));
                                         }
                                         got += 1;
                                     }
@@ -1041,10 +1177,13 @@ impl JsonlChunker {
                     if l.trim().is_empty() {
                         continue;
                     }
-                    // Malformed lines are skipped (already counted in pass 1).
-                    if scan_row(l, &self.names, &mut scratch) {
+                    // Malformed lines are skipped — counted in pass 1 for
+                    // canonical opens, in-stream for speculative ones (#239).
+                    if !scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                        self.bad_rows += usize::from(self.count_stream_bad);
+                    } else {
                         for (b, v) in builders.iter_mut().zip(&scratch) {
-                            b.push(v);
+                            self.lane_mismatches += u64::from(b.push(v));
                         }
                         got += 1;
                     }
@@ -1156,9 +1295,15 @@ impl crate::codec::Decoder for JsonlChunker {
 /// two-pass [`infer_global`], so the schema (incl. nested shape, §32 s3b) is
 /// inferred from a buffered sample of the first `chunk_size` objects, then the
 /// rest is streamed. Same trade-off as the compressed CSV path: a key/type that
-/// only appears (or widens) past the sample is missed (documented, §33).
+/// only appears (or widens) past the sample is missed (documented, §33). The
+/// Stage C speculative path (#239) closes exactly that hole for PLAIN files —
+/// via [`JsonlChunker::open_speculative`], which re-decodes from byte 0 with
+/// the block walk and counts `lane_mismatches`; this read_line-based stream
+/// stays what it is: the non-seekable transport's reader.
 #[cfg(any(feature = "net", feature = "gzip", feature = "zstd"))]
 pub struct StreamJsonlReader {
+    /// Key-order template for the fused fast scan (see [`RowTemplate`]).
+    tmpl: RowTemplate,
     reader: Box<dyn BufRead + Send>,
     names: Vec<String>,
     jtypes: Vec<JType>,
@@ -1218,6 +1363,7 @@ impl StreamJsonlReader {
         Ok((
             schema,
             StreamJsonlReader {
+                tmpl: RowTemplate::new(&names),
                 reader,
                 names,
                 jtypes,
@@ -1254,7 +1400,7 @@ impl StreamJsonlReader {
             let line = std::mem::take(&mut self.pending[self.pending_pos]);
             self.pending_pos += 1;
             let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-            if scan_row(&line, &self.names, &mut scratch) {
+            if scan_row_fast(&line, &self.tmpl, &self.names, &mut scratch) {
                 for (b, v) in builders.iter_mut().zip(&scratch) {
                     b.push(v);
                 }
@@ -1279,7 +1425,7 @@ impl StreamJsonlReader {
                 continue;
             }
             let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-            if scan_row(l, &self.names, &mut scratch) {
+            if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
                 for (b, v) in builders.iter_mut().zip(&scratch) {
                     b.push(v);
                 }
@@ -1498,6 +1644,38 @@ fn snap_ranges(path: &str, nparts: usize) -> Option<Vec<(u64, u64)>> {
 /// (per-key [`Infer`]s, first-seen order) and capturing `first_names` from the
 /// first valid object. `false` = malformed (counted by the caller), with the
 /// same acceptance as [`parse_object`].
+/// [`scan_line_infer`] with the [`RowTemplate`] fast path. `map[k]` is the
+/// `seen` index of template key `k`. A deviating line falls back to the
+/// generic scan MID-LINE: the prefix values the template already observed
+/// are then observed again by the generic pass — harmless, because `Infer`
+/// state is a monotone class lattice (re-observing an identical value is a
+/// state no-op; pinned by `infer_double_observe_is_idempotent`), so the
+/// final inference is exactly the generic scanner's.
+fn scan_line_infer_fast(
+    line: &str,
+    tmpl: &RowTemplate,
+    map: &[usize],
+    seen: &mut Vec<(String, Infer)>,
+    first_names: &mut Option<Vec<String>>,
+) -> bool {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    for (k, seg) in tmpl.segs.iter().enumerate() {
+        if b.len() < i + seg.len() || &b[i..i + seg.len()] != seg.as_slice() {
+            return scan_line_infer(line, seen, first_names);
+        }
+        i += seg.len();
+        let ix = map[k];
+        if !scan_value_into(b, &mut i, &mut seen[ix].1) {
+            return scan_line_infer(line, seen, first_names);
+        }
+    }
+    if i + 1 == b.len() && b[i] == b'}' && !tmpl.segs.is_empty() {
+        return true;
+    }
+    scan_line_infer(line, seen, first_names)
+}
+
 fn scan_line_infer(
     line: &str,
     seen: &mut Vec<(String, Infer)>,
@@ -1866,73 +2044,105 @@ impl ColBuilder {
             ),
         }
     }
-    fn push(&mut self, v: &ScVal<'_>) {
+    /// Push one scanned value into the lane. Returns `true` when a NON-NULL
+    /// value's syntax class fell outside the lane and was folded to null — the
+    /// Stage C contradiction signal (#239). A `Null` is a legitimate null
+    /// (`false`); an int into a float lane is a legal coercion (`false`).
+    fn push(&mut self, v: &ScVal<'_>) -> bool {
         match self {
             // Mirrors `build_scalar`'s I64 arm: Int valid, anything else null.
             ColBuilder::I64(out, valid) => match v {
                 ScVal::I(i) => {
                     out.push(*i);
                     valid.push(true);
+                    false
+                }
+                ScVal::Null => {
+                    out.push(0);
+                    valid.push(false);
+                    false
                 }
                 _ => {
                     out.push(0);
                     valid.push(false);
+                    true
                 }
             },
             ColBuilder::F64(out, valid) => match v {
                 ScVal::I(i) => {
                     out.push(*i as f64);
                     valid.push(true);
+                    false
                 }
                 ScVal::F(f) => {
                     out.push(*f);
                     valid.push(true);
+                    false
+                }
+                ScVal::Null => {
+                    out.push(0.0);
+                    valid.push(false);
+                    false
                 }
                 _ => {
                     out.push(0.0);
                     valid.push(false);
+                    true
                 }
             },
             ColBuilder::Bool(out, valid) => match v {
                 ScVal::B(b) => {
                     out.push(*b);
                     valid.push(true);
+                    false
+                }
+                ScVal::Null => {
+                    out.push(false);
+                    valid.push(false);
+                    false
                 }
                 _ => {
                     out.push(false);
                     valid.push(false);
+                    true
                 }
             },
-            ColBuilder::Str(out, valid) => match v {
-                ScVal::Null => {
-                    out.push("");
-                    valid.push(false);
+            // Str is the lattice top: everything folds in losslessly enough
+            // for inference to agree (sample Str ⇒ full Str) — never a
+            // contradiction.
+            ColBuilder::Str(out, valid) => {
+                match v {
+                    ScVal::Null => {
+                        out.push("");
+                        valid.push(false);
+                    }
+                    ScVal::B(b) => {
+                        out.push(if *b { "true" } else { "false" });
+                        valid.push(true);
+                    }
+                    ScVal::I(i) => {
+                        out.push(&i.to_string());
+                        valid.push(true);
+                    }
+                    ScVal::F(f) => {
+                        out.push(&f.to_string());
+                        valid.push(true);
+                    }
+                    ScVal::S(x) => {
+                        out.push(x);
+                        valid.push(true);
+                    }
+                    ScVal::SOwned(x) => {
+                        out.push(x);
+                        valid.push(true);
+                    }
+                    ScVal::NestedJson(t) => {
+                        out.push(t);
+                        valid.push(true);
+                    }
                 }
-                ScVal::B(b) => {
-                    out.push(if *b { "true" } else { "false" });
-                    valid.push(true);
-                }
-                ScVal::I(i) => {
-                    out.push(&i.to_string());
-                    valid.push(true);
-                }
-                ScVal::F(f) => {
-                    out.push(&f.to_string());
-                    valid.push(true);
-                }
-                ScVal::S(x) => {
-                    out.push(x);
-                    valid.push(true);
-                }
-                ScVal::SOwned(x) => {
-                    out.push(x);
-                    valid.push(true);
-                }
-                ScVal::NestedJson(t) => {
-                    out.push(t);
-                    valid.push(true);
-                }
-            },
+                false
+            }
         }
     }
     fn finish(self) -> Column {
@@ -1956,6 +2166,57 @@ impl ColBuilder {
 /// Scan one line into the reused row `scratch` (one slot per column,
 /// first-occurrence-wins, missing → Null). `false` = malformed line (same
 /// acceptance as `parse_object`); nothing is committed for it.
+/// A literal key-segment template for the overwhelmingly common line shape:
+/// keys in exact schema order with no interior whitespace —
+/// `{"k0":<v>,"k1":<v>,…}`. One `memcmp` per key replaces the generic
+/// key-scan + name-position lookup. ANY deviation (reordered/missing/extra
+/// keys, whitespace, an escaped key, a scan failure, trailing bytes) falls
+/// back to [`scan_row`] for that line, so the accepted language — and every
+/// scanned value (`scan_cell` is shared) — is exactly the generic scanner's.
+pub(crate) struct RowTemplate {
+    segs: Vec<Vec<u8>>,
+}
+
+impl RowTemplate {
+    pub(crate) fn new(names: &[String]) -> Self {
+        let mut segs = Vec::with_capacity(names.len());
+        for (k, n) in names.iter().enumerate() {
+            let mut seg = Vec::with_capacity(n.len() + 4);
+            seg.extend_from_slice(if k == 0 { b"{\"" } else { b",\"" });
+            seg.extend_from_slice(n.as_bytes());
+            seg.extend_from_slice(b"\":");
+            segs.push(seg);
+        }
+        RowTemplate { segs }
+    }
+}
+
+/// [`scan_row`] with the template fast path (see [`RowTemplate`]).
+fn scan_row_fast<'a>(
+    line: &'a str,
+    tmpl: &RowTemplate,
+    names: &[String],
+    scratch: &mut Vec<ScVal<'a>>,
+) -> bool {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    scratch.clear();
+    for seg in &tmpl.segs {
+        if b.len() < i + seg.len() || &b[i..i + seg.len()] != seg.as_slice() {
+            return scan_row(line, names, scratch);
+        }
+        i += seg.len();
+        let Some(v) = scan_cell(b, &mut i) else {
+            return scan_row(line, names, scratch);
+        };
+        scratch.push(v);
+    }
+    if i + 1 == b.len() && b[i] == b'}' && !tmpl.segs.is_empty() {
+        return true;
+    }
+    scan_row(line, names, scratch)
+}
+
 fn scan_row<'a>(line: &'a str, names: &[String], scratch: &mut Vec<ScVal<'a>>) -> bool {
     let b = line.as_bytes();
     let mut i = 0usize;
@@ -2335,6 +2596,138 @@ mod tests {
     /// edges (i64 overflow → float, bare `-`, `1e5`), duplicate keys (top and
     /// nested — the first-object name-order rule), heterogeneous columns,
     /// nested obj/arr recursion, empty objects, truncated lines.
+    /// The template fast path must infer exactly what the generic scanner
+    /// infers — over template-matching lines AND every deviation class
+    /// (reorder, missing/extra key, whitespace, duplicate keys, malformed,
+    /// empty object, escaped key), in both orders of appearance.
+    #[test]
+    fn infer_template_matches_generic() {
+        let corpus: &[&str] = &[
+            r#"{"a":1,"b":"x","c":true}"#,
+            r#"{"a":2,"b":"y","c":false}"#,
+            r#"{"b":"z","a":3,"c":true}"#,              // reordered
+            r#"{"a":4,"b":"w"}"#,                       // missing key
+            r#"{"a":5,"b":"v","c":true,"d":9}"#,        // extra key
+            r#"{ "a" : 6 , "b" : "u" , "c" : false }"#, // whitespace
+            r#"{"a":7,"a":8,"b":"t","c":true}"#,        // duplicate key
+            r#"{"a":not json"#,                         // malformed
+            r#"{}"#,                                    // empty object
+            r#"{"a":1.5,"b":"s","c":true}"#,            // widening value
+            r#"{"\u0061":9,"b":"r","c":false}"#,        // escaped key (deviates)
+        ];
+        let run_generic = |lines: &[&str]| {
+            let mut seen: Vec<(String, Infer)> = Vec::new();
+            let mut first: Option<Vec<String>> = None;
+            let mut bad = 0usize;
+            for l in lines {
+                if !l.trim().is_empty() && !scan_line_infer(l, &mut seen, &mut first) {
+                    bad += 1;
+                }
+            }
+            (
+                seen.iter()
+                    .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                    .collect::<Vec<_>>(),
+                first,
+                bad,
+            )
+        };
+        let run_template = |lines: &[&str]| {
+            let mut seen: Vec<(String, Infer)> = Vec::new();
+            let mut first: Option<Vec<String>> = None;
+            let mut bad = 0usize;
+            let mut tmpl: Option<(RowTemplate, Vec<usize>)> = None;
+            for l in lines {
+                if l.trim().is_empty() {
+                    continue;
+                }
+                let ok = match tmpl.as_ref() {
+                    Some((t, map)) => scan_line_infer_fast(l, t, map, &mut seen, &mut first),
+                    None => scan_line_infer(l, &mut seen, &mut first),
+                };
+                if !ok {
+                    bad += 1;
+                }
+                if tmpl.is_none() {
+                    if let Some(names) = first.as_ref() {
+                        if !names.is_empty() {
+                            let map: Vec<usize> = names
+                                .iter()
+                                .map(|n| match seen.iter().position(|(sn, _)| sn == n) {
+                                    Some(ix) => ix,
+                                    None => {
+                                        seen.push((n.clone(), Infer::new()));
+                                        seen.len() - 1
+                                    }
+                                })
+                                .collect();
+                            tmpl = Some((RowTemplate::new(names), map));
+                        }
+                    }
+                }
+            }
+            (
+                seen.iter()
+                    .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                    .collect::<Vec<_>>(),
+                first,
+                bad,
+            )
+        };
+        // Whole corpus, plus every rotation (so deviants also appear FIRST,
+        // exercising template-built-after-a-deviant-start).
+        for rot in 0..corpus.len() {
+            let lines: Vec<&str> = corpus
+                .iter()
+                .cycle()
+                .skip(rot)
+                .take(corpus.len())
+                .copied()
+                .collect();
+            assert_eq!(
+                run_template(&lines),
+                run_generic(&lines),
+                "template != generic at rotation {rot}"
+            );
+        }
+    }
+
+    /// Re-observing an identical value is a state no-op (`Infer` is a
+    /// monotone class lattice) — the property that makes the template's
+    /// mid-line fallback (which re-observes the already-observed prefix)
+    /// exactly equivalent to a pure generic scan.
+    #[test]
+    fn infer_double_observe_is_idempotent() {
+        let lines: &[&str] = &[
+            r#"{"a":1,"b":"x","c":true}"#,
+            r#"{"a":1.5,"b":"","c":false}"#,
+            r#"{"a":[1,2],"b":{"k":3},"c":null}"#,
+        ];
+        for l in lines {
+            let mut once: Vec<(String, Infer)> = Vec::new();
+            let mut f1 = None;
+            assert!(scan_line_infer(l, &mut once, &mut f1));
+            let mut twice: Vec<(String, Infer)> = Vec::new();
+            let mut f2 = None;
+            assert!(scan_line_infer(l, &mut twice, &mut f2));
+            let snap: Vec<String> = twice
+                .iter()
+                .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                .collect();
+            assert!(scan_line_infer(l, &mut twice, &mut f2));
+            let snap2: Vec<String> = twice
+                .iter()
+                .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                .collect();
+            assert_eq!(snap, snap2, "double observe changed state: {l}");
+            let base: Vec<String> = once
+                .iter()
+                .map(|(n, i)| format!("{n}={:?}", i.resolve()))
+                .collect();
+            assert_eq!(base, snap, "observe count changed resolution: {l}");
+        }
+    }
+
     #[test]
     fn scanner_matches_parser_inference() {
         let corpus: &[&str] = &[

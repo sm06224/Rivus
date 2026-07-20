@@ -590,6 +590,50 @@ impl GroupBy {
         }
     }
 
+    /// Row-level observation for the fused worker loop (design/41 Stage A):
+    /// the engine hands the finished composite key, a lazy key-parts renderer
+    /// (run only when the group is first seen), and one optional `Value` per
+    /// aggregate (`None` = the agg's column is absent for this row — exactly
+    /// a `agg_idx` miss in [`GroupBy::process`], which observes nothing).
+    /// State handling is [`GroupBy::process`]'s inner loop verbatim — same
+    /// scratch map, same `GroupState`, same `AggAcc::observe` — so a fused
+    /// stream is byte-identical to feeding whole chunks.
+    pub(crate) fn observe_row(
+        &mut self,
+        composite: &str,
+        parts: impl FnOnce() -> Vec<String>,
+        vals: &[Option<Value>],
+    ) {
+        match self.scratch.get_mut(composite) {
+            Some(state) => {
+                state.count += 1;
+                for (j, v) in vals.iter().enumerate() {
+                    if let Some(v) = v {
+                        state.accs[j].observe(v);
+                    }
+                }
+            }
+            None => {
+                let mut state = GroupState {
+                    key_parts: parts(),
+                    count: 1,
+                    accs: self.aggs.iter().map(|(f, _)| AggAcc::new(*f)).collect(),
+                };
+                for (j, v) in vals.iter().enumerate() {
+                    if let Some(v) = v {
+                        state.accs[j].observe(v);
+                    }
+                }
+                self.scratch.insert(composite.to_string(), state);
+            }
+        }
+    }
+
+    /// The aggregate count (arity of the `vals` slice `observe_row` expects).
+    pub(crate) fn agg_count(&self) -> usize {
+        self.aggs.len()
+    }
+
     /// Fold the row-hot scratch into the sorted canonical store. Called before
     /// every read of `groups` (finish, merge). In the real lifecycles (process*
     /// → finish; process* → merge_from) every scratch entry is a pure move —

@@ -1987,3 +1987,432 @@ JSONL group: 1984 → **1898–1905 ms** (interleaved control), open
 (`scan_row`/`scan_line_infer` byte-walking every object twice) — the next
 JSONL lever is SWAR inside the scanner (delimiter/quote scanning), not
 loop structure.
+
+### Probe projection pushdown (design/41 Stage A-1, #239)
+
+The broadcast probe gathered EVERY column of every output row; a later
+project then dropped most of them. The driver now proves the downstream
+column set (filter predicates, projections, casts, later joins' left keys,
+group keys/aggs) and the probe gathers only those. Conservative by
+construction: a positional `$_[i]`, an op outside the modeled set
+(Rename/DropNa/Reorder/…), or a non-enumerable expression disables pruning
+entirely; over-approximation only costs what the old shape already paid.
+Output names (incl. the `_r` collision suffix, still judged against the
+full left schema) are unchanged, so downstream name resolution — and the
+output bytes — are identical (verified by `cmp` against the pre-pushdown
+binary, parallel and serial).
+
+Measured (WPROF per file):
+
+| shape | probe | filter | feed total |
+|---|---|---|---|
+| 10M standard (3 of 4 cols used) | 51 → 48 ms | — | ~165 → ~161 ms |
+| wide (3 of 16 cols used, 1M×2 files) | 79–88 → **24–25 ms** | 47–54 → **10–11 ms** | 176–189 → **84–86 ms (halved)** |
+
+Research verdict: the effect is proportional to the UNUSED width — near
+zero on the narrow standard fixture, structural on wide schemas (the
+common real-ETL case). Kept: ~60 lines, composes with the Stage A fused
+loop, whose target (killing the gather entirely plus project/group
+materialization) is unchanged.
+
+### The fused worker row loop (design/41 Stage A-2, #239)
+
+For the detected `read → cast? → (⋈ broadcast) → filter? → project? → group`
+shape (one join; predicates = `Compare`/`And` over bare columns and
+literals; projections = bare columns, string literals, or
+`coalesce(<Str col>, "lit")`; bare group keys), the worker now runs ONE
+row loop from the join onward: reused-buffer join key → Fx table lookup →
+left-only predicate via the SHARED interpreter (`eval_predicate_acc`, zero
+semantics duplication) → composite group key encoded straight off the
+source lanes (`push_group_key_field`'s exact `\x00`/`\x01` form) →
+`GroupBy::observe_row` (the generic path's own scratch/`AggAcc`, exposed
+row-wise). **No chunk exists between the join and the group** — the probe
+gather, the projection rebuild, and the group's second key walk are gone.
+Anything outside the modeled set latches the worker back to the generic
+op chain (including the chunk that failed resolution — the fallback is
+never lossy).
+
+Measured (interleaved best-of, quiet box; all four formats `cmp`-identical
+to the pre-change binary, parallel AND serial, plus the 189-test stress
+suite with the R1/R2 guards — R1's parallel leg now exercises the fused
+loop against the generic serial oracle directly):
+
+| shape | before (A-1) | fused | DuckDB | ratio |
+|---|---|---|---|---|
+| CSV group 10M | 908–911 ms / 14 MB | **754–771 ms / 14 MB** | 808 ms / 236 MB | **0.93× — beaten** |
+| JSONL group 10M | 1905 ms | **1709 ms** | 1418 ms | 1.21× |
+
+Per-file worker profile: the fused segment runs in ~98 ms where the
+generic ops it replaces cost ~142 ms (probe 48 + filter 1 + project 28 +
+group 65). With this, **every 10M standard shape now beats DuckDB on
+wall** (ETL 0.96×, csv.gz 0.86×, jsonl.gz 0.90×, CSV group 0.93×) at
+1/16th–1/53rd of its memory; plain JSONL (1.21×) remains the one gap —
+the scanner SWAR lever, not pipeline structure.
+
+### JSONL row-template scan (#239)
+
+The overwhelming majority of JSONL lines carry their keys in exact schema
+order with no interior whitespace. `RowTemplate` precomputes the expected
+key fragments (`{"k0":`, `,"k1":`, …) and matches them with one `memcmp`
+each — the generic key-scan and name-position lookup vanish; values still
+go through the shared `scan_cell`. ANY deviation (reordered/missing/extra
+keys, whitespace, escaped keys, a failed value scan, trailing bytes) falls
+back to `scan_row` for that line, so the accepted language and every
+produced value are exactly the generic scanner's. Wired into both the
+plain (`JsonlChunker`) and compressed (`StreamJsonlReader`) fused paths.
+
+Measured (same-window interleaved, 3 rounds, loaded box — ratios are
+window-internal): JSONL group 2526–2582 → **2214–2277 ms** (−12%);
+DuckDB in the same window 1928 ms, so 1.31× → **1.15×**. JSONL × parallel/
+serial and jsonl.gz all `cmp`-identical to the pre-change binary. The
+remaining gap is the value scan + per-row commit — and the open phase's
+second full scan (the infer-side template is the natural next increment).
+
+### JSONL infer-side template — the full sweep completes (#239)
+
+The same `RowTemplate` now drives pass 1: `infer_range` builds the
+template lazily from the range's first valid object (`map[k]` = the `seen`
+index of template key `k`, so a range that started on a deviant line stays
+correct) and matching lines skip the generic key scan. The mid-line
+fallback re-observes the already-observed prefix — exactly equivalent
+because `Infer` is a monotone class lattice (re-observing an identical
+value is a state no-op). Both properties are pinned by new unit tests:
+`infer_template_matches_generic` (template vs generic over every deviation
+class, at every corpus rotation) and `infer_double_observe_is_idempotent`.
+
+Measured (quiet box, same window): JSONL open phase 540 → **320 ms**
+(−40%); JSONL group 1682–1688 → **1452–1475 ms**; DuckDB same-window
+**1516 ms** → **0.97× — beaten**. JSONL × parallel/serial `cmp`-identical.
+
+**With this, every 10M-standard shape beats DuckDB on wall**: CSV group
+0.93×, ETL 0.96×, csv.gz 0.86×, jsonl.gz 0.90×, **JSONL 0.97×** — at
+1/16th–1/53rd of its memory, under the never-silent dirty-data contract,
+all byte-identity-proven serial == parallel == chunk-size.
+
+### Negative result: sink-side fusion does not pay (#239, destroyed)
+
+A `FusedReadSink` (filter+project+emit as one row loop, mirroring the
+group-side fusion) was built, verified byte-identical, measured — and
+**destroyed**. Two findings, recorded so the next profiler doesn't rebuild
+it:
+
+1. Row-wise predicate evaluation loses to `FilterProject`'s **vectorized
+   kernel**: the first cut ran the shared interpreter per row and was
+   ~100 ms/run SLOWER than generic (fused segment 102–112 ms vs the
+   ops+emit 84 ms it replaced).
+2. With the kernel restored for predicates (fusing only the write), the
+   result is a statistical wash (1007–1041 vs 1000–1066 ms interleaved):
+   the eliminated gather is small (3 columns, ~half the rows), and writing
+   from the wide unfiltered chunk loses the cache locality that the
+   compact gathered chunk gave the emit loop.
+
+Rule of thumb this pins down: **fusion pays where it removes LARGE
+materializations** (the group side's full-width probe gather, projection
+rebuild, and per-row `Value`s) — not where the generic pipeline is already
+"vectorized filter + one compact gather". The ETL gap to Polars (~1010 vs
+583 ms eager) lives in decode (~80 ms/file vs the ~55 ms replica floor)
+and the pass-1 scan (Stage C territory), not in the sink pipeline.
+
+### Negative result: cell-primitive tuning is exhausted (#239, destroyed)
+
+Batch-lazy validity (a single `len` register while all-valid) plus
+raw-parse-first (skip `fast_trim` when the untrimmed parse succeeds — the
+all-digit case where trim is provably the identity) was built,
+byte-identical, and measured: decode ~80 → ~76 ms/file, **wall-neutral**
+(1015–1037 both sides, interleaved). The synthetic replica had attributed
+~20 ms/file to these primitives; the real delta is 3–4 ms — replica
+attribution at this granularity is confounded by branch-predictor and
+code-layout noise. Destroyed (complexity unpaid). Rungs S1–S3 of the
+small-to-large ladder are closed: the real decode floor is ~75 ms/file
+against the ~55 ms synthetic floor, with the gap spread thin across bounds
+checks and per-block setup. The remaining decode lever is structural —
+**S4: fusing pass 1 into the decode (design/41 Stage C)**.
+
+### Stage C-1 — speculative sampled open for the CSV group driver (#239)
+
+S4, first rung (design/41 §5). When the flow passes the static C-eq gate
+(`stage_c_eligible`: aggregate/predicate columns cast-normalized to
+i64/f64/str, keys bare/coalesce — the standard flow qualifies), phase 1
+opens plain-CSV files **speculatively**: schema from a `chunk_size`-row
+sample (one short read), decode streamed against it, contradiction =
+any non-empty parse failure. Contradicted files re-run through the
+canonical two-pass open against a **recomputed union′** after the worker
+wave (never-silent: the canonical run's cast-failure accounting sees the
+true lanes); every kept partial is valid by C-eq. A union widening to a
+non-Str lane (i64→f64, not Display-exact above 2^53) abandons the
+parallel driver entirely — serial canonical, correctness over speed.
+Bool-sampled, compressed and JSONL files fall back per-file inside the
+sampled open (C-2 territory). Engagement is surfaced: strategy becomes
+`parallel read group-by (per-file workers, speculative open)`.
+
+Guards added: 4 unit tests (detector completeness on clean files,
+late-surprise contradiction, Bool fallback, in-stream arity count ==
+pass 1's count) and R3/R3b integration tests (byte-identity with and
+without a mid-stream contradiction at cs=7/4096, malformed-report
+parity, numeric-widening bail — each asserting engagement so the guard
+can't rot silent).
+
+Measured (10M CSV group standard, 4-core box, same-day interleave,
+best-of-3): open phase **210 ms → 2–3 ms**; wall 945 → **799 ms**
+(−146 ms vs the pre-change binary in the same window); DuckDB same
+window 943 ms → **0.85×** (previous record 0.93×). Peak RSS **9.5 MB**
+(below the previous 11–16 MB — the pass-1 buffers are gone). Dirty
+standard re-runs **0 files** (arity dirt is not a contradiction — it is
+counted in-stream by `count_stream_bad`). Byte-identity: plain parallel,
+serial, csv.gz, jsonl, ETL all `cmp`-identical to pre-change references.
+
+### Stage C-2a — JSONL joins the speculative open (#239)
+
+Same driver, same C-eq gate — the JSONL branch of the sampled open. Two
+findings worth the record:
+
+1. **The first cut lost most of the win to decode speed.** Reusing
+   `StreamJsonlReader` (the compressed/net path's `read_line`-per-line
+   reader) for plain-file speculation made `open` 320→16 ms but pushed
+   the worker decode from the block walk to the line loop: wall only
+   1342→1284 ms. The speculative decoder must be **the same block-walk
+   chunker the canonical path uses** — `JsonlChunker::open_speculative`
+   (whole-file range, sample-inferred lanes) — or the open win is paid
+   back with interest in the stream.
+2. **JSONL needs no Bool exception.** JSON is syntax-typed: a stray
+   `"true"` (string) or `1` in a Bool-sampled lane is a counted
+   `lane_mismatches` contradiction (`ColBuilder::push` now reports the
+   foreign-lane fold; a JSON `null` and int→float stay legal). The CSV
+   blind spot simply does not exist here, so Bool-sampled JSONL files
+   may speculate. Nested/`>128`-key samples fall back to the canonical
+   two-pass (the general decode path does not count mismatches).
+
+Guards: 4 JSONL unit tests (detector completeness incl. malformed lines
+in and beyond the sample, late-float contradiction, Bool-lane string
+mismatch, nested fallback) + R3j integration (contradiction → 1-file
+local re-run at cs=7, zero at cs=4096, byte-identity + engagement).
+
+Measured (10M JSONL group standard, same-day interleave, best-of-3):
+open **320 → 13 ms**; wall 1381 → **1080 ms** (−300 ms, −22% vs the
+pre-change binary in the same window); DuckDB same window 1534 ms →
+**0.70×** (previous record 0.97×). Peak RSS **8.2 MB**. Byte-identity:
+JSONL parallel+serial, CSV, jsonl.gz, ETL all `cmp`-identical.
+
+### Stage C-2b — the sink driver speculates (#239)
+
+The read→sink driver gets its own C-eq gate, `stage_c_sink_eligible`:
+the consumption classes shift because every surviving cell is WRITTEN.
+The proof leans on an already-pinned property: `write_cell`'s numeric/
+bool lanes are byte-identical to `Display` by construction
+(`rivus_core::numfmt`), which is exactly what `reconcile_chunk`'s
+widen-to-Str produces — and digit strings never trigger CSV quoting —
+so written cells are Display-safe under a →Str widening, like group
+keys. Predicates must be cast-normalized (i64/f64/str, cast before
+use); computed projections must be Display-safe cells or expressions
+over cast-normalized columns; join keys bare. A contradicted file
+re-writes its OWN temp segment canonically under the recomputed union′
+(kept segments' bytes stay valid); a numeric widening deletes the
+segments and bails to serial.
+
+Guards: R4 (contradiction → segment re-write, whole-file bytes ==
+serial oracle), R4b (numeric-widening bail + no leftover temp
+segments), R2 updated (plain-CSV sink fixtures now engage the
+speculative strategy string).
+
+Measured (10M ETL standard `read→cast→filter→project→join→save`,
+same-day interleave, best-of-3): wall 1059 → **914 ms** (−14% vs the
+pre-change binary); DuckDB same window 1459 ms → **0.63×** (previous
+record 0.96×). Peak RSS **9.7 MB**. Byte-identity: ETL
+parallel+serial, CSV/JSONL/gz group standards all `cmp`-identical.
+Polars' contract-violating eager 583 ms remains the open target — the
+gap is now decode-bound, Stage B (mmap windows) territory.
+
+### Negative result: mmap windows (Stage B) do not pay here (destroyed)
+
+design/41 Stage B was built end-to-end and measured — `MmapFile`
+(private read-only map, `MADV_SEQUENTIAL`, ≤256 KiB in-place `BufRead`
+windows, `MADV_DONTNEED` behind the cursor at a tunable stride) behind
+a `SeqReader` enum at the `FileTransport::open` seam, `libc` vetted
+per the SUPPLY-CHAIN checklist, full suite green, all three plain
+standards byte-identical. Destroyed on the numbers:
+
+- **CSV group (same-binary A/B via `RIVUS_NO_MMAP`, 5 interleaved
+  rounds)**: buf best 1141 ms vs mmap 1244–1345 ms (~+8%) at EVERY
+  reclaim stride — 1 MiB, 8 MiB, and **reclaim disabled entirely** —
+  so the loss is NOT `madvise` TLB shootdown; it is the soft
+  page-fault path itself (4 KiB granularity, containerized cgroup
+  box) costing more than the 256 KiB buffered copies into an
+  L2-resident reused buffer. JSONL group was a wash; ETL a ~5% win —
+  not enough to carry a new dependency, `unsafe`, and +2 MB peak RSS
+  (11.4 vs 9.4 MB).
+- Rule pinned: **for one-pass streaming decode, `read()` into a hot
+  reused buffer beats a faulting mapping** unless pages are reused
+  across passes (they are not — Stage C made every path one-pass) or
+  the copy itself dominates (it does not: decode compute does). Any
+  future mmap revisit must first show a fault-side win on THIS
+  environment (e.g. hugepage-backed maps), not assume zero-copy wins.
+
+The remaining ETL/decode residual vs Polars is compute in the block
+walk (field split + lane parse), not the kernel→user copy.
+
+### Negative result: block structural-mark scan is a wash (destroyed)
+
+The "one SIMD pass per block indexes every delim/newline/quote, the
+line walk consumes marks from a cursor" rewrite (#71 step 4 candidate)
+was built (AVX2+SWAR `scan_marks`, mark-cursor walk in
+`next_columns`, scalar-equivalence unit test), verified byte-identical
+on CSV group + ETL + serial, and measured DEAD EVEN: wall 780–856 vs
+772–794 ms interleaved on a quiet box, per-file decode median ~85 ms
+both sides. Why it cannot win here: `split_offsets` already does
+simdjson-style movemask+trailing_zeros extraction per line, so the
+only removable work was the per-line newline pre-scan (LLVM already
+auto-vectorizes it) — and the mark stream's ~4 `Vec` pushes per line
+cost exactly what that saved. Destroyed. Rule: a structural index only
+pays when stage 2 re-branches per byte; our stage 2 already consumes
+bitmasks.
+
+With cell primitives (S1–S3), mmap (Stage B) and the structural index
+all measured out, the decode floor (~85 ms/file real) is effectively
+reached for this architecture. The remaining measurable slack is NOT
+in decode: it is `reconcile` (23–28 ms/file × 8 clean files on the
+dirty standard — every clean file pays parse-i64-then-Display to widen
+`amount` into the union's Str lane) and the fused feed. Next lever:
+decode-to-union for →Str-widened columns (raw-bytes Str build with a
+canonical-form check, killing both the wasted i64 parse and the
+Display rebuild).
+
+### Narrow-keep — the C-eq gate pays a second time (landed)
+
+The widen itself is the waste: on the dirty standard every clean file
+parses `amount` to i64, `Display`s it back to Str for the union lane
+(`reconcile`, 23–28 ms/file), and the downstream `cast :int`
+re-parses the string. Under the Stage C eligibility gates this whole
+round trip is provably removable: each worker now reconciles to a
+per-file **narrow-keep target** — a →Str-widened column stays on the
+file's own scalar lane (i64/f64/bool) when it is cast-normalized
+downstream (`narrow_keep_target`, driven by `stage_c_cast_set`).
+Byte-identity is C-eq itself: the cast output is equal on narrow-fit
+cells (condition 2), and every other gate-permitted consumer is
+Display-encoded, where both lanes already produce the same bytes. The
+raw-bytes/canonical-form idea above became unnecessary — values, not
+bytes, flow onward, so no per-cell form check exists at all. Being a
+reconcile-level change it is **format-agnostic** (CSV and JSONL both
+win), and `cast_column` narrow→narrow is the identity fast path, so
+the cast cost vanishes too. Applied in all four worker paths (group/
+sink × first-wave/re-run); the dirty file itself still widens (its
+full schema IS Str) — `reconcile` now shows 0 ms on all 8 clean
+files, 22 ms on the dirty one.
+
+Measured (10M standards, same-binary interleave, best-of): CSV group
+781 → **667 ms** (−15%; DuckDB same window 944 ms → **0.71×**), JSONL
+group 1105 → **1003 ms** (−9%), ETL 896 → **800 ms** (−11%). Peak RSS
+**9.3 MB**. All three parallel outputs + CSV serial `cmp`-identical;
+stress suite (incl. R3/R3j/R4 contradiction paths, which exercise
+narrow-keep directly — `amount` is the widened, cast column there)
+194/0 green.
+
+### Fused loop: vectorized predicate mask (landed)
+
+The sink-fusion negative result's lesson, applied where it DOES pay:
+`fused_feed_chunk` evaluated its (left-only) predicates through the
+row-wise interpreter — per row, per file. Now the predicates compile
+once per chunk into the existing `kernel::NumCmp` conjunction (pinned
+byte-identical to the interpreter, null semantics included) and the
+row loop iterates the branch-free selection vector; dropped rows skip
+the join probe too (pure, so unobservable). Non-kernel shapes (string
+compares, Str lanes on the canonical worker) keep the interpreter row
+path — same results either way. Note the composition: narrow-keep is
+what makes the standard's `amount > 0` kernel-compilable in the first
+place (the lane arrives as i64, not Str).
+
+Measured (same-binary interleave, best-of, on a QUIET box — absolute
+numbers below are the new reference class): CSV group 541 → **440–478
+ms** (−12%; DuckDB same window 653–660 ms → **0.69×**), JSONL group
+745 → **611–720 ms** (−13%; DuckDB same window 1257 ms → **~0.50×**),
+ETL unaffected (its FilterProject was already vectorized). Peak RSS
+**9.4 MB**. Identity: parallel + serial `cmp`-identical, stress 194/0.
+
+### Negative result: fixed-width packed group key is a wash (destroyed)
+
+The next rung after the prefix precompute — replace the composite
+String probe entirely with a 16-byte packed key `(right-row id | cell
+len | null flag, ≤8-byte left cell)` into a second `GroupBy` scratch
+(`HashMap<(u64,u64), (String, GroupState)>`, composite built only on
+first insert; seal folds both maps, disjointness + the associative-
+lane gate covering the duplicate-frag merge case) — was built,
+verified (stress 194/0, all standards + serial `cmp`-identical,
+engagement probed on all 9 workers) and measured a WASH: 8-round
+paired interleave medians 555 vs 552 ms, mean paired diff +5 ms.
+Destroyed. Why there was nothing to win: after the prefix precompute
+the composite path is a single memcpy + a ~3-byte push + one FxHash of
+12–18 bytes (~15 ns); fixed-width packing saves a few ns of hashing
+but pays them back in per-row branching and a fatter emit body. The
+row-hot floor of this loop is NOT the key probe — it is the residual
+per-row work (join-key build + `Value` round trip + `AggAcc` moment
+updates + loop overhead), which no key representation changes. A
+future 2× on feed needs decode-time dictionary lanes (a Chunk-level
+design decision, ratification territory), not a smarter map.
+
+### Fused set expansion: `or` predicates (landed)
+
+勝ちやすいパターンだけではダメ — a filter containing `or` used to knock
+the whole flow off BOTH the fused loop and the speculative open (three
+gates each accepted conjunctions only). All three now take any and/or
+tree over bare fields/literals: the shared interpreter evaluates it
+exactly (same leaves ⇒ the cast-fail counter still provably 0), the
+kernel mask simply stays off for non-conjunctions (interpreter row
+path), and C-eq only cares WHICH columns a predicate reads, not its
+boolean shape. Found-by-verification note: the graph-level gate alone
+made the identity test pass via silent generic fallback — only the
+WPROF engagement check exposed that the WORKER-level `pred_left_only`
+still rejected `or`; both halves are now aligned and activation was
+verified `(active)` on every worker. Guard: R5 (or-predicate flow,
+speculative strategy asserted + serial==parallel at cs=7/4096).
+
+### Prefilter fast lane: SWAR digits instead of std f64 parse (landed)
+
+`row_passes_prefilter` paid a `str::parse::<f64>` per row per pushed
+predicate. Cells of 1–15 pure ASCII digits now ride `parse_i64_fast`
++ `as f64` — exact in f64 at that length, so the value is bit-equal to
+the std parse and every skip decision (and the exactness-pinned skip
+count) is unchanged; anything else (signs, dots, exponents, padding,
+longer runs) takes the std parse as before. Measured (6-round paired
+interleave): CSV group paired-median **−18 ms** (5/6 rounds, ~−4% —
+`amount > 0` runs on every row there), ETL mean −16 ms (4/6). Small
+but strictly-nonnegative and six lines. Outputs `cmp`-identical.
+
+### Decode-column pruning: designed, NOT started (contract question)
+
+The sink driver still decodes every column (`allow = None`) — ETL
+builds `category` cells 10M times for nothing; a `used`-set allow-list
+(plus every right-side name, to keep the probe's `_r` collision naming
+identical) would kill that. Shelved before implementation on a
+CONTRACT question: a pruned parallel run cannot count parse failures
+in never-consumed columns, so its error stream would diverge from the
+serial oracle's (the reader-prefilter precedent doesn't apply — it
+skips identically on BOTH paths). Options: prune the serial multi-file
+path with the same set, or rule the divergence acceptable for
+never-consumed columns. Needs a 統括/指揮 ruling; est. −30-60 ms on
+ETL when unblocked.
+
+### Compressed standards: the cycle's wins were already banked (measured)
+
+The `.gz` group standards had not been re-measured since the
+narrow-keep / kernel-mask / prefix slices — all of which apply to the
+compressed workers too (the fused loop is decoder-agnostic; gz opens
+were already sample-typed, so Stage C changed nothing there). Current
+binary, same-window interleave: **csv.gz 711–903 ms vs DuckDB
+1177 ms → 0.60×** (previous record 0.86×), **jsonl.gz 999–1119 ms vs
+DuckDB 1777–1922 ms → 0.56×** (previous 0.90×). Both `cmp`-identical
+to references; gz worker profile decode 131–139 ms/file (decompress +
+parse), feed 87–93 ms (fused active). With these, every one of the
+five 10M standards now sits at **0.50×–0.70× of DuckDB** under the
+never-silent contract at single-digit-MB RSS.
+
+### Fused loop: right-only key-prefix precompute (landed)
+
+The composite key's leading cells that read only the RIGHT side (or
+literals) — `coalesce(country, "@")` in the standard — depend on the
+matched right row alone, so their encoded bytes (internal separators
+included, plus the `ri = None` variant) are now built once per worker
+at plan resolution (`FusedPlan::right_prefix`, capped at 4096 right
+rows) and each emit `push_str`s one precomputed fragment instead of
+running per-cell null checks and pushes. Measured (8-round paired
+interleave, noisy box): CSV group median 567 → **540 ms** (7/8 rounds
+won, ~−5%); JSONL group 883–952 → ~850 ms class. Parallel + serial
+`cmp`-identical, stress 194/0.

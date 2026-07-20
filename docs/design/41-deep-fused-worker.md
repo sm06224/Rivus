@@ -76,6 +76,13 @@ and `explain` (Observable First — never a silent engine swap).
 
 ## 2. Fusion stage B — transport windows (mmap, bounded)
 
+> **判定（2026-07-17・実測で不採用）**: 本節の設計どおり実装・計測した結果、
+> CSV group で **mmap が全 reclaim 設定（DONTNEED 無効含む）で ~8% 負け** —
+> 敗因は madvise ではなく soft page fault 経路そのもの（4KiB 粒度、cgroup 箱）
+> が 256KiB buffered copy（L2 常駐の再利用バッファ）より高いこと。Stage C で
+> 全経路が 1 パスになった今、ページ再利用が無く zero-copy の勝ち筋が消えた。
+> 詳細と再訪条件は BENCHMARKS.md「Negative result: mmap windows」。
+
 The reader still pays one kernel→user copy per byte per pass (fill_buf).
 A `MmapTransport` (behind the same `FileTransport` seam) hands the block
 walk **windows of a private read-only mapping** instead:
@@ -127,3 +134,76 @@ combined effect on the group standard: CSV 939 → ~600 ms class (vs DuckDB
 Ratification: stages A and B are engine-internal (no syntax, no IR change)
 and ride the standing perf mandate; stage C changes pass structure but not
 observable output — flagged to 統括/指揮 in #237 before landing regardless.
+
+## 5. Stage C refined（2026-07-18 の設計検証 — 実装前に固定）
+
+素朴な投機（sample 推論→投機 decode→矛盾で file 再走）は**汚れデータ標準で
+敗北する**: 矛盾ファイルの full スキーマが union を拡幅すると、他ファイルの
+投機 partial は「狭い union」前提で無効化され全体再走 — 標準 fixture は
+設計上汚れを含むため、常に「今日のコスト＋投機の無駄」になる。
+
+### 生き残る形: 局所再走の等価条件
+
+矛盾ファイル F だけを正準二パスで再走し、**他ファイルの投機 partial を保持**
+できる条件（C-eq）:
+
+union が列 c を W に拡幅したとき、非矛盾ファイルの partial が正準実行と
+byte-identical であるのは、c が次のいずれかを満たす場合に限る:
+
+1. **c は group キーとしてのみ消費**: キー符号化は Display 経由なので、
+   狭レーン直接（I64 の桁）と W 経由（Str の同桁文字列）は**同一バイト**。
+   key_parts も同様。
+2. **c は集約前に明示 cast で正規化**: 狭レーンに適合したセルに限り、
+   narrow-direct == widen-then-cast が成立（int 往復・f64 Display 往復の
+   正確性）。#239 第14弾の「押し下げ不可」と矛盾しない — あちらは全セル、
+   こちらは**狭レーン適合済みセルのみ**が対象なので切り捨てフォールバックの
+   差分が発生しない。
+3. 上記以外（cast 無しで集約に入る等）→ C-eq 不成立 → **全体を正準二パスへ
+   フォールバック**（正しさは常に保持、速度だけ今日並み）。
+
+### 検出器の完全性
+
+投機の妥当性 = 「sample スキーマで decode して非空 parse 失敗ゼロ」。
+証明: 無矛盾 ⇒ 全セルが sample レーンに適合 ⇒ full 推論も同型に解決
+（格子の上限一致）。**例外は Bool レーン**（`t=="true"` は失敗を発しない
+ため "maybe" を無音で偽に折る）— sample に Bool 列を含むファイルは投機
+不適格（二パスへ）。Str はレーン頂点なので常に安全。
+
+### 期待値（10M標準）
+
+sample 開 ~2ms/file×9 ＋ 投機 decode（今日の decode と同額）＋ 汚れ2ファイル
+の局所再走（~2×110ms CPU）で、open の全走査 210ms（CSV）/320ms（JSONL）
+wall がほぼ消える。C-eq は標準 flow（amount は cast:int 済み・キーは
+country/region/category）で成立する。
+
+### 実装順
+
+C-1: CSV group driver に C-eq 判定＋sample 開＋矛盾検出＋局所再走。
+C-2: sink driver・JSONL。C-3: 統括へ実測報告（本節が事前提示を兼ねる —
+統括の「最終段まで一気に」指示 2026-07-18 に基づき着手）。
+
+### C-1 実装で確定した精密化（2026-07-17 着地）
+
+- **数値レーン間の拡幅（i64→f64）は C-eq 不成立**: 2^53 超の i64 は f64
+  経由で Display が変わるため、条件1（Display 同一）も条件2（narrow-fit
+  cell の cast 等価）も破れる。再走時に union′ が **Str 以外**へ拡幅した
+  列を検出したら並列 driver ごと放棄して正準直列へ（R3b で恒久固定）。
+  →Str 拡幅のみ局所再走で partial 保持。
+- **C-eq 静的ゲート `stage_c_eligible`**: fused shape 前提で、(a) cast 対象
+  は I64/F64/Str のみ（temporal/decimal cast は生セルを消費するため不適格）、
+  (b) filter 述語の列は**cast 済みのみ**（cast は述語より前）、(c) 集約入力
+  は cast 済み or `count`（null 性はレーン非依存）、(d) キーは bare /
+  coalesce(col,"lit") / StrLit。右起源列の静的判別は不可能なので全列を
+  左起源とみなす（保守的・常に安全、外れても正準に落ちるだけ）。
+- **arity 不正行の在流カウント**: sample 開は pass 1 を走らせないため
+  `CsvChunker::count_stream_bad` が stream 中に計数（preview 窓の再デコード
+  分はリセットして二重計数を防ぐ）。pass 1 と同一基準（空行スキップ後の
+  列数不一致のみ）— 単体テストで pass 1 の計数と一致を固定。
+- **Observable First**: 投機が 1 ファイルでも発動したら strategy が
+  `parallel read group-by (per-file workers, speculative open)` になる。
+  圧縮/JSONL/Bool-sample はファイル単位で正準へフォールバック（suffix 無し）。
+- **実測（10M CSV group 標準・4 コア箱・同日 interleave）**: open 210ms→
+  2-3ms、wall 945ms→**799ms**（旧バイナリ比 −146ms）、DuckDB 同条件 943ms
+  → **0.85×**（初の明確な DuckDB 超え）。peak RSS 9.5MB（従来 11-16MB より
+  低下 — pass 1 バッファ消滅）。全 4 経路（plain/serial/gz/jsonl/ETL）
+  byte-identical、汚れ標準の再走 0 件（arity 汚れは矛盾ではない）。

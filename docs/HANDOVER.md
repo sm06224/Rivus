@@ -1,7 +1,7 @@
 # セッション・ハンドオーバー（次セッションの担当者へ）
 
-最終更新: **2026-07-06**（先行研究セッションによる全面刷新 — 旧版は §28 時代の文脈で
-陳腐化していた。過去の詳細は git 履歴の本ファイル参照）。
+最終更新: **2026-07-17**（design/41 Stage A＋Stage C 全段が #239 ブランチに着地。
+過去の詳細は git 履歴の本ファイル参照）。
 
 ---
 
@@ -26,67 +26,111 @@
 - **裁可フロー**：PR 作成 → #180 に裁可依頼コメント（実測・破壊的変更・ゲート数値を明記）
   → 指揮が squash-merge → **マージ毎にタグ提案**（`v1.4.0-dev.N`、カットは統括専権）。
 - **ゲート（push 前・毎回・数値で確認）**：fmt --check clean／clippy default **と**
-  `--all-features -D warnings` = 0／test 両 feature セット 0 failed／
-  `cargo tree -p rivus-cli --edges normal` = rivus-* のみ。gitleaks / cargo-deny は
-  コンテナに無ければ CI に委ねる（CI は `cargo deny check --all-features`）。
+  `--all-features -D warnings` = 0／test 両 feature セット 0 failed／依存樹は
+  **policy v2 基準「documented, not zero」**（default は gzip/zstd の pure-Rust 8 crate
+  常時搭載・SUPPLY-CHAIN.md が台帳）。gitleaks / cargo-deny はコンテナに無ければ
+  CI に委ねる（CI は `cargo deny check --all-features`）。
 - **GitHub API は希少資源**：CI をポーリングしない（webhook 購読）、コメントは束ねて1回。
+- **裁可スレッド移行予定（統括発言 2026-07-19）**: #180 が長大化したため、統括が
+  **新しい裁可用イシューを起こす予定**。次セッション開始時、統括がこの件に触れて
+  いなければ**こちらから確認・想起させること**（統括依頼: 「わたしが指示を忘れたら
+  教えてください」）。新イシューが立つまでは #180 を継続使用。
 
-## 2. main の現在地（v1.4.0-dev.7 = #220 以降）
+## 2. main の現在地（`6d36543`・v1.4.0-dev.9 提案中 = 統括の cut 待ち）
 
-- **Wave-1 正しさ債（#188 官能テスト起票分）ほぼ完済**：#218 decimal overflow surface・
-  #219 to_source 可逆性・#220 pushdown 一般化（1.57×）・#221 式レーン never-silent
-  （checked cast・div/0→null 破壊的）・#222 fill mean/median 実装・#223 **Plan
-  Validation Gate**（未知列 did-you-mean・空プログラム・route 拒否・log フック実装・
-  未知関数）— すべてマージ済み。
-- 分散実行（§33/§34）・null model・decimal レーン・SWAR/AVX2 CSV scan・部分 route 出力は
-  以前から landed（詳細は BENCHMARKS / design docs）。
+**性能戦争バッチ（2026-07-12〜15 に全着地）**: #237（perf 第1-18弾＋R1/R2 ガード）→
+#232 shift/diff → #234 date_bin → #233 as-of join。#235 は #237 包摂でクローズ。
+統合 main の独立ゲート実測 = fmt clean・clippy 0/0 両 feature・test **487/518** 全 pass・
+deny ok。
 
-## 3. 裁可待ち PR（2026-07-06 時点・5本）
+**10M×9ファイル標準（汚れ入り・等価契約）の現在地（wall / peak RSS、
+2026-07-17〜18 の同窓 interleave — #239 ブランチ、Stage C＋narrow-keep＋
+kernel マスク＋キー・プレフィクス込み）**:
 
-| PR | 中身 | 特記 |
-|---|---|---|
-| **#224** | sink 書式高速化 2 弾：数値 LUT＋f64 exact fast path（save 1.80×）／temporal・decimal LUT＋**Display 委譲**（datetime 3.58×） | byte-identity は旧バイナリ A/B cmp＋オラクル 20万件で実証 |
-| **#226** | UX 債バッチ：#203 map/裸ブロック明示拒否・#194 explain node サマリ・#199 basename/stem/dirname＋split_part 負 index＋**式の単項マイナス** | — |
-| **#227** | **sliding window** = `hops(ts,size,hop)`（窓開始 List）＋既存 explode＋group | §36 メモの批准込み。column_from_values に List アーム新設 |
-| **#228** | **session window** = `sessionize ts gap "30m" by user`（session 開始 datetime を付与） | **#227 の上にスタック** — #227 squash 後にリベース要 |
-| **#229** | **Parquet リーダ**（feature `parquet`・arrow 抜き 22 crate・C ビルド皆無） | **RUSTSEC-2024-0436（paste unmaintained）の文書化例外を1件持ち込み** — 裁可時に明示確認。`full` 搭載は統括の配布判断 |
+| 形状 | rivus | DuckDB 同窓 | 比 |
+|---|---|---|---|
+| CSV group | **440-478ms** / 9.4MB | 653-660ms | **0.69× 勝ち** |
+| JSONL group | **611-720ms** / 8.2MB | 1257ms | **~0.50× 勝ち** |
+| CSV ETL | ~712-754ms / 9.7MB | 1459ms（前日窓） | **~0.5× 勝ち** |
+| CSV.gz group | **711-903ms** | 1177ms | **0.60× 勝ち**（旧 0.86×） |
+| JSONL.gz group | **999-1119ms** | 1777-1922ms | **0.56× 勝ち**（旧 0.90×） |
 
-マージされたら：#227→#60 リスコープコメント（tumbling=済・sliding/session=着地・
-watermark 系=§30.5 で永続対象外）、#228→リベース、タグ提案を忘れずに。
+**全 5 形状で DuckDB の 0.50-0.70×**（byte-identity 証明付き・一桁 MB RSS）。
+gz 2 形状は個別最適化なしで narrow-keep/kernel マスク/prefix の恩恵が
+自動適用された結果（fused loop はデコーダ非依存 — 計測 2026-07-18）。
+残る未踏峰は Polars eager ETL 583ms（契約違反実装）— 現在 ~730ms 級で射程内。
+箱ノイズが大きい（同一バイナリで日内 ±40% 変動）ため、比較は必ず同窓
+interleave で（絶対値の日跨ぎ比較は無意味）。
 
-## 4. 計測済みの知見（BENCHMARKS.md に台帳あり）
+**#237 で入った主要機構**（詳細は BENCHMARKS.md 第1-18弾の各節）:
+ファイル毎 worker 並列（read→group / read→sink）・BroadcastProbe・ブロック歩行
+decode/推論（CSV/JSONL）・列指向セルバッチ（`push_many`）・`fast_trim`・
+reconcile/Cast のムーブ意味論・Str↔数値の列指向変換・in-tree FxHasher
+（`fxhash.rs`、group scratch＋seal() / JoinTable — 出力順はハッシュ非依存を構造保証）・
+preface（安全性サンプルの推論二周目排除）・WPROF（worker/op/phase 分解、env-gated）・
+R1/R2 並列 identity ガード（`tests/stress/parallel_read_identity.rs`）。
 
-- **1GB プロファイル**：open（parse）支配 → SWAR/AVX2 split 着地済み。**save が第2コスト
-  かつ並列時の Amdahl 支配項**だった → #224 で書式コストを解消（レーン別 5M 行 save：
-  datetime 1045→292ms・f64 625→296・date 435→152・decimal 328→190・int 113ms）。
-- **読み側の f64 は std が既に Eisel-Lemire**（rust-lang/rust#86761）— 置換不要。
-  `std::simd` は 2026 年も nightly — SIMD は `core::arch`＋実行時検出が正解のまま。
-- **否定結果（#225 に記録）**：collected 一括書き出しの並列レンダは**どのホット経路にも
-  乗らず無効果 → リバート済み**。sink 経路の地図：大ファイル streaming-parallel は
-  per-worker part file で既に並列／blocking op 後の merge ストリームだけが直列面
-  （sort→save で save≈760ms が残存標的）。
-- 裸 `|# d count` は**幻の第2キー**になる parser quirk があった（#223 の Gate が教育的
-  エラーで捕捉するようになった）。
+## 3. 主計画 design/41 の現在地（Stage A・C 着地済み／B 未着手）
 
-## 5. 開いている設計判断（勝手に決めない）
+`docs/design/41-deep-fused-worker.md` の3段計画のうち、#239 ブランチ
+（`claude/perf-join-groupkey`、レビュー再ゲート待ち）に着地済み:
 
-1. **§36（sliding/session）の批准** — #227/#228 のマージ＝批准の理解で依頼中。
-2. **Parquet の `full` 搭載可否**＋ **paste 例外の受容**（#229）。
-3. **#41 の残り半分＝#45 正準縮約木**：f64 並列 sum/avg/std の byte-identity 化。
-   pairwise/固定ブロック縮約は **serial の出力値も変える**（ULP レベル）ので、
-   「バージョン間の値変化を許すか」という**批准事項**。次の研究の本丸候補。
-4. §30.5 の裁定（watermark・unbounded 集計解除＝永続対象外）は**現行有効** — 窓 3 種が
-   揃った今も、これを覆すには再批准が要る。
-5. `unbounded` feature を `full` に入れるか（旧 issue の統括判断待ちのまま）。
+- **Stage A（着地）**: A-1 probe projection pushdown（`fused_used_columns`）＋
+  A-2 FusedReadGroup（join→pred→キー符号化→observe_row の単一行ループ、
+  worker 毎 lossless フォールバック）。JSONL RowTemplate（decode 側＋infer 側）も同梱。
+- **Stage C（着地・3 コミット 5df2b7e/fe621f7/cb01f7b）**: 投機 sample 開＋矛盾検出＋
+  局所再走。§5 の C-eq が理論核（キーと書き出しセルは Display-safe、値消費は cast 正規化、
+  →Str 拡幅のみ保持可・数値拡幅は直列 bail）。CSV は parse 失敗が検出器（Bool sample は
+  不適格→正準）、JSONL は構文型なので lane_mismatches が完全検出器（Bool 例外なし）。
+  group driver＋sink driver 両方、発動は strategy 接尾辞 "…, speculative open"。
+  ガード: 単体 8 本＋R3/R3j/R3b/R4/R4b（矛盾あり/なし×byte-identity×bail×発動 assert）。
+- **Stage B: mmap 窓トランスポート（実装→計測→不採用・破壊済み 2026-07-17）** —
+  全 reclaim 設定（DONTNEED 無効含む）で CSV group ~8% 負け。敗因は soft page
+  fault 経路 > 256KiB buffered copy（cgroup 箱・1 パス化済みでページ再利用なし）。
+  再訪条件は BENCHMARKS の負の結果節。ETL の Polars 残差は decode の**計算**
+  （field split＋lane parse）であってカーネル→ユーザコピーではない。
+- 負の結果（BENCHMARKS 台帳）: sink 側融合は不採用・セル原語チューニング枯渇・
+  StreamJsonlReader（read_line）を投機に転用すると open の勝ち分を decode で返上
+  （投機デコーダは正準と同じ block-walk であること）・mmap 窓は上記。
 
-## 6. 次のレバー候補（優先順は裁可の流れ次第）
+## 4. 計測済みの知見（BENCHMARKS.md が台帳）
 
-- **#45 正準縮約木**（上記 5-3。設計メモ→プロトタイプ→計測の王道パターン）。
-- **Parquet write 側**＋ row-group メタデータへの述語/射影 pushdown（#229 の残タスク）。
-- sort→save の直列 merge ストリーム並列レンダ（#225 の提案、期待 ~2.5×）。
-- Ryū/Dragonbox 移植（長仮数 f64 の std fallback テール）・Duration LUT。
-- Track C 残り：resample/gap-fill（#62）・rolling（#63）・as-of join（#64）・lead/lag（#65）。
-- Housekeeping：#188 サブの状態同期・GUIDE の窓 3 種チュートリアル節。
+- worker コスト表（CSV group、20MB/file）: decode 110 / feed 165（probe 51・group 65・
+  project 28）/ reconcile 33 ms。open（推論）210ms が最大の直列ブロック
+- **負の結果（再発掘防止）**: cast の read 押し下げは意味論非保存（cast_value の文字列→int
+  は f64 切り捨て "1.5"→1、リーダ I64 レーンは null）／0行チャンクでのスクラッチ型付けは
+  式型導出の保証が無く #41 の罠（誤 approve で byte-identity 破壊リスク）
+- JSONL の残る 1.34× はスキャナ自体（scan_row 全バイト×2パス）— ループ構造ではなく
+  **スキャナ内 SWAR** が次のレバー
+- ベンチ計測は bench_io.py 型（VmHWM ポーリングに sleep 必須・インターリーブ対照・
+  ボックスノイズに注意）。旧バイナリ対照は git stash → build → cmp が定石
+
+## 5. 開いている判断（勝手に決めない）
+
+1. **#236 構文簡素化**（P1-P5、項目別裁可待ち）— 裁可されれば P1+P2 から実装
+2. **design/40 Q1-Q4**（OTel T1 / QUIC B2）・**design/41 Stage C**（批准事項）
+3. **#45 f64 並列 byte-identity**: Q1（一度きり ~1 ULP シフト）は統括許容済み —
+   実装 PR は CHANGELOG 明記＋decimal/`--exact` 無影響が条件
+4. #229 Parquet の `full` 搭載可否（配布判断）・`unbounded` の full 搭載
+5. FxHash は「性能ツールであり防御境界ではない」で指揮承認済み（SipHash 復帰は
+   JoinTable/scratch の型1行）
+
+## 6. 次のレバー候補（優先順・2026-07-18 改）
+
+残レバーは全て ≤30ms 級（decode floor 実質到達・reconcile 0 化・述語 kernel 化・
+キー prefix 事前計算まで完了）。次の 2 倍は構造変更から:
+
+1. **辞書化 group-by（次の研究アーク）**: Str レーンの dictionary encode →
+   group キーを整数 ID 組へ（composite String＋hash probe ~40-50ns/row の根治）。
+   join probe の右表引きも ID 化で無料化しうる。IR/Chunk 層の設計判断を伴う
+   ため design doc → 批准 → 実装の順。
+2. fused 対応集合の拡張（Or 述語・数値 coalesce・複数 join — 適用面を広げる）
+3. ETL 残差（Polars 583ms vs ~730ms）: prefilter の行毎 f64 parse を SWAR
+   数字列比較へ（保守的意味論は維持）／typed agg リーダ（Value 往復除去、
+   各 ~10-30ms 級）
+4. 圧縮標準（csv.gz/jsonl.gz）の decode 側最適化（Stage C 非対象だった）
+5. Track C 残り: resample/gap-fill（#62 の agg 側）・rolling（#63）
+6. #45 正準縮約木の実装スライス（Q1 許容済み）
 
 ## 7. 落とし穴（実際に踏んだもの）
 

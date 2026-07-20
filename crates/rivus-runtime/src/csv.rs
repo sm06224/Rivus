@@ -80,7 +80,19 @@ fn cmp_num(value: f64, op: CmpOp, rhs: f64) -> bool {
 fn row_passes_prefilter(pf: &[PreCmp], line: &str, offsets: &[(usize, usize)]) -> bool {
     for &(idx, op, rhs) in pf {
         let (s, e) = offsets[idx];
-        if let Ok(v) = line[s..e].trim().parse::<f64>() {
+        let cell = &line[s..e];
+        // Fast lane: 1..=15 pure ASCII digits — the SWAR int parse is exact,
+        // ≤15 digits are exactly representable in f64, so `v as f64` equals
+        // `cell.parse::<f64>()` bit-for-bit and every decision below is
+        // unchanged. Anything else (signs, dots, exponents, padding, longer
+        // digit runs) takes the std parse exactly as before.
+        let b = cell.as_bytes();
+        let v: Option<f64> = if !b.is_empty() && b.len() <= 15 && b.iter().all(u8::is_ascii_digit) {
+            parse_i64_fast(cell).map(|v| v as f64)
+        } else {
+            cell.trim().parse::<f64>().ok()
+        };
+        if let Some(v) = v {
             if !cmp_num(v, op, rhs) {
                 return false;
             }
@@ -113,6 +125,11 @@ pub struct CsvChunker {
     /// character may itself straddle the block, so the fragment alone can be
     /// invalid UTF-8; validation happens when the line completes.
     carry: Vec<u8>,
+    /// Count wrong-arity rows DURING streaming (Stage C speculative open,
+    /// #239): the sampled open never ran pass 1, so the malformed-row total
+    /// must accrue here or the never-silent report would go missing. Full
+    /// two-pass opens leave this `false` (pass 1 already counted).
+    count_stream_bad: bool,
     /// Rows skipped in pass 1 for wrong arity (reported once by the source).
     pub bad_rows: usize,
     /// Rows the pushed-down prefilter skipped *building* (definitely-out rows).
@@ -165,6 +182,15 @@ impl crate::codec::Decoder for CsvChunker {
 }
 
 impl CsvChunker {
+    /// Speculative-open mode (Stage C): count wrong-arity rows during the
+    /// stream (no pass 1 ran to count them). Resets any sample-window count a
+    /// preview open accumulated — the stream re-decodes from the first data
+    /// row, so it recounts those rows itself (double-count otherwise).
+    pub fn count_stream_bad(&mut self) {
+        self.count_stream_bad = true;
+        self.bad_rows = 0;
+    }
+
     /// Open `path` for streaming, returning the inferred schema and the reader
     /// positioned just after the header (ready for `next_columns`).
     ///
@@ -268,6 +294,7 @@ impl CsvChunker {
                 dt_specs,
                 chunk_size: chunk_size.max(1),
                 carry: Vec::new(),
+                count_stream_bad: false,
                 bad_rows: bad,
                 rows_prefiltered: 0,
                 eof: false,
@@ -354,6 +381,7 @@ impl CsvChunker {
                 dt_specs,
                 chunk_size: chunk_size.max(1),
                 carry: Vec::new(),
+                count_stream_bad: false,
                 bad_rows: bad,
                 rows_prefiltered: 0,
                 eof: false,
@@ -399,6 +427,7 @@ impl CsvChunker {
             dt_specs,
             chunk_size: chunk_size.max(1),
             carry: Vec::new(),
+            count_stream_bad: false,
             bad_rows: 0,
             rows_prefiltered: 0,
             eof: false,
@@ -585,6 +614,7 @@ impl CsvChunker {
                 }
                 if split_offsets(l, &mut offsets, self.delim) {
                     if offsets.len() != self.ncols {
+                        self.bad_rows += usize::from(self.count_stream_bad);
                         continue;
                     }
                     // Pushed-down prefilter: skip building rows that are
@@ -605,6 +635,7 @@ impl CsvChunker {
                     // downstream). Drain the batch first to keep row order.
                     let fields = split_record_q(l, self.delim);
                     if fields.len() != self.ncols {
+                        self.bad_rows += usize::from(self.count_stream_bad);
                         continue;
                     }
                     for (k, cells) in batch.iter_mut().enumerate() {
@@ -664,6 +695,7 @@ impl CsvChunker {
         }
         if split_offsets(l, offsets, self.delim) {
             if offsets.len() != self.ncols {
+                self.bad_rows += usize::from(self.count_stream_bad);
                 return false;
             }
             if !self.prefilter.is_empty() && !row_passes_prefilter(&self.prefilter, l, offsets) {
@@ -679,6 +711,7 @@ impl CsvChunker {
         } else {
             let fields = split_record_q(l, self.delim);
             if fields.len() != self.ncols {
+                self.bad_rows += usize::from(self.count_stream_bad);
                 return false;
             }
             for (k, &ci) in self.keep.iter().enumerate() {

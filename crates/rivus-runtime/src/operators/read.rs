@@ -61,6 +61,17 @@ pub(crate) enum FileDecoder {
         chunks: std::vec::IntoIter<Vec<Column>>,
         bad_rows: usize,
     },
+    /// Stage C speculative stream (#239): a live whole-file chunker whose
+    /// schema came from the SAMPLE (first chunk) instead of a full pass-1
+    /// scan. Contradictions (any non-empty parse failure) tell the driver to
+    /// discard this file's partial and re-run it canonically.
+    CsvStream(crate::csv::CsvChunker),
+    /// Stage C speculative JSONL stream (#239): the block-walk chunker over
+    /// the whole file with a sample-inferred flat-scalar schema (same decode
+    /// speed as the canonical range path); contradictions are counted
+    /// `lane_mismatches` (JSON is syntax-typed, so the detector is complete
+    /// with no Bool exception).
+    JsonlStream(crate::jsonl::JsonlChunker),
     /// Compressed CSV stream (sample-inferred; the reader replays its sample).
     #[cfg(any(feature = "gzip", feature = "zstd"))]
     CompCsv(crate::csv::CompressedCsvReader),
@@ -143,6 +154,8 @@ impl FileDecoder {
                 cur.as_ref()?;
             },
             FileDecoder::Buffered { chunks, .. } => chunks.next(),
+            FileDecoder::CsvStream(ch) => ch.next_columns(),
+            FileDecoder::JsonlStream(ch) => ch.next_columns(),
             #[cfg(any(feature = "gzip", feature = "zstd"))]
             FileDecoder::CompCsv(r) => r.decode_chunk(),
             #[cfg(any(feature = "gzip", feature = "zstd"))]
@@ -158,10 +171,33 @@ impl FileDecoder {
             FileDecoder::CsvRanges { plan, .. } => plan.bad_rows,
             FileDecoder::JsonlRanges { bad_rows, .. } => *bad_rows,
             FileDecoder::Buffered { bad_rows, .. } => *bad_rows,
+            FileDecoder::CsvStream(ch) => ch.bad_rows,
+            FileDecoder::JsonlStream(ch) => ch.bad_rows,
             #[cfg(any(feature = "gzip", feature = "zstd"))]
             FileDecoder::CompCsv(r) => r.bad_rows,
             #[cfg(any(feature = "gzip", feature = "zstd"))]
             FileDecoder::CompJsonl(r) => r.bad_rows,
+        }
+    }
+
+    /// Stage C (#239): is this a speculative sampled-schema stream (vs a
+    /// canonical two-pass decoder)? Surfaced in `RunResult::strategy` so the
+    /// engine swap is never silent (Observable First).
+    pub(crate) fn is_speculative(&self) -> bool {
+        matches!(
+            self,
+            FileDecoder::CsvStream(_) | FileDecoder::JsonlStream(_)
+        )
+    }
+
+    /// Stage C (#239): did a speculative stream contradict its sampled schema
+    /// (any non-empty parse failure)? Canonical decoders never do — only the
+    /// sampled `CsvStream` path can speculate.
+    pub(crate) fn spec_contradicted(&self) -> bool {
+        match self {
+            FileDecoder::CsvStream(ch) => ch.parse_failures.iter().any(|&n| n > 0),
+            FileDecoder::JsonlStream(ch) => ch.lane_mismatches > 0,
+            _ => false,
         }
     }
 }
@@ -208,6 +244,77 @@ impl Read {
                     FileFmt::Jsonl
                 } else {
                     FileFmt::Csv(rivus_ir::delim_for_path(l))
+                }
+            }
+        }
+    }
+
+    /// Stage C (#239): open one plain-CSV file **speculatively** — infer the
+    /// schema from a `chunk_size`-row sample (one short read instead of the
+    /// full pass-1 scan) and stream-decode assuming it. The caller must check
+    /// `FileDecoder::spec_contradicted()` after draining: any non-empty parse
+    /// failure means a cell fell outside the sampled lanes, and the file must
+    /// be re-run through the canonical two-pass `open_file_stream` (design/41
+    /// §5). Files whose sample infers a Bool column are ineligible (Bool cells
+    /// never emit parse failures, so contradiction detection is blind there)
+    /// and fall back to the canonical open, as do compressed inputs and JSONL.
+    pub(crate) fn open_file_stream_sampled(
+        &self,
+        uri: &str,
+    ) -> Result<(Schema, FileDecoder), String> {
+        if crate::transport::Scheme::of(uri).is_compressed() {
+            return self.open_file_stream(uri);
+        }
+        match self.fmt_for(uri) {
+            FileFmt::Csv(delim) => {
+                let Ok((schema, mut ch)) = crate::csv::CsvChunker::open(
+                    uri,
+                    None,
+                    self.chunk_size,
+                    true, // preview: sample-based inference, no pass-1 scan
+                    &[],
+                    &[],
+                    true,
+                    None,
+                    &[],
+                    delim,
+                ) else {
+                    // Let the canonical open raise its own message (the
+                    // quarantine text must match the serial run's).
+                    return self.open_file_stream(uri);
+                };
+                if schema
+                    .fields
+                    .iter()
+                    .any(|f| f.dtype == rivus_core::DataType::Bool)
+                {
+                    return self.open_file_stream(uri);
+                }
+                ch.count_stream_bad();
+                Ok((schema, FileDecoder::CsvStream(ch)))
+            }
+            FileFmt::Jsonl => {
+                // Only a FLAT all-scalar sample may speculate: the fused block
+                // walk is the one path that counts lane mismatches. (No Bool
+                // exclusion here: JSON is syntax-typed, a stray `"true"` or
+                // `1` in a Bool lane IS a counted mismatch.) A sample-phase
+                // error or unusable sample falls back so the canonical open
+                // raises its own message (the quarantine text must match the
+                // serial run's).
+                let Ok(Some((names, jtypes))) =
+                    crate::jsonl::sample_infer_flat(uri, self.chunk_size)
+                else {
+                    return self.open_file_stream(uri);
+                };
+                let schema = crate::jsonl::schema_from(&names, &jtypes);
+                match crate::jsonl::JsonlChunker::open_speculative(
+                    uri,
+                    names,
+                    jtypes,
+                    self.chunk_size,
+                ) {
+                    Ok(ch) => Ok((schema, FileDecoder::JsonlStream(ch))),
+                    Err(_) => self.open_file_stream(uri),
                 }
             }
         }
@@ -830,4 +937,300 @@ fn str_repeat(s: &str, n: usize) -> Column {
         c.push(s);
     }
     Column::str(c)
+}
+
+#[cfg(test)]
+mod stage_c_tests {
+    //! Stage C sampled-open contract (design/41 §5): the detector must be
+    //! complete (zero non-empty parse failures ⇔ sample schema == full
+    //! inference), Bool-sampled files must fall back to the canonical open,
+    //! and the in-stream malformed-row count must equal pass 1's.
+
+    use super::*;
+
+    fn write_tmp(tag: &str, text: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rivus_stagec_{tag}_{}_{}.csv",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&p, text).expect("write fixture");
+        p
+    }
+
+    fn reader(chunk_size: usize) -> Read {
+        Read::new(
+            Some(ReadFmt::Csv),
+            rivus_ir::Provenance::default(),
+            chunk_size,
+        )
+    }
+
+    fn drain(dec: &mut FileDecoder) -> usize {
+        let mut rows = 0;
+        while let Some(cols) = dec.next_chunk() {
+            rows += cols.first().map(|c| c.len()).unwrap_or(0);
+        }
+        rows
+    }
+
+    /// Clean file: the sample schema equals the full-pass schema, the stream
+    /// never contradicts, and the row count matches the canonical decode.
+    #[test]
+    fn sampled_clean_file_matches_canonical() {
+        let mut text = String::from("id,region,amount\n");
+        for i in 0..500 {
+            text.push_str(&format!("{i},r{},{}\n", i % 3, i * 7 % 100));
+        }
+        let p = write_tmp("clean", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader(64);
+        let (s_spec, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        let (s_full, mut d_full) = r.open_file_stream(uri).expect("canonical open");
+        assert!(
+            matches!(d_spec, FileDecoder::CsvStream(_)),
+            "must speculate"
+        );
+        assert_eq!(s_spec, s_full, "sample inference == full inference");
+        assert_eq!(drain(&mut d_spec), drain(&mut d_full), "same row count");
+        assert!(
+            !d_spec.spec_contradicted(),
+            "clean stream never contradicts"
+        );
+        assert_eq!(d_spec.bad_rows(), d_full.bad_rows());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A type surprise BEYOND the sample window (an unparsable cell under the
+    /// sampled i64 lane) must be detected as a contradiction.
+    #[test]
+    fn sampled_late_type_surprise_contradicts() {
+        let mut text = String::from("id,amount\n");
+        for i in 0..200 {
+            text.push_str(&format!("{i},{}\n", i * 3));
+        }
+        text.push_str("200,notanumber\n");
+        let p = write_tmp("surprise", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader(64); // sample = 64 rows; the surprise is at row 201
+        let (s_spec, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        assert_eq!(
+            s_spec.fields.iter().map(|f| f.dtype).collect::<Vec<_>>(),
+            vec![rivus_core::DataType::I64, rivus_core::DataType::I64],
+            "sample sees only integers"
+        );
+        drain(&mut d_spec);
+        assert!(
+            d_spec.spec_contradicted(),
+            "the stray cell must be detected"
+        );
+        // The canonical open resolves the column to Str instead.
+        let (s_full, _) = r.open_file_stream(uri).expect("canonical open");
+        assert_eq!(s_full.fields[1].dtype, rivus_core::DataType::Str);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Bool lanes never emit parse failures (`"maybe"` folds to a silent
+    /// false), so a Bool-sampled file is ineligible and must take the
+    /// canonical two-pass open instead.
+    #[test]
+    fn sampled_bool_column_falls_back_to_canonical() {
+        let mut text = String::from("id,flag\n");
+        for i in 0..100 {
+            text.push_str(&format!(
+                "{i},{}\n",
+                if i % 2 == 0 { "true" } else { "false" }
+            ));
+        }
+        text.push_str("100,maybe\n"); // would fold to false, silently
+        let p = write_tmp("bool", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader(64);
+        let (s_spec, d_spec) = r.open_file_stream_sampled(uri).expect("open");
+        assert!(
+            !matches!(d_spec, FileDecoder::CsvStream(_)),
+            "Bool sample must not speculate (contradiction detection is blind there)"
+        );
+        // And the schema is therefore the full-pass truth (flag widens to Str).
+        assert_eq!(s_spec.fields[1].dtype, rivus_core::DataType::Str);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Wrong-arity rows both inside and beyond the sample window: the
+    /// speculative stream's in-stream count must equal pass 1's count
+    /// (no double count of the sample window, no missed tail).
+    #[test]
+    fn sampled_bad_row_count_matches_pass1() {
+        let mut text = String::from("id,region,amount\n");
+        for i in 0..300 {
+            if i == 10 || i == 250 {
+                text.push_str("onlyonefield\n"); // one inside, one beyond the sample
+            }
+            text.push_str(&format!("{i},r{},{}\n", i % 3, i));
+        }
+        let p = write_tmp("arity", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader(64);
+        let (_, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        let (_, mut d_full) = r.open_file_stream(uri).expect("canonical open");
+        assert!(
+            matches!(d_spec, FileDecoder::CsvStream(_)),
+            "must speculate"
+        );
+        let (rs, rf) = (drain(&mut d_spec), drain(&mut d_full));
+        assert_eq!(rs, rf, "same surviving rows");
+        assert!(
+            !d_spec.spec_contradicted(),
+            "arity dirt is not a contradiction"
+        );
+        assert_eq!(d_full.bad_rows(), 2, "pass 1 counts both");
+        assert_eq!(d_spec.bad_rows(), 2, "in-stream count == pass 1 count");
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod stage_c_jsonl_tests {
+    //! Stage C sampled-open contract for JSONL (design/41 §5, C-2): JSON is
+    //! syntax-typed, so lane mismatches are counted (no CSV-style Bool
+    //! exception); nested samples fall back to the canonical two-pass.
+
+    use super::*;
+
+    fn write_tmp(tag: &str, text: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rivus_stagecj_{tag}_{}_{}.jsonl",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&p, text).expect("write fixture");
+        p
+    }
+
+    fn reader(chunk_size: usize) -> Read {
+        Read::new(
+            Some(ReadFmt::Jsonl),
+            rivus_ir::Provenance::default(),
+            chunk_size,
+        )
+    }
+
+    fn drain(dec: &mut FileDecoder) -> usize {
+        let mut rows = 0;
+        while let Some(cols) = dec.next_chunk() {
+            rows += cols.first().map(|c| c.len()).unwrap_or(0);
+        }
+        rows
+    }
+
+    /// Clean file (with malformed lines both inside and beyond the sample):
+    /// sample inference == full inference, no contradiction, and the streamed
+    /// bad-line count equals pass 1's.
+    #[test]
+    fn jsonl_sampled_clean_file_matches_canonical() {
+        let mut text = String::new();
+        for i in 0..300 {
+            if i == 10 || i == 250 {
+                text.push_str("{\"id\":oops\n"); // malformed: one in, one past the sample
+            }
+            text.push_str(&format!(
+                "{{\"id\":{i},\"region\":\"r{}\",\"amount\":{}}}\n",
+                i % 3,
+                i * 7 % 100
+            ));
+        }
+        let p = write_tmp("clean", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader(64);
+        let (s_spec, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        let (s_full, mut d_full) = r.open_file_stream(uri).expect("canonical open");
+        assert!(
+            matches!(d_spec, FileDecoder::JsonlStream(_)),
+            "must speculate"
+        );
+        assert_eq!(s_spec, s_full, "sample inference == full inference");
+        assert_eq!(drain(&mut d_spec), drain(&mut d_full), "same row count");
+        assert!(
+            !d_spec.spec_contradicted(),
+            "clean stream never contradicts"
+        );
+        assert_eq!(d_full.bad_rows(), 2, "pass 1 counts both malformed lines");
+        assert_eq!(d_spec.bad_rows(), 2, "in-stream count == pass 1 count");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A float beyond the int-sampled window is a counted lane mismatch →
+    /// contradiction (canonical inference resolves the column to F64).
+    #[test]
+    fn jsonl_sampled_late_float_contradicts() {
+        let mut text = String::new();
+        for i in 0..200 {
+            text.push_str(&format!("{{\"id\":{i},\"amount\":{}}}\n", i * 3));
+        }
+        text.push_str("{\"id\":200,\"amount\":1.5}\n");
+        let p = write_tmp("float", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader(64);
+        let (s_spec, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        assert_eq!(s_spec.fields[1].dtype, rivus_core::DataType::I64);
+        drain(&mut d_spec);
+        assert!(d_spec.spec_contradicted(), "the float must be detected");
+        let (s_full, _) = r.open_file_stream(uri).expect("canonical open");
+        assert_eq!(s_full.fields[1].dtype, rivus_core::DataType::F64);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The CSV Bool blind spot does NOT exist here: a quoted `"true"` (a
+    /// string) in a Bool lane is a syntax-class mismatch and is counted.
+    #[test]
+    fn jsonl_bool_lane_mismatch_is_detected() {
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!(
+                "{{\"id\":{i},\"flag\":{}}}\n",
+                if i % 2 == 0 { "true" } else { "false" }
+            ));
+        }
+        text.push_str("{\"id\":100,\"flag\":\"true\"}\n"); // a STRING, not a bool
+        let p = write_tmp("bool", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader(64);
+        let (s_spec, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        assert!(
+            matches!(d_spec, FileDecoder::JsonlStream(_)),
+            "Bool lanes may speculate in JSONL (syntax-typed)"
+        );
+        assert_eq!(s_spec.fields[1].dtype, rivus_core::DataType::Bool);
+        drain(&mut d_spec);
+        assert!(
+            d_spec.spec_contradicted(),
+            "the stray string must be counted"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A nested sample streams through the silent general path, so it must
+    /// take the canonical two-pass instead of speculating.
+    #[test]
+    fn jsonl_nested_sample_falls_back_to_canonical() {
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!("{{\"id\":{i},\"meta\":{{\"k\":{i}}}}}\n"));
+        }
+        let p = write_tmp("nested", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader(64);
+        let (_, d_spec) = r.open_file_stream_sampled(uri).expect("open");
+        assert!(
+            !matches!(d_spec, FileDecoder::JsonlStream(_)),
+            "nested sample must not speculate (mismatches are not counted there)"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
 }
