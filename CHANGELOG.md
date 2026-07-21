@@ -7,6 +7,16 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **design/38 P4 — the as-of join joins the join-kind family (migration
+  release, breaking next release).** The canonical spelling is
+  `A &asof B [on k…] by ts [within "5s"]`: `&asof` is a peer of
+  `&left`/`&right`/`&full`, `by` names the temporal axis (the `on` keys stay
+  the exact-match group, `within` the one option). The retired grafted form
+  `A & B [on k…] asof ts [within]` still parses this release and `rivus fmt`
+  rewrites it to `&asof`; **next release it becomes a never-silent error**.
+  Execution is unchanged (both spellings build the identical `AsofJoin` op);
+  a column literally named `by` can no longer appear in a join's `on` key
+  list (it now ends the list, like the stage keywords).
 - **Decode-column pruning on join-free `read`→…→`save` chains — contract
   narrowing.** When a flow's downstream is a linear filter/cast/projection
   chain into a sink (no join, no group), the CSV readers now decode only the
