@@ -368,10 +368,13 @@ impl Parser {
                 }
                 Tok::PipeMap => {
                     self.bump();
-                    let op = self.parse_projection()?;
-                    let n = self.g.add_node(op);
-                    self.g.add_edge(current, n, EdgeKind::Stream);
-                    current = n;
+                    // Window items lower to append ops ahead of the projection
+                    // (design/38 P3); `|> *` may produce append ops only.
+                    for op in self.parse_projection()? {
+                        let n = self.g.add_node(op);
+                        self.g.add_edge(current, n, EdgeKind::Stream);
+                        current = n;
+                    }
                 }
                 Tok::PipeGroup => {
                     self.bump();
@@ -795,7 +798,14 @@ impl Parser {
                             return Err(self.err("sessionize `by` expects at least one column"));
                         }
                     }
-                    let n = self.g.add_node(Op::Sessionize { ts, gap, by });
+                    let n = self.g.add_node(Op::Sessionize {
+                        ts,
+                        gap,
+                        by,
+                        // The retired verb always appended `session`; the
+                        // canonical `|> * (session(…) over …) as OUT` names it.
+                        out: "session".to_string(),
+                    });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
@@ -1567,16 +1577,39 @@ impl Parser {
     }
 
     /// Parse a `|>` projection list. Items are bare fields (`name`), `:`
-    /// definition chains (`name [:alias] [:type]`, §29.2), renames
-    /// (`name as alias`), or computed columns (`(expr) as alias`). When every
-    /// item is a bare field this lowers to the pure-selection `Op::Project`
-    /// (so existing fusion/pushdown are untouched); otherwise to `ProjectExpr`.
-    fn parse_projection(&mut self) -> Result<Op, RivusError> {
+    /// definition chains (`name [:alias] [:type]`, §29.2), computed columns
+    /// (`(expr) as alias`), or WINDOW items (design/38 P3:
+    /// `(session|lag|diff|pct_change(args) [over col…]) as alias`, which
+    /// lower to the bespoke append ops BEFORE the projection). `|> *` keeps
+    /// every column and appends the window outputs — the retired
+    /// `sessionize`/`shift` verbs' keep-all semantics, so `fmt` migrates them
+    /// mechanically. Returns the op chain in stream order (window ops, then
+    /// the projection — omitted under `*`). When every projected item is a
+    /// bare field this lowers to the pure-selection `Op::Project` (so
+    /// existing fusion/pushdown are untouched); otherwise to `ProjectExpr`.
+    fn parse_projection(&mut self) -> Result<Vec<Op>, RivusError> {
         let mut items: Vec<(Expr, String)> = Vec::new();
         let mut views: Vec<ViewDef> = Vec::new();
         let mut all_bare = true;
+        let mut win_ops: Vec<Op> = Vec::new();
+        let mut star = false;
         loop {
             match self.tok().clone() {
+                Tok::Star => {
+                    self.bump();
+                    star = true;
+                }
+                // Window item — peeked structurally (`(name(` with a window
+                // function name) so ordinary computed items are untouched.
+                Tok::LParen if self.peek_window_fn() => {
+                    let op = self.parse_window_item()?;
+                    let out = match &op {
+                        Op::Sessionize { out, .. } | Op::Shift { out, .. } => out.clone(),
+                        _ => unreachable!("window items lower to Sessionize/Shift"),
+                    };
+                    items.push((Expr::field(&out), out));
+                    win_ops.push(op);
+                }
                 // `(expr) as alias` — computed column.
                 Tok::LParen => {
                     let e = self.parse_primary()?; // consumes the parenthesized expr
@@ -1606,15 +1639,132 @@ impl Parser {
                 _ => break,
             }
         }
+        if star {
+            // `*` = keep-all: the window ops already append their outputs
+            // onto the full row, so no projection node follows. A plain item
+            // under `*` would need a new keep-all-compute op — never-silent.
+            if !win_ops.is_empty() && items.len() == win_ops.len() {
+                return Ok(win_ops);
+            }
+            return Err(self.err(
+                "`|> *` keeps every column and appends WINDOW items only \
+                 (e.g. `|> * (lag(price, 1) over sym) as prev`); to select \
+                 columns, list them without `*`",
+            ));
+        }
         if items.is_empty() {
             return Err(self.err("`|>` requires at least one field or computed column"));
         }
-        if all_bare {
+        let proj = if all_bare {
             let fields = items.into_iter().map(|(_, alias)| alias).collect();
-            Ok(Op::Project { fields })
+            Op::Project { fields }
         } else {
-            Ok(Op::ProjectExpr { items, views })
+            Op::ProjectExpr { items, views }
+        };
+        let mut ops = win_ops;
+        ops.push(proj);
+        Ok(ops)
+    }
+
+    /// Is the upcoming `(` a WINDOW item — `(session|lag|diff|pct_change(` —
+    /// as opposed to an ordinary computed column?
+    fn peek_window_fn(&self) -> bool {
+        matches!(
+            (&self.toks[self.pos].0, self.toks.get(self.pos + 1).map(|t| &t.0)),
+            (Tok::LParen, Some(Tok::Word(w)))
+                if matches!(w.as_str(), "session" | "lag" | "diff" | "pct_change")
+        ) && matches!(self.toks.get(self.pos + 2).map(|t| &t.0), Some(Tok::LParen))
+    }
+
+    /// Parse one window item `(FN(args…) [over col…]) as alias` (design/38
+    /// P3) into its bespoke append op. Restrictions are never-silent: the
+    /// window call must be the WHOLE item (`(col - lag(col,1))` is what
+    /// `diff` is for), its first argument is a bare column, and the alias is
+    /// required (it names the appended column).
+    fn parse_window_item(&mut self) -> Result<Op, RivusError> {
+        self.expect(&Tok::LParen)?;
+        let name = self.word()?;
+        self.expect(&Tok::LParen)?;
+        let col = self.word()?;
+        let op = if name == "session" {
+            self.expect(&Tok::Comma)?;
+            let gap = match self.bump() {
+                Tok::Str(s) => s,
+                other => {
+                    return Err(self.err(format!(
+                        "session(ts, \"gap\") expects a quoted gap duration, found {other:?}"
+                    )))
+                }
+            };
+            self.expect(&Tok::RParen)?;
+            let by = self.parse_over()?;
+            self.expect(&Tok::RParen)?;
+            let out = self.window_alias("session(…)")?;
+            Op::Sessionize {
+                ts: col,
+                gap,
+                by,
+                out,
+            }
+        } else {
+            let kind = rivus_ir::ShiftKind::parse(&name).expect("peek_window_fn matched");
+            // Optional row count (defaults to 1, like the retired verb).
+            let n = if self.eat(&Tok::Comma) {
+                match self.bump() {
+                    Tok::Int(v) if v >= 1 => v as u32,
+                    other => {
+                        return Err(self.err(format!(
+                            "{name}(col, N) expects a positive integer N, found {other:?}"
+                        )))
+                    }
+                }
+            } else {
+                1
+            };
+            self.expect(&Tok::RParen)?;
+            let by = self.parse_over()?;
+            self.expect(&Tok::RParen)?;
+            let out = self.window_alias(&format!("{name}(…)"))?;
+            Op::Shift {
+                col,
+                kind,
+                n,
+                by,
+                out,
+            }
+        };
+        Ok(op)
+    }
+
+    /// The `over col…` partition clause of a window item (design/38 P3) —
+    /// the uniform replacement for the retired per-verb `by …`.
+    fn parse_over(&mut self) -> Result<Vec<String>, RivusError> {
+        let mut by = Vec::new();
+        if self.peek_is_word("over") {
+            self.bump();
+            while let Tok::Word(name) = self.tok().clone() {
+                if is_keyword(&name) || name == "over" {
+                    break;
+                }
+                self.bump();
+                by.push(name);
+            }
+            if by.is_empty() {
+                return Err(self.err("`over` expects at least one partition column"));
+            }
         }
+        Ok(by)
+    }
+
+    /// The required `as ALIAS` after a window item.
+    fn window_alias(&mut self, what: &str) -> Result<String, RivusError> {
+        if !self.peek_is_word("as") {
+            return Err(self.err(format!(
+                "window item {what} requires `as <name>` (it names the appended column)"
+            )));
+        }
+        self.bump();
+        self.word()
     }
 
     /// Parse the tail of a `:` definition chain (§29.2) after its column word:
@@ -4976,43 +5126,110 @@ Import:
 
     #[test]
     fn shift_parses_and_round_trips() {
-        // #65: shift col lag|diff|pct_change [N] [by …] as alias.
+        // #65 semantics under the design/38 P3 canonical spelling: the
+        // retired `shift` verb still parses (migration release) and renders
+        // as `|> * (lag(col, N) over …) as alias`; the canonical form is
+        // idempotent and builds the IDENTICAL op.
         let g = parse("T:\n open t.csv (sym:str price:int)\n shift price lag 2 by sym as p2\n;")
             .unwrap();
         let src = g.to_source();
-        assert!(src.contains("shift price lag 2 by sym as p2"), "{src}");
+        assert!(src.contains("|> * (lag(price, 2) over sym) as p2"), "{src}");
         assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        let canon =
+            parse("T:\n open t.csv (sym:str price:int)\n |> * (lag(price, 2) over sym) as p2\n;")
+                .unwrap();
+        assert_eq!(
+            format!("{:?}", g.nodes[1].op),
+            format!("{:?}", canon.nodes[1].op),
+            "verb and canonical form must build the same Shift op"
+        );
         // diff with default N=1 omits the count; pct_change keeps it.
         let g = parse("T:\n open t.csv\n shift price diff as d\n;").unwrap();
         assert!(
-            g.to_source().contains("shift price diff as d"),
+            g.to_source().contains("|> * (diff(price)) as d"),
             "{}",
             g.to_source()
         );
-        // Malformed: unknown kind, missing `as`.
+        // Malformed: unknown kind, missing `as` (verb and canonical form).
         assert!(parse("T:\n open t.csv\n shift price wat as x\n;").is_err());
         let e = parse("T:\n open t.csv\n shift price lag 1\n;")
             .expect_err("as required")
             .to_string();
         assert!(e.contains("as ALIAS"), "{e}");
+        let e = parse("T:\n open t.csv\n |> * (lag(price, 1) over sym)\n;")
+            .expect_err("window alias required")
+            .to_string();
+        assert!(e.contains("as <name>"), "{e}");
     }
 
     #[test]
     fn sessionize_parses_and_round_trips() {
-        // §36.5: session windows — ts, gap duration, optional by columns.
+        // §36.5 semantics under the design/38 P3 canonical spelling: the
+        // retired `sessionize` verb still parses (migration release) and
+        // renders as `|> * (session(ts, "gap") over …) as session`; the
+        // canonical form is idempotent and builds the IDENTICAL op.
         let g =
             parse("S:\n open e.csv (ts:datetime user:str)\n sessionize ts gap \"30m\" by user\n;")
                 .unwrap();
         let src = g.to_source();
-        assert!(src.contains("sessionize ts gap \"30m\" by user"), "{src}");
+        assert!(
+            src.contains("|> * (session(ts, \"30m\") over user) as session"),
+            "{src}"
+        );
         assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
-        // Without `by` (single implicit group).
+        let canon = parse(
+            "S:\n open e.csv (ts:datetime user:str)\n \
+             |> * (session(ts, \"30m\") over user) as session\n;",
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", g.nodes[1].op),
+            format!("{:?}", canon.nodes[1].op),
+            "verb and canonical form must build the same Sessionize op"
+        );
+        // Without `over` (single implicit group), and an alias names the
+        // appended column.
         let g = parse("S:\n open e.csv (ts:datetime)\n sessionize ts gap \"1h\"\n;").unwrap();
         assert!(
-            g.to_source().contains("sessionize ts gap \"1h\"\n"),
+            g.to_source()
+                .contains("|> * (session(ts, \"1h\")) as session\n"),
             "{}",
             g.to_source()
         );
+        let g =
+            parse("S:\n open e.csv (ts:datetime)\n |> * (session(ts, \"1h\")) as w\n;").unwrap();
+        assert!(matches!(&g.nodes[1].op, Op::Sessionize { out, .. } if out == "w"));
+    }
+
+    /// design/38 P3: a window item WITHOUT `*` composes with an ordinary
+    /// (narrowing) projection — the append op runs first, then the listed
+    /// columns are selected; `|> *` rejects plain items (never-silent).
+    #[test]
+    fn window_items_compose_with_projection() {
+        let g = parse(
+            "T:\n open t.csv (sym:str price:int)\n \
+             |> sym (lag(price, 1) over sym) as prev\n;",
+        )
+        .unwrap();
+        assert!(
+            matches!(&g.nodes[1].op, Op::Shift { out, .. } if out == "prev"),
+            "window op first: {:?}",
+            g.nodes[1].op
+        );
+        assert!(
+            matches!(&g.nodes[2].op, Op::Project { fields } if fields == &["sym", "prev"]),
+            "then the narrowing selection: {:?}",
+            g.nodes[2].op
+        );
+        let src = g.to_source();
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent: {src}");
+        // `|> *` with a plain item is a shape error pointing at the rule.
+        let e = parse("T:\n open t.csv\n |> * sym (lag(price, 1)) as p\n;")
+            .expect_err("star takes window items only")
+            .to_string();
+        assert!(e.contains("WINDOW items only"), "{e}");
+        // A window function outside its item position stays an error.
+        assert!(parse("T:\n open t.csv\n |? lag(price, 1) > 0\n;").is_err());
         // Malformed forms teach the shape.
         let e = parse("S:\n open e.csv\n sessionize ts \"30m\"\n;")
             .expect_err("gap keyword required")

@@ -99,12 +99,12 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
         // `sessionize` appends the `session` column (the ts column's datetime
         // lane) when the named ts column exists on a datetime lane; otherwise
         // the runtime warns and passes through, so the schema stays unchanged.
-        Op::Sessionize { ts, .. } => input.map(|s| {
+        Op::Sessionize { ts, out, .. } => input.map(|s| {
             let mut s = s;
             if let Some(i) = s.index_of(ts) {
                 if matches!(s.fields[i].dtype, DataType::DateTime { .. }) {
                     let dtype = s.fields[i].dtype;
-                    s.fields.push(Field::new("session", dtype));
+                    s.fields.push(Field::new(out.clone(), dtype));
                 }
             }
             s
