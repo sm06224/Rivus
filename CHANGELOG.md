@@ -16,11 +16,12 @@ All notable changes to Rivus. Format loosely follows
   rewrites it to `&asof`; **next release it becomes a never-silent error**.
   Execution is unchanged (both spellings build the identical `AsofJoin` op);
   a column literally named `by` can no longer appear in a join's `on` key
-  list (it now ends the list, like the stage keywords). Known limitation: an
-  as-of join followed by a same-statement chain (e.g. `… asof … save o.csv`)
-  is refused by `rivus fmt` (explicit error, source left unchanged — split
-  the statement to migrate); fixing that chain rendering is a separate slice
-  and a **precondition for the removal release**.
+  list (it now ends the list, like the stage keywords). The former known
+  limitation is FIXED: an as-of join followed by a same-statement chain
+  (e.g. `… asof … save o.csv`) now renders and migrates like every other
+  join head (`write_chain` gained the `AsofJoin` fan-in head), so `rivus
+  fmt` no longer refuses those programs — the removal-release precondition
+  is met.
 - **design/38 P3 — the window / time-series family has ONE grammar (migration
   release, breaking next release).** `session` / `lag` / `diff` / `pct_change`
   are now **window items inside `|>`** with the uniform `over` partition

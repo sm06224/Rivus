@@ -2068,6 +2068,24 @@ impl PlanGraph {
                         let names = self.input_labels(&self.inputs_of(nid)).join(&sep);
                         Some(format!("{names} {}", join_on_clause(left_keys, right_keys)))
                     }
+                    // An as-of join heading a chain renders the same binary
+                    // head as `Op::Join` — `A &asof B [on k…] by ts [within]`
+                    // (design/38 P4 canonical). Without this arm the chain
+                    // form (`… asof … save o.csv`) fell to the headless
+                    // `to_src_line` and `fmt` refused the round-trip — the
+                    // removal-release blocker recorded in CHANGELOG/design38.
+                    Op::AsofJoin { by, ts, tolerance } => {
+                        let names = self.input_labels(&self.inputs_of(nid)).join(" &asof ");
+                        let mut clause = String::new();
+                        if !by.is_empty() {
+                            clause.push_str(&format!("on {} ", by.join(" ")));
+                        }
+                        clause.push_str(&format!("by {ts}"));
+                        if let Some(t) = tolerance {
+                            clause.push_str(&format!(" within \"{t}\""));
+                        }
+                        Some(format!("{names} {clause}"))
+                    }
                     _ => None,
                 };
                 if let Some(head) = head {
