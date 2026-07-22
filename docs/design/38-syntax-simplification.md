@@ -3,8 +3,12 @@
 **Status:** P1+P2 GO 済（#236 issuecomment-5017506345）・**P1+P2 移行リリース実装済み**
 （削除綴りは本リリースは parse 可＋`fmt` が正典へ自動書換、次リリースで
 did-you-mean エラー化。`readbin` は `open … as bin` 文法の裁可待ちでエラー化
-リリースへ繰延べ）。P3（`over` 窓統一）・P4（`&asof`）は独立スライスで GO 済・
-未着手。P5 は使用調査待ちで保留。
+リリースへ繰延べ）。**P3（`over` 窓統一）実装済み**（同じ移行方式 —
+`session`/`lag`/`diff`/`pct_change` は `|>` の窓 item＋一様な `over` 句、
+keep-all は新設の `|> *`（窓 item 専用）が担い旧 verb を機械移行。
+`sessionize`/`shift` verb は本リリース parse 可・次リリースでエラー化。
+`lead` は #65 の follow-up のまま）。P4（`&asof`）は GO 済・未着手。
+P5 は使用調査待ちで保留。
 **Author:** 先行研究担当. **Decision:** レビュー兼統括指揮 (ratify per-item; 現運用 #240).
 
 > 統括の指摘：「構文が難しくなってきている。シンプルさが損なわれている。」
