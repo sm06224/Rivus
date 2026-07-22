@@ -185,6 +185,7 @@ impl FileDecoder {
     pub(crate) fn dict_status(&self) -> Option<(usize, u32)> {
         match self {
             FileDecoder::CsvStream(ch) => ch.dict_status(),
+            FileDecoder::JsonlStream(ch) => ch.dict_status(),
             _ => None,
         }
     }
@@ -342,8 +343,8 @@ impl Read {
                 // error or unusable sample falls back so the canonical open
                 // raises its own message (the quarantine text must match the
                 // serial run's).
-                let Ok(Some((names, jtypes))) =
-                    crate::jsonl::sample_infer_flat(uri, self.chunk_size)
+                let Ok(Some((names, jtypes, dict_cols))) =
+                    crate::jsonl::sample_infer_flat(uri, self.chunk_size, self.dict_keys.as_ref())
                 else {
                     return self.open_file_stream(uri);
                 };
@@ -352,6 +353,7 @@ impl Read {
                     uri,
                     names,
                     jtypes,
+                    dict_cols,
                     self.chunk_size,
                 ) {
                     Ok(ch) => Ok((schema, FileDecoder::JsonlStream(ch))),
@@ -1461,6 +1463,155 @@ mod dict_stage_b_tests {
                     .all(|c| !matches!(c.data(), rivus_core::ColumnData::StrDict(_))),
                 "unkeyed sampled chunks must stay plain"
             );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod dict_stage_b_jsonl_tests {
+    //! design/42 stage (b), JSONL side: the sampled open dictionary-encodes
+    //! low-cardinality KEY columns (plan-aware candidacy), escapes past
+    //! DICT_CAP, and canonical/unkeyed opens stay plain — the same contract
+    //! (and the same serial-oracle asymmetry) as the CSV lane.
+
+    use super::*;
+
+    fn write_tmp(tag: &str, text: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rivus_dictbj_{tag}_{}_{}.jsonl",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&p, text).expect("write fixture");
+        p
+    }
+
+    fn reader(chunk_size: usize) -> Read {
+        Read::new(
+            Some(ReadFmt::Jsonl),
+            rivus_ir::Provenance::default(),
+            chunk_size,
+        )
+    }
+
+    fn reader_keyed(chunk_size: usize, keys: &[&str]) -> Read {
+        reader(chunk_size).with_dict_keys(Some(keys.iter().map(|s| s.to_string()).collect()))
+    }
+
+    fn all_rows(dec: &mut FileDecoder) -> Vec<Vec<rivus_core::Value>> {
+        let mut out = Vec::new();
+        while let Some(cols) = dec.next_chunk() {
+            let n = cols.first().map(|c| c.len()).unwrap_or(0);
+            for r in 0..n {
+                out.push(
+                    cols.iter()
+                        .map(|c| {
+                            if c.is_null(r) {
+                                rivus_core::Value::Null
+                            } else {
+                                c.value_at(r)
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sampled_low_card_key_builds_dicts() {
+        let mut text = String::new();
+        for i in 0..500 {
+            text.push_str(&format!(
+                "{{\"id\":{i},\"region\":\"r{}\",\"note\":\"free-{i}\"}}\n",
+                i % 5
+            ));
+        }
+        let p = write_tmp("lowcard", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader_keyed(64, &["region", "note"]);
+        let (_, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        let cols = d_spec.next_chunk().expect("chunk");
+        assert!(
+            matches!(cols[1].data(), rivus_core::ColumnData::StrDict(_)),
+            "region must be dict-encoded"
+        );
+        assert!(
+            matches!(cols[2].data(), rivus_core::ColumnData::Str(_)),
+            "all-distinct note must stay plain"
+        );
+        drop(cols);
+        let (_, mut d_full) = r.open_file_stream(uri).expect("canonical open");
+        let mut d_spec2 = r.open_file_stream_sampled(uri).expect("re-open").1;
+        assert_eq!(
+            all_rows(&mut d_spec2),
+            all_rows(&mut d_full),
+            "dict decode must read back the canonical values"
+        );
+        assert_eq!(d_spec2.dict_status(), Some((1, 0)));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn dict_cap_escape_hatch_fires() {
+        // Chunk-local dictionaries: an escape needs one chunk holding more
+        // than DICT_CAP distincts, so chunk_size exceeds the cap; the sample
+        // window (chunk_size objects) stays low-cardinality.
+        let mut text = String::new();
+        for i in 0..8192 {
+            text.push_str(&format!("{{\"id\":{i},\"cat\":\"c{}\"}}\n", i % 4));
+        }
+        for i in 8192..14192 {
+            text.push_str(&format!("{{\"id\":{i},\"cat\":\"u-{i}\"}}\n"));
+        }
+        let p = write_tmp("escape", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader_keyed(8192, &["cat"]);
+        let (_, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        let (_, mut d_full) = r.open_file_stream(uri).expect("canonical open");
+        assert_eq!(
+            all_rows(&mut d_spec),
+            all_rows(&mut d_full),
+            "escaped decode must read back the canonical values"
+        );
+        let (n, esc) = d_spec.dict_status().expect("cat was a candidate");
+        assert_eq!(n, 1);
+        assert!(esc > 0, "crossing DICT_CAP must count an escape");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn canonical_and_unkeyed_opens_stay_plain() {
+        let mut text = String::new();
+        for i in 0..300 {
+            text.push_str(&format!("{{\"id\":{i},\"region\":\"r{}\"}}\n", i % 3));
+        }
+        let p = write_tmp("canon", &text);
+        let uri = p.to_str().unwrap();
+        let r = reader_keyed(64, &["region"]);
+        let (_, mut d_full) = r.open_file_stream(uri).expect("canonical open");
+        assert_eq!(d_full.dict_status(), None);
+        while let Some(cols) = d_full.next_chunk() {
+            assert!(cols
+                .iter()
+                .all(|c| !matches!(c.data(), rivus_core::ColumnData::StrDict(_))));
+        }
+        let r = reader(64);
+        let (_, mut d_spec) = r.open_file_stream_sampled(uri).expect("sampled open");
+        assert_eq!(
+            d_spec.dict_status(),
+            None,
+            "no key columns -> no candidates"
+        );
+        while let Some(cols) = d_spec.next_chunk() {
+            assert!(cols
+                .iter()
+                .all(|c| !matches!(c.data(), rivus_core::ColumnData::StrDict(_))));
         }
         let _ = std::fs::remove_file(&p);
     }

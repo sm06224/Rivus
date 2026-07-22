@@ -2532,3 +2532,32 @@ estimate from the design note. `category` (10M cells) is no longer decoded.
 CSV group standard: analysis returns `None` (shape has a join+group), runs
 bit-identical, 3/3 interleaved pairs show no regression (quiet box, both
 binaries now carry the dict-lane win: base 425-451 ms class).
+
+## design/42 (b)(c) JSONL side: dictionary lanes for the JSONL reader (landed)
+
+The ratified stage (b) scope named "CSV/**JSONL** reader" — the CSV half
+landed in #242; this closes the JSONL half. The speculative JSONL open now
+carries the fused plan's key-column names into `sample_infer_flat`, which
+tracks per-key distincts (string values only — a mixed column is
+disqualified; repetition evidence `0 < distinct < sampled objects ≤ 256`).
+Flagged columns build chunk-local dictionaries in the fused block-walk
+builder (`ColBuilder::StrDict`: intern → u32 codes, byte-rules identical to
+the Str arm including the bool/number→text folds), escape past
+`DICT_CAP = 4096` by materializing the built prefix (条件②), and surface as
+`[WPROF] … dict=Ncols(esc=M)` through the same `dict_status()` plumbing
+(条件④). Canonical opens, range workers, and the compressed stream reader
+never dictionary-encode — the serial oracle stays plain, so the
+serial==parallel guards pin dict vs plain end to end (条件①③), and the
+stage-(c) fused id loop engages with NO further changes (it is chunk-level
+and format-agnostic).
+
+Measured (10M JSONL standard, same-window interleave vs main `4ca4478`,
+outputs bit-identical, RSS 10.1 MB unchanged): **6/8 pairs won,
+min 719 → 681 ms, median ~745 → ~714 ms (−4〜5%)**; WPROF shows
+`idloop≈1.105M` rows/file (~99.5% activation), feed 39-51 ms/file. CSV group
+standard: bit-identical, 3/3 pairs non-regressed. NOTE: the scratchpad was
+reclaimed mid-session, so the fixture was REGENERATED from the documented
+spec (10M × 9 files, same dirty-data mix) — the A/B above is same-window and
+self-consistent, but absolute walls are not comparable to earlier ledger
+entries (the regenerated JSONL objects are leaner than the original 606 MB
+fixture).
