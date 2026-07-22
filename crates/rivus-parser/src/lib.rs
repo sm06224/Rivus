@@ -4588,6 +4588,37 @@ Import:
         assert!(parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T &left Q asof ts ;").is_err());
     }
 
+    /// The as-of join heading a SAME-STATEMENT chain (`… asof … save o.csv`)
+    /// renders and round-trips — the removal-release blocker from the P4
+    /// review (`write_chain` lacked an `AsofJoin` fan-in head, so `fmt`
+    /// refused the whole program). Both spellings migrate to the canonical
+    /// chained form and the result is fmt-stable.
+    #[test]
+    fn asof_join_chain_renders_and_round_trips() {
+        for src in [
+            // retired spelling with a chain
+            "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
+             T: open t.csv (sym:str ts:datetime px:int) ;\n\
+             J: T & Q on sym asof ts within \"5m\" |> sym px bid save o.csv ;",
+            // canonical spelling with a chain
+            "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
+             T: open t.csv (sym:str ts:datetime px:int) ;\n\
+             J: T &asof Q on sym by ts within \"5m\" |> sym px bid save o.csv ;",
+        ] {
+            let g = parse(src).unwrap();
+            let out = g.to_source();
+            assert!(
+                out.contains("T &asof Q on sym by ts within \"5m\""),
+                "canonical head: {out}"
+            );
+            assert!(
+                out.contains("|> sym px bid") && out.contains("save o.csv"),
+                "chain preserved: {out}"
+            );
+            assert_eq!(out, parse(&out).unwrap().to_source(), "idempotent: {out}");
+        }
+    }
+
     #[test]
     fn join_kinds_parse_and_round_trip() {
         // `&` is inner, `&left` is a left outer join; `on lk:rk` sets distinct keys.
