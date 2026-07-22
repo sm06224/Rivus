@@ -1555,14 +1555,15 @@ impl Op {
                 kind,
             } => format!("{} {}", kind.amp(), join_on_clause(left_keys, right_keys)),
             Op::AsofJoin { by, ts, tolerance } => {
-                // `& [on k…] asof ts [within "dur"]` — the amp is the plain `&`
-                // (as-of is a left-outer enrichment; a kind selector is a later
-                // slice), the by-keys ride the `on` clause.
-                let mut s = String::from("&");
+                // `&asof [on k…] by ts [within "dur"]` (design/38 P4) — the
+                // as-of kind is a peer of `&left`/`&right`/`&full`; `by`
+                // names the temporal axis, the `on` keys stay the exact-match
+                // group, `within` the one option.
+                let mut s = String::from("&asof");
                 if !by.is_empty() {
                     s.push_str(&format!(" on {}", by.join(" ")));
                 }
-                s.push_str(&format!(" asof {ts}"));
+                s.push_str(&format!(" by {ts}"));
                 if let Some(t) = tolerance {
                     s.push_str(&format!(" within \"{t}\""));
                 }
@@ -2007,13 +2008,17 @@ impl PlanGraph {
                     continue;
                 }
                 Op::AsofJoin { by, ts, tolerance } => {
-                    // `Label: Left & Right [on k…] asof ts [within "dur"] ;`
-                    let names = self.input_labels(&inputs).join(" & ");
+                    // Canonical as-of spelling (design/38 P4):
+                    // `Label: Left &asof Right [on k…] by ts [within "dur"] ;`
+                    // — `&asof` is a peer of `&left`/`&right`/`&full`, `by`
+                    // names the temporal axis. The retired `& … asof ts` form
+                    // still parses this release and rewrites to this.
+                    let names = self.input_labels(&inputs).join(" &asof ");
                     let mut clause = String::new();
                     if !by.is_empty() {
                         clause.push_str(&format!("on {} ", by.join(" ")));
                     }
-                    clause.push_str(&format!("asof {ts}"));
+                    clause.push_str(&format!("by {ts}"));
                     if let Some(t) = tolerance {
                         clause.push_str(&format!(" within \"{t}\""));
                     }

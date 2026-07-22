@@ -1414,6 +1414,10 @@ impl Parser {
                 } else if self.eat(&Tok::Amp) {
                     // `&` is an inner join; `&left`/`&right`/`&full` are outer
                     // joins (the qualifier lexes as a bare word right after `&`).
+                    // `&asof` (design/38 P4) is the as-of temporal join as a
+                    // peer of the other kinds — canonical form
+                    // `A &asof B [on k…] by ts [within "5s"]`.
+                    let mut asof_kind = false;
                     let kind = if self.peek_is_word("left") {
                         self.bump();
                         JoinKind::Left
@@ -1423,6 +1427,10 @@ impl Parser {
                     } else if self.peek_is_word("full") {
                         self.bump();
                         JoinKind::Full
+                    } else if self.peek_is_word("asof") {
+                        self.bump();
+                        asof_kind = true;
+                        JoinKind::Inner
                     } else {
                         JoinKind::Inner
                     };
@@ -1442,7 +1450,10 @@ impl Parser {
                     if self.peek_is_word("on") {
                         self.bump(); // `on`
                         while let Tok::Word(w) = self.tok().clone() {
-                            if is_keyword(&w) {
+                            // `by` opens `&asof`'s temporal-axis clause
+                            // (design/38 P4) — it ends the key list like a
+                            // keyword does.
+                            if is_keyword(&w) || w == "by" {
                                 break;
                             }
                             let lk = self.word()?;
@@ -1458,10 +1469,49 @@ impl Parser {
                             return Err(self.err("join `on` requires at least one key"));
                         }
                     }
-                    // `asof TS [within "DUR"]` — as-of / temporal join (#64):
-                    // nearest right row with ts ≤ the left's, grouped by the
-                    // `on` keys. Only the plain `&` (inner qualifier) form takes
-                    // `asof` in this slice.
+                    // `&asof … by TS [within "DUR"]` — the canonical as-of spelling
+                    // (design/38 P4): `by` names the temporal axis, `on` stays
+                    // the exact-match group, `within` the one option.
+                    if asof_kind {
+                        if !self.peek_is_word("by") {
+                            return Err(self.err(
+                                "`&asof` needs `by TS` (the temporal axis), e.g. \
+                                 `A &asof B on sym by ts within \"5s\"`",
+                            ));
+                        }
+                        self.bump(); // `by`
+                        let ts = self.word()?;
+                        if left_keys != right_keys {
+                            return Err(self.err(
+                                "as-of `on` keys use the same name on both sides (no `lk:rk`)",
+                            ));
+                        }
+                        let tolerance = if self.peek_is_word("within") {
+                            self.bump();
+                            match self.bump() {
+                                Tok::Str(d) => Some(d),
+                                other => {
+                                    return Err(self.err(format!(
+                                        "asof `within` expects a duration string like \"5m\", \
+                                         found {other:?}"
+                                    )))
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let asof = self.g.add_node(Op::AsofJoin {
+                            by: left_keys,
+                            ts,
+                            tolerance,
+                        });
+                        self.g.add_edge(first, asof, EdgeKind::Stream);
+                        self.g.add_edge(rid, asof, EdgeKind::Stream);
+                        return Ok(asof);
+                    }
+                    // RETIRED spelling (design/38 P4 migration release):
+                    // `A & B [on k…] asof TS [within]` still parses; `fmt`
+                    // rewrites it to `&asof`; next release it errors.
                     if self.peek_is_word("asof") {
                         if kind != JoinKind::Inner {
                             return Err(self.err(
@@ -4497,20 +4547,43 @@ Import:
 
     #[test]
     fn asof_join_parses_and_round_trips() {
-        // #64: `L & R [on k…] asof ts [within "d"]` — as-of / temporal join.
+        // #64 semantics under the design/38 P4 canonical spelling: `&asof` is
+        // a peer of the other join kinds — `L &asof R [on k…] by ts
+        // [within "d"]`. The retired `& … asof ts` form still parses
+        // (migration release), renders canonically, and builds the SAME op.
         let g = parse(
+            "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
+             T: open t.csv (sym:str ts:datetime px:int) ;\n\
+             J: T &asof Q on sym by ts within \"5m\" ;",
+        )
+        .unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(&n.op, Op::AsofJoin { .. })));
+        let src = g.to_source();
+        assert!(
+            src.contains("T &asof Q on sym by ts within \"5m\""),
+            "{src}"
+        );
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // The retired spelling migrates to the identical op + canonical form.
+        let old = parse(
             "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
              T: open t.csv (sym:str ts:datetime px:int) ;\n\
              J: T & Q on sym asof ts within \"5m\" ;",
         )
         .unwrap();
-        assert!(g.nodes.iter().any(|n| matches!(&n.op, Op::AsofJoin { .. })));
-        let src = g.to_source();
-        assert!(src.contains("T & Q on sym asof ts within \"5m\""), "{src}");
-        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        assert_eq!(old.to_source(), src, "retired form must render canonically");
         // Without `on` (pure temporal) and without tolerance.
-        let g = parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T & Q asof ts ;").unwrap();
-        assert!(g.to_source().contains("T & Q asof ts"), "{}", g.to_source());
+        let g = parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T &asof Q by ts ;").unwrap();
+        assert!(
+            g.to_source().contains("T &asof Q by ts"),
+            "{}",
+            g.to_source()
+        );
+        // Shape errors teach the canonical form.
+        let e = parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T &asof Q on sym ;")
+            .expect_err("by TS required")
+            .to_string();
+        assert!(e.contains("by TS"), "{e}");
         // A left/right/full qualifier with `asof` is rejected (later slice).
         assert!(parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T &left Q asof ts ;").is_err());
     }
