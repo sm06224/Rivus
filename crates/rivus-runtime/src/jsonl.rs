@@ -876,20 +876,41 @@ pub struct JsonlChunker {
     /// Canonical opens decode with the file's own full inference, so this
     /// stays 0 there by construction.
     pub lane_mismatches: u64,
+    /// design/42 stage (b), JSONL side: per-column dictionary candidacy from
+    /// the speculative sample (`SAMPLE_DICT_MAX` distinct). Empty = no column
+    /// flagged (canonical opens, range workers).
+    dict_cols: Vec<bool>,
+    /// Chunks whose candidate column crossed `DICT_CAP` and escaped to the
+    /// plain lane (design/42 条件④ observability).
+    dict_escapes: u32,
 }
 
-/// A sampled flat-scalar schema: column names and their (all-`Scalar`) types.
-pub type SampledSchema = (Vec<String>, Vec<JType>);
+/// A sampled flat-scalar schema: column names, their (all-`Scalar`) types, and
+/// the dictionary-candidate flags (design/42 stage b — key columns whose
+/// sample showed repetition evidence; empty when no `dict_keys` were given).
+pub type SampledSchema = (Vec<String>, Vec<JType>, Vec<bool>);
 
 /// Stage C (#239): infer a schema from the first `n` objects of a plain JSONL
 /// file — the speculative substitute for `infer_global`'s whole-file pass.
 /// Returns `Ok(None)` when the sample is unusable for speculation (no valid
 /// object, a nested/list value, or more than 128 keys — the fused block walk
 /// is the only path that counts lane mismatches, and it is flat-only).
-pub fn sample_infer_flat(path: &str, n: usize) -> Result<Option<SampledSchema>, String> {
+///
+/// design/42 stage (b), JSONL side: `dict_keys` are the plan's join/group key
+/// column names — the only dictionary candidates (same rule as CSV: interning
+/// is pure cost off the key paths). A candidate must resolve `Str`, see ONLY
+/// string values in the sample (a mixed column is disqualified — its Str
+/// folds of numbers/bools are poor dictionary members), and show repetition
+/// evidence: 0 < distinct < sampled objects, distinct ≤ `SAMPLE_DICT_MAX`.
+pub fn sample_infer_flat(
+    path: &str,
+    n: usize,
+    dict_keys: Option<&std::collections::HashSet<String>>,
+) -> Result<Option<SampledSchema>, String> {
     let mut reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
     let mut names: Vec<String> = Vec::new();
     let mut infers: Vec<Infer> = Vec::new();
+    let mut d_sets: Vec<Option<std::collections::HashSet<Box<str>>>> = Vec::new();
     let mut started = false;
     let mut seen = 0usize;
     let mut l = String::new();
@@ -906,11 +927,43 @@ pub fn sample_infer_flat(path: &str, n: usize) -> Result<Option<SampledSchema>, 
             if !started {
                 names = obj.iter().map(|(k, _)| k.clone()).collect();
                 infers = names.iter().map(|_| Infer::new()).collect();
+                d_sets = names
+                    .iter()
+                    .map(|k| {
+                        dict_keys
+                            .is_some_and(|dk| dk.contains(k))
+                            .then(Default::default)
+                    })
+                    .collect();
                 started = true;
             }
             for (k, v) in &obj {
                 if let Some(i) = names.iter().position(|n| n == k) {
                     infers[i].observe(v);
+                    let over = {
+                        let Some(set) = d_sets[i].as_mut() else {
+                            continue;
+                        };
+                        match v {
+                            JVal::Str(s) => {
+                                if set.contains(s.as_str()) {
+                                    false
+                                } else if set.len() >= crate::csv::SAMPLE_DICT_MAX {
+                                    true
+                                } else {
+                                    set.insert(s.as_str().into());
+                                    false
+                                }
+                            }
+                            // Null never adds evidence; any non-string value
+                            // disqualifies the key (see the doc above).
+                            JVal::Null => false,
+                            _ => true,
+                        }
+                    };
+                    if over {
+                        d_sets[i] = None;
+                    }
                 }
             }
             seen += 1;
@@ -925,7 +978,17 @@ pub fn sample_infer_flat(path: &str, n: usize) -> Result<Option<SampledSchema>, 
     if names.len() > 128 || jtypes.iter().any(|t| !matches!(t, JType::Scalar(_))) {
         return Ok(None);
     }
-    Ok(Some((names, jtypes)))
+    let dict_cols: Vec<bool> = jtypes
+        .iter()
+        .zip(&d_sets)
+        .map(|(t, set)| {
+            matches!(t, JType::Scalar(DataType::Str))
+                && set
+                    .as_ref()
+                    .is_some_and(|s| !s.is_empty() && s.len() < seen)
+        })
+        .collect();
+    Ok(Some((names, jtypes, dict_cols)))
 }
 
 impl JsonlChunker {
@@ -949,6 +1012,8 @@ impl JsonlChunker {
                 limit: None,
                 bad_rows,
                 count_stream_bad: false,
+                dict_cols: Vec::new(),
+                dict_escapes: 0,
                 lane_mismatches: 0,
             },
         ))
@@ -962,6 +1027,7 @@ impl JsonlChunker {
         path: &str,
         names: Vec<String>,
         jtypes: Vec<JType>,
+        dict_cols: Vec<bool>,
         chunk_size: usize,
     ) -> Result<JsonlChunker, String> {
         let reader = FileTransport::open(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
@@ -979,7 +1045,16 @@ impl JsonlChunker {
             bad_rows: 0,
             count_stream_bad: true,
             lane_mismatches: 0,
+            dict_cols,
+            dict_escapes: 0,
         })
+    }
+
+    /// design/42 発動可観測性: `(dictionary-candidate columns, chunk escapes)`
+    /// — `None` when no column was flagged (canonical opens).
+    pub fn dict_status(&self) -> Option<(usize, u32)> {
+        let n = self.dict_cols.iter().filter(|&&b| b).count();
+        (n > 0).then_some((n, self.dict_escapes))
     }
 
     /// Open `path` for streaming one newline-aligned byte range `[start, end)`
@@ -1011,6 +1086,8 @@ impl JsonlChunker {
             bad_rows: 0,
             count_stream_bad: false,
             lane_mismatches: 0,
+            dict_cols: Vec::new(),
+            dict_escapes: 0,
         })
     }
 
@@ -1038,7 +1115,16 @@ impl JsonlChunker {
             .collect();
         let mut builders: Vec<ColBuilder> = dtypes
             .iter()
-            .map(|d| ColBuilder::new(*d, self.chunk_size))
+            .enumerate()
+            .map(|(k, d)| {
+                // design/42 stage (b): sample-flagged low-cardinality key
+                // columns build chunk-local dictionaries (DICT_CAP escapes).
+                if self.dict_cols.get(k).copied().unwrap_or(false) {
+                    ColBuilder::dict_str(self.chunk_size)
+                } else {
+                    ColBuilder::new(*d, self.chunk_size)
+                }
+            })
             .collect();
         let mut got = 0usize;
         while got < self.chunk_size {
@@ -1200,7 +1286,21 @@ impl JsonlChunker {
         if got == 0 {
             return None;
         }
-        Some(builders.into_iter().map(ColBuilder::finish).collect())
+        // Activation observability (design/42 条件④): a candidate that comes
+        // back on the plain lane crossed DICT_CAP mid-chunk — count the escape.
+        let cols: Vec<Column> = builders
+            .into_iter()
+            .enumerate()
+            .map(|(k, b)| {
+                let escaped = self.dict_cols.get(k).copied().unwrap_or(false)
+                    && matches!(b, ColBuilder::Str(..));
+                if escaped {
+                    self.dict_escapes += 1;
+                }
+                b.finish()
+            })
+            .collect();
+        Some(cols)
     }
 
     pub fn next_columns(&mut self) -> Option<Vec<Column>> {
@@ -2030,6 +2130,15 @@ enum ColBuilder {
     F64(Vec<f64>, Vec<bool>),
     Bool(Vec<bool>, Vec<bool>),
     Str(StrColumn, Vec<bool>),
+    /// design/42 stage (b), JSONL side: chunk-local dictionary build for a
+    /// sample-flagged low-cardinality key column — same contract as the CSV
+    /// lane (intern → u32 codes; crossing `DICT_CAP` escapes to `Str`).
+    StrDict {
+        dict: StrColumn,
+        codes: Vec<u32>,
+        valid: Vec<bool>,
+        map: std::collections::HashMap<Box<str>, u32, crate::fxhash::FxBuild>,
+    },
 }
 
 impl ColBuilder {
@@ -2043,6 +2152,57 @@ impl ColBuilder {
                 Vec::with_capacity(cap),
             ),
         }
+    }
+
+    /// A dictionary-building Str lane (design/42 stage b; candidates only).
+    fn dict_str(cap: usize) -> ColBuilder {
+        ColBuilder::StrDict {
+            dict: StrColumn::with_capacity(64, 64 * 8),
+            codes: Vec::with_capacity(cap),
+            valid: Vec::with_capacity(cap),
+            map: std::collections::HashMap::default(),
+        }
+    }
+
+    /// Escape hatch (design/42 条件②): materialize the built prefix to the
+    /// plain lane and continue there — values identical, only representation.
+    fn dict_escape(&mut self) {
+        if let ColBuilder::StrDict {
+            dict, codes, valid, ..
+        } = self
+        {
+            let mut out = StrColumn::with_capacity(codes.len() + 1, (codes.len() + 1) * 8);
+            for &c in codes.iter() {
+                out.push(dict.get(c as usize));
+            }
+            *self = ColBuilder::Str(out, std::mem::take(valid));
+        }
+    }
+
+    /// Intern one string cell into the dict lane; `false` = would cross
+    /// `DICT_CAP` (the caller escapes and re-pushes on the plain lane).
+    fn dict_intern(&mut self, cell: &str, is_valid: bool) -> bool {
+        let ColBuilder::StrDict {
+            dict,
+            codes,
+            valid,
+            map,
+        } = self
+        else {
+            unreachable!("dict_intern on a non-dict lane")
+        };
+        if let Some(&c) = map.get(cell) {
+            codes.push(c);
+        } else if map.len() < crate::csv::DICT_CAP {
+            let c = map.len() as u32;
+            map.insert(cell.into(), c);
+            dict.push(cell);
+            codes.push(c);
+        } else {
+            return false;
+        }
+        valid.push(is_valid);
+        true
     }
     /// Push one scanned value into the lane. Returns `true` when a NON-NULL
     /// value's syntax class fell outside the lane and was folded to null — the
@@ -2107,6 +2267,32 @@ impl ColBuilder {
                     true
                 }
             },
+            // Dict lane (design/42 stage b): intern EXACTLY the text the Str
+            // arm would push (same validity rule), so the representation is
+            // observationally invisible. Crossing DICT_CAP escapes to the
+            // plain lane and re-pushes this cell there.
+            ColBuilder::StrDict { .. } => {
+                let (text, is_valid): (std::borrow::Cow<'_, str>, bool) = match v {
+                    ScVal::Null => (std::borrow::Cow::Borrowed(""), false),
+                    ScVal::B(b) => (
+                        std::borrow::Cow::Borrowed(if *b { "true" } else { "false" }),
+                        true,
+                    ),
+                    ScVal::I(i) => (std::borrow::Cow::Owned(i.to_string()), true),
+                    ScVal::F(f) => (std::borrow::Cow::Owned(f.to_string()), true),
+                    ScVal::S(x) => (std::borrow::Cow::Borrowed(x), true),
+                    ScVal::SOwned(x) => (std::borrow::Cow::Borrowed(x.as_str()), true),
+                    ScVal::NestedJson(t) => (std::borrow::Cow::Borrowed(t.as_str()), true),
+                };
+                if !self.dict_intern(&text, is_valid) {
+                    self.dict_escape();
+                    if let ColBuilder::Str(out, valid) = self {
+                        out.push(&text);
+                        valid.push(is_valid);
+                    }
+                }
+                false
+            }
             // Str is the lattice top: everything folds in losslessly enough
             // for inference to agree (sample Str ⇒ full Str) — never a
             // contradiction.
@@ -2159,6 +2345,12 @@ impl ColBuilder {
             ColBuilder::Str(out, valid) => {
                 Column::new(ColumnData::Str(out), Validity::from_bits(&valid))
             }
+            ColBuilder::StrDict {
+                dict, codes, valid, ..
+            } => Column::new(
+                ColumnData::StrDict(rivus_core::DictColumn { dict, codes }),
+                Validity::from_bits(&valid),
+            ),
         }
     }
 }

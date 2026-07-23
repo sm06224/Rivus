@@ -846,3 +846,96 @@ fn decode_prune_is_symmetric_and_identical() {
         rp.errors
     );
 }
+
+/// design/42 (b)(c) JSONL side: the JSONL reader's dictionary lanes engage
+/// the SAME fused integer-id fast path (chunk-level, format-agnostic), the
+/// parallel output is byte-identical to the forced-serial run, and the
+/// activation is asserted (発動 assert) — the JSONL twin of
+/// `fused_id_path_activates_and_matches_serial`.
+#[test]
+fn jsonl_dict_lanes_activate_id_path_and_match_serial() {
+    let dir = std::env::temp_dir().join(format!("rivus_jdict_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let right = dir.join("regions.csv");
+    let mut rtext = String::from("region,country\n");
+    for r in 0..5 {
+        rtext.push_str(&format!("r{r},C{}\n", r % 3));
+    }
+    std::fs::write(&right, rtext).unwrap();
+    for f in 0..3usize {
+        let mut t = String::new();
+        for i in 0..20_000usize {
+            t.push_str(&format!(
+                "{{\"order_id\":{i},\"region\":\"r{}\",\"category\":\"c{}\",\"amount\":{}}}\n",
+                (i + f) % 5,
+                i % 7,
+                (i % 100) as i64 - 5
+            ));
+        }
+        std::fs::write(dir.join(format!("part_{f}.jsonl")), t).unwrap();
+    }
+    let glob = dir.join("part_*.jsonl");
+    let out_par = dir.join("out_par.csv");
+    let out_ser = dir.join("out_ser.csv");
+    let src = |out: &std::path::Path| {
+        format!(
+            "R: open {} (region:str country:str) ;\n\
+             S: ls \"{}\" read as jsonl cast amount :int ;\n\
+             J: S &left R on region\n \
+             |? amount > 0\n \
+             |> (coalesce(country, \"@\")) as country (coalesce(category, \"@\")) as category amount\n \
+             |# country category sum:amount count:amount\n \
+             sort country category\n \
+             save {} ;\n",
+            right.display(),
+            glob.display(),
+            out.display()
+        )
+    };
+    let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
+    let gp = parse_opt(&src(&out_par));
+    let gs = parse_opt(&src(&out_ser));
+
+    let _env = env_guard();
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let before = rivus_runtime::fused_id_rows_total();
+    run(
+        &gp,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("parallel run");
+    let id_delta = rivus_runtime::fused_id_rows_total() - before;
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    run(
+        &gs,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("serial run");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    let a = std::fs::read_to_string(&out_par).unwrap();
+    let b = std::fs::read_to_string(&out_ser).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(a.lines().count() > 1, "expected real grouped output");
+    assert_eq!(a, b, "JSONL dict/id path must be byte-identical to serial");
+    if std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        < 2
+    {
+        eprintln!("skipping activation assert: <2 CPUs available");
+        return;
+    }
+    assert!(
+        id_delta > 0,
+        "JSONL dictionary chunks must engage the fused id fast path"
+    );
+}

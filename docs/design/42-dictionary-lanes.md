@@ -4,7 +4,9 @@ Status: **批准済み（2026-07-19、#180 記録 → 現運用は #240）・第
 （#241）・第 (b)(c) 段実装済み（(b) reader 低カード検出＋escape hatch＋発動
 可観測性 = wall +25-45ms の投資段、(c) fused loop の整数 id 直引き group/join
 で回収 — (b)+(c) 合算で CSV group 標準 median −58ms・全標準 bit-identical。
-計測は BENCHMARKS「design/42 stage (b)」「stage (c)」節）**。
+計測は BENCHMARKS「design/42 stage (b)」「stage (c)」節。**JSONL 側も実装済み**
+（批准スコープ「CSV/JSONL reader」の残り半分 — JSONL 標準 median −4〜5%・
+bit-identical、「design/42 (b)(c) JSONL side」節）**。
 批准条件 4 点＝①§2 不変条件の property test（dict vs plain の value()/gather/
 write_cell バイト一致）②高カード escape hatch 必須 ③(a)→(b)→(c) の段階ごとに
 既存ガード＋計測 ④発動可観測性を最初から（WPROF/strategy）。

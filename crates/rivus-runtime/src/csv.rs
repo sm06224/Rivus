@@ -1756,11 +1756,12 @@ enum Lane {
 
 /// Runtime dictionary cap (design/42 ratified default): a chunk whose column
 /// exceeds this many distinct values escapes to the plain lane mid-build.
-const DICT_CAP: usize = 4096;
+/// Shared with the JSONL reader (same contract, same observability).
+pub(crate) const DICT_CAP: usize = 4096;
 /// Sample-side candidate threshold: a column qualifies for dictionary builds
 /// only when the speculative sample saw at most this many distinct values
 /// (comfortably under `DICT_CAP`, so escapes stay rare by construction).
-const SAMPLE_DICT_MAX: usize = 256;
+pub(crate) const SAMPLE_DICT_MAX: usize = 256;
 
 /// A typed, pre-sized column accumulator that also tracks **per-row validity**
 /// (the null model; design 26 §26.3). A null row keeps a type-default backing
