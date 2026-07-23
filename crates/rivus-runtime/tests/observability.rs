@@ -939,3 +939,138 @@ fn jsonl_dict_lanes_activate_id_path_and_match_serial() {
         "JSONL dictionary chunks must engage the fused id fast path"
     );
 }
+
+/// #45 方式(b): f64 Sum/Avg/Std over a multi-file read→group flow — the
+/// previously serial-only agg set — now runs the file-major canonical fold on
+/// BOTH paths: parallel workers and the forced-serial mirror (the same
+/// machinery at P=1). Byte-identical across (a) parallel vs mirror and
+/// (b) chunk sizes (条件①), with the mirror's driver engagement asserted
+/// (its per-worker telemetry is non-empty even under RIVUS_NO_PARALLEL).
+#[test]
+fn f64_group_file_major_parallel_matches_serial_mirror() {
+    let dir = std::env::temp_dir().join(format!("rivus_canon_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in 0..3usize {
+        let mut t = String::from("region,amount\n");
+        for i in 0..20_000usize {
+            // Fractional amounts with a wide dynamic range — the case where
+            // a naive partition->merge sum drifts by ULPs (#41).
+            t.push_str(&format!(
+                "r{},{}\n",
+                (i + f) % 5,
+                (i as f64 * 1.000_001 + f as f64 * 0.377) * if i % 7 == 0 { 1e6 } else { 1e-3 }
+            ));
+        }
+        std::fs::write(dir.join(format!("p{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("p*.csv");
+    let mk = |out: &std::path::Path| {
+        format!(
+            "S: ls \"{}\" read as csv\n |# region sum:amount avg:amount std:amount\n \
+             sort region save {} ;",
+            glob.display(),
+            out.display()
+        )
+    };
+    let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
+    let run_one = |out: &std::path::Path, serial: bool, chunk: usize| {
+        let g = parse_opt(&mk(out));
+        let _guard = ();
+        if serial {
+            std::env::set_var("RIVUS_NO_PARALLEL", "1");
+        } else {
+            std::env::remove_var("RIVUS_NO_PARALLEL");
+        }
+        let r = run(
+            &g,
+            RunOptions {
+                chunk_size: chunk,
+                ..Default::default()
+            },
+        )
+        .expect("run");
+        std::env::remove_var("RIVUS_NO_PARALLEL");
+        r
+    };
+
+    let _env = env_guard();
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let out_par = dir.join("out_par.csv");
+    let out_ser = dir.join("out_ser.csv");
+    let out_cs = dir.join("out_cs.csv");
+    let rp = run_one(&out_par, false, 4096);
+    let rs = run_one(&out_ser, true, 4096);
+    let _ = run_one(&out_cs, false, 512);
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    let a = std::fs::read_to_string(&out_par).unwrap();
+    let b = std::fs::read_to_string(&out_ser).unwrap();
+    let c = std::fs::read_to_string(&out_cs).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(a.lines().count() > 1, "expected real grouped output");
+    assert_eq!(
+        a, b,
+        "f64 file-major: parallel must equal the serial mirror"
+    );
+    assert_eq!(a, c, "f64 file-major: chunk-size independent (条件①)");
+    // Mirror-activation assert: the forced-serial run went through the
+    // driver (per-file partial GroupBys), not the generic op chain.
+    assert!(
+        !rs.workers.is_empty(),
+        "the serial mirror must run the per-file driver at P=1"
+    );
+    if std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        >= 2
+    {
+        assert!(!rp.workers.is_empty(), "parallel run must use workers");
+    }
+}
+
+/// #45 条件④: the exact lanes are UNTOUCHED by the canonical trees — a
+/// decimal sum/avg still answers from the i128 path with the arithmetically
+/// exact value (pinned as text), identically on the parallel and serial
+/// paths. (An f64 fold of 30,000 × 0.10 would drift; the decimal lane must
+/// not.)
+#[test]
+fn decimal_exact_lane_unaffected_by_canonical_trees() {
+    let dir = std::env::temp_dir().join(format!("rivus_canon_dec_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in 0..2usize {
+        let mut t = String::from("k,amt\n");
+        for _ in 0..15_000usize {
+            t.push_str(&format!("g{f},0.10\n"));
+        }
+        std::fs::write(dir.join(format!("p{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("p*.csv");
+    let mk = |out: &std::path::Path| {
+        format!(
+            "S: ls \"{}\" read as csv cast amt :decimal(2)\n |# k sum:amt\n sort k save {} ;",
+            glob.display(),
+            out.display()
+        )
+    };
+    let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
+    let _env = env_guard();
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    let out_par = dir.join("out_par.csv");
+    run(&parse_opt(&mk(&out_par)), RunOptions::default()).expect("parallel");
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    let out_ser = dir.join("out_ser.csv");
+    run(&parse_opt(&mk(&out_ser)), RunOptions::default()).expect("serial");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    let a = std::fs::read_to_string(&out_par).unwrap();
+    let b = std::fs::read_to_string(&out_ser).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(a, b, "decimal outputs must match across paths");
+    // 15,000 × 0.10 = 1500.00 exactly — the i128 lane's answer.
+    assert!(
+        a.contains("1500.00") || a.contains("1500.0"),
+        "decimal sum must be arithmetically exact: {a}"
+    );
+}
