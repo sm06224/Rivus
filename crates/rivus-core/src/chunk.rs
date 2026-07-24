@@ -890,6 +890,31 @@ impl Column {
         self.data.append(&other.data);
         self.validity.append(self_len, &other.validity, other_len);
     }
+
+    /// Rebuild this column on the plain Str lane: every non-null cell becomes
+    /// its `Value` Display text — the exact bytes group keys, join keys, and
+    /// the CSV writer already render for a non-Str lane — and nulls stay null
+    /// ("" under a null validity bit, like the readers produce). Used by
+    /// [`Chunk::concat_reconciling`] to merge buffered chunks whose lanes
+    /// disagree.
+    pub fn widen_to_str(&self) -> Column {
+        if matches!(self.data, ColumnData::Str(_)) {
+            return self.clone();
+        }
+        let n = self.data.len();
+        let mut s = StrColumn::default();
+        for i in 0..n {
+            if self.is_null(i) {
+                s.push("");
+            } else {
+                s.push(&self.value_at(i).to_string());
+            }
+        }
+        Column {
+            data: ColumnData::Str(s),
+            validity: self.validity.clone(),
+        }
+    }
 }
 
 /// A bounded, columnar, metadata-bearing batch of rows.
@@ -927,6 +952,52 @@ impl Chunk {
 
     pub fn value(&self, row: usize, col: usize) -> Value {
         self.columns[col].value_at(row)
+    }
+
+    /// Concatenate buffered chunks (source order) into one, **reconciling
+    /// lane drift**. Chunks of one stream normally share their lanes, but a
+    /// computed column's lane is data-dependent per chunk (a `case` over
+    /// mixed branches: an all-int chunk infers I64, a mixed one Str), and a
+    /// variant-mismatched `ColumnData::append` is a silent no-op — the
+    /// column truncates and the result is a ragged chunk (debug assert /
+    /// corrupt in release; audit 2026-07-24). When lanes disagree, both
+    /// sides widen to the plain Str lane ([`Column::widen_to_str`] — each
+    /// non-null cell its `Value` Display, the same bytes keys and the CSV
+    /// writer render) and the schema field's dtype follows. The Str/StrDict
+    /// pair is NOT a mismatch (design/42: one logical lane; `append`
+    /// materializes). Returns `None` for an empty buffer.
+    pub fn concat_reconciling(bufs: Vec<Chunk>) -> Option<Chunk> {
+        let mut it = bufs.into_iter();
+        let first = it.next()?;
+        let mut schema = first.schema.clone();
+        let mut cols = first.columns;
+        let mut widened: Vec<usize> = Vec::new();
+        for c in it {
+            for (i, col) in c.columns.iter().enumerate() {
+                let str_family =
+                    |d: &ColumnData| matches!(d, ColumnData::Str(_) | ColumnData::StrDict(_));
+                let compat = std::mem::discriminant(cols[i].data())
+                    == std::mem::discriminant(col.data())
+                    || (str_family(cols[i].data()) && str_family(col.data()));
+                if compat {
+                    cols[i].append(col);
+                } else {
+                    if !matches!(cols[i].data(), ColumnData::Str(_)) {
+                        cols[i] = cols[i].widen_to_str();
+                    }
+                    cols[i].append(&col.widen_to_str());
+                    widened.push(i);
+                }
+            }
+        }
+        if !widened.is_empty() {
+            let mut fields = schema.fields.clone();
+            for &i in &widened {
+                fields[i].dtype = DataType::Str;
+            }
+            schema = Arc::new(Schema::new(fields));
+        }
+        Some(Chunk::new(0, schema, cols))
     }
 
     /// Keep only the rows whose index appears in `indices`, preserving schema

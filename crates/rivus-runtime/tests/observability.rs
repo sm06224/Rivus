@@ -1177,3 +1177,84 @@ fn segment_write_failure_is_surfaced_not_silent() {
         "counted rows must be reset when their segment is dropped"
     );
 }
+
+/// Audit 2026-07-24 (confirmed bug #2): a pre-join ProjectExpr re-derives its
+/// schema PER CHUNK (a `case` lane is data-dependent: all-int chunk → I64,
+/// mixed → Str), but resolve_fused_plan's Str gate checks only the first
+/// chunk per worker. A later all-int chunk then hit fused_push_key's
+/// CoalesceLeft `_ => lit` fallback: the composite key said "na" while
+/// fused_value rendered the actual int — fused bytes diverged from the
+/// generic chain, breaking the fused==generic contract. The fallback now
+/// Display-writes the cell (like push_col's `_` arm), so key and value stay
+/// coherent and fused == generic again.
+#[test]
+fn fused_coalesce_key_matches_generic_when_lane_shifts_mid_worker() {
+    let dir = std::env::temp_dir().join(format!("rivus_coal_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dim.csv"), "region,country\nr0,JP\nr1,US\n").unwrap();
+    for f in 0..2usize {
+        let mut t = String::from("region,tag,amt\n");
+        // Rows 0..64 (chunk 1 at chunk_size=64): mixed case results → the
+        // projected `x` lane is Str, so the fused plan resolves CoalesceLeft.
+        for i in 0..64usize {
+            let tag = if i % 2 == 0 { "x" } else { "y" };
+            t.push_str(&format!("r{},{},{}\n", i % 2, tag, i % 10));
+        }
+        // Rows 64..128 (chunk 2): all "x" → every case result is the int 1 →
+        // the re-derived `x` lane is I64 (non-null) — the reachable fallback.
+        for i in 64..128usize {
+            t.push_str(&format!("r{},x,{}\n", i % 2, i % 10));
+        }
+        std::fs::write(dir.join(format!("cx{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("cx*.csv");
+    let mk = |out: &std::path::Path| {
+        format!(
+            "D: open {} (region:str country:str) ;\n\
+             S: ls \"{}\" read as csv\n |> region (case when tag == \"x\" then 1 else tag end) as x amt ;\n\
+             J: S &left D on region\n |> (coalesce(x, \"na\")) as k amt\n |# k sum:amt\n save {} ;\n",
+            dir.join("dim.csv").display(),
+            glob.display(),
+            out.display()
+        )
+    };
+    let run_flow = |out: &std::path::Path| {
+        let g = rivus_parser::parse(&mk(out)).expect("parse");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: 64,
+                ..Default::default()
+            },
+        )
+        .expect("run")
+    };
+
+    let _env = env_guard();
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    let out_ser = dir.join("out_ser.csv");
+    run_flow(&out_ser);
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let out_par = dir.join("out_par.csv");
+    let rp = run_flow(&out_par);
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    assert!(
+        rp.strategy
+            .as_deref()
+            .is_some_and(|s| s.contains("parallel read group-by")),
+        "the parallel group driver must engage (else this guards nothing): {:?}",
+        rp.strategy
+    );
+    let a = std::fs::read_to_string(&out_ser).unwrap();
+    let b = std::fs::read_to_string(&out_par).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The generic chain keys chunk-2 rows under "1" (coalesce of a non-null
+    // int); the broken fused arm keyed them under "na".
+    assert!(
+        a.contains("1,"),
+        "oracle must contain the int-keyed group: {a}"
+    );
+    assert_eq!(a, b, "fused must be byte-identical to the generic chain");
+}

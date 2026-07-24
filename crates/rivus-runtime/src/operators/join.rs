@@ -97,18 +97,12 @@ pub(crate) fn fill_join_key(chunk: &Chunk, idxs: &[usize], row: usize, buf: &mut
     true
 }
 
-/// Concatenate buffered chunks (sharing a schema) into one.
+/// Concatenate buffered chunks into one — reconciling per-chunk lane drift
+/// (a computed column's lane is data-dependent per chunk; the naive append
+/// silently truncated it into a ragged chunk — audit 2026-07-24). See
+/// [`Chunk::concat_reconciling`].
 fn concat_chunks(bufs: Vec<Chunk>) -> Option<Chunk> {
-    let mut it = bufs.into_iter();
-    let first = it.next()?;
-    let schema = first.schema.clone();
-    let mut cols = first.columns;
-    for c in it {
-        for (i, col) in c.columns.iter().enumerate() {
-            cols[i].append(col);
-        }
-    }
-    Some(Chunk::new(0, schema, cols))
+    Chunk::concat_reconciling(bufs)
 }
 
 impl Join {

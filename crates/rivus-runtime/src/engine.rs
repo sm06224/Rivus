@@ -3653,6 +3653,13 @@ struct FusedPlan {
     /// unmatched-left (`ri = None`) variant; `None` = no right-only prefix
     /// (or an unusually large right side, capped to bound the precompute).
     right_prefix: Option<(usize, Vec<String>)>,
+    /// The left-schema dtypes this plan resolved against. A pre-join computed
+    /// column re-derives its lane PER CHUNK (a `case` over mixed branches:
+    /// all-int chunk → I64, mixed → Str), so a later chunk can arrive with
+    /// lanes the resolved cells no longer describe — the fused loop validates
+    /// each chunk against this and turns itself off (sticky, lossless
+    /// fallback) on a shift (audit 2026-07-24).
+    left_dtypes: Vec<rivus_core::DataType>,
 }
 
 fn resolve_fused_plan(
@@ -3799,6 +3806,7 @@ fn resolve_fused_plan(
         key_cells,
         agg_cells,
         right_prefix,
+        left_dtypes: left.fields.iter().map(|f| f.dtype).collect(),
     })
 }
 
@@ -3837,11 +3845,24 @@ fn fused_push_key(
         },
         FusedCell::CoalesceLeft(ci, lit) => {
             key.push('\u{1}');
-            match l.columns[*ci].data() {
-                ColumnData::Str(s) if !l.columns[*ci].is_null(li) => key.push_str(s.get(li)),
-                // Dict lane is the same Str lane (design/42): cell, not literal.
-                ColumnData::StrDict(d) if !l.columns[*ci].is_null(li) => key.push_str(d.get(li)),
-                _ => key.push_str(lit),
+            if l.columns[*ci].is_null(li) {
+                key.push_str(lit);
+            } else {
+                match l.columns[*ci].data() {
+                    ColumnData::Str(s) => key.push_str(s.get(li)),
+                    // Dict lane is the same Str lane (design/42): cell, not
+                    // literal.
+                    ColumnData::StrDict(d) => key.push_str(d.get(li)),
+                    // A non-null non-Str cell renders itself (Display), like
+                    // push_col's `_` arm and `fused_value` — encoding the
+                    // LITERAL here made key and value disagree when a chunk
+                    // arrived with a shifted lane (audit 2026-07-24). The
+                    // per-chunk plan validation now bails before this can
+                    // happen; this arm keeps key/value coherent regardless.
+                    _ => {
+                        let _ = write!(key, "{}", l.value(li, *ci));
+                    }
+                }
             }
         }
         FusedCell::CoalesceRight(ci, lit) => {
@@ -3850,7 +3871,12 @@ fn fused_push_key(
                 Some(r_) if !r.columns[*ci].is_null(r_) => match r.columns[*ci].data() {
                     ColumnData::Str(s) => key.push_str(s.get(r_)),
                     ColumnData::StrDict(d) => key.push_str(d.get(r_)),
-                    _ => key.push_str(lit),
+                    // Same coherence rule as CoalesceLeft (the right side is
+                    // resolution-validated and prebuilt, so this is currently
+                    // unreachable — kept identical for symmetry).
+                    _ => {
+                        let _ = write!(key, "{}", r.value(r_, *ci));
+                    }
                 },
                 _ => key.push_str(lit),
             }
@@ -4196,6 +4222,25 @@ fn worker_feed(
                 match resolve_fused_plan(sp, graph, shape, &c.schema, right, rk) {
                     Some(p) => fu.plan = Some(p),
                     None => fu.off = true,
+                }
+            }
+            // A resolved plan only fits chunks whose lanes still match the
+            // schema it resolved against (a pre-join computed column can
+            // shift its lane per chunk — see FusedPlan::left_dtypes). A
+            // shifted chunk turns the fused loop OFF (sticky) and routes down
+            // the generic ops below — the same lossless fallback as an
+            // unresolvable plan. The fused prefix precedes the fallback
+            // suffix in file order (off is one-way), so group first-seen
+            // order stays the serial order.
+            if let (Some(plan), false) = (&fu.plan, fu.off) {
+                let same = plan.left_dtypes.len() == c.schema.fields.len()
+                    && plan
+                        .left_dtypes
+                        .iter()
+                        .zip(&c.schema.fields)
+                        .all(|(d, f)| *d == f.dtype);
+                if !same {
+                    fu.off = true;
                 }
             }
             if let (Some(plan), false) = (&fu.plan, fu.off) {
