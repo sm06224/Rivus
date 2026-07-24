@@ -1258,3 +1258,68 @@ fn fused_coalesce_key_matches_generic_when_lane_shifts_mid_worker() {
     );
     assert_eq!(a, b, "fused must be byte-identical to the generic chain");
 }
+
+/// Audit 2026-07-24 (confirmed bug #6): GroupBy::finish required EVERY group
+/// to carry the runtime-observed exact lane (dec_scale/dur_unit/…), so one
+/// group whose cast-to-decimal failed on every row (all cells null → zero
+/// observations) silently dropped the WHOLE column to the f64 path — float
+/// money against the #202 contract, and a serial-vs-parallel byte divergence
+/// on the drivers that admit decimal sum/avg from the static sampled type.
+/// The rule is now: an empty group emits a NULL cell and does not veto; the
+/// exact lane holds for everyone else, byte-identically on every path.
+#[test]
+fn exact_lane_survives_an_all_null_group() {
+    let dir = std::env::temp_dir().join(format!("rivus_declane_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (f, rows) in [
+        (0, "a,12.34\na,10.00\nb,5.50\nbad,oops\n"),
+        (1, "a,2.34\nb,4.50\nbad,nope\n"),
+    ] {
+        std::fs::write(dir.join(format!("dl{f}.csv")), format!("k,amt\n{rows}")).unwrap();
+    }
+    let glob = dir.join("dl*.csv");
+    let mk = |out: &std::path::Path| {
+        format!(
+            "S: ls \"{}\" read as csv\n cast amt :decimal(2)\n |# k sum:amt avg:amt min:amt max:amt\n sort k\n save {} ;",
+            glob.display(),
+            out.display()
+        )
+    };
+    let run_flow = |out: &std::path::Path| {
+        let g = rivus_parser::parse(&mk(out)).expect("parse");
+        run(&g, RunOptions::default()).expect("run")
+    };
+
+    let _env = env_guard();
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    let out_ser = dir.join("out_ser.csv");
+    run_flow(&out_ser);
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let out_par = dir.join("out_par.csv");
+    let rp = run_flow(&out_par);
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    assert!(
+        rp.strategy
+            .as_deref()
+            .is_some_and(|s| s.contains("parallel read group-by")),
+        "the parallel group driver must engage (else this guards nothing): {:?}",
+        rp.strategy
+    );
+    let a = std::fs::read_to_string(&out_ser).unwrap();
+    let b = std::fs::read_to_string(&out_par).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The exact decimal lane must hold: sum(a) = 24.68 exactly, two decimals.
+    assert!(
+        a.contains("24.68"),
+        "decimal lane must survive (exact sum, not a float collapse): {a}"
+    );
+    // The all-null group emits null cells (empty), not fake zeros.
+    assert!(
+        a.lines()
+            .any(|l| l.starts_with("bad,") && l.ends_with(",,,,")),
+        "the empty group's exact cells must be null: {a}"
+    );
+    assert_eq!(a, b, "serial and parallel bytes must be identical");
+}
