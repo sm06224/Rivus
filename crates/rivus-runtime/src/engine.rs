@@ -2310,10 +2310,21 @@ fn worker_read_to_segment(
     let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
     let sep = delim as char;
     let mut line = String::new();
+    // A write/flush failure is sticky: the first one is surfaced as Critical
+    // and the segment is dropped at the end (a failed BufWriter can hold a
+    // partial line, and concatenating a truncated tail would garble the next
+    // segment's first row in the final file). `RIVUS_TEST_SEG_WRITE_FAIL`
+    // injects the failure for tests — ENOSPC is not portably reproducible.
+    let mut write_failed = false;
+    let inject_fail = std::env::var_os("RIVUS_TEST_SEG_WRITE_FAIL").is_some();
     let mut emit = |chunks: Vec<Chunk>,
                     header: &mut Option<String>,
                     rows: &mut u64,
-                    errors: &mut Vec<ErrorEvent>| {
+                    errors: &mut Vec<ErrorEvent>,
+                    write_failed: &mut bool| {
+        if *write_failed {
+            return; // already surfaced; don't stack one Critical per chunk
+        }
         for ch in chunks {
             if header.is_none() {
                 *header = Some(format!(
@@ -2330,7 +2341,12 @@ fn worker_read_to_segment(
                     operators::write_cell(&mut line, &ch.columns[c], row, delim);
                 }
                 line.push('\n');
-                if let Err(e) = w.write_all(line.as_bytes()) {
+                let res = if inject_fail {
+                    Err(std::io::Error::other("injected segment write failure"))
+                } else {
+                    w.write_all(line.as_bytes())
+                };
+                if let Err(e) = res {
                     errors.push(
                         ErrorEvent::new(
                             Severity::Critical,
@@ -2339,6 +2355,7 @@ fn worker_read_to_segment(
                         )
                         .at_node(read_label.to_string()),
                     );
+                    *write_failed = true;
                     return;
                 }
                 *rows += 1;
@@ -2384,7 +2401,7 @@ fn worker_read_to_segment(
         let out = run_level(&mut ops, 0, vec![ch], &mut errors, &mut next_id);
         t_ops += t2.elapsed();
         let t3 = Instant::now();
-        emit(out, &mut header, &mut rows, &mut errors);
+        emit(out, &mut header, &mut rows, &mut errors, &mut write_failed);
         t_emit += t3.elapsed();
     }
     if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
@@ -2408,10 +2425,32 @@ fn worker_read_to_segment(
         };
         if !fin.is_empty() {
             let out = run_level(&mut ops, i + 1, fin, &mut errors, &mut next_id);
-            emit(out, &mut header, &mut rows, &mut errors);
+            emit(out, &mut header, &mut rows, &mut errors, &mut write_failed);
         }
     }
-    let _ = w.flush();
+    // A flush failure (ENOSPC/EDQUOT at the 256 KiB buffer boundary) is the
+    // same silent-loss hole as a failed write_all: rows were counted but the
+    // bytes never landed. Surface it (never-silent) instead of discarding.
+    if let Err(e) = w.flush() {
+        if !write_failed {
+            errors.push(
+                ErrorEvent::new(
+                    Severity::Critical,
+                    ErrorScope::Graph,
+                    format!("segment flush failed for '{uri}': {e}"),
+                )
+                .at_node(read_label.to_string()),
+            );
+        }
+        write_failed = true;
+    }
+    if write_failed {
+        // Drop the whole segment: its tail may end mid-line, and the row
+        // count no longer matches what is on disk. The Critical above is the
+        // never-silent record; the finalizer skips a rows==0 missing segment.
+        let _ = std::fs::remove_file(seg);
+        rows = 0;
+    }
     let bad = dec.bad_rows();
     if bad > 0 {
         errors.push(
@@ -2775,6 +2814,7 @@ fn try_parallel_read_sink(
     let mut total_rows = 0u64;
     let mut header: Option<String> = None;
     let nseg = worker_results.len();
+    let seg_rows: Vec<u64> = worker_results.iter().map(|r| r.1).collect();
     for (errs, rows, hdr, _) in worker_results.into_iter() {
         errors.extend(errs);
         total_rows += rows;
@@ -2793,8 +2833,17 @@ fn try_parallel_read_sink(
             w.write_all(h.as_bytes())?;
         }
         for i in 0..nseg {
-            if let Ok(mut rf) = std::fs::File::open(seg_path(i)) {
-                std::io::copy(&mut rf, &mut w)?;
+            match std::fs::File::open(seg_path(i)) {
+                Ok(mut rf) => {
+                    std::io::copy(&mut rf, &mut w)?;
+                }
+                // A missing segment whose worker reported zero rows is an
+                // already-surfaced case (create failed / vanished file /
+                // dropped after a write failure — each pushed its own error).
+                // A missing segment with counted rows is real, un-surfaced
+                // data loss: propagate instead of silently skipping.
+                Err(_) if seg_rows[i] == 0 => {}
+                Err(e) => return Err(e),
             }
         }
         w.flush()

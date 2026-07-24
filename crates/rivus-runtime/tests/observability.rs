@@ -1074,3 +1074,106 @@ fn decimal_exact_lane_unaffected_by_canonical_trees() {
         "decimal sum must be arithmetically exact: {a}"
     );
 }
+
+/// A segment write/flush failure on the parallel read→sink driver is
+/// never-silent (audit 2026-07-24): the worker surfaces exactly ONE Critical
+/// error (sticky — not one per chunk), drops its possibly-mid-line segment,
+/// and reports zero rows, so the final file keeps a valid structure (here:
+/// header only, since the injection hits every worker) instead of silently
+/// concatenating a truncated tail. `RIVUS_TEST_SEG_WRITE_FAIL` injects the
+/// failure — a real ENOSPC is not portably reproducible in a test.
+#[test]
+fn segment_write_failure_is_surfaced_not_silent() {
+    let dir = std::env::temp_dir().join(format!("rivus_segfail_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in 0..2usize {
+        let mut t = String::from("id,region\n");
+        for i in 0..2_000usize {
+            t.push_str(&format!("{i},r{}\n", i % 3));
+        }
+        std::fs::write(dir.join(format!("sf{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("sf*.csv");
+    let out = dir.join("out_segfail.csv");
+    let src = format!(
+        "S: ls \"{}\" read as csv save {} ;",
+        glob.display(),
+        out.display()
+    );
+    let g = rivus_parser::parse(&src).expect("parse");
+    // chunk_size 64 → many emit calls per worker; the sticky flag must keep
+    // the error count at one per file, not one per chunk.
+    let opts = || RunOptions {
+        chunk_size: 64,
+        ..Default::default()
+    };
+
+    let _env = env_guard();
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+
+    // Control: the parallel sink driver engages and writes every row.
+    let ok = run(&g, opts()).expect("control run");
+    assert!(
+        ok.strategy
+            .as_deref()
+            .is_some_and(|s| s.contains("parallel read sink")),
+        "the parallel sink driver must engage (else this guards nothing): {:?}",
+        ok.strategy
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().lines().count(),
+        1 + 4_000,
+        "control run must write all rows"
+    );
+
+    // Injected write failure in every segment worker.
+    std::env::set_var("RIVUS_TEST_SEG_WRITE_FAIL", "1");
+    let bad = run(&g, opts()).expect("failure run");
+    std::env::remove_var("RIVUS_TEST_SEG_WRITE_FAIL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    assert!(
+        bad.strategy
+            .as_deref()
+            .is_some_and(|s| s.contains("parallel read sink")),
+        "the failure run must still ride the parallel sink driver: {:?}",
+        bad.strategy
+    );
+    let seg_errs: Vec<_> = bad
+        .errors
+        .iter()
+        .filter(|e| e.message.contains("segment write failed"))
+        .collect();
+    assert_eq!(
+        seg_errs.len(),
+        2,
+        "exactly one sticky Critical per failed worker (2 files): {:?}",
+        bad.errors
+    );
+    assert!(
+        seg_errs
+            .iter()
+            .all(|e| e.severity == rivus_core::Severity::Critical),
+        "segment write failures must be Critical: {seg_errs:?}"
+    );
+    let bytes = std::fs::read_to_string(&out).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        bytes.lines().count(),
+        1,
+        "failed segments must be dropped whole (header only), not \
+         concatenated as truncated tails: {bytes:?}"
+    );
+    // Telemetry must not claim rows that never reached the disk.
+    let read_rows = bad
+        .telemetry
+        .iter()
+        .find(|t| t.kind == "read")
+        .map(|t| t.rows_out);
+    assert_eq!(
+        read_rows,
+        Some(0),
+        "counted rows must be reset when their segment is dropped"
+    );
+}
