@@ -1119,7 +1119,12 @@ impl Parser {
     /// aggregates. A leading word is an aggregate (not a key) only when it is a
     /// known agg func immediately followed by `:` (e.g. `sum:score`); every other
     /// leading word is a key, and at least one key is required. Shared by `|#`
-    /// and the `group` alias so the two stay identical (§25, #171).
+    /// and the `group` alias so the two stay identical (§25, #171). Like every
+    /// other column list, the keys stop at a stage keyword — without that break
+    /// `|# region save out.csv` absorbed `save out.csv` as keys and the sink
+    /// silently vanished (audit 2026-07-24; a column literally named like a
+    /// stage keyword cannot be a bare group key, same trade-off as the P4 `by`
+    /// rule).
     fn parse_group_tail(&mut self, current: NodeId) -> Result<NodeId, RivusError> {
         let is_agg = |p: &Self| {
             matches!(p.tok(), Tok::Word(w)
@@ -1127,8 +1132,8 @@ impl Parser {
                     && p.toks[p.pos + 1].0 == Tok::Colon)
         };
         let mut keys = Vec::new();
-        while let Tok::Word(_) = self.tok() {
-            if is_agg(self) {
+        while let Tok::Word(w) = self.tok() {
+            if is_agg(self) || is_keyword(w) {
                 break;
             }
             keys.push(self.word()?);
@@ -2598,6 +2603,14 @@ fn resolve_format(path: &str, explicit: Option<&str>) -> Option<Format> {
     }
 }
 
+/// Stage keywords: every word that can BEGIN a pipeline stage in a flow body.
+/// Column-list loops (group keys, sort keys, project names, join `on` keys, …)
+/// break on these, so **every new stage word MUST be added here** — a stage
+/// word missing from this list is silently absorbed as a column name by the
+/// preceding list loop and its statement vanishes (the `|# region save
+/// out.csv` bug, audit 2026-07-24). Words that only appear inside one
+/// construct (`by`, `over`, `within`, `asc`/`desc`) are per-call-site stops by
+/// design, not global keywords.
 fn is_keyword(w: &str) -> bool {
     matches!(
         w,
@@ -2676,6 +2689,40 @@ mod tests {
     fn nth_op(src: &str, n: usize) -> Op {
         let g = parse(src).unwrap();
         g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn group_keys_stop_at_stage_keywords() {
+        // Audit 2026-07-24: the group key loop was the only column list
+        // without an is_keyword break, so `|# region save out.csv` absorbed
+        // `save` and `out.csv` as KEYS and the sink silently vanished (empty
+        // error stream, round-trip-stable but wrong). A stage keyword after
+        // the keys must now begin its own stage node.
+        let g = parse("F:\n open d.csv\n |# region\n save out.csv\n;").unwrap();
+        assert!(
+            g.nodes.iter().any(|n| matches!(n.op, Op::Sink { .. })),
+            "save after group must build a sink"
+        );
+        let keys = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::GroupBy { keys, .. } => Some(keys.clone()),
+                _ => None,
+            })
+            .expect("group node");
+        assert_eq!(keys.len(), 1, "only `region` is a key: {keys:?}");
+
+        // The other stage keywords likewise stay stages after a group.
+        let g = parse("F:\n open d.csv\n |# region count:id\n sort region\n take 5\n;").unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Sort { .. })));
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Take { .. })));
+        let g = parse("F:\n open d.csv\n |# region\n distinct region\n print\n;").unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Distinct { .. })));
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::SinkPrint)));
+        // Same via the `group` alias route (shared tail).
+        let g = parse("F:\n open d.csv\n group region\n save o.csv\n;").unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Sink { .. })));
     }
 
     #[test]
