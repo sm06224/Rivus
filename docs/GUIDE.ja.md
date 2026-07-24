@@ -88,7 +88,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | 構文 | 読み込むもの |
 |---|---|
 | `open PATH` | 拡張子で形式判定（`.csv`→CSV、`.jsonl`/`.ndjson`/`.json`→JSON、`.parquet`→Parquet） |
-| `open PATH as FMT` | 形式を強制（`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson` \| `parquet`） |
+| `open PATH as FMT` | 形式を強制（`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson` \| `parquet` \| `bin` — `bin` はバイナリのフィールド列も取る、下の行参照） |
 | `open PATH`（`.tsv`/`.tab`） | **TSV** — タブ区切り、拡張子で判定（std のみ）。`as tsv` で任意パスに強制、`as csv` でカンマに戻す |
 | `open PATH.gz` / `PATH.zst` | **圧縮** CSV/TSV — gzip（`.gz`、`--features gzip`）または zstd（`.zst`/`.zstd`、`--features zstd`）。直列・単一パス・有界メモリ。既定（依存ゼロ）ビルドは `rebuild with --features gzip`/`zstd` を促すエラー |
 | `open PATH.parquet` | **Apache Parquet**（`--features parquet`・読み取りのみ）：ファイル埋め込みスキーマから型付きレーンへ直行 — int64→int・double→float・utf8→str・DATE→date・TIMESTAMP millis/micros→datetime・DECIMAL→decimal、null も本物。非圧縮/snappy/gzip、row-group ストリーミング（有界メモリ）、ネスト列は誘導付きエラー。既定（依存ゼロ）ビルドは `--features parquet` を促すエラー |
@@ -96,7 +96,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定 — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点）, `datetime[("fmt")]`（厳密な時刻）, `duration`（符号付き時間量）, `date`（ISO `yyyy-MM-dd` の暦日）, `time`（`HH:mm:ss` の時刻、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む。`open log.csv (ts:datetime("yyMMddHHmmss"))` は `ts` を時刻として読む |
 | `readcsv PATH` | CSV を明示 |
 | `readjson PATH` | JSON / JSON Lines を明示 |
-| `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ） |
+| `open PATH as bin [be] [aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ）。既定の `le`/`packed` は書かない。拡張子は `bin` を暗示しない（常に `as bin` を明示）。旧 `readbin PATH …` も本リリースは parse 可・`rivus fmt` が正典へ書換 |
 | `open stdin` / `open -` | 標準入力から CSV（または `as FMT`）を読む |
 | `stream NAME` | 名前付きフローを再生（MVP: 参照） |
 
@@ -117,7 +117,7 @@ JSON 配列（`[ {...}, {...} ]`）、固定長バイナリ。JSON/JSONL/NDJSON 
 **バイナリ例** — `(i32 id, i32 age, f64 score, u8 active)` レコードをデコード：
 
 ```
-B: readbin dump.bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
+B: open dump.bin as bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
 ```
 
 `le`/`be` でバイト順を選択（既定リトルエンディアン）、`packed`（既定）vs `aligned`
@@ -125,7 +125,7 @@ B: readbin dump.bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
 `i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool`、加えて **`char[N]`** — 固定 `N` バイトの
 テキスト欄（C の `char[N]`）を UTF-8 デコードします。**全 `N` バイトを値として保持**
 （末尾 NUL／パディングも含む・`char[N]` は 1 バイト境界）。例：
-`readbin people.bin (id:i32 name:char[16])` は 16 バイトの名前欄を読みます。
+`open people.bin as bin (id:i32 name:char[16])` は 16 バイトの名前欄を読みます。
 
 ### 来歴（provenance）— `with source` / `with filename`
 
@@ -1181,8 +1181,9 @@ scope      = IDENT ':' body ';'  |  ':' body ';' IDENT? ;     (named / anonymous
 body       = source transform* ;
 
 source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
-           | 'readcsv' PATH | 'readjson' PATH
-           | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
+           | 'open' PATH 'as' 'bin' ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
+           | 'readcsv' PATH | 'readjson' PATH                       (旧綴り; fmt が書換)
+           | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'   (旧綴り; fmt が書換)
            | 'stream' IDENT
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 

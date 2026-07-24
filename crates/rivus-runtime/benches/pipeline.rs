@@ -270,7 +270,7 @@ fn bench_binary(c: &mut Criterion) {
 
     g.bench_function("filter_only", |b| {
         let src =
-            format!("F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n;");
+            format!("F:\n open {p} as bin (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n;");
         b.iter(|| black_box(run_source(&src)));
     });
 

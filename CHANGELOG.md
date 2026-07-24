@@ -7,6 +7,32 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **design/38 — the binary source joins `open` (`as bin`; migration release,
+  breaking next release).** The canonical spelling is
+  `open PATH as bin [be] [aligned] (name:bintype …) [with source]`: `bin` is
+  the single format word (`binary` was not adopted), the layout modifiers
+  stay `le`/`be` (default little-endian) and `packed`/`aligned` (default
+  packed), and **defaults are never rendered** — `rivus fmt` suppresses
+  `le`/`packed`, so the canonical form is a fixed point. The legacy `readbin`
+  verb still parses this release and `fmt` rewrites it to the canonical form
+  (the identical `Codec::Binary` op — fields, endianness, and alignment
+  preserved, pinned by round-trip tests); **next release it becomes a
+  never-silent did-you-mean error**. Misuse errors teach the canonical form:
+  `as bin` with `noheader`, a CSV-vocabulary declared schema (`(id:int)`)
+  under `as bin`, a binary layout modifier (`be`/`aligned`/`le`/`packed`) on
+  a text codec, an empty field list, and `char` without its `[N]` width all
+  fail with a pointer to the right spelling. **No extension implies the
+  binary codec** — `.bin` without `as bin` still resolves to the CSV default;
+  `as bin` is always explicit. The parse branch forks immediately after
+  `as bin` (before the paren), so `open x.dat as bin (id:i32)` reads binary
+  fields instead of tripping over the CSV schema vocabulary.
+- **Codec×option consistency on `open` — never-silent.** `noheader` and a
+  declared schema `(col[:type] …)` configure the CSV codec only; on a
+  JSONL/JSON/Parquet `open` they used to parse and be **silently ignored**
+  (an accepted option that does nothing). They are now errors that teach
+  where the option belongs: `open d.jsonl noheader`,
+  `open d.jsonl (a:int b:str)`, and `open d.parquet noheader (a:int)` all
+  fail with a pointer to the CSV form.
 - **f64 `sum`/`avg`/`std` are now parallel — and their values shift ONCE (#45,
   canonical reduction trees).** Group-by f64 moments are computed with a
   fixed-block canonical reduction tree (BLOCK=128) plus a file-major fold:
@@ -80,8 +106,11 @@ All notable changes to Rivus. Format loosely follows
   still parse and `rivus fmt` rewrites them to the canonical spelling
   (auto-migration, pinned by round-trip tests); **next release the deleted
   spellings become never-silent errors** with a did-you-mean pointing at the
-  survivor. `readbin` is deferred to that flip (its binary schema has no
-  `open` equivalent yet). Also fixed while auditing the migration: a codec
+  survivor. (Correction: `readbin` was initially listed among these aliases,
+  but it is not one — it carries its own grammar, a binary field schema plus
+  the `le`/`be`/`packed`/`aligned` layout modifiers — so its retirement is
+  the `open … as bin` **absorption** in its own entry above, not part of
+  this alias deletion.) Also fixed while auditing the migration: a codec
   that disagrees with the path extension now round-trips explicitly —
   `readjson d.weird` renders `open d.weird as jsonl` (it used to render bare
   and re-parse as CSV, a silent semantic flip), and a CSV `save` onto a
