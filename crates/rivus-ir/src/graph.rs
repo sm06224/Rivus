@@ -1998,49 +1998,14 @@ impl PlanGraph {
 
         for node in labeled {
             let label = node.label.as_ref().unwrap();
-            let inputs = self.inputs_of(node.id);
-
-            // Merge / join scopes render as `Label: A + B ;`.
-            match &node.op {
-                Op::Merge => {
-                    let names = self.input_labels(&inputs).join(" + ");
-                    let _ = writeln!(out, "{label}:\n    {names}\n;");
-                    continue;
-                }
-                Op::Join {
-                    left_keys,
-                    right_keys,
-                    kind,
-                } => {
-                    let sep = format!(" {} ", kind.amp());
-                    let names = self.input_labels(&inputs).join(&sep);
-                    let on = join_on_clause(left_keys, right_keys);
-                    let _ = writeln!(out, "{label}:\n    {names} {on}\n;");
-                    continue;
-                }
-                Op::AsofJoin { by, ts, tolerance } => {
-                    // Canonical as-of spelling (design/38 P4):
-                    // `Label: Left &asof Right [on k…] by ts [within "dur"] ;`
-                    // — `&asof` is a peer of `&left`/`&right`/`&full`, `by`
-                    // names the temporal axis. The retired `& … asof ts` form
-                    // still parses this release and rewrites to this.
-                    let names = self.input_labels(&inputs).join(" &asof ");
-                    let mut clause = String::new();
-                    if !by.is_empty() {
-                        clause.push_str(&format!("on {} ", by.join(" ")));
-                    }
-                    clause.push_str(&format!("by {ts}"));
-                    if let Some(t) = tolerance {
-                        clause.push_str(&format!(" within \"{t}\""));
-                    }
-                    let _ = writeln!(out, "{label}:\n    {names} {clause}\n;");
-                    continue;
-                }
-                _ => {}
-            }
-
-            // Otherwise walk the linear chain ending at this node, inlining any
-            // branch children that fan out from it.
+            // Walk the chain ending at this node, inlining branch children
+            // that fan out from it. A bare merge/join/as-of scope is just the
+            // single-node case: `write_chain`'s fan-in head renders the
+            // binary `A + B` / `A &kind B on k` line AND the node's leading
+            // comments and hooks. (These scopes used to have their own
+            // head-only arms here, which silently dropped a hook or comment
+            // attached to the fan-in node — audit 2026-07-24; `rivus fmt`
+            // deleted user error hooks on a bare merge scope.)
             let _ = writeln!(out, "{label}:");
             self.write_chain(&mut out, node.id, 1);
             let _ = writeln!(out, ";");

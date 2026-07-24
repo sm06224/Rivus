@@ -4435,6 +4435,51 @@ Import:
     }
 
     #[test]
+    fn fan_in_scope_hooks_and_comments_survive_round_trip() {
+        // Audit 2026-07-24: the bare merge/join/as-of scope arms of
+        // to_source rendered only the head line, silently deleting a hook or
+        // leading comment attached to the fan-in node — `rivus fmt` erased
+        // user error hooks. Bare fan-in scopes now render through
+        // write_chain (comments + hooks included) like every other scope.
+        for (src, tail_label) in [
+            (
+                "A:\n open a.csv\n;\nB:\n open b.csv\n;\nM:\n # keep both feeds\n A + B\n \
+                 on error severity >= warning:\n transition degraded\n ;\n;",
+                "M",
+            ),
+            (
+                "A:\n open a.csv\n;\nB:\n open b.csv\n;\nJ:\n A & B on id\n \
+                 on error severity >= warning:\n transition degraded\n ;\n;",
+                "J",
+            ),
+            (
+                "A:\n open a.csv\n;\nB:\n open b.csv\n;\nJ:\n A &asof B on id by ts\n \
+                 on error severity >= warning:\n transition degraded\n ;\n;",
+                "J",
+            ),
+        ] {
+            let g1 = parse(src).unwrap();
+            let tail = g1.labels[tail_label];
+            assert_eq!(g1.nodes[tail].hooks.len(), 1, "fixture must attach a hook");
+            let s = g1.to_source();
+            let g2 = parse(&s).unwrap();
+            let tail2 = g2.labels[tail_label];
+            assert_eq!(
+                g2.nodes[tail2].hooks.len(),
+                1,
+                "hook must survive the round-trip:\n{s}"
+            );
+            if src.contains("keep both feeds") {
+                assert!(
+                    !g2.nodes[tail2].leading_comments.is_empty(),
+                    "leading comment must survive the round-trip:\n{s}"
+                );
+            }
+            assert_eq!(s, g2.to_source(), "not idempotent:\n{s}");
+        }
+    }
+
+    #[test]
     fn tsv_extension_sets_tab_delim() {
         // `.tsv`/`.tab` open as tab-delimited without an explicit `as tsv`.
         assert!(matches!(
