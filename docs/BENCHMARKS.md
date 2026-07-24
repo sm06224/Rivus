@@ -2561,3 +2561,36 @@ spec (10M × 9 files, same dirty-data mix) — the A/B above is same-window and
 self-consistent, but absolute walls are not comparable to earlier ledger
 entries (the regenerated JSONL objects are leaner than the original 606 MB
 fixture).
+
+## #45 canonical reduction trees — f64 sum/avg/std parallel byte-identity (landed, 方式(b))
+
+Ruling (issuecomment-5039548220): file-major canonical, serial mirror =
+the same per-file machinery at P=1. Implemented as `CanonTree` in
+`AggAcc`: a streaming fixed-block (128) reduction spine per group
+(chunk-size independent by construction — blocks align to observation
+indices), plus a `folded` left-fold of collapsed per-file totals that
+`merge` extends IN CALL ORDER (the driver merges single-file partials in
+uri order on both paths). Engine routing: a force-serial run bails to
+the generic oracle for every plain-safe agg set (条件② — the design/42
+dict-vs-plain guards keep their serial half), and runs the driver at
+P=1 only when the agg set needs the file-major fold. The single-file
+byte-range and chunk-partition group paths keep the old exact-only gate
+(条件⑤).
+
+Measured (regenerated 10M standards, same-window interleave vs main
+`94b5a38`):
+
+- **f64 aggregate flow** (`cast amount :float |# region sum avg std` —
+  previously forced the whole flow onto the generic buffering serial
+  path): wall **1492-2453 → 675-718 ms (2.2-3.4×)**, peak RSS
+  **670 → 12.6 MB (53×)**. Output happens to be byte-identical to the
+  old serial value on this fixture (integer-valued floats < 2^53 sum
+  exactly on both folds); the general ~1 ULP shift is exercised and
+  pinned by the fractional-value unit test instead.
+- Exact-agg standards: CSV group / JSONL group bit-identical, 8-pair
+  interleave floor identical (401 vs 401 ms) — the per-observation tree
+  push is inside noise.
+- New guards: `f64_group_file_major_parallel_matches_serial_mirror`
+  (parallel == mirror bytes, chunk-size independence 条件①, mirror
+  activation assert) and `decimal_exact_lane_unaffected_by_canonical_
+  trees` (条件④ — i128 answers pinned exact across paths).

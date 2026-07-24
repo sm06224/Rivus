@@ -7,6 +7,25 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **f64 `sum`/`avg`/`std` are now parallel — and their values shift ONCE (#45,
+  canonical reduction trees).** Group-by f64 moments are computed with a
+  fixed-block canonical reduction tree (BLOCK=128) plus a file-major fold:
+  per-file partial groups merged in uri order. This makes the result a pure
+  function of the data — independent of thread count, chunk size, and
+  serial-vs-parallel — so multi-file `read`→group flows with f64
+  sum/avg/std now run on the PARALLEL driver (they previously forced the
+  whole flow serial; measured on a 10M f64 aggregate: wall 1.5-2.5 s →
+  **~0.7 s**, peak RSS **670 MB → 13 MB**). THE ONE-TIME SHIFT: canonical
+  block sums differ from the previous naive left fold by ~1 ULP class —
+  and are measurably MORE accurate (design/37 §37.3: 39/40 seeds, mean
+  70.5×). Exact lanes are untouched: integer/decimal/duration sums still
+  answer from their i128 accumulators bit-for-bit (pinned by tests), so
+  `--exact`/decimal users see no change. Under `RIVUS_NO_PARALLEL` (or one
+  CPU), flows that NEED the file-major fold run the same per-file machinery
+  at P=1 (the serial mirror — its per-worker telemetry stays visible);
+  every other flow keeps the generic serial path unchanged. Single-file
+  byte-range parallel aggregation still excludes f64 moments (unchanged;
+  a future slice).
 - **design/38 P4 — the as-of join joins the join-kind family (migration
   release, breaking next release).** The canonical spelling is
   `A &asof B [on k…] by ts [within "5s"]`: `&asof` is a peer of

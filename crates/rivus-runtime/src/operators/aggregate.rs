@@ -7,14 +7,104 @@ use super::*;
 
 // ------------------------------------------------------------------- group by
 
+/// Fixed block width of the canonical reduction tree (design/37 prototype
+/// default; #45 ruling Q2 left the sweep to a later slice).
+const CANON_BLOCK: usize = 128;
+
+/// design/37 (#45, 方式(b)): streaming canonical fixed-block reduction tree
+/// for f64 sums. `canonical(v, BLOCK)` is a pure function of the value
+/// SEQUENCE — blocks align to absolute observation indices, so the result is
+/// chunk-size independent, and any partitioning that preserves the sequence
+/// reproduces the same bits. Block summation is also measurably more accurate
+/// than the naive left fold it replaces (error O(log n) vs O(n); design/37
+/// §37.3: 39/40 seeds more accurate, mean 70.5×).
+///
+/// The FILE-MAJOR spine (`folded`) realizes the ruling's merge rule: each
+/// merged-in tree is collapsed to its canonical total and left-folded IN CALL
+/// ORDER. The engine merges single-file partials in uri order on both the
+/// parallel path and the serial mirror (the same machinery at P=1), which is
+/// what makes serial == parallel bit-identical by construction.
+#[derive(Clone, Default)]
+struct CanonTree {
+    /// Pending (unfolded) block sums per level; each holds < `CANON_BLOCK`.
+    levels: Vec<Vec<f64>>,
+    /// Left-fold of already-collapsed trees in merge (uri) order.
+    folded: f64,
+    /// Collapsed-tree count folded so far (0 = live sequence only).
+    folded_n: u64,
+}
+
+impl CanonTree {
+    fn push(&mut self, x: f64) {
+        if self.levels.is_empty() {
+            self.levels.push(Vec::new());
+        }
+        self.levels[0].push(x);
+        let mut k = 0;
+        while self.levels[k].len() == CANON_BLOCK {
+            let s: f64 = self.levels[k].iter().fold(0.0, |a, &b| a + b);
+            self.levels[k].clear();
+            if self.levels.len() == k + 1 {
+                self.levels.push(Vec::new());
+            }
+            self.levels[k + 1].push(s);
+            k += 1;
+        }
+    }
+
+    /// The canonical total: pending levels fold bottom-up (each level's tail
+    /// carry appended AFTER its earlier full-block sums — exactly
+    /// `canonical(v)`'s recursion), plus the file-major spine.
+    fn total(&self) -> f64 {
+        let mut carry: Option<f64> = None;
+        for lv in &self.levels {
+            if lv.is_empty() && carry.is_none() {
+                continue;
+            }
+            let mut s = 0.0;
+            for &x in lv {
+                s += x;
+            }
+            if let Some(c) = carry {
+                s += c;
+            }
+            carry = Some(s);
+        }
+        match (self.folded_n, carry) {
+            (0, c) => c.unwrap_or(0.0),
+            (_, None) => self.folded,
+            // Defensive: a live tail after folds (the merge invariant —
+            // single-file partials merged in uri order — never produces one).
+            (_, Some(c)) => self.folded + c,
+        }
+    }
+
+    /// File-major merge (#45 (b)): collapse `other` and left-fold its total
+    /// onto the spine IN CALL ORDER. The caller (GroupBy::merge_from via the
+    /// read→group driver) merges single-file partials in uri order.
+    fn merge(&mut self, other: &CanonTree) {
+        if self.folded_n == 0 {
+            self.folded = self.total();
+            self.levels.clear();
+            self.folded_n = 1;
+        }
+        self.folded += other.total();
+        self.folded_n += other.folded_n.max(1);
+    }
+}
+
 /// Running accumulator for one aggregate within one group. Carries the
 /// aggregate's `func` so it only maintains the state that function needs
 /// (numeric moments, a distinct set, or first/last cells).
 #[derive(Clone)]
 pub(crate) struct AggAcc {
     func: AggFunc,
-    sum: f64,
-    sum_sq: f64,
+    /// f64 sum as a canonical reduction tree (#45): consumed only by the f64
+    /// Sum/Avg/Std outputs — the exact lanes (i128 int/decimal/duration)
+    /// still answer for their types.
+    sum: CanonTree,
+    /// Σx² for `std` (same tree, same file-major fold).
+    sum_sq: CanonTree,
     min: f64,
     max: f64,
     n: i64,
@@ -110,8 +200,8 @@ impl AggAcc {
     pub(crate) fn new(func: AggFunc) -> Self {
         AggAcc {
             func,
-            sum: 0.0,
-            sum_sq: 0.0,
+            sum: CanonTree::default(),
+            sum_sq: CanonTree::default(),
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             n: 0,
@@ -152,8 +242,14 @@ impl AggAcc {
         match self.func {
             AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max | AggFunc::Std => {
                 if let Some(x) = v.as_f64() {
-                    self.sum += x;
-                    self.sum_sq += x * x;
+                    // Canonical tree (#45): only Sum/Avg/Std consume the f64
+                    // sums, so Min/Max skip the tree entirely.
+                    if matches!(self.func, AggFunc::Sum | AggFunc::Avg | AggFunc::Std) {
+                        self.sum.push(x);
+                        if self.func == AggFunc::Std {
+                            self.sum_sq.push(x * x);
+                        }
+                    }
                     self.min = self.min.min(x);
                     self.max = self.max.max(x);
                     self.n += 1;
@@ -273,9 +369,16 @@ impl AggAcc {
     /// counts, min/max, buffered percentile values) merge byte-identically; the
     /// f64 moments are folded too but a *parallel* group-by is only enabled when
     /// no aggregate depends on f64 associativity (the engine gates that).
+    /// Fold `other` (a LATER partition in source/uri order) into this
+    /// accumulator. The f64 sums use the file-major canonical fold (#45):
+    /// callers merge single-file partials sequentially in uri order.
     pub(crate) fn merge(&mut self, other: &AggAcc) {
-        self.sum += other.sum;
-        self.sum_sq += other.sum_sq;
+        if matches!(self.func, AggFunc::Sum | AggFunc::Avg | AggFunc::Std) {
+            self.sum.merge(&other.sum);
+            if self.func == AggFunc::Std {
+                self.sum_sq.merge(&other.sum_sq);
+            }
+        }
         // Exact integer lane: associative i128 (order-independent merge).
         self.int_only &= other.int_only;
         self.int_overflow |= other.int_overflow;
@@ -358,11 +461,11 @@ impl AggAcc {
         let exact_int = self.int_only && !self.int_overflow && self.n > 0;
         match self.func {
             AggFunc::Sum if exact_int => self.int_sum as f64,
-            AggFunc::Sum => self.sum,
+            AggFunc::Sum => self.sum.total(),
             AggFunc::Avg if exact_int => self.int_sum as f64 / self.n as f64,
             AggFunc::Avg => {
                 if self.n > 0 {
-                    self.sum / self.n as f64
+                    self.sum.total() / self.n as f64
                 } else {
                     0.0
                 }
@@ -384,8 +487,9 @@ impl AggAcc {
             // ddof=1 sample std needs ≥2 values; otherwise it falls to `_ => 0.0`.
             AggFunc::Std if self.n > 1 => {
                 // Sample standard deviation (ddof=1): √((Σx² − Σx·mean)/(n−1)).
-                let mean = self.sum / self.n as f64;
-                let var = (self.sum_sq - self.sum * mean) / (self.n as f64 - 1.0);
+                let sum = self.sum.total();
+                let mean = sum / self.n as f64;
+                let var = (self.sum_sq.total() - sum * mean) / (self.n as f64 - 1.0);
                 var.max(0.0).sqrt()
             }
             AggFunc::Pct(p) => self.percentile(p),

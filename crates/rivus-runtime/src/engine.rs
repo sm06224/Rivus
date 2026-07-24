@@ -1608,9 +1608,28 @@ fn try_parallel_read_group(
     let threads = std::thread::available_parallelism()
         .map(|t| t.get())
         .unwrap_or(1);
-    if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
+    // #45 方式(b): a force-serial run (1 CPU / RIVUS_NO_PARALLEL) bails to the
+    // generic serial oracle — UNLESS the agg set needs the FILE-MAJOR fold
+    // (f64 Sum/Avg/Std, decided at the type-check below), in which case the
+    // serial mirror IS this driver at P=1: per-file partial GroupBys merged in
+    // uri order, the same machinery as parallel, so serial == parallel holds
+    // bit-for-bit by construction. Flows with no Sum/Avg/Std keep today's
+    // zero-cost bail here (条件②: the generic oracle — and the design/42
+    // dict-vs-plain asymmetry it anchors — survives for every plain-safe set).
+    let force_serial = threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some();
+    let has_moment_agg = match &graph.nodes[shape.group_id].op {
+        Op::GroupBy { aggs, .. } => aggs.iter().any(|(f, _)| {
+            matches!(
+                f,
+                rivus_ir::AggFunc::Sum | rivus_ir::AggFunc::Avg | rivus_ir::AggFunc::Std
+            )
+        }),
+        _ => false,
+    };
+    if force_serial && !has_moment_agg {
         return None;
     }
+    let threads = if force_serial { 1 } else { threads };
     if opts.max_capture.is_some() && !must_drain(graph) {
         return None;
     }
@@ -1865,7 +1884,15 @@ fn try_parallel_read_group(
         let safe = operators::group_parallel_safe(&aggs, |name| {
             in_schema.index_of(name).map(|i| in_schema.fields[i].dtype)
         });
-        if !safe {
+        // Plain-safe (exact-lane) agg sets under force-serial keep the
+        // generic serial oracle (#45 条件② — same result bit-for-bit, since
+        // exact lanes are associative, and the design/42 guards keep their
+        // plain-decode serial half). A NOT-plain-safe set (f64 Sum/Avg/Std)
+        // proceeds on BOTH paths: the canonical file-major fold (per-file
+        // partials merged in uri order — what this driver already does)
+        // makes it deterministic, and force-serial runs the same machinery
+        // at P=1 (the ratified serial mirror).
+        if safe && force_serial {
             return None;
         }
         preface0 = cols0;

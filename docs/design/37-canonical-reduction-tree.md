@@ -1,6 +1,9 @@
 # 37. 正準縮約木 — f64 並列 sum/avg/std の byte-identity 化（#45 / #41 の残り半分・批准依頼）
 
-> **状態：批准依頼（先行研究・独立プロトタイプで計測済み・出荷エンジンには未配線）。**
+> **状態：Q1 許容済（#240 キュー1）→ 方式 (b) 裁定（issuecomment-5039548220）→
+> 実装済み（file-major 正準・serial mirror = P=1 同一機械・条件 5 点対応、
+> BENCHMARKS「#45 canonical reduction trees」節）。単一ファイル byte-range
+> 経路（§37.4-37.5 のプリパス＋carry）は対象外のまま＝将来スライス。**
 > #41（f64 非結合ゆえ並列 partition→merge の sum/avg/std は ULP ズレ）に対する現行裁定は
 > 「f64 は serial 据え置き・exactness は decimal レーン迂回」（BENCHMARKS「f64 parallel
 > aggregation」節）。本メモは**新しい精度計測が判断材料を変えうる**ことを示し、正準縮約木を
