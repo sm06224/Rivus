@@ -2591,7 +2591,11 @@ fn resolve_format(path: &str, explicit: Option<&str>) -> Option<Format> {
             _ => None,
         };
     }
-    let lower = path.to_ascii_lowercase();
+    // The transport layer decompresses `.gz`/`.zst`/`.zstd` independently of
+    // the codec, so the DATA extension decides the format: `d.jsonl.gz` is
+    // gzipped JSONL, not CSV (audit 2026-07-24 — this ladder had drifted from
+    // `delim_for_path`, which already stripped).
+    let lower = rivus_ir::strip_compression_suffix(path).to_ascii_lowercase();
     if lower.ends_with(".parquet") {
         Some(Format::Parquet)
     } else if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
@@ -2723,6 +2727,54 @@ mod tests {
         // Same via the `group` alias route (shared tail).
         let g = parse("F:\n open d.csv\n group region\n save o.csv\n;").unwrap();
         assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Sink { .. })));
+    }
+
+    #[test]
+    fn compression_suffix_does_not_hide_the_data_extension() {
+        // Audit 2026-07-24: `open d.jsonl.gz` silently decoded gzipped JSONL
+        // as CSV — the transport decompresses regardless of codec, but the
+        // format ladder didn't strip .gz/.zst/.zstd (delim_for_path did; the
+        // ladders had drifted). The DATA extension now decides the format.
+        for (path, want_jsonl) in [
+            ("d.jsonl.gz", true),
+            ("d.ndjson.zst", true),
+            ("d.json.gz", true),
+            ("d.csv.gz", false),
+            ("d.csv.zstd", false),
+            ("plain.gz", false), // no data extension → CSV default, as before
+        ] {
+            let src = format!("F:\n open {path}\n;");
+            match (first_op(&src), want_jsonl) {
+                (
+                    Op::Source {
+                        codec: rivus_ir::Codec::Jsonl,
+                        ..
+                    },
+                    true,
+                )
+                | (
+                    Op::Source {
+                        codec: rivus_ir::Codec::Csv { .. },
+                        ..
+                    },
+                    false,
+                ) => {}
+                (other, want) => panic!("{path}: wrong codec (want jsonl={want}): {other:?}"),
+            }
+            // The bare spelling round-trips: the data extension re-implies
+            // the codec, so `to_source` needs no `as FMT` on these.
+            let s = parse(&src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(!s.contains(" as "), "{path} needs no explicit as: {s}");
+        }
+        // An explicit `as` still overrides the (stripped) extension — and the
+        // disagreement stays explicit through to_source.
+        let s = parse("F:\n open d.jsonl.gz as csv\n;").unwrap().to_source();
+        assert!(
+            s.contains("as csv"),
+            "codec-vs-extension disagreement must stay explicit: {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
     }
 
     #[test]

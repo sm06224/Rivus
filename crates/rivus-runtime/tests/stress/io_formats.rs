@@ -389,6 +389,51 @@ fn zstd_csv_matches_uncompressed_oracle() {
     }
 }
 
+#[cfg(feature = "gzip")]
+#[test]
+fn gzip_jsonl_bare_open_decodes_as_jsonl() {
+    // Audit 2026-07-24: a bare `open d.jsonl.gz` used to resolve its format
+    // from the RAW extension (".gz" matches nothing → CSV default) while the
+    // transport still decompressed — gzipped JSONL decoded as garbage CSV
+    // with an EMPTY error stream (silent wrong decode). The data extension
+    // now decides the codec: same rows as the uncompressed twin.
+    use std::io::Write as _;
+    let rows = 3_000usize;
+    let mut text = String::new();
+    let mut ge = 0u64;
+    let mut rng = Rng::new(23);
+    for i in 0..rows {
+        let age = rng.below(100);
+        text.push_str(&format!("{{\"id\":{i},\"age\":{age}}}\n"));
+        if age >= 50 {
+            ge += 1;
+        }
+    }
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("rivus_gzj_{}.jsonl.gz", std::process::id()));
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        enc.write_all(text.as_bytes()).unwrap();
+        enc.finish().unwrap();
+    }
+    let _guard = TempCsv(path.clone());
+    let p = path.display();
+    for cs in [7usize, 1024] {
+        let res = run_src(&format!("G:\n open {p}\n |? age >= 50\n;"), cs);
+        assert_eq!(
+            res.total_rows_out(),
+            ge,
+            "bare .jsonl.gz must decode as JSONL @cs={cs}"
+        );
+        assert!(
+            res.errors.is_empty(),
+            "clean gzipped JSONL must not error @cs={cs}: {:?}",
+            res.errors
+        );
+    }
+}
+
 #[test]
 fn route_save_partitions_deterministically_and_byte_identically() {
     // §28.7 route (#143): Hive layout + template + flat, the null-key

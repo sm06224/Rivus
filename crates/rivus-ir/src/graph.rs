@@ -469,7 +469,7 @@ fn flatten_and_chain(pred: &Expr) -> Vec<String> {
 /// would render as a bare `open d.weird` and re-parse as CSV (a silent
 /// semantic flip; found by the design/38 P1 migration audit).
 fn ext_codec_of(path: &str) -> &'static str {
-    let l = path.to_ascii_lowercase();
+    let l = strip_compression_suffix(path).to_ascii_lowercase();
     if l.ends_with(".parquet") {
         "parquet"
     } else if l.ends_with(".jsonl") || l.ends_with(".ndjson") || l.ends_with(".json") {
@@ -980,19 +980,30 @@ pub fn join_on_clause(left_keys: &[PathExpr], right_keys: &[PathExpr]) -> String
     format!("on {}", parts.join(" "))
 }
 
-/// Pick the field delimiter for a path by extension: `.tsv`/`.tab` use a tab,
-/// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
-/// feature — `open f.tsv` and `save out.tsv` just work.
-pub fn delim_for_path(path: &str) -> u8 {
-    let mut lower = path.to_ascii_lowercase();
-    // A compression suffix doesn't change the field delimiter: `.tsv.gz` is
-    // still tab-delimited. Strip it before checking the data extension.
+/// Strip one trailing compression suffix (`.gz`/`.zst`/`.zstd`, any case) so
+/// extension-based inference sees the DATA extension: `d.jsonl.gz` is a
+/// gzipped JSONL stream, not a file of format "gz". The transport layer
+/// decompresses independently of the codec, so **every** extension ladder
+/// (format inference, the `ext_codec_of` to_source mirror, the delimiter)
+/// must strip before matching — two of the three had drifted (audit
+/// 2026-07-24: `open d.jsonl.gz` silently decoded the gzipped JSONL as CSV
+/// with an empty error stream).
+pub fn strip_compression_suffix(path: &str) -> &str {
+    let l = path.to_ascii_lowercase();
     for suf in [".gz", ".zst", ".zstd"] {
-        if let Some(stripped) = lower.strip_suffix(suf) {
-            lower = stripped.to_string();
-            break;
+        if l.ends_with(suf) {
+            return &path[..path.len() - suf.len()];
         }
     }
+    path
+}
+
+/// Pick the field delimiter for a path by extension: `.tsv`/`.tab` use a tab,
+/// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
+/// feature — `open f.tsv` and `save out.tsv` just work. A compression suffix
+/// doesn't change the delimiter: `.tsv.gz` is still tab-delimited.
+pub fn delim_for_path(path: &str) -> u8 {
+    let lower = strip_compression_suffix(path).to_ascii_lowercase();
     if lower.ends_with(".tsv") || lower.ends_with(".tab") {
         b'\t'
     } else {

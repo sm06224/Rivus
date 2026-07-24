@@ -4978,7 +4978,11 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
         }
         Codec::Jsonl => {
             let path = discovery.path();
-            if path == "-" {
+            // Same gate as the CSV arm: only a seekable plain file can be
+            // byte-range split (stdin can't re-read; a compressed stream has
+            // no meaningful byte ranges — it stays on the serial
+            // decompressing reader).
+            if !crate::transport::Scheme::of(path).is_seekable() {
                 return None;
             }
             let (schema, names, jtypes, ranges, bad_rows) =
