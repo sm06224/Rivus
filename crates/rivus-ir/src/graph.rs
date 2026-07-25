@@ -998,6 +998,24 @@ pub fn strip_compression_suffix(path: &str) -> &str {
     path
 }
 
+/// The as-of join's clause — `[on k…] by ts [within "dur"]` (design/38 P4
+/// canonical: `by` names the temporal axis, the `on` keys stay the
+/// exact-match group, `within` the one option). The ONE construction shared
+/// by `to_src_line` (`&asof {clause}`) and `write_chain`'s fan-in head
+/// (`A &asof B {clause}`) — three verbatim copies once drifted apart here
+/// (audit 2026-07-24).
+fn asof_clause(by: &[String], ts: &str, tolerance: &Option<String>) -> String {
+    let mut s = String::new();
+    if !by.is_empty() {
+        s.push_str(&format!("on {} ", by.join(" ")));
+    }
+    s.push_str(&format!("by {ts}"));
+    if let Some(t) = tolerance {
+        s.push_str(&format!(" within \"{t}\""));
+    }
+    s
+}
+
 /// Pick the field delimiter for a path by extension: `.tsv`/`.tab` use a tab,
 /// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
 /// feature — `open f.tsv` and `save out.tsv` just work. A compression suffix
@@ -1567,18 +1585,8 @@ impl Op {
             } => format!("{} {}", kind.amp(), join_on_clause(left_keys, right_keys)),
             Op::AsofJoin { by, ts, tolerance } => {
                 // `&asof [on k…] by ts [within "dur"]` (design/38 P4) — the
-                // as-of kind is a peer of `&left`/`&right`/`&full`; `by`
-                // names the temporal axis, the `on` keys stay the exact-match
-                // group, `within` the one option.
-                let mut s = String::from("&asof");
-                if !by.is_empty() {
-                    s.push_str(&format!(" on {}", by.join(" ")));
-                }
-                s.push_str(&format!(" by {ts}"));
-                if let Some(t) = tolerance {
-                    s.push_str(&format!(" within \"{t}\""));
-                }
-                s
+                // as-of kind is a peer of `&left`/`&right`/`&full`.
+                format!("&asof {}", asof_clause(by, ts, tolerance))
             }
             Op::SinkPrint => "print".to_string(),
             // The v1 `save` forms restore byte-identically: codec/route carry
@@ -2052,15 +2060,7 @@ impl PlanGraph {
                     // removal-release blocker recorded in CHANGELOG/design38.
                     Op::AsofJoin { by, ts, tolerance } => {
                         let names = self.input_labels(&self.inputs_of(nid)).join(" &asof ");
-                        let mut clause = String::new();
-                        if !by.is_empty() {
-                            clause.push_str(&format!("on {} ", by.join(" ")));
-                        }
-                        clause.push_str(&format!("by {ts}"));
-                        if let Some(t) = tolerance {
-                            clause.push_str(&format!(" within \"{t}\""));
-                        }
-                        Some(format!("{names} {clause}"))
+                        Some(format!("{names} {}", asof_clause(by, ts, tolerance)))
                     }
                     _ => None,
                 };

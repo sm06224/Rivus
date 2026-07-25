@@ -423,9 +423,6 @@ fn build_ops(
         .collect()
 }
 
-/// Drive the DAG to completion with a pre-built operator set (the chunk-granular
-/// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
-#[allow(clippy::too_many_arguments)]
 /// Could a chunk pulled from `src` still have an observable effect — is there a
 /// path from `src` to a sink / leaf capture that does not pass a **saturated**
 /// operator (a `take N` that has emitted its N)? When no such path remains, an
@@ -460,6 +457,8 @@ fn unbounded_effect_remains(graph: &PlanGraph, src: NodeId, ops: &[Box<dyn Opera
         .any(|m| effect(graph, m, ops, &mut memo))
 }
 
+/// Drive the DAG to completion with a pre-built operator set (the chunk-granular
+/// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
 fn drive(
     graph: &PlanGraph,
     mut ops: Vec<Box<dyn Operator>>,
@@ -1171,6 +1170,10 @@ impl ParProgress {
     }
 }
 
+/// Byte-range parallel run of a single-file STATELESS flow (source → row-wise
+/// ops → optional sink): split the file into ranges, one worker per range,
+/// results concatenated in range order. Returns `None` (caller falls back to
+/// serial) for previews, non-splittable sources, or ineligible shapes.
 fn try_parallel(
     graph: &PlanGraph,
     opts: &RunOptions,
@@ -1442,8 +1445,6 @@ fn expr_used_cols(e: &rivus_ir::Expr, out: &mut Vec<String>) -> bool {
 }
 
 fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<String>> {
-    let add = add_used;
-    let expr_cols = expr_used_cols;
     let mut used = Vec::new();
     for step in &shape.path {
         let nid = match step {
@@ -1457,39 +1458,39 @@ fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<S
             // the first join; over-approximation is safe.)
             Op::Join { left_keys, .. } => {
                 for k in left_keys {
-                    add(&k.root, &mut used);
+                    add_used(&k.root, &mut used);
                 }
             }
             Op::Cast { casts } => {
                 for (n, _) in casts {
-                    add(n, &mut used);
+                    add_used(n, &mut used);
                 }
             }
             Op::Filter { pred } => {
-                if !expr_cols(pred, &mut used) {
+                if !expr_used_cols(pred, &mut used) {
                     return None;
                 }
             }
             Op::FilterProject { preds, fields } => {
                 for p in preds {
-                    if !expr_cols(p, &mut used) {
+                    if !expr_used_cols(p, &mut used) {
                         return None;
                     }
                 }
                 if let Some(fs) = fields {
                     for f in fs {
-                        add(f, &mut used);
+                        add_used(f, &mut used);
                     }
                 }
             }
             Op::Project { fields } => {
                 for f in fields {
-                    add(f, &mut used);
+                    add_used(f, &mut used);
                 }
             }
             Op::ProjectExpr { items, .. } => {
                 for (e, _) in items {
-                    if !expr_cols(e, &mut used) {
+                    if !expr_used_cols(e, &mut used) {
                         return None;
                     }
                 }
@@ -1503,10 +1504,10 @@ fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<S
         return None;
     };
     for k in keys {
-        add(&k.root, &mut used);
+        add_used(&k.root, &mut used);
     }
     for (_, c) in aggs {
-        add(c, &mut used);
+        add_used(c, &mut used);
     }
     Some(used)
 }
@@ -1630,9 +1631,10 @@ fn try_parallel_read_group(
         return None;
     }
     let threads = if force_serial { 1 } else { threads };
-    if opts.max_capture.is_some() && !must_drain(graph) {
-        return None;
-    }
+    // A preview (capture cap, no drain) can't reach this driver: the shape
+    // requires a group, which is blocking, so `must_drain` is always true
+    // here — the preview guard lives on the stateless `try_parallel` path.
+    debug_assert!(opts.max_capture.is_none() || must_drain(graph));
     let Op::Read { fmt, provenance } = &graph.nodes[shape.read_id].op else {
         return None;
     };
@@ -2832,7 +2834,7 @@ fn try_parallel_read_sink(
         if let Some(h) = &header {
             w.write_all(h.as_bytes())?;
         }
-        for i in 0..nseg {
+        for (i, &rows) in seg_rows.iter().enumerate() {
             match std::fs::File::open(seg_path(i)) {
                 Ok(mut rf) => {
                     std::io::copy(&mut rf, &mut w)?;
@@ -2842,7 +2844,7 @@ fn try_parallel_read_sink(
                 // dropped after a write failure — each pushed its own error).
                 // A missing segment with counted rows is real, un-surfaced
                 // data loss: propagate instead of silently skipping.
-                Err(_) if seg_rows[i] == 0 => {}
+                Err(_) if rows == 0 => {}
                 Err(e) => return Err(e),
             }
         }
@@ -4528,6 +4530,9 @@ fn worker_read_partial_group(
     (group, errors, rows, dec.spec_contradicted())
 }
 
+/// A linear `source → [row-wise]* → group → [sort]* → [sink]` flow whose
+/// aggregates are safe under partition→merge (#41 associative lanes) —
+/// eligible for the byte-range parallel group driver. `(src, group, sink)`.
 fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<NodeId>)> {
     eligible_group_flow_inner(graph, true)
 }
@@ -4807,9 +4812,9 @@ fn try_parallel_group(
     if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
         return None;
     }
-    if opts.max_capture.is_some() && !must_drain(graph) {
-        return None;
-    }
+    // Preview runs can't reach a group driver (a group is blocking →
+    // `must_drain` is always true) — see `try_parallel` for the live guard.
+    debug_assert!(opts.max_capture.is_none() || must_drain(graph));
     // Plan a bounded byte-range read of the (splittable) source — CSV or JSONL.
     let plan = plan_parallel_source(&graph.nodes[src_id].op, threads)?;
     let path_nodes = pre_group_path(graph, src_id, group_id);
@@ -5272,9 +5277,9 @@ fn try_unbounded_group(
     if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
         return None;
     }
-    if opts.max_capture.is_some() && !must_drain(graph) {
-        return None;
-    }
+    // Preview runs can't reach a group driver (a group is blocking →
+    // `must_drain` is always true) — see `try_parallel` for the live guard.
+    debug_assert!(opts.max_capture.is_none() || must_drain(graph));
 
     // Materialize the source (the opt-in unbounded cost).
     let mut src_errors: Vec<ErrorEvent> = Vec::new();

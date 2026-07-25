@@ -695,14 +695,7 @@ impl Parser {
                 // the named key columns). Bare words until the next transform.
                 Tok::Word(w) if w == "distinct" => {
                     self.bump();
-                    let mut keys = Vec::new();
-                    while let Tok::Word(name) = self.tok().clone() {
-                        if is_keyword(&name) {
-                            break;
-                        }
-                        self.bump();
-                        keys.push(name);
-                    }
+                    let keys = self.parse_word_list();
                     let keys = keys.into_iter().map(key_path).collect();
                     let n = self.g.add_node(Op::Distinct { keys });
                     self.g.add_edge(current, n, EdgeKind::Stream);
@@ -718,14 +711,7 @@ impl Parser {
                 // `dropna [col ...]` — drop rows with empty values.
                 Tok::Word(w) if w == "dropna" => {
                     self.bump();
-                    let mut cols = Vec::new();
-                    while let Tok::Word(name) = self.tok().clone() {
-                        if is_keyword(&name) {
-                            break;
-                        }
-                        self.bump();
-                        cols.push(name);
-                    }
+                    let cols = self.parse_word_list();
                     let n = self.g.add_node(Op::DropNa { cols });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
@@ -787,13 +773,7 @@ impl Parser {
                     let mut by = Vec::new();
                     if self.peek_is_word("by") {
                         self.bump();
-                        while let Tok::Word(name) = self.tok().clone() {
-                            if is_keyword(&name) {
-                                break;
-                            }
-                            self.bump();
-                            by.push(name);
-                        }
+                        by = self.parse_word_list();
                         if by.is_empty() {
                             return Err(self.err("sessionize `by` expects at least one column"));
                         }
@@ -841,13 +821,7 @@ impl Parser {
                     let mut by = Vec::new();
                     if self.peek_is_word("by") {
                         self.bump();
-                        while let Tok::Word(name) = self.tok().clone() {
-                            if is_keyword(&name) {
-                                break;
-                            }
-                            self.bump();
-                            by.push(name);
-                        }
+                        by = self.parse_word_list();
                         if by.is_empty() {
                             return Err(self.err("shift `by` expects at least one column"));
                         }
@@ -873,14 +847,7 @@ impl Parser {
                 // `drop COL [COL ...]` — remove the named columns.
                 Tok::Word(w) if w == "drop" => {
                     self.bump();
-                    let mut cols = Vec::new();
-                    while let Tok::Word(name) = self.tok().clone() {
-                        if is_keyword(&name) {
-                            break;
-                        }
-                        self.bump();
-                        cols.push(name);
-                    }
+                    let cols = self.parse_word_list();
                     if cols.is_empty() {
                         return Err(self.err("drop expects at least one column name"));
                     }
@@ -913,14 +880,7 @@ impl Parser {
                 // `reorder COL [COL ...]` — move named columns to the front.
                 Tok::Word(w) if w == "reorder" => {
                     self.bump();
-                    let mut cols = Vec::new();
-                    while let Tok::Word(name) = self.tok().clone() {
-                        if is_keyword(&name) {
-                            break;
-                        }
-                        self.bump();
-                        cols.push(name);
-                    }
+                    let cols = self.parse_word_list();
                     if cols.is_empty() {
                         return Err(self.err("reorder expects at least one column name"));
                     }
@@ -1112,6 +1072,29 @@ impl Parser {
                 "`with` expects `source` or `filename`, found {other:?}"
             ))),
         }
+    }
+
+    /// Consume a run of bare column words, stopping at a stage keyword
+    /// (`is_keyword` — see its contract) or any non-word token. The ONE body
+    /// behind every simple column list (`distinct`, `dropna`, `drop`,
+    /// `reorder`, the `by` clauses); a single shared loop is what prevents
+    /// the "missing keyword break absorbs the next statement" bug class
+    /// (audit 2026-07-24 — the `|# … save out.csv` swallow). Callers keep
+    /// their own at-least-one error message. Lists with per-item tails
+    /// (sort's `asc`/`desc`, cast's `:type`, rename's pairs) keep their own
+    /// loops but the same stop rule.
+    fn parse_word_list(&mut self) -> Vec<String> {
+        let mut words = Vec::new();
+        while let Tok::Word(w) = self.tok() {
+            if is_keyword(w) {
+                break;
+            }
+            match self.bump() {
+                Tok::Word(w) => words.push(w),
+                _ => unreachable!("peeked a Word"),
+            }
+        }
+        words
     }
 
     /// Parse the tail of a group-by stage (the `|#` token or the `group` keyword
