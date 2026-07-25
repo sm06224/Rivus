@@ -919,9 +919,9 @@ impl Parser {
     }
 
     /// Parse a declared column schema `( name[:type] name[:type] … )` for
-    /// `open`. Space-separated (like `readbin`); a type fixes that column's
-    /// lane, otherwise it is inferred. Types: `int`/`i64`, `float`/`f64`,
-    /// `str`/`string`, `bool`.
+    /// `open`. Space-separated (like the `as bin` field list); a type fixes
+    /// that column's lane, otherwise it is inferred. Types: `int`/`i64`,
+    /// `float`/`f64`, `str`/`string`, `bool`.
     #[allow(clippy::type_complexity)]
     fn parse_decl_schema(
         &mut self,
@@ -1127,6 +1127,124 @@ impl Parser {
         Ok(n)
     }
 
+    /// Parse the tail of a binary source, shared by the canonical
+    /// `open PATH as bin [le|be] [packed|aligned] (name:bintype …) [with …]`
+    /// (design/38) and the legacy `readbin` alias (the verb and PATH are
+    /// already consumed). Defaults are `le` + `packed`; `to_source` suppresses
+    /// defaults, so the canonical rendering carries only `be` / `aligned`.
+    fn parse_bin_open_tail(&mut self, path: String) -> Result<NodeId, RivusError> {
+        let mut endian = Endian::Little;
+        let mut c_align = false;
+        loop {
+            match self.tok() {
+                Tok::Word(m) if m == "le" => {
+                    endian = Endian::Little;
+                    self.bump();
+                }
+                Tok::Word(m) if m == "be" => {
+                    endian = Endian::Big;
+                    self.bump();
+                }
+                Tok::Word(m) if m == "packed" => {
+                    c_align = false;
+                    self.bump();
+                }
+                Tok::Word(m) if m == "aligned" => {
+                    c_align = true;
+                    self.bump();
+                }
+                // `noheader` on a binary source is a never-silent misuse — a
+                // binary record has no header row to skip.
+                Tok::Word(m) if m == "noheader" => {
+                    return Err(self.err_bin_noheader(&path));
+                }
+                _ => break,
+            }
+        }
+        let fields = self.parse_bin_fields()?;
+        // Also catch `noheader` after the field list, so the teaching error
+        // is the same wherever the word lands.
+        if self.peek_is_word("noheader") {
+            return Err(self.err_bin_noheader(&path));
+        }
+        let provenance = self.parse_provenance()?;
+        Ok(self.g.add_node(Op::Source {
+            discovery: Discovery::Fixed(path),
+            transport: Transport::Local,
+            codec: Codec::Binary {
+                fields,
+                endian,
+                c_align,
+            },
+            provenance,
+        }))
+    }
+
+    fn err_bin_noheader(&self, path: &str) -> RivusError {
+        self.err(format!(
+            "`noheader` does not apply to `as bin` (a binary record has no header \
+             row); the canonical form is \
+             `open {path} as bin [be] [aligned] (name:bintype …)`"
+        ))
+    }
+
+    /// Parse the binary field list `(name:bintype …)`. The vocabulary is
+    /// [`BinType`] (`i8`…`i64`, `u8`…`u64`, `f32`, `f64`, `bool`, `char[N]`) —
+    /// not the CSV declared-schema types — and at least one field is required
+    /// (a binary record without a layout cannot be decoded).
+    fn parse_bin_fields(&mut self) -> Result<Vec<(String, BinType)>, RivusError> {
+        self.expect(&Tok::LParen)?;
+        let mut fields = Vec::new();
+        while !self.at(&Tok::RParen) && !self.at(&Tok::Eof) {
+            let name = self.word()?;
+            self.expect(&Tok::Colon)?;
+            let ty = self.word()?;
+            // `char[N]` — a fixed-width text field (§29.4): N raw bytes
+            // decoded as UTF-8. Carries its byte width, so it is parsed
+            // here rather than via the word-keyed `BinType::parse`.
+            let bt = if ty == "char" {
+                if !self.eat(&Tok::LBracket) {
+                    return Err(self.err(
+                        "binary `char` needs a byte width: write `char[N]`, \
+                         e.g. `name:char[16]`",
+                    ));
+                }
+                let n = match self.bump() {
+                    Tok::Int(v) if v >= 0 => v as u32,
+                    other => {
+                        return Err(self.err(format!(
+                            "char[N]: N must be a non-negative integer, found {other:?}"
+                        )))
+                    }
+                };
+                self.expect(&Tok::RBracket)?;
+                BinType::Char(n)
+            } else {
+                BinType::parse(&ty).ok_or_else(|| {
+                    // A CSV-schema type word here is the likeliest misuse —
+                    // teach the vocabulary split rather than just "unknown".
+                    let hint = if decl_type(&ty).is_some() {
+                        " — a `(name:int …)` declared schema belongs to text \
+                         formats; binary fields use i8…i64, u8…u64, f32, f64, \
+                         bool, char[N]"
+                    } else {
+                        ""
+                    };
+                    self.err(format!("unknown binary type '{ty}'{hint}"))
+                })?
+            };
+            fields.push((name, bt));
+        }
+        self.expect(&Tok::RParen)?;
+        if fields.is_empty() {
+            return Err(self.err(
+                "`as bin` requires at least one field: \
+                 `open data.bin as bin (id:i32 name:char[16])`",
+            ));
+        }
+        Ok(fields)
+    }
+
     /// Parse the first element of a body: a source, a stream replay, or a
     /// merge/join over named scopes — or, for branch children, the inherited
     /// upstream node. (This doc was severed from its fn by an interleaved
@@ -1134,9 +1252,10 @@ impl Parser {
     fn parse_body_head(&mut self, input: Option<NodeId>) -> Result<NodeId, RivusError> {
         match self.tok().clone() {
             // `open PATH [as FMT]` — extension is only the default; an explicit
-            // `as csv|tsv|json|jsonl|ndjson` overrides it (and works when the
-            // path has no/odd extension). `readcsv`/`readjson`/`readbin` are
-            // equivalent explicit aliases (lower cognitive load, fewer surprises).
+            // `as csv|tsv|json|jsonl|ndjson|parquet|bin` overrides it (and works
+            // when the path has no/odd extension; `bin` is *only* reachable
+            // explicitly). `readcsv`/`readjson`/`readbin` are legacy aliases
+            // (design/38 — they parse, `fmt` canonicalizes them away).
             Tok::Word(w) if w == "open" => {
                 self.bump();
                 let path = norm_path(self.path_word()?);
@@ -1146,6 +1265,29 @@ impl Parser {
                 } else {
                     None
                 };
+                // `as bin` — the canonical binary source (design/38):
+                // `open PATH as bin [le|be] [packed|aligned] (name:bintype …)`.
+                // This branch MUST run before the noheader/declared-schema
+                // parse below: the bin parenthesis vocabulary (`i32`, `u16`,
+                // `char[8]`, …) is not the CSV declared-schema vocabulary, so
+                // reading the paren as a CSV schema first would report a
+                // misleading `unknown column type 'i32'` instead of binary
+                // fields. `as bin` is always explicit — no extension (not
+                // even `.bin`) implies the binary codec.
+                if explicit.as_deref() == Some("bin") {
+                    return self.parse_bin_open_tail(path);
+                }
+                // Binary layout modifiers only mean something under `as bin` —
+                // on a text codec they are a never-silent error that teaches
+                // the canonical form instead of a generic parse failure.
+                if let Tok::Word(m) = self.tok() {
+                    if matches!(m.as_str(), "le" | "be" | "packed" | "aligned") {
+                        return Err(self.err(format!(
+                            "`{m}` is a binary layout modifier and requires `as bin`: \
+                             `open {path} as bin [be] [aligned] (name:bintype …)`"
+                        )));
+                    }
+                }
                 // Optional `noheader`: the file has no header row (CSV only).
                 let noheader = self.peek_is_word("noheader");
                 if noheader {
@@ -1164,6 +1306,35 @@ impl Parser {
                 let fmt = resolve_format(&path, explicit.as_deref()).ok_or_else(|| {
                     self.err(format!("unknown format '{}'", explicit.unwrap_or_default()))
                 })?;
+                // Codec×option consistency (never-silent): `noheader` and a
+                // declared schema configure the **CSV** codec only. On JSONL/
+                // JSON (self-describing objects) and Parquet (schema in the
+                // file footer) they used to be silently ignored — an accepted
+                // option that does nothing is a contract violation, so both
+                // are now errors that teach where the option belongs.
+                if !matches!(fmt, Format::Csv) {
+                    let fmt_name = match fmt {
+                        Format::Jsonl => "JSONL",
+                        Format::Json => "JSON",
+                        Format::Parquet => "Parquet",
+                        Format::Csv => unreachable!(),
+                    };
+                    if noheader {
+                        return Err(self.err(format!(
+                            "`noheader` does not apply to a {fmt_name} source (it is \
+                             self-describing — there is no header row to skip); \
+                             `noheader` belongs to CSV: `open data.csv noheader`"
+                        )));
+                    }
+                    if decl.is_some() {
+                        return Err(self.err(format!(
+                            "a declared schema `(col[:type] …)` does not apply to a \
+                             {fmt_name} source (its schema comes from the data itself); \
+                             a declared schema belongs to CSV: \
+                             `open data.csv (id:int name:str)`"
+                        )));
+                    }
+                }
                 let mut op = fmt.into_op(path, delim);
                 // Layer the parsed read config / provenance onto the fresh source.
                 if let Op::Source {
@@ -1295,80 +1466,14 @@ impl Parser {
                     provenance: Provenance::Off,
                 }))
             }
-            // `readbin path [le|be] [packed|aligned] (name:type ...)`.
+            // `readbin path [le|be] [packed|aligned] (name:type ...)` — legacy
+            // alias of the canonical `open PATH as bin …` (design/38): it still
+            // parses this release and `fmt` rewrites it to the canonical form;
+            // the alias becomes a did-you-mean error at the migration flip.
             Tok::Word(w) if w == "readbin" => {
                 self.bump();
                 let path = self.word()?;
-                let mut endian = Endian::Little;
-                let mut c_align = false;
-                loop {
-                    match self.tok() {
-                        Tok::Word(m) if m == "le" => {
-                            endian = Endian::Little;
-                            self.bump();
-                        }
-                        Tok::Word(m) if m == "be" => {
-                            endian = Endian::Big;
-                            self.bump();
-                        }
-                        Tok::Word(m) if m == "packed" => {
-                            c_align = false;
-                            self.bump();
-                        }
-                        Tok::Word(m) if m == "aligned" => {
-                            c_align = true;
-                            self.bump();
-                        }
-                        _ => break,
-                    }
-                }
-                self.expect(&Tok::LParen)?;
-                let mut fields = Vec::new();
-                while !self.at(&Tok::RParen) && !self.at(&Tok::Eof) {
-                    let name = self.word()?;
-                    self.expect(&Tok::Colon)?;
-                    let ty = self.word()?;
-                    // `char[N]` — a fixed-width text field (§29.4): N raw bytes
-                    // decoded as UTF-8. Carries its byte width, so it is parsed
-                    // here rather than via the word-keyed `BinType::parse`.
-                    let bt = if ty == "char" {
-                        if !self.eat(&Tok::LBracket) {
-                            return Err(self.err(
-                                "binary `char` needs a byte width: write `char[N]`, \
-                                 e.g. `name:char[16]`",
-                            ));
-                        }
-                        let n = match self.bump() {
-                            Tok::Int(v) if v >= 0 => v as u32,
-                            other => {
-                                return Err(self.err(format!(
-                                    "char[N]: N must be a non-negative integer, found {other:?}"
-                                )))
-                            }
-                        };
-                        self.expect(&Tok::RBracket)?;
-                        BinType::Char(n)
-                    } else {
-                        BinType::parse(&ty)
-                            .ok_or_else(|| self.err(format!("unknown binary type '{ty}'")))?
-                    };
-                    fields.push((name, bt));
-                }
-                self.expect(&Tok::RParen)?;
-                if fields.is_empty() {
-                    return Err(self.err("readbin requires at least one field"));
-                }
-                let provenance = self.parse_provenance()?;
-                Ok(self.g.add_node(Op::Source {
-                    discovery: Discovery::Fixed(path),
-                    transport: Transport::Local,
-                    codec: Codec::Binary {
-                        fields,
-                        endian,
-                        c_align,
-                    },
-                    provenance,
-                }))
+                self.parse_bin_open_tail(path)
             }
             // Reference to a named scope → merge (`+`) or join (`&`).
             Tok::Word(name) if self.g.labels.contains_key(&name) => {
@@ -2502,7 +2607,10 @@ fn norm_path(p: String) -> String {
     }
 }
 
-/// A text source format selectable on `open` (binary goes via `readbin`).
+/// A text source format selectable on `open`. Binary (`as bin`) never reaches
+/// this resolver — it branches right after the format word is read, before the
+/// paren is parsed (its field vocabulary is not the CSV declared schema), and
+/// no extension implies it.
 enum Format {
     Csv,
     Jsonl,
@@ -3028,6 +3136,177 @@ mod tests {
         );
         // A bare `char` with no width is a never-silent error.
         assert!(parse("R:\n readbin f.bin (id:i32 x:char)\n;").is_err());
+    }
+
+    #[test]
+    fn bin_canonical_form_parses_and_is_idempotent() {
+        // design/38: `open PATH as bin [be] [aligned] (…)` is the canonical
+        // binary source. Defaults (`le`/`packed`) are never rendered, so the
+        // canonical spelling is a fixed point of parse -> to_source.
+        let src = "B:\n open f.dat as bin (id:i32 name:char[8])\n |> id name\n;";
+        let g = parse(src).unwrap();
+        match &g.nodes[0].op {
+            Op::Source {
+                codec:
+                    rivus_ir::Codec::Binary {
+                        fields,
+                        endian,
+                        c_align,
+                    },
+                ..
+            } => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[1].1, rivus_ir::BinType::Char(8));
+                assert_eq!(*endian, rivus_ir::Endian::Little);
+                assert!(!c_align);
+            }
+            other => panic!("expected a binary Source, got {other:?}"),
+        }
+        let s = g.to_source();
+        assert!(
+            s.contains("open f.dat as bin (id:i32 name:char[8])"),
+            "canonical spelling lost: {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not idempotent: {s}");
+    }
+
+    #[test]
+    fn readbin_alias_canonicalizes_to_open_as_bin() {
+        // Migration pin (design/38): the legacy `readbin` spelling still
+        // parses, `to_source` rewrites it to the canonical `open … as bin`
+        // form, the rewrite is idempotent, and both spellings build the same
+        // op (fields / endian / c_align all preserved).
+        let old = "B:\n readbin f.bin be aligned (id:i32 v:u16)\n |> id\n;";
+        let g = parse(old).unwrap();
+        let s = g.to_source();
+        assert!(
+            s.contains("open f.bin as bin be aligned (id:i32 v:u16)"),
+            "canonical rewrite missing: {s}"
+        );
+        assert!(!s.contains("readbin"), "legacy verb must not survive: {s}");
+        let g2 = parse(&s).unwrap();
+        assert_eq!(s, g2.to_source(), "not idempotent: {s}");
+        match (&g.nodes[0].op, &g2.nodes[0].op) {
+            (
+                Op::Source {
+                    codec:
+                        rivus_ir::Codec::Binary {
+                            fields: f1,
+                            endian: e1,
+                            c_align: a1,
+                        },
+                    ..
+                },
+                Op::Source {
+                    codec:
+                        rivus_ir::Codec::Binary {
+                            fields: f2,
+                            endian: e2,
+                            c_align: a2,
+                        },
+                    ..
+                },
+            ) => {
+                assert_eq!(f1, f2, "fields must survive the rewrite");
+                assert_eq!(e1, e2, "endianness must survive the rewrite");
+                assert_eq!(a1, a2, "alignment must survive the rewrite");
+                assert_eq!(*e1, rivus_ir::Endian::Big);
+                assert!(*a1);
+            }
+            other => panic!("expected binary Sources, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bin_default_modifiers_are_suppressed_in_canonical_form() {
+        // Explicit defaults (`le`, `packed`) parse but are not rendered —
+        // `fmt` normalizes them away and the result is idempotent.
+        let src = "B:\n open f.dat as bin le packed (x:i32)\n;";
+        let s = parse(src).unwrap().to_source();
+        assert!(
+            s.contains("open f.dat as bin (x:i32)"),
+            "defaults must be suppressed: {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not idempotent: {s}");
+    }
+
+    #[test]
+    fn bin_misuse_errors_teach_the_canonical_form() {
+        // Never-silent misuse: each error names the canonical form (or the
+        // binary type vocabulary) instead of failing with a generic message.
+        // `as bin` + `noheader`, before or after the field list.
+        for src in [
+            "B:\n open f.dat as bin noheader (x:i32)\n;",
+            "B:\n open f.dat as bin (x:i32) noheader\n;",
+        ] {
+            let e = parse(src).unwrap_err().to_string();
+            assert!(e.contains("as bin"), "noheader misuse should teach: {e}");
+        }
+        // `as bin` + a CSV declared-schema type word.
+        let e = parse("B:\n open f.dat as bin (id:int name:str)\n;")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("unknown binary type 'int'") && e.contains("char[N]"),
+            "CSV-vocabulary misuse should list the binary types: {e}"
+        );
+        // Binary layout modifiers on a text codec.
+        for src in [
+            "B:\n open f.csv be (a:int)\n;",
+            "B:\n open f.csv aligned\n;",
+            "B:\n open f.jsonl le\n;",
+        ] {
+            let e = parse(src).unwrap_err().to_string();
+            assert!(
+                e.contains("as bin"),
+                "layout modifier on a text codec should teach `as bin`: {e}"
+            );
+        }
+        // Empty field list / missing char width.
+        let e = parse("B:\n open f.dat as bin ()\n;")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at least one field"), "{e}");
+        let e = parse("B:\n open f.dat as bin (x:char)\n;")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("char[N]"), "{e}");
+    }
+
+    #[test]
+    fn text_codec_options_are_checked_for_consistency() {
+        // Bundled never-silent fix: `noheader` / a declared schema on a
+        // JSONL/JSON/Parquet open used to parse and be silently ignored
+        // (they only configure the CSV codec). Now they error and teach.
+        for src in [
+            "J:\n open d.jsonl noheader\n;",
+            "J:\n open d.jsonl (a:int b:str)\n;",
+            "P:\n open d.parquet noheader (a:int)\n;",
+            "J:\n open d.json (a:int)\n;",
+        ] {
+            let e = parse(src).unwrap_err().to_string();
+            assert!(
+                e.contains("CSV"),
+                "should teach the option is CSV-only: {e}"
+            );
+        }
+        // The CSV spellings keep parsing (including via `as csv`).
+        assert!(parse("C:\n open d.csv noheader (a:int b:str)\n;").is_ok());
+        assert!(parse("C:\n open d.jsonl as csv noheader\n;").is_ok());
+    }
+
+    #[test]
+    fn bin_extension_does_not_imply_binary() {
+        // No extension implies the binary codec — `.bin` without `as bin`
+        // falls back to the CSV default like any unrecognized extension;
+        // `as bin` is always explicit.
+        match first_op("F:\n open data.bin\n;") {
+            Op::Source {
+                codec: rivus_ir::Codec::Csv { .. },
+                ..
+            } => {}
+            other => panic!("`.bin` must not imply binary; got {other:?}"),
+        }
     }
 
     #[test]

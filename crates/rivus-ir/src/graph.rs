@@ -388,13 +388,13 @@ impl Provenance {
 }
 
 /// **Discovery** (design §28.2): which resource(s) a source reads. The v1 form
-/// is a single fixed path (`open PATH` / `readbin PATH`); slice 3 adds `ls` /
+/// is a single fixed path (`open PATH`, any codec); slice 3 adds `ls` /
 /// `glob` / recursive discovery as further variants. Keeping it a layer (not a
 /// bare `path: String` on the source) is what lets discovery become a flow
 /// without re-shaping `Op`.
 #[derive(Debug, Clone)]
 pub enum Discovery {
-    /// A single fixed resource path — the v1 `open` / `readbin` source.
+    /// A single fixed resource path — the v1 `open` source.
     Fixed(String),
     /// A glob pattern enumerated into a **stream of resources** (`ls "logs/**/*.csv"`,
     /// design §28.3): `**` recurses, `*`/`?`/`[...]` match within a path segment.
@@ -749,9 +749,10 @@ pub enum Op {
     /// One composable node replacing the former format-specific `OpenCsv` /
     /// `OpenJsonl` / `OpenBinary`, so discovery (slice 3) and routing (slice 4)
     /// attach here without re-stratifying I/O by format. The v1 surface forms —
-    /// `open PATH [as FMT] (schema) [with …]`, `readcsv`/`readjson`/`readbin` —
-    /// desugar to this (`Discovery::Fixed` + `Transport::Local` + the matching
-    /// `Codec`), and `to_source` restores the original surface form (reversible).
+    /// `open PATH [as FMT] (schema) [with …]` (`as bin` for binary) and the
+    /// legacy `readcsv`/`readjson`/`readbin` aliases — desugar to this
+    /// (`Discovery::Fixed` + `Transport::Local` + the matching `Codec`), and
+    /// `to_source` renders the canonical surface form (reversible).
     ///
     /// Reader pushdowns set by the optimizer ride on `Codec::Csv`: `projection`
     /// (`project_pushdown`) restricts which columns the reader builds; `prefilter`
@@ -1156,13 +1157,14 @@ impl Op {
 
     pub fn kind_str(&self) -> &'static str {
         match self {
-            // `readbin` for the binary codec, `open` for csv/jsonl (matching the
-            // surface verb each desugars from). A discovery source is `ls`, or
+            // `open` for the file codecs — including binary, whose canonical
+            // surface form is `open … as bin` (design/38; the legacy `readbin`
+            // alias desugars to the same op). A discovery source is `ls`, or
             // `watch` when the discovery is the unbounded subscription (§28.12).
             Op::Source {
                 codec, discovery, ..
             } => match codec {
-                Codec::Binary { .. } => "readbin",
+                Codec::Binary { .. } => "open",
                 Codec::Discover { .. } if discovery.is_unbounded() => "watch",
                 Codec::Discover { .. } => "ls",
                 // A data codec over the unbounded network `subscribe` source
@@ -1312,6 +1314,10 @@ impl Op {
                         }
                         s
                     }
+                    // Binary renders canonically as `open PATH as bin [be]
+                    // [aligned] (…)` (design/38; the legacy `readbin` alias
+                    // parses but never renders). Defaults (`le`, `packed`) are
+                    // suppressed so the canonical form is idempotent.
                     Codec::Binary {
                         fields,
                         endian,
@@ -1321,18 +1327,14 @@ impl Op {
                             .iter()
                             .map(|(n, t)| format!("{n}:{}", t.label()))
                             .collect();
-                        let mut mods = String::new();
+                        let mut s = format!("open {path} as bin");
                         if *endian == Endian::Big {
-                            mods.push_str("be ");
+                            s.push_str(" be");
                         }
                         if *c_align {
-                            mods.push_str("aligned ");
+                            s.push_str(" aligned");
                         }
-                        format!(
-                            "readbin {path} {mods}({}){}",
-                            cols.join(" "),
-                            provenance.modifier()
-                        )
+                        format!("{s} ({}){}", cols.join(" "), provenance.modifier())
                     }
                     // Parquet: a file `open` keeps the bare path (the `.parquet`
                     // extension picks the codec back up on re-parse); any other

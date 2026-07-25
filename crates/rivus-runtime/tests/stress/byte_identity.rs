@@ -245,7 +245,7 @@ fn binary_char_field_is_parallel_chunk_size_byte_identical() {
 
     let run_to_file = |cs: usize, pref: rivus_runtime::MemoryPref, out: &std::path::Path| {
         let src = format!(
-            "B:\n readbin {p} (id:i32 name:char[12])\n |? id >= 1000\n |> id name\n save {}\n;",
+            "B:\n open {p} as bin (id:i32 name:char[12])\n |? id >= 1000\n |> id name\n save {}\n;",
             out.display()
         );
         let g = rivus_parser::parse(&src).expect("parse");
@@ -1036,10 +1036,10 @@ fn parallel_binary_byte_identical() {
     // Stateless filter+project to a file, and a group-by — both parallel paths.
     for flow in [
         format!(
-            "F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n |> id age\n save {{OUT}}\n;"
+            "F:\n open {p} as bin (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n |> id age\n save {{OUT}}\n;"
         ),
         format!(
-            "F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |# active min:age max:age count_distinct:age\n save {{OUT}}\n;"
+            "F:\n open {p} as bin (id:i32 age:i32 score:f64 active:u8)\n |# active min:age max:age count_distinct:age\n save {{OUT}}\n;"
         ),
     ] {
         let ser = TempCsv(gendata::write_temp_bytes("bin_ser", b""));
