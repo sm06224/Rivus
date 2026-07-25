@@ -198,6 +198,7 @@ fn validate_dispositions_surface_and_dispose_chunk_size_independent() {
     }
 
     // reject is byte-identical serial vs parallel (row-wise predicate).
+    let _env = crate::env_guard();
     let rows_for = |pref: rivus_runtime::MemoryPref| {
         let g = rivus_parser::parse(&reject).expect("parse");
         std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
@@ -211,6 +212,20 @@ fn validate_dispositions_surface_and_dispose_chunk_size_independent() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            // This shape is not partitionable today, so Fast runs serial — the
+            // engine must SAY so (never-silent). Under the env lock a size-gate
+            // downgrade is impossible, so the only legitimate outcomes are real
+            // workers or the explicit structural fallback note; if this shape
+            // ever becomes partitionable, this pin fails and real parallel
+            // identity coverage must be added.
+            let strat = res.strategy.clone().unwrap_or_default();
+            assert!(
+                !res.workers.is_empty() || strat.contains("not partitionable"),
+                "parallel side must engage or explicitly report the serial \
+                 fallback: {strat}"
+            );
+        }
         collect_i64(&res, "V", "id")
     };
     assert_eq!(

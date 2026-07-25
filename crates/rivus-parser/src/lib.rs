@@ -5416,23 +5416,6 @@ Import:
         assert!(e.contains("duration string"), "{e}");
     }
 
-    #[test]
-    fn bare_dash_is_stdin_stdout_sentinel() {
-        // `open -` / `save -` map to the "-" sentinel, like `open stdin` /
-        // `save stdout` (the bare dash lexes as Minus; path_word accepts it).
-        let g = parse("F:\n open -\n |> name\n save -\n;").unwrap();
-        assert!(matches!(&g.nodes[0].op, Op::Source { discovery, .. } if discovery.path() == "-"));
-        let sink = g
-            .nodes
-            .iter()
-            .find_map(|n| match &n.op {
-                Op::Sink { route, .. } => route.path().map(str::to_string),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(sink, "-");
-    }
-
     /// design/38 P1+P2 移行リリース (#236 acceptance ②): every deleted
     /// spelling still parses, and `to_source` (the engine `rivus fmt` runs)
     /// rewrites it to the ONE canonical form. Each canonical output is

@@ -477,11 +477,12 @@ fn route_save_partitions_deterministically_and_byte_identically() {
     let tmpl = format!(
         "R:\n open {p} (id:int country:str score:int)\n |> id country\n save \"{base}/t/{{country}}.csv\"\n;"
     );
+    let _env = crate::env_guard();
     let bytes_for = |pref: rivus_runtime::MemoryPref| {
         let _ = std::fs::remove_dir_all(&dir);
         let g = rivus_parser::parse(&tmpl).expect("parse");
         std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
-        run(
+        let res = run(
             &g,
             RunOptions {
                 chunk_size: 2,
@@ -491,6 +492,20 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            // This shape is not partitionable today, so Fast runs serial — the
+            // engine must SAY so (never-silent). Under the env lock a size-gate
+            // downgrade is impossible, so the only legitimate outcomes are real
+            // workers or the explicit structural fallback note; if this shape
+            // ever becomes partitionable, this pin fails and real parallel
+            // identity coverage must be added.
+            let strat = res.strategy.clone().unwrap_or_default();
+            assert!(
+                !res.workers.is_empty() || strat.contains("not partitionable"),
+                "parallel side must engage or explicitly report the serial \
+                 fallback: {strat}"
+            );
+        }
         format!("{}|{}", read("t/JP.csv"), read("t/a%2Fb.csv"))
     };
     let serial = bytes_for(rivus_runtime::MemoryPref::Low);
@@ -584,6 +599,20 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            // Route-template saves are not partitionable today, so Fast runs
+            // serial — the engine must SAY so (never-silent). Under the env
+            // lock a size-gate downgrade is impossible; if this shape ever
+            // becomes partitionable, this pin fails and real parallel
+            // identity coverage must be added.
+            let strat = res.strategy.clone().unwrap_or_default();
+            assert!(
+                !res.workers.is_empty() || strat.contains("not partitionable"),
+                "parallel side must engage or explicitly report the serial \
+                 fallback: {strat}"
+            );
+        }
+
         assert!(
             res.errors
                 .iter()

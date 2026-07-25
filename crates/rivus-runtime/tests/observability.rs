@@ -975,7 +975,7 @@ fn f64_group_file_major_parallel_matches_serial_mirror() {
     let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
     let run_one = |out: &std::path::Path, serial: bool, chunk: usize| {
         let g = parse_opt(&mk(out));
-        let _guard = ();
+        // The real env_guard is taken by the caller around all run_one calls.
         if serial {
             std::env::set_var("RIVUS_NO_PARALLEL", "1");
         } else {
