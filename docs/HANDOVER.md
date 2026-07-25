@@ -60,8 +60,10 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 | #248 | design/42 JSONL 側（批准スコープ完了）— JSONL group median −4〜5% |
 | #249 | **#45 正準縮約木**（方式(b)・file-major 正準）— f64 sum/avg/std が並列化: f64 集計フロー wall 2.2〜3.4×・RSS 53× 改善 |
 
-**エラー化リリース（P1〜P4 の旧綴り一括 flip）の前提**: 残るは `readbin`
-（`open … as bin` 文法）の裁可のみ＝**統括専権**。asof チェーン描画は #247 で解消済み。
+**エラー化リリース（P1〜P4 の旧綴り一括 flip）**: 前提は**全充足**（asof チェーン
+描画 = #247・readbin 文法 = #252 で `open … as bin` 着地済み）。**flip 本体も統括 GO 済み**
+（2026-07-25・仕様正典 = #240 issuecomment-5078743131 — recognize-but-refuse・
+受入条件 7 点・着地順は #255→#250 の後）。
 
 **標準フィクスチャの注意（2026-07-23）**: scratchpad がコンテナ再生成で消失し、
 10M×9 files 標準は文書仕様（BENCHMARKS「standard fixture」節・dirty mix 込み）から
@@ -96,10 +98,10 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 
 ## 5. 開いている判断（勝手に決めない）
 
-1. **readbin 文法（`open … as bin`）** — エラー化 flip の最後の前提・統括専権。
-2. **P5（制御プレーン verb の整理）** — 使用調査待ち・統括判断。
-3. **design/40 Q1-Q4**（OTel T1 / QUIC B2）— 引き続き裁可待ち。
-4. **#45 の将来スライス**: 単一ファイル byte-range の file-major 化（§37.5）・BLOCK 掃引（Q2）。
+1. **P5（制御プレーン verb の整理）** — 使用調査待ち・統括判断。（readbin 文法は
+   #252 で裁可・着地済み — flip 本体も GO 済み・issuecomment-5078743131 が仕様正典。）
+2. **design/40 Q1-Q4**（OTel T1 / QUIC B2）— 引き続き裁可待ち。
+3. **#45 の将来スライス**: 単一ファイル byte-range の file-major 化（§37.5）・BLOCK 掃引（Q2）。
 5. #229 Parquet の full 搭載可否・`unbounded` full 搭載 — 従来どおり保留。
 
 ## 6. 次のレバー候補（優先順・2026-07-24 実測に基づく）
