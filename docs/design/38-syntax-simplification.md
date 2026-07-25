@@ -1,8 +1,14 @@
 # Design 38 — Syntax simplification (restoring "one obvious way")
 
-**Status:** P1+P2 GO 済（#236 issuecomment-5017506345）・**P1+P2 移行リリース実装済み**
-（削除綴りは本リリースは parse 可＋`fmt` が正典へ自動書換、次リリースで
-did-you-mean エラー化）。**readbin 吸収実装済み**（`open … as bin` 文法は
+**Status:** **flip 済み（2026-07-25・仕様正典 #240 issuecomment-5078743131）** —
+P1〜P4 の全退役綴り（P1 11 語・P2 2 形・P3 2 verb・P4 接ぎ木形、計 16 パース
+サイト）は **recognize-but-refuse** の never-silent エラー：字句・構文として
+認識し続け、①退役綴りの名指し ②正典の置き換え（インライン例つき）③前リリース
+(v1.4.x) の `rivus fmt --write` での一括移行、の 3 要素を必ず教える
+（`err_retired`・全綴り 1 本ずつ pin テスト済み）。正典綴りの挙動は不変。
+fmt の自動移行パスは parse 拒否により同時消滅（専用コードは元々なし）。
+経緯: P1+P2 GO 済（#236 issuecomment-5017506345）・P1+P2 移行リリース実装済み
+（削除綴りは移行リリースでは parse 可＋`fmt` が正典へ自動書換）。**readbin 吸収実装済み**（`open … as bin` 文法は
 #240 issuecomment-5074891399/5075090723 で裁可 — 正典は
 `open PATH as bin [be] [aligned] (name:bintype …) [with source]`、既定値
 `le`/`packed` は非描画。`readbin` は同じ移行方式: 本リリース parse 可＋fmt

@@ -92,8 +92,8 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH.parquet` | **Apache Parquet** (opt-in `--features parquet`, read-only): typed lanes come straight from the file's schema — int64→int, double→float, utf8→str, DATE→date, TIMESTAMP millis/micros→datetime, DECIMAL→decimal — with real nulls. Uncompressed/snappy/gzip codecs; row-group streaming (bounded memory); nested columns error with guidance. The default (zero-dependency) build errors with `rebuild with --features parquet` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), `duration` (signed time spans), `date` (ISO `yyyy-MM-dd` calendar dates), or `time` (`HH:mm:ss` time-of-day; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
-| `readcsv PATH` / `readjson PATH` | deprecated aliases of `open PATH [as csv\|jsonl]` — still parse; `rivus fmt` rewrites them (§12 migration table) |
-| `open PATH as bin [be] [aligned] (name:type …)` | fixed-width binary records (a C-struct dump). Defaults `le`/`packed` are not written; no extension implies `bin` (always spell `as bin`). Legacy `readbin PATH …` still parses and `rivus fmt` rewrites it |
+| `readcsv PATH` / `readjson PATH` | retired spellings of `open PATH [as csv\|jsonl]` — never-silent errors since the design/38 flip; migrate with the previous release's (v1.4.x) `rivus fmt --write` (§12 migration table) |
+| `open PATH as bin [be] [aligned] (name:type …)` | fixed-width binary records (a C-struct dump). Defaults `le`/`packed` are not written; no extension implies `bin` (always spell `as bin`). The legacy `readbin PATH …` spelling is a retired teaching error (§12 migration table) |
 | `open stdin` / `open -` | read CSV (or `as FMT`) from standard input |
 | `stream NAME` | replay a named flow (MVP: reference) |
 
@@ -271,8 +271,8 @@ Keep rows where the predicate is true.
 
 **Commas mean AND** (the one top-level conjunction); `and`/`or` still work
 *inside* a boolean expression where precedence matters. (`where` and a
-top-level `and` between predicates are deprecated spellings — `rivus fmt`
-rewrites them, §12.)
+top-level `and` between predicates are retired spellings — never-silent
+teaching errors since the design/38 flip, §12.)
 
 ```
 |? age >= 20
@@ -615,7 +615,7 @@ Merged:
   time-ascending; the right side is sorted per group so the result is
   chunk-size independent (serial). Datetime `≤` is exact (i64 ticks).
   Example: `Trades &asof Quotes on sym by ts within "1m"`. (The old grafted
-  `A & B … asof ts` spelling is deprecated — `rivus fmt` rewrites it, §12.)
+  `A & B … asof ts` spelling is retired — a teaching error, §12.)
 
 ```
 # inner join two CSVs on `id`
@@ -841,7 +841,7 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   source order; null for the first `N`), `|> * (diff(ts)) as gap` (`col −
   lag`; a `datetime` column yields an exact `Duration`), `pct_change` =
   `(col − lag)/lag` as float; chunk-size independent, serial (the retired
-  `sessionize`/`shift` verbs still parse and `rivus fmt` rewrites them, §12);
+  `sessionize`/`shift` verbs are teaching errors since the design/38 flip, §12);
   `format(ts, "fmt")` (→ text, same tokens incl.
   `ddd`/`[ja-jp]`/`n…n` — `format(ts, "[ja-jp]ddd")` renders `水`). Default
   rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss` (+ full-width fraction on a
@@ -934,7 +934,7 @@ open events.csv (ts:datetime)
 |---|---|
 | `save PATH` | format from the extension (mirrors the sources; `.tsv`/`.tab` → tab-delimited; `.json` → JSON array; `.jsonl`/`.ndjson` → NDJSON) |
 | `save PATH as FMT` | force the format (`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
-| `writecsv PATH` / `writejson PATH` | deprecated aliases of `save PATH [as csv\|jsonl]` — still parse; `rivus fmt` rewrites them (§12) |
+| `writecsv PATH` / `writejson PATH` | retired spellings of `save PATH [as csv\|jsonl]` — never-silent errors since the design/38 flip (§12 migration table) |
 | `save stdout` / `save -` | write to standard output |
 | `print` | capture for the on-screen preview |
 
@@ -1258,12 +1258,13 @@ construct it cannot yet render losslessly (e.g. an anonymous, unlabeled scope),
 refuses with a non-zero exit and leaves the source untouched rather than rewrite
 it into something different.
 
-**Deprecated spellings (design/38 migration).** The following still parse in
-this release; `rivus fmt` rewrites each to its canonical form, and **the next
-release turns them into never-silent did-you-mean errors** — run `rivus fmt
---write` on your programs before upgrading:
+**Retired spellings (design/38 flip).** The following are **never-silent
+did-you-mean errors** in this release — each error names the retired spelling,
+teaches the canonical replacement with an inline example, and points at the
+migration path. Files that still use an old spelling migrate mechanically with
+the **previous release's (v1.4.x)** `rivus fmt --write` before upgrading:
 
-| deprecated | canonical |
+| retired | canonical |
 |---|---|
 | `readcsv P` / `readjson P` | `open P [as csv\|jsonl]` |
 | `readbin P … (…)` | `open P as bin … (…)` |
@@ -1289,17 +1290,15 @@ body       = source transform* ;
 
 source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | 'open' PATH 'as' 'bin' ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
-           | 'readcsv' PATH | 'readjson' PATH                       (legacy; fmt rewrites)
-           | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'   (legacy; fmt rewrites)
            | 'stream' IDENT
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
-transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
+transform  = '|?' expr (',' expr)*                             (filter; comma = AND)
            | '|!' (contract | '{' (contract ';'?)+ '}')        (validate: row contract(s))
            | '|' IDENT (IDENT '=' VALUE)*                      (apply a named flow; bind value holes)
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
-           | ('take'|'limit'|'head') INT
+           | 'take' INT
            | 'sort' (IDENT ('asc'|'desc')?)+
            | 'distinct' IDENT*
            | 'describe'
@@ -1308,10 +1307,10 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'cast' (IDENT ':' TYPE)+
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' (PATH | TEMPLATE) ('as' FMT)? ('by' IDENT+)? ('as' 'flat')?
-              | 'writecsv' PATH | 'writejson' PATH | 'print')   (TEMPLATE = "…{col}…", {{ }} escape)
+              | 'print')                                       (TEMPLATE = "…{col}…", {{ }} escape)
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)
 
-proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;
+proj       = IDENT (':' IDENT)? (':' TYPE)? | '(' expr ')' 'as' IDENT ;   (the ':' chain)
 contract   = expr (',' expr)* ('warn'|'reject'|'halt') ;       (disposition is mandatory)
 expr       = or ; or = and ('or' and)* ; and = cmp ('and' cmp)* ;
 cmp        = add (CMP add | '~' (REGEX | add))? ;               (REGEX = raw '…' literal)

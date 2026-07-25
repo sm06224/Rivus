@@ -6,7 +6,8 @@
 //! The grammar is documented — and kept current — in
 //! `docs/design/10-shell-syntax.md` (full EBNF) and `docs/GUIDE.md` §"Quick
 //! grammar reference"; `docs/design/38-syntax-simplification.md` tracks the
-//! one-spelling migrations (P1-P4 + readbin) that retire alias forms. An
+//! one-spelling migrations (P1-P4 + readbin) whose retired forms are now
+//! never-silent teaching errors (`err_retired`, the flip release). An
 //! inline sketch here rotted against all three (it predated windows, joins'
 //! kinds, validate, route, …) — link, don't copy (audit 2026-07-24).
 
@@ -306,17 +307,15 @@ impl Parser {
                 // `|? pred` / `|? a, b` (comma = AND). `where` is a readable alias.
                 Tok::PipeFilter => {
                     self.bump();
-                    let pred = self.parse_filter_preds()?;
+                    let pred = self.parse_filter_preds(true)?;
                     let n = self.g.add_node(Op::Filter { pred });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // design/38 flip: `where` retired (the `|?` symbol is the
+                // one filter spelling).
                 Tok::Word(w) if w == "where" => {
-                    self.bump();
-                    let pred = self.parse_filter_preds()?;
-                    let n = self.g.add_node(Op::Filter { pred });
-                    self.g.add_edge(current, n, EdgeKind::Stream);
-                    current = n;
+                    return Err(self.err_retired("where", "`|? PRED`", "|? age >= 20"));
                 }
                 // `|! pred warn|reject|halt` — a row contract; the disposition is
                 // required (no implicit default, so a silent policy is impossible).
@@ -333,7 +332,7 @@ impl Parser {
                             if self.eat(&Tok::RBrace) {
                                 break;
                             }
-                            let pred = self.parse_filter_preds()?;
+                            let pred = self.parse_filter_preds(false)?;
                             let disposition = self.parse_disposition()?;
                             let n = self.g.add_node(Op::Validate { pred, disposition });
                             self.g.add_edge(current, n, EdgeKind::Stream);
@@ -346,7 +345,7 @@ impl Parser {
                             ));
                         }
                     } else {
-                        let pred = self.parse_filter_preds()?;
+                        let pred = self.parse_filter_preds(false)?;
                         let disposition = self.parse_disposition()?;
                         let n = self.g.add_node(Op::Validate { pred, disposition });
                         self.g.add_edge(current, n, EdgeKind::Stream);
@@ -590,27 +589,24 @@ impl Parser {
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
                 }
+                // design/38 flip: the write* verbs retired (`save` is the
+                // one sink spelling; format via `as FMT` or the extension).
                 Tok::Word(w) if w == "writecsv" => {
-                    self.bump();
-                    let path = self.word()?;
-                    let n = self.g.add_node(Op::sink(
-                        path.clone(),
-                        SinkCodec::Csv {
-                            delim: rivus_ir::delim_for_path(&path),
-                        },
-                    ));
-                    self.g.add_edge(current, n, EdgeKind::Stream);
-                    current = n;
+                    return Err(self.err_retired("writecsv", "`save PATH`", "save out.csv"));
                 }
                 Tok::Word(w) if w == "writejson" => {
-                    self.bump();
-                    let path = self.word()?;
-                    let n = self.g.add_node(Op::sink(path, SinkCodec::Jsonl));
-                    self.g.add_edge(current, n, EdgeKind::Stream);
-                    current = n;
+                    return Err(self.err_retired(
+                        "writejson",
+                        "`save PATH [as jsonl]`",
+                        "save out.jsonl",
+                    ));
                 }
-                // `take N` / `limit N` / `head N` — cap the stream at N rows.
+                // `take N` — cap the stream at N rows. design/38 flip:
+                // `limit`/`head` retired.
                 Tok::Word(w) if w == "take" || w == "limit" || w == "head" => {
+                    if w != "take" {
+                        return Err(self.err_retired(&w, "`take N`", "take 100"));
+                    }
                     self.bump();
                     let n = match self.tok().clone() {
                         Tok::Int(v) if v >= 0 => {
@@ -706,6 +702,10 @@ impl Parser {
                 // `explode COL` / `unnest COL` — multiply rows over a List column
                 // (§32 s4c).
                 Tok::Word(w) if w == "explode" || w == "unnest" => {
+                    // design/38 flip: `unnest` retired.
+                    if w == "unnest" {
+                        return Err(self.err_retired("unnest", "`explode COL`", "explode tags"));
+                    }
                     self.bump();
                     let col = self.word()?;
                     let n = self.g.add_node(Op::Explode { col });
@@ -738,98 +738,27 @@ impl Parser {
                 // (§36.5 / #60): append a `session` column carrying the row's
                 // session start (same "window start as key" shape as bucket/
                 // hops, so `|# session …` aggregates per session).
+                // design/38 flip: the `sessionize` verb retired — session
+                // windows are `|>` window items (P3).
                 Tok::Word(w) if w == "sessionize" => {
-                    self.bump();
-                    let ts = self.word()?;
-                    if !self.peek_is_word("gap") {
-                        return Err(self.err(
-                            "sessionize expects `gap \"DUR\"` after the timestamp column \
-                             (e.g. `sessionize ts gap \"30m\"`)",
-                        ));
-                    }
-                    self.bump(); // 'gap'
-                    let gap = match self.bump() {
-                        Tok::Str(s) => s,
-                        other => {
-                            return Err(self.err(format!(
-                                "sessionize gap expects a duration string like \"30m\", \
-                                 found {other:?}"
-                            )))
-                        }
-                    };
-                    let mut by = Vec::new();
-                    if self.peek_is_word("by") {
-                        self.bump();
-                        by = self.parse_word_list();
-                        if by.is_empty() {
-                            return Err(self.err("sessionize `by` expects at least one column"));
-                        }
-                    }
-                    let n = self.g.add_node(Op::Sessionize {
-                        ts,
-                        gap,
-                        by,
-                        // The retired verb always appended `session`; the
-                        // canonical `|> * (session(…) over …) as OUT` names it.
-                        out: "session".to_string(),
-                    });
-                    self.g.add_edge(current, n, EdgeKind::Stream);
-                    current = n;
+                    return Err(self.err_retired(
+                        "sessionize",
+                        "`|> * (session(TS, \"GAP\") over BY…) as OUT`",
+                        "|> * (session(ts, \"30m\") over user) as session",
+                    ));
                 }
                 // `shift COL lag|diff|pct_change [N] [by COL ...] as ALIAS` —
                 // time-series shift/difference primitives (#65). `N` (rows back)
                 // defaults to 1; `by` groups the shift; `as ALIAS` names the
                 // appended column.
+                // design/38 flip: the `shift` verb retired — lag/diff/
+                // pct_change are `|>` window items (P3).
                 Tok::Word(w) if w == "shift" => {
-                    self.bump();
-                    let col = self.word()?;
-                    let kind = match self.bump() {
-                        Tok::Word(k) => rivus_ir::ShiftKind::parse(&k).ok_or_else(|| {
-                            self.err(format!(
-                                "shift expects `lag`, `diff`, or `pct_change`, found '{k}'"
-                            ))
-                        })?,
-                        other => {
-                            return Err(self.err(format!(
-                                "shift expects `lag`/`diff`/`pct_change`, found {other:?}"
-                            )))
-                        }
-                    };
-                    // Optional row count (defaults to 1).
-                    let n_rows = if let Tok::Int(v) = self.tok().clone() {
-                        if v < 1 {
-                            return Err(self.err("shift N (rows back) must be a positive integer"));
-                        }
-                        self.bump();
-                        v as u32
-                    } else {
-                        1
-                    };
-                    let mut by = Vec::new();
-                    if self.peek_is_word("by") {
-                        self.bump();
-                        by = self.parse_word_list();
-                        if by.is_empty() {
-                            return Err(self.err("shift `by` expects at least one column"));
-                        }
-                    }
-                    if !self.peek_is_word("as") {
-                        return Err(self.err(
-                            "shift needs `as ALIAS` to name the appended column \
-                             (e.g. `shift price diff as delta`)",
-                        ));
-                    }
-                    self.bump(); // 'as'
-                    let out = self.word()?;
-                    let node = self.g.add_node(Op::Shift {
-                        col,
-                        kind,
-                        n: n_rows,
-                        by,
-                        out,
-                    });
-                    self.g.add_edge(current, node, EdgeKind::Stream);
-                    current = node;
+                    return Err(self.err_retired(
+                        "shift",
+                        "a `|>` window item (`lag`/`diff`/`pct_change`)",
+                        "|> * (lag(price, 1) over sym) as prev",
+                    ));
                 }
                 // `drop COL [COL ...]` — remove the named columns.
                 Tok::Word(w) if w == "drop" => {
@@ -1057,6 +986,21 @@ impl Parser {
                 "`with` expects `source` or `filename`, found {other:?}"
             ))),
         }
+    }
+
+    /// A spelling deleted by the design/38 flip: **recognized, refused,
+    /// taught** (never-silent — a deleted word must not fall through to a
+    /// generic "unexpected token"). Three mandatory elements (#240 flip
+    /// ruling): the retirement, the canonical replacement with an inline
+    /// example, and the mechanical migration path via the PREVIOUS
+    /// release's formatter.
+    fn err_retired(&self, retired: &str, canonical: &str, example: &str) -> RivusError {
+        self.err(format!(
+            "`{retired}` was retired by the design/38 syntax simplification — \
+             write {canonical} (e.g. `{example}`); files with the old \
+             spelling migrate mechanically with the previous release's \
+             (v1.4.x) `rivus fmt --write`"
+        ))
     }
 
     /// Consume a run of bare column words, stopping at a stage keyword
@@ -1358,28 +1302,13 @@ impl Parser {
                 }
                 Ok(self.g.add_node(op))
             }
+            // design/38 flip: the read* verbs retired (`open` is the one
+            // source spelling; format via `as FMT` or the extension).
             Tok::Word(w) if w == "readcsv" => {
-                self.bump();
-                let path = norm_path(self.path_word()?);
-                let provenance = self.parse_provenance()?;
-                let delim = rivus_ir::delim_for_path(&path);
-                Ok(self.g.add_node(Op::Source {
-                    discovery: Discovery::Fixed(path),
-                    transport: Transport::Local,
-                    codec: Codec::csv(delim),
-                    provenance,
-                }))
+                Err(self.err_retired("readcsv", "`open PATH`", "open data.csv"))
             }
             Tok::Word(w) if w == "readjson" => {
-                self.bump();
-                let path = norm_path(self.path_word()?);
-                let provenance = self.parse_provenance()?;
-                Ok(self.g.add_node(Op::Source {
-                    discovery: Discovery::Fixed(path),
-                    transport: Transport::Local,
-                    codec: Codec::Jsonl,
-                    provenance,
-                }))
+                Err(self.err_retired("readjson", "`open PATH [as jsonl]`", "open data.jsonl"))
             }
             Tok::Word(w) if w == "stream" => {
                 self.bump();
@@ -1391,6 +1320,10 @@ impl Parser {
             // pattern is a string literal (`**` recurses); no codec decode.
             // Aliases `gci` / `dir` (PowerShell), verb-only (no `Verb-Noun`).
             Tok::Word(w) if w == "ls" || w == "gci" || w == "dir" => {
+                // design/38 flip: `gci`/`dir` retired.
+                if w != "ls" {
+                    return Err(self.err_retired(&w, "`ls \"GLOB\"`", "ls \"logs/*.csv\""));
+                }
                 self.bump();
                 let pattern = match self.bump() {
                     Tok::Str(s) => s,
@@ -1466,15 +1399,12 @@ impl Parser {
                     provenance: Provenance::Off,
                 }))
             }
-            // `readbin path [le|be] [packed|aligned] (name:type ...)` — legacy
-            // alias of the canonical `open PATH as bin …` (design/38): it still
-            // parses this release and `fmt` rewrites it to the canonical form;
-            // the alias becomes a did-you-mean error at the migration flip.
-            Tok::Word(w) if w == "readbin" => {
-                self.bump();
-                let path = self.word()?;
-                self.parse_bin_open_tail(path)
-            }
+            // design/38 flip: `readbin` retired — binary is `open … as bin`.
+            Tok::Word(w) if w == "readbin" => Err(self.err_retired(
+                "readbin",
+                "`open PATH as bin [be] [aligned] (name:bintype …)`",
+                "open dump.bin as bin (id:i32 name:char[16])",
+            )),
             // Reference to a named scope → merge (`+`) or join (`&`).
             Tok::Word(name) if self.g.labels.contains_key(&name) => {
                 let first = self.g.labels[&name];
@@ -1590,47 +1520,15 @@ impl Parser {
                         self.g.add_edge(rid, asof, EdgeKind::Stream);
                         return Ok(asof);
                     }
-                    // RETIRED spelling (design/38 P4 migration release):
-                    // `A & B [on k…] asof TS [within]` still parses; `fmt`
-                    // rewrites it to `&asof`; next release it errors.
+                    // design/38 flip: the grafted as-of form
+                    // (`A & B [on k…] asof TS [within]`) retired — `&asof` is
+                    // a join kind, `by` names the temporal axis.
                     if self.peek_is_word("asof") {
-                        if kind != JoinKind::Inner {
-                            return Err(self.err(
-                                "as-of join uses plain `&` (a left/right/full qualifier is a \
-                                 later slice)",
-                            ));
-                        }
-                        self.bump(); // `asof`
-                        let ts = self.word()?;
-                        // `on lk:rk` isn't supported for the as-of `by` (same
-                        // name both sides); reject a `:` form clearly.
-                        if left_keys != right_keys {
-                            return Err(self.err(
-                                "as-of `on` keys use the same name on both sides (no `lk:rk`)",
-                            ));
-                        }
-                        let tolerance = if self.peek_is_word("within") {
-                            self.bump();
-                            match self.bump() {
-                                Tok::Str(d) => Some(d),
-                                other => {
-                                    return Err(self.err(format!(
-                                        "asof `within` expects a duration string like \"5m\", \
-                                         found {other:?}"
-                                    )))
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        let asof = self.g.add_node(Op::AsofJoin {
-                            by: left_keys,
-                            ts,
-                            tolerance,
-                        });
-                        self.g.add_edge(first, asof, EdgeKind::Stream);
-                        self.g.add_edge(rid, asof, EdgeKind::Stream);
-                        return Ok(asof);
+                        return Err(self.err_retired(
+                            "& … asof",
+                            "`A &asof B [on K…] by TS [within \"DUR\"]`",
+                            "T &asof Q on sym by ts within \"1m\"",
+                        ));
                     }
                     if left_keys.is_empty() {
                         return Err(self.err("join `A & B` requires `on <key>` (or `on lk:rk`)"));
@@ -1663,8 +1561,8 @@ impl Parser {
     /// `(session|lag|diff|pct_change(args) [over col…]) as alias`, which
     /// lower to the bespoke append ops BEFORE the projection). `|> *` keeps
     /// every column and appends the window outputs — the retired
-    /// `sessionize`/`shift` verbs' keep-all semantics, so `fmt` migrates them
-    /// mechanically. Returns the op chain in stream order (window ops, then
+    /// `sessionize`/`shift` verbs' keep-all semantics under one grammar.
+    /// Returns the op chain in stream order (window ops, then
     /// the projection — omitted under `*`). When every projected item is a
     /// bare field this lowers to the pure-selection `Op::Project` (so
     /// existing fusion/pushdown are untouched); otherwise to `ProjectExpr`.
@@ -1691,25 +1589,55 @@ impl Parser {
                     items.push((Expr::field(&out), out));
                     win_ops.push(op);
                 }
-                // `(expr) as alias` — computed column.
+                // `(expr) as alias` — computed column. design/38 flip: the
+                // `(name:type) as alias` cast-rename form retired (a cast of
+                // a BARE field is `:` chain territory; `as` stays for real
+                // computed expressions, incl. the `(col) as int` escape hatch
+                // for renaming to a type-word name).
                 Tok::LParen => {
+                    // The retired sugar is detected on the SURFACE (`(name:`
+                    // opener) and confirmed on the AST (a pure cast of a bare
+                    // field) — a call spelling like `(resource(col)) as x`
+                    // parses to the same Cast node but is a genuine computed
+                    // column and survives.
+                    let colon_opener = matches!(
+                        (
+                            self.toks.get(self.pos + 1).map(|t| &t.0),
+                            self.toks.get(self.pos + 2).map(|t| &t.0)
+                        ),
+                        (Some(Tok::Word(_)), Some(Tok::Colon))
+                    );
                     let e = self.parse_primary()?; // consumes the parenthesized expr
                     if !self.peek_is_word("as") {
                         return Err(self.err("computed projection `(expr)` requires `as <name>`"));
+                    }
+                    if colon_opener {
+                        if let Expr::Cast { expr: inner, .. } = &e {
+                            if matches!(**inner, Expr::Field { .. }) {
+                                return Err(self.err_retired(
+                                    "(name:type) as ALIAS",
+                                    "the `:` definition chain",
+                                    "|> amount :amt :decimal(2)",
+                                ));
+                            }
+                        }
                     }
                     self.bump(); // `as`
                     let alias = self.word()?;
                     items.push((e, alias));
                     all_bare = false;
                 }
-                // `name`, `name as alias`, or a `:` definition chain.
+                // `name` or a `:` definition chain. design/38 flip: the
+                // `name as alias` rename form retired (`as` stays for
+                // computed columns only).
                 Tok::Word(w) if !is_keyword(&w) => {
                     self.bump();
                     if self.peek_is_word("as") {
-                        self.bump();
-                        let alias = self.word()?;
-                        items.push((Expr::field(&w), alias));
-                        all_bare = false;
+                        return Err(self.err_retired(
+                            &format!("{w} as ALIAS"),
+                            "the `:` definition chain",
+                            &format!("|> {w} :alias"),
+                        ));
                     } else if self.at(&Tok::Colon) {
                         items.push(self.parse_colon_chain(&w, &mut views)?);
                         all_bare = false;
@@ -2083,10 +2011,31 @@ impl Parser {
 
     /// A filter predicate, optionally comma-separated where `,` means AND —
     /// `|? age >= 20, country == "JP"` reads better than chained `and`.
-    fn parse_filter_preds(&mut self) -> Result<Expr, RivusError> {
+    /// `retire_top_and` (design/38 flip): on the `|?` filter, a comma part
+    /// whose ROOT is `and` means the user wrote `and` as the part's top-level
+    /// conjunction — retired (the comma is the one filter conjunction).
+    /// `and`/`or` INSIDE a boolean expression survive: precedence makes
+    /// `a and b or c` an `or` root, which passes untouched. The commas below
+    /// build the same `Expr::And` chain the retired spelling did, so the IR —
+    /// and every canonical rendering — is unchanged. A `|!` contract passes
+    /// `false`: its pred renders with ` and ` (P2 scoped the comma rule to
+    /// the filter), so `and` IS its canonical round-trip spelling.
+    fn parse_filter_preds(&mut self, retire_top_and: bool) -> Result<Expr, RivusError> {
+        let no_top_and = |p: &Self, e: &Expr| -> Result<(), RivusError> {
+            if retire_top_and && matches!(e, Expr::And(..)) {
+                return Err(p.err_retired(
+                    "and (between filter predicates)",
+                    "the comma",
+                    "|? age >= 20, country == \"JP\"",
+                ));
+            }
+            Ok(())
+        };
         let mut pred = self.parse_expr()?;
+        no_top_and(self, &pred)?;
         while self.eat(&Tok::Comma) {
             let rhs = self.parse_expr()?;
+            no_top_and(self, &rhs)?;
             pred = Expr::And(Box::new(pred), Box::new(rhs));
         }
         Ok(pred)
@@ -2906,8 +2855,9 @@ mod tests {
 
     #[test]
     fn comma_filter_is_and_and_where_is_an_alias() {
-        // `|? a, b`, `|? a and b`, and `where a, b` all lower to the same
-        // Filter(And(a, b)).
+        // The comma is the ONE filter conjunction (Filter(And(a, b)));
+        // design/38 flip: `where` and a top-level `and` between predicates
+        // are teaching errors.
         let want = |op: &Op| {
             matches!(
                 op,
@@ -2920,14 +2870,14 @@ mod tests {
             "F:\n open d.csv\n |? age >= 20, country == \"JP\"\n;",
             1
         )));
-        assert!(want(&nth_op(
-            "F:\n open d.csv\n |? age >= 20 and country == \"JP\"\n;",
-            1
-        )));
-        assert!(want(&nth_op(
-            "F:\n open d.csv\n where age >= 20, country == \"JP\"\n;",
-            1
-        )));
+        let e = parse("F:\n open d.csv\n |? age >= 20 and country == \"JP\"\n;")
+            .expect_err("top-level and retired")
+            .to_string();
+        assert!(e.contains("retired") && e.contains("comma"), "{e}");
+        let e = parse("F:\n open d.csv\n where age >= 20, country == \"JP\"\n;")
+            .expect_err("where retired")
+            .to_string();
+        assert!(e.contains("retired") && e.contains("|? PRED"), "{e}");
     }
 
     #[test]
@@ -3016,13 +2966,16 @@ mod tests {
             parse(&s1).unwrap().to_source(),
             "chain not reversible: {s1}"
         );
-        let sugar =
-            "F:\n open a.csv\n |> (amount:decimal(2)) as amt (qty:int) as qty (note) as memo\n;";
-        assert_eq!(
-            parse(sugar).unwrap().to_source(),
-            s1,
-            "parenthesized forms must canonicalize to the chain"
+        // design/38 flip: the parenthesized cast-rename sugar is a teaching
+        // error; the paren-Field escape hatch (`(note) as memo`) survives.
+        let e = parse("F:\n open a.csv\n |> (amount:decimal(2)) as amt\n;")
+            .expect_err("cast-rename sugar retired")
+            .to_string();
+        assert!(
+            e.contains("retired") && e.contains("definition chain"),
+            "{e}"
         );
+        assert!(parse("F:\n open a.csv\n |> (note) as memo\n;").is_ok());
     }
 
     #[test]
@@ -3115,7 +3068,7 @@ mod tests {
     fn readbin_char_field_parses_and_round_trips() {
         // `char[N]` binary field (§29.4): parses to `BinType::Char(N)`, renders
         // back as `name:char[N]`, and re-parses to the same IR (reversible).
-        let src = "R:\n readbin f.bin (id:i32 name:char[16])\n |> id name\n;";
+        let src = "R:\n open f.bin as bin (id:i32 name:char[16])\n |> id name\n;";
         let g = parse(src).unwrap();
         match &g.nodes[0].op {
             Op::Source {
@@ -3135,7 +3088,7 @@ mod tests {
             "char[N] not reversible: {s}"
         );
         // A bare `char` with no width is a never-silent error.
-        assert!(parse("R:\n readbin f.bin (id:i32 x:char)\n;").is_err());
+        assert!(parse("R:\n open f.bin as bin (id:i32 x:char)\n;").is_err());
     }
 
     #[test]
@@ -3172,49 +3125,34 @@ mod tests {
 
     #[test]
     fn readbin_alias_canonicalizes_to_open_as_bin() {
-        // Migration pin (design/38): the legacy `readbin` spelling still
-        // parses, `to_source` rewrites it to the canonical `open … as bin`
-        // form, the rewrite is idempotent, and both spellings build the same
-        // op (fields / endian / c_align all preserved).
+        // Flip pin (design/38): the legacy `readbin` spelling is now a
+        // never-silent retired error teaching the canonical `open … as bin`
+        // form, while the canonical spelling still builds the full binary
+        // Source op (fields / endian / c_align all honored).
         let old = "B:\n readbin f.bin be aligned (id:i32 v:u16)\n |> id\n;";
-        let g = parse(old).unwrap();
-        let s = g.to_source();
-        assert!(
-            s.contains("open f.bin as bin be aligned (id:i32 v:u16)"),
-            "canonical rewrite missing: {s}"
-        );
-        assert!(!s.contains("readbin"), "legacy verb must not survive: {s}");
-        let g2 = parse(&s).unwrap();
-        assert_eq!(s, g2.to_source(), "not idempotent: {s}");
-        match (&g.nodes[0].op, &g2.nodes[0].op) {
-            (
-                Op::Source {
-                    codec:
-                        rivus_ir::Codec::Binary {
-                            fields: f1,
-                            endian: e1,
-                            c_align: a1,
-                        },
-                    ..
-                },
-                Op::Source {
-                    codec:
-                        rivus_ir::Codec::Binary {
-                            fields: f2,
-                            endian: e2,
-                            c_align: a2,
-                        },
-                    ..
-                },
-            ) => {
-                assert_eq!(f1, f2, "fields must survive the rewrite");
-                assert_eq!(e1, e2, "endianness must survive the rewrite");
-                assert_eq!(a1, a2, "alignment must survive the rewrite");
-                assert_eq!(*e1, rivus_ir::Endian::Big);
-                assert!(*a1);
+        let e = parse(old).unwrap_err().to_string();
+        assert!(e.contains("readbin"), "must name the retired verb: {e}");
+        assert!(e.contains("open"), "must teach the canonical form: {e}");
+        let canonical = "B:\n open f.bin as bin be aligned (id:i32 v:u16)\n |> id\n;";
+        let g = parse(canonical).unwrap();
+        match &g.nodes[0].op {
+            Op::Source {
+                codec:
+                    rivus_ir::Codec::Binary {
+                        fields,
+                        endian,
+                        c_align,
+                    },
+                ..
+            } => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(*endian, rivus_ir::Endian::Big);
+                assert!(*c_align);
             }
-            other => panic!("expected binary Sources, got {other:?}"),
+            other => panic!("expected a binary Source, got {other:?}"),
         }
+        let s = g.to_source();
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not idempotent: {s}");
     }
 
     #[test]
@@ -3520,7 +3458,7 @@ mod tests {
                 "with filename",
             ),
             (
-                "F:\n readbin a.bin (x:i32) with source\n |> x\n;",
+                "F:\n open a.bin as bin (x:i32) with source\n |> x\n;",
                 "with source",
             ),
         ] {
@@ -3600,16 +3538,12 @@ mod tests {
         let s = g.to_source();
         assert!(s.contains("ls \"logs/**/*.csv\""), "ls lost in {s}");
         assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
-        // Aliases `gci` / `dir` parse to the same discovery codec (verb-only).
+        // design/38 flip: `gci`/`dir` are teaching errors.
         for alias in ["gci", "dir"] {
-            let a = parse(&format!("A:\n {alias} \"*.csv\"\n;")).unwrap();
-            assert!(matches!(
-                &a.nodes[0].op,
-                Op::Source {
-                    codec: Codec::Discover { .. },
-                    ..
-                }
-            ));
+            let e = parse(&format!("A:\n {alias} \"*.csv\"\n;"))
+                .expect_err("ls alias retired")
+                .to_string();
+            assert!(e.contains("retired") && e.contains("ls \""), "{e}");
         }
     }
 
@@ -3754,7 +3688,7 @@ mod tests {
         // `decimal(N)` in a declared schema and as an expression/verb cast.
         for src in [
             "F:\n open sales.csv (id amount:decimal(2))\n |> id amount\n;",
-            "F:\n open sales.csv\n |> id (amount:decimal(4)) as a\n;",
+            "F:\n open sales.csv\n |> id amount :a :decimal(4)\n;",
             "F:\n open sales.csv\n cast amount:decimal(3)\n;",
         ] {
             let s = parse(src).unwrap().to_source();
@@ -3816,8 +3750,8 @@ mod tests {
         // temporal lanes that the expr cast now recognizes (date/time/datetime).
         for src in [
             "F:\n open log.csv\n cast ts:datetime\n;",
-            "F:\n open log.csv\n |> (ts:date) as d\n;",
-            "F:\n open log.csv\n |> (t:time) as tm\n;",
+            "F:\n open log.csv\n |> ts :d :date\n;",
+            "F:\n open log.csv\n |> t :tm :time\n;",
         ] {
             let s = parse(src).unwrap().to_source();
             assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
@@ -4152,14 +4086,11 @@ mod tests {
                 ..
             }
         ));
-        // `writejson` keeps emitting NDJSON (backward-compatible).
-        assert!(matches!(
-            nth_op("F:\n open a.csv\n writejson o.x\n;", 1),
-            Op::Sink {
-                codec: SinkCodec::Jsonl,
-                ..
-            }
-        ));
+        // The retired sink verbs are never-silent errors teaching `save`.
+        let e = parse("F:\n open a.csv\n writejson o.x\n;")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("writejson") && e.contains("save"), "{e}");
         // Round-trip: `save o.json` (array) and `save o.jsonl` survive to_source.
         for prog in [
             "F:\n open a.csv\n save o.json\n;",
@@ -4168,13 +4099,10 @@ mod tests {
             let s = parse(prog).unwrap().to_source();
             assert_eq!(s, parse(&s).unwrap().to_source(), "round-trip: {s}");
         }
-        assert!(matches!(
-            nth_op("F:\n open a.csv\n writecsv o.x\n;", 1),
-            Op::Sink {
-                codec: SinkCodec::Csv { .. },
-                ..
-            }
-        ));
+        let e = parse("F:\n open a.csv\n writecsv o.x\n;")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("writecsv") && e.contains("save"), "{e}");
     }
 
     #[test]
@@ -4287,21 +4215,15 @@ mod tests {
                 ..
             }
         ));
-        // Explicit aliases ignore the extension.
-        assert!(matches!(
-            first_op("F:\n readjson d.weird\n;"),
-            Op::Source {
-                codec: Codec::Jsonl,
-                ..
-            }
-        ));
-        assert!(matches!(
-            first_op("F:\n readcsv d.weird\n;"),
-            Op::Source {
-                codec: Codec::Csv { .. },
-                ..
-            }
-        ));
+        // design/38 flip: the read* verbs are teaching errors (the explicit
+        // `as FMT` override is the surviving spelling, covered above).
+        for (src, canonical) in [
+            ("F:\n readjson d.weird\n;", "open PATH [as jsonl]"),
+            ("F:\n readcsv d.weird\n;", "open PATH"),
+        ] {
+            let e = parse(src).expect_err("read verb retired").to_string();
+            assert!(e.contains("retired") && e.contains(canonical), "{e}");
+        }
         // Unknown explicit format is an error.
         assert!(parse("F:\n open d.x as toml\n;").is_err());
     }
@@ -4943,8 +4865,8 @@ Import:
     fn asof_join_parses_and_round_trips() {
         // #64 semantics under the design/38 P4 canonical spelling: `&asof` is
         // a peer of the other join kinds — `L &asof R [on k…] by ts
-        // [within "d"]`. The retired `& … asof ts` form still parses
-        // (migration release), renders canonically, and builds the SAME op.
+        // [within "d"]`. The retired grafted `& … asof ts` form is a
+        // never-silent teaching error (the flip release).
         let g = parse(
             "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
              T: open t.csv (sym:str ts:datetime px:int) ;\n\
@@ -4958,14 +4880,15 @@ Import:
             "{src}"
         );
         assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
-        // The retired spelling migrates to the identical op + canonical form.
-        let old = parse(
+        // design/38 flip: the grafted spelling is a teaching error.
+        let e = parse(
             "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
              T: open t.csv (sym:str ts:datetime px:int) ;\n\
              J: T & Q on sym asof ts within \"5m\" ;",
         )
-        .unwrap();
-        assert_eq!(old.to_source(), src, "retired form must render canonically");
+        .expect_err("grafted asof retired")
+        .to_string();
+        assert!(e.contains("retired") && e.contains("&asof"), "{e}");
         // Without `on` (pure temporal) and without tolerance.
         let g = parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T &asof Q by ts ;").unwrap();
         assert!(
@@ -4982,35 +4905,37 @@ Import:
         assert!(parse("Q: open q.csv ;\nT: open t.csv ;\nJ: T &left Q asof ts ;").is_err());
     }
 
-    /// The as-of join heading a SAME-STATEMENT chain (`… asof … save o.csv`)
-    /// renders and round-trips — the removal-release blocker from the P4
+    /// The as-of join heading a SAME-STATEMENT chain (`… by ts … save o.csv`)
+    /// renders and round-trips — the flip-release blocker from the P4
     /// review (`write_chain` lacked an `AsofJoin` fan-in head, so `fmt`
-    /// refused the whole program). Both spellings migrate to the canonical
-    /// chained form and the result is fmt-stable.
+    /// refused the whole program). The canonical chained form is fmt-stable;
+    /// the grafted chain form errs like the plain one.
     #[test]
     fn asof_join_chain_renders_and_round_trips() {
-        for src in [
-            // retired spelling with a chain
+        // design/38 flip: the grafted chain form errs like the plain one.
+        assert!(parse(
             "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
              T: open t.csv (sym:str ts:datetime px:int) ;\n\
              J: T & Q on sym asof ts within \"5m\" |> sym px bid save o.csv ;",
-            // canonical spelling with a chain
-            "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
+        )
+        .expect_err("grafted asof retired")
+        .to_string()
+        .contains("retired"));
+        // canonical spelling with a chain
+        let src = "Q: open q.csv (sym:str ts:datetime bid:int) ;\n\
              T: open t.csv (sym:str ts:datetime px:int) ;\n\
-             J: T &asof Q on sym by ts within \"5m\" |> sym px bid save o.csv ;",
-        ] {
-            let g = parse(src).unwrap();
-            let out = g.to_source();
-            assert!(
-                out.contains("T &asof Q on sym by ts within \"5m\""),
-                "canonical head: {out}"
-            );
-            assert!(
-                out.contains("|> sym px bid") && out.contains("save o.csv"),
-                "chain preserved: {out}"
-            );
-            assert_eq!(out, parse(&out).unwrap().to_source(), "idempotent: {out}");
-        }
+             J: T &asof Q on sym by ts within \"5m\" |> sym px bid save o.csv ;";
+        let g = parse(src).unwrap();
+        let out = g.to_source();
+        assert!(
+            out.contains("T &asof Q on sym by ts within \"5m\""),
+            "canonical head: {out}"
+        );
+        assert!(
+            out.contains("|> sym px bid") && out.contains("save o.csv"),
+            "chain preserved: {out}"
+        );
+        assert_eq!(out, parse(&out).unwrap().to_source(), "idempotent: {out}");
     }
 
     #[test]
@@ -5201,19 +5126,16 @@ Import:
         // (no second canonical form), so a leading-pipe flow and its bare
         // equivalent produce byte-identical source.
         let with_pipes =
-            parse("F:\n open a.csv\n | where age >= 30\n | sort score desc\n | save out.csv\n;")
-                .unwrap();
-        let plain =
-            parse("F:\n open a.csv\n |? age >= 30\n sort score desc\n save out.csv\n;").unwrap();
+            parse("F:\n open a.csv\n | take 10\n | sort score desc\n | save out.csv\n;").unwrap();
+        let plain = parse("F:\n open a.csv\n take 10\n sort score desc\n save out.csv\n;").unwrap();
         assert_eq!(
             with_pipes.to_source(),
             plain.to_source(),
             "leading-pipe sugar must normalize to the canonical form"
         );
-        // The canonical form is the typed pipe `|?` (a bare field renders as
-        // `$_.age`), with no leading bare `|` before the stage.
+        // The canonical form has no leading bare `|` before the stage.
         let src = with_pipes.to_source();
-        assert!(src.contains("|? $_.age >= 30"), "where→|? canonical: {src}");
+        assert!(src.contains("take 10"), "take stage lost: {src}");
         assert!(
             !src.lines().any(|l| l.trim_start().starts_with("| ")),
             "no leading bare pipe in canonical source: {src}"
@@ -5223,7 +5145,7 @@ Import:
         // Single-line chaining: stages separated by `|` on one line parse to the
         // same graph as the multi-line form.
         let one_line =
-            parse("F:\n open a.csv | where age >= 30 | sort score desc | save out.csv\n;").unwrap();
+            parse("F:\n open a.csv | take 10 | sort score desc | save out.csv\n;").unwrap();
         assert_eq!(
             one_line.to_source(),
             with_pipes.to_source(),
@@ -5245,9 +5167,9 @@ Import:
         // ```flow fence body is ordinary flow syntax, so leading pipes / single
         // line / `group` parse there too, and lower to the same graph as the
         // canonical `.riv`.
-        let md = "# demo\n\nprose\n\n```flow\nG:\n open a.csv | where age >= 30 | group country sum:score\n;\n```\n";
+        let md = "# demo\n\nprose\n\n```flow\nG:\n open a.csv | take 10 | group country sum:score\n;\n```\n";
         let from_md = parse_md(md).unwrap();
-        let canonical = parse("G:\n open a.csv\n |? age >= 30\n |# country sum:score\n;").unwrap();
+        let canonical = parse("G:\n open a.csv\n take 10\n |# country sum:score\n;").unwrap();
         assert_eq!(
             from_md.to_source(),
             canonical.to_source(),
@@ -5354,15 +5276,11 @@ Import:
             "not idempotent: {src}"
         );
 
-        // `unnest` is an alias and normalizes to `explode` in the source form.
-        let u = parse("U:\n open d.jsonl\n unnest items\n;").unwrap();
-        let usrc = u.to_source();
-        assert!(usrc.contains("explode items"), "unnest alias: {usrc}");
-        assert_eq!(
-            usrc,
-            parse(&usrc).unwrap().to_source(),
-            "alias not idempotent"
-        );
+        // design/38 flip: `unnest` is a teaching error.
+        let e = parse("U:\n open d.jsonl\n unnest items\n;")
+            .expect_err("unnest retired")
+            .to_string();
+        assert!(e.contains("retired") && e.contains("explode COL"), "{e}");
     }
 
     #[test]
@@ -5551,36 +5469,32 @@ Import:
 
     #[test]
     fn shift_parses_and_round_trips() {
-        // #65 semantics under the design/38 P3 canonical spelling: the
-        // retired `shift` verb still parses (migration release) and renders
-        // as `|> * (lag(col, N) over …) as alias`; the canonical form is
-        // idempotent and builds the IDENTICAL op.
-        let g = parse("T:\n open t.csv (sym:str price:int)\n shift price lag 2 by sym as p2\n;")
-            .unwrap();
-        let src = g.to_source();
-        assert!(src.contains("|> * (lag(price, 2) over sym) as p2"), "{src}");
-        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // #65 semantics under the design/38 canonical spelling: the retired
+        // `shift` verb is a never-silent error teaching the `|>` window-item
+        // form; the canonical spelling is idempotent and builds the Shift op.
+        let e = parse("T:\n open t.csv (sym:str price:int)\n shift price lag 2 by sym as p2\n;")
+            .expect_err("retired verb")
+            .to_string();
+        assert!(e.contains("shift") && e.contains("lag"), "{e}");
         let canon =
             parse("T:\n open t.csv (sym:str price:int)\n |> * (lag(price, 2) over sym) as p2\n;")
                 .unwrap();
-        assert_eq!(
-            format!("{:?}", g.nodes[1].op),
-            format!("{:?}", canon.nodes[1].op),
-            "verb and canonical form must build the same Shift op"
+        assert!(
+            matches!(&canon.nodes[1].op, Op::Shift { out, .. } if out == "p2"),
+            "canonical form must build the Shift op: {:?}",
+            canon.nodes[1].op
         );
-        // diff with default N=1 omits the count; pct_change keeps it.
-        let g = parse("T:\n open t.csv\n shift price diff as d\n;").unwrap();
+        let src = canon.to_source();
+        assert!(src.contains("|> * (lag(price, 2) over sym) as p2"), "{src}");
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // diff with default N=1 omits the count in the canonical rendering.
+        let g = parse("T:\n open t.csv\n |> * (diff(price)) as d\n;").unwrap();
         assert!(
             g.to_source().contains("|> * (diff(price)) as d"),
             "{}",
             g.to_source()
         );
-        // Malformed: unknown kind, missing `as` (verb and canonical form).
-        assert!(parse("T:\n open t.csv\n shift price wat as x\n;").is_err());
-        let e = parse("T:\n open t.csv\n shift price lag 1\n;")
-            .expect_err("as required")
-            .to_string();
-        assert!(e.contains("as ALIAS"), "{e}");
+        // Canonical malformed: a window item still requires its alias.
         let e = parse("T:\n open t.csv\n |> * (lag(price, 1) over sym)\n;")
             .expect_err("window alias required")
             .to_string();
@@ -5589,38 +5503,33 @@ Import:
 
     #[test]
     fn sessionize_parses_and_round_trips() {
-        // §36.5 semantics under the design/38 P3 canonical spelling: the
-        // retired `sessionize` verb still parses (migration release) and
-        // renders as `|> * (session(ts, "gap") over …) as session`; the
-        // canonical form is idempotent and builds the IDENTICAL op.
-        let g =
+        // §36.5 semantics under the design/38 canonical spelling: the retired
+        // `sessionize` verb is a never-silent error teaching the `|>`
+        // window-item form; the canonical spelling is idempotent and builds
+        // the Sessionize op.
+        let e =
             parse("S:\n open e.csv (ts:datetime user:str)\n sessionize ts gap \"30m\" by user\n;")
-                .unwrap();
-        let src = g.to_source();
-        assert!(
-            src.contains("|> * (session(ts, \"30m\") over user) as session"),
-            "{src}"
-        );
-        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+                .expect_err("retired verb")
+                .to_string();
+        assert!(e.contains("sessionize") && e.contains("session("), "{e}");
         let canon = parse(
             "S:\n open e.csv (ts:datetime user:str)\n \
              |> * (session(ts, \"30m\") over user) as session\n;",
         )
         .unwrap();
-        assert_eq!(
-            format!("{:?}", g.nodes[1].op),
-            format!("{:?}", canon.nodes[1].op),
-            "verb and canonical form must build the same Sessionize op"
-        );
-        // Without `over` (single implicit group), and an alias names the
-        // appended column.
-        let g = parse("S:\n open e.csv (ts:datetime)\n sessionize ts gap \"1h\"\n;").unwrap();
         assert!(
-            g.to_source()
-                .contains("|> * (session(ts, \"1h\")) as session\n"),
-            "{}",
-            g.to_source()
+            matches!(&canon.nodes[1].op, Op::Sessionize { out, .. } if out == "session"),
+            "canonical form must build the Sessionize op: {:?}",
+            canon.nodes[1].op
         );
+        let src = canon.to_source();
+        assert!(
+            src.contains("|> * (session(ts, \"30m\") over user) as session"),
+            "{src}"
+        );
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // Without `over` (single implicit group), and the alias names the
+        // appended column.
         let g =
             parse("S:\n open e.csv (ts:datetime)\n |> * (session(ts, \"1h\")) as w\n;").unwrap();
         assert!(matches!(&g.nodes[1].op, Op::Sessionize { out, .. } if out == "w"));
@@ -5655,73 +5564,135 @@ Import:
         assert!(e.contains("WINDOW items only"), "{e}");
         // A window function outside its item position stays an error.
         assert!(parse("T:\n open t.csv\n |? lag(price, 1) > 0\n;").is_err());
-        // Malformed forms teach the shape.
+        // The retired verb is refused even when malformed — the retirement
+        // error fires before shape validation (never-silent either way).
         let e = parse("S:\n open e.csv\n sessionize ts \"30m\"\n;")
-            .expect_err("gap keyword required")
+            .expect_err("retired verb")
             .to_string();
-        assert!(e.contains("gap \"DUR\""), "{e}");
+        assert!(e.contains("retired"), "{e}");
         let e = parse("S:\n open e.csv\n sessionize ts gap 30\n;")
-            .expect_err("gap must be a duration string")
+            .expect_err("retired verb")
             .to_string();
-        assert!(e.contains("duration string"), "{e}");
+        assert!(e.contains("retired"), "{e}");
     }
 
-    /// design/38 P1+P2 移行リリース (#236 acceptance ②): every deleted
-    /// spelling still parses, and `to_source` (the engine `rivus fmt` runs)
-    /// rewrites it to the ONE canonical form. Each canonical output is
-    /// fmt-stable (idempotent), pinning the pre/post-migration round-trip.
-    /// The did-you-mean hard error replaces the alias parse in the NEXT
-    /// release (CHANGELOG).
+    /// design/38 flip (#240 issuecomment-5078743131 acceptance ②): every
+    /// retired spelling is a never-silent did-you-mean error whose message
+    /// carries the three required elements — ① it names the retired
+    /// spelling, ② it teaches the one canonical replacement with an inline
+    /// example, ③ it points at the previous release's (v1.4.x)
+    /// `rivus fmt --write` bulk migration.
     #[test]
-    fn p1_p2_migration_rewrites_deleted_spellings() {
-        let canon = |src: &str| parse(src).unwrap().to_source();
-        let cases: &[(&str, &str)] = &[
-            // P1 alias families -> the surviving spelling
-            ("F:\n readcsv d.weird\n;", "open d.weird"),
-            ("F:\n readjson d.weird\n;", "open d.weird as jsonl"),
-            ("F:\n gci \"in/*.csv\"\n;", "ls \"in/*.csv\""),
-            ("F:\n dir \"in/*.csv\"\n;", "ls \"in/*.csv\""),
-            ("F:\n open d.csv\n limit 5\n;", "take 5"),
-            ("F:\n open d.csv\n head 5\n;", "take 5"),
-            ("F:\n open d.jsonl\n unnest items\n;", "explode items"),
-            ("F:\n open d.csv\n writecsv o.any\n;", "save o.any"),
-            (
-                "F:\n open d.csv\n writejson o.any\n;",
-                "save o.any as jsonl",
-            ),
-            ("F:\n open d.csv\n where x > 1\n;", "|? $_.x > 1"),
-            // P2: one project spelling (the `:` chain) …
-            ("F:\n open d.csv\n |> a as b\n;", "a :b"),
-            ("F:\n open d.csv\n |> (c:int) as d\n;", "c :d :i64"),
-            // … and one top-level conjunction (the comma)
-            (
-                "F:\n open d.csv\n |? x > 1 and y < 2\n;",
-                "|? $_.x > 1, $_.y < 2",
-            ),
-        ];
-        for (old, want) in cases {
-            let out = canon(old);
+    fn flip_retired_spellings_are_never_silent_errors() {
+        let refuse = |src: &str, retired: &str, canonical: &str| {
+            let e = match parse(src) {
+                Err(e) => e.to_string(),
+                Ok(g) => panic!("must refuse {src:?}, parsed to:\n{}", g.to_source()),
+            };
             assert!(
-                out.contains(want),
-                "{old:?} must canonicalize to {want:?}, got:\n{out}"
+                e.contains("retired"),
+                "① `retired` missing for {src:?}: {e}"
             );
-            assert_eq!(out, canon(&out), "canonical form not fmt-stable: {old:?}");
-        }
-        // `and`/`or` survive INSIDE a boolean expression where precedence
-        // matters: `a and b or c` roots at `Or`, so nothing is flattened.
-        let keep = canon("F:\n open d.csv\n |? x > 1 and y < 2 or z > 3\n;");
+            assert!(
+                e.contains(retired),
+                "① spelling {retired:?} missing for {src:?}: {e}"
+            );
+            assert!(
+                e.contains(canonical),
+                "② canonical {canonical:?} missing for {src:?}: {e}"
+            );
+            assert!(
+                e.contains("e.g. `"),
+                "② inline example missing for {src:?}: {e}"
+            );
+            assert!(
+                e.contains("v1.4") && e.contains("rivus fmt --write"),
+                "③ fmt-migration pointer missing for {src:?}: {e}"
+            );
+        };
+        // P1 alias families -> the surviving spelling
+        refuse("F:\n readcsv d.csv\n;", "readcsv", "open PATH");
+        refuse(
+            "F:\n readjson d.jsonl\n;",
+            "readjson",
+            "open PATH [as jsonl]",
+        );
+        refuse(
+            "F:\n readbin d.bin (x:i32)\n;",
+            "readbin",
+            "open PATH as bin",
+        );
+        refuse("F:\n gci \"in/*.csv\"\n;", "gci", "ls \"GLOB\"");
+        refuse("F:\n dir \"in/*.csv\"\n;", "dir", "ls \"GLOB\"");
+        refuse("F:\n open d.csv\n limit 5\n;", "limit", "take N");
+        refuse("F:\n open d.csv\n head 5\n;", "head", "take N");
+        refuse(
+            "F:\n open d.jsonl\n unnest items\n;",
+            "unnest",
+            "explode COL",
+        );
+        refuse(
+            "F:\n open d.csv\n writecsv o.csv\n;",
+            "writecsv",
+            "save PATH",
+        );
+        refuse(
+            "F:\n open d.csv\n writejson o.jsonl\n;",
+            "writejson",
+            "save PATH [as jsonl]",
+        );
+        refuse("F:\n open d.csv\n where x > 1\n;", "where", "|? PRED");
+        // P2: the `as` rename/cast forms -> the `:` definition chain …
+        refuse(
+            "F:\n open d.csv\n |> a as b\n;",
+            "a as ALIAS",
+            ":` definition chain",
+        );
+        refuse(
+            "F:\n open d.csv\n |> (c:int) as d\n;",
+            "(name:type) as ALIAS",
+            ":` definition chain",
+        );
+        // … and the top-level `and` -> the comma
+        refuse(
+            "F:\n open d.csv\n |? x > 1 and y < 2\n;",
+            "and (between filter predicates)",
+            "the comma",
+        );
+        // P3 window verbs -> `|>` window items
+        refuse(
+            "S:\n open e.csv\n sessionize ts gap \"30m\" by u\n;",
+            "sessionize",
+            "session(TS, \"GAP\")",
+        );
+        refuse(
+            "T:\n open t.csv\n shift price lag 1 by sym as p\n;",
+            "shift",
+            "window item",
+        );
+        // P4 grafted as-of form -> the `&asof` join kind
+        refuse(
+            "Q: open q.csv ;\nT: open t.csv ;\nJ: T & Q on sym asof ts within \"5m\" ;",
+            "& … asof",
+            "`A &asof B [on K…] by TS [within \"DUR\"]`",
+        );
+
+        // Keep-checks: what the flip must NOT break.
+        // `and`/`or` INSIDE a boolean expression survive where precedence
+        // matters: `a and b or c` roots at `Or`, so nothing is retired.
+        let keep = parse("F:\n open d.csv\n |? x > 1 and y < 2 or z > 3\n;")
+            .unwrap()
+            .to_source();
         assert!(
             keep.contains(" and ") && keep.contains(" or "),
             "or-rooted expr keeps its inner and: {keep}"
         );
-        // Comma and `and` parse to the IDENTICAL IR (the rewrite is pure
-        // canonicalization, not a semantic change).
-        let a = parse("F:\n open d.csv\n |? x > 1, y < 2\n;").unwrap();
-        let b = parse("F:\n open d.csv\n |? x > 1 and y < 2\n;").unwrap();
-        assert_eq!(
-            format!("{:?}", a.nodes[1].op),
-            format!("{:?}", b.nodes[1].op),
-            "comma and top-level `and` must build the same predicate"
+        // The canonical comma still builds a conjunction (an `And` predicate).
+        let g = parse("F:\n open d.csv\n |? x > 1, y < 2\n;").unwrap();
+        assert!(
+            format!("{:?}", g.nodes[1].op).contains("And"),
+            "comma must build the conjunction: {:?}",
+            g.nodes[1].op
         );
     }
 
@@ -5743,7 +5714,7 @@ Import:
             assert_eq!(s1, parse(&s1).unwrap().to_source(), "unstable: {src}");
             s1
         };
-        assert!(rt("F:\n readjson d.weird\n;").contains("as jsonl"));
+        assert!(rt("F:\n open d.weird as jsonl\n;").contains("as jsonl"));
         assert!(rt("F:\n open d.jsonl as csv\n;").contains("as csv"));
         // Sink side: a CSV save onto a jsonl-implying path stays explicit.
         let g = parse("F:\n open d.csv\n save o.jsonl as csv\n;").unwrap();

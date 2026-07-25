@@ -876,7 +876,7 @@ fn sliding_window_serial_parallel_chunk_size_byte_identical() {
     }
 }
 
-// --- session windows via `sessionize ts gap "30m" by user` (§36.5 / #60,
+// --- session windows via `|> * (session(ts, "30m") over user) as session` (§36.5 / #60,
 // research prototype: session start as the derived key). ---
 
 #[test]
@@ -896,7 +896,7 @@ fn sessionize_assigns_session_starts_per_group() {
     let f = TempCsv(gendata::write_temp_bytes("sess_oracle", text.as_bytes()));
     let p = f.0.display();
     let flow = format!(
-        "S:\n open {p} (ts:datetime user:str)\n sessionize ts gap \"30m\" by user\n \
+        "S:\n open {p} (ts:datetime user:str)\n |> * (session(ts, \"30m\") over user) as session\n \
          |# user session count:ts\n sort user session\n;"
     );
     // Chunk-size sweep pins the cross-chunk state carry (cz=1 = every row its
@@ -939,7 +939,7 @@ fn sessionize_gap_boundary_is_closed() {
     let f = TempCsv(gendata::write_temp_bytes("sess_edge", text.as_bytes()));
     let p = f.0.display();
     let flow = format!(
-        "S:\n open {p} (ts:datetime v:int)\n sessionize ts gap \"30m\"\n \
+        "S:\n open {p} (ts:datetime v:int)\n |> * (session(ts, \"30m\")) as session\n \
          |# session count:v\n sort session\n;"
     );
     let res = run_src(&flow, 4096);
@@ -963,7 +963,7 @@ fn sessionize_surfaces_time_regressions_and_null_ts() {
     let f = TempCsv(gendata::write_temp_bytes("sess_reg", text.as_bytes()));
     let p = f.0.display();
     let flow =
-        format!("S:\n open {p} (ts:datetime v:int)\n sessionize ts gap \"10m\"\n |> v session\n;");
+        format!("S:\n open {p} (ts:datetime v:int)\n |> * (session(ts, \"10m\")) as session\n |> v session\n;");
     let res = run_src(&flow, 4096);
     assert_eq!(
         collect_strings(&res, "S", "session"),
@@ -991,7 +991,7 @@ fn sessionize_surfaces_time_regressions_and_null_ts() {
     );
 }
 
-// --- time-series shift/difference via `shift col lag|diff|pct_change …` (#65,
+// --- time-series shift/difference via `|> * (lag|diff|pct_change(col…) over …) as A` (#65,
 // Track C slice 1: backward-only, order-dependent, per-group serial). ---
 
 #[test]
@@ -1008,9 +1008,9 @@ fn shift_lag_diff_pct_change_by_group_matches_oracle() {
     let p = f.0.display();
     let flow = format!(
         "T:\n open {p} (sym:str price:int)\n \
-         shift price lag 1 by sym as prev\n \
-         shift price diff by sym as delta\n \
-         shift price pct_change by sym as ret\n;"
+         |> * (lag(price, 1) over sym) as prev\n \
+         |> * (diff(price) over sym) as delta\n \
+         |> * (pct_change(price) over sym) as ret\n;"
     );
     for cz in [1usize, 2, 3, 4096] {
         let res = run_src(&flow, cz);
@@ -1047,7 +1047,7 @@ fn shift_datetime_diff_is_exact_duration() {
     // Declare millisecond precision (the `nnn` fraction run → ms unit) so the
     // sub-second gap is exact and rides the Duration's millisecond ticks.
     let flow = format!(
-        "D:\n open {p} (ts:datetime(\"yyyy-MM-ddTHH:mm:ss.nnn\"))\n          shift ts diff as gap\n |> gap\n;"
+        "D:\n open {p} (ts:datetime(\"yyyy-MM-ddTHH:mm:ss.nnn\"))\n          |> * (diff(ts)) as gap\n |> gap\n;"
     );
     let res = run_src(&flow, 4096);
     assert_eq!(
@@ -1063,7 +1063,7 @@ fn shift_lag_n_and_endpoints() {
     let text = "v\n1\n2\n3\n4\n5\n";
     let f = TempCsv(gendata::write_temp_bytes("shift_lagn", text.as_bytes()));
     let p = f.0.display();
-    let flow = format!("N:\n open {p} (v:int)\n shift v lag 2 as p2\n;");
+    let flow = format!("N:\n open {p} (v:int)\n |> * (lag(v, 2)) as p2\n;");
     for cz in [1usize, 2, 5] {
         let res = run_src(&flow, cz);
         assert_eq!(

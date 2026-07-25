@@ -748,9 +748,10 @@ pub enum Op {
     /// `transport`, decode it with a `codec`, optionally attaching `provenance`.
     /// One composable node replacing the former format-specific `OpenCsv` /
     /// `OpenJsonl` / `OpenBinary`, so discovery (slice 3) and routing (slice 4)
-    /// attach here without re-stratifying I/O by format. The v1 surface forms —
-    /// `open PATH [as FMT] (schema) [with …]` (`as bin` for binary) and the
-    /// legacy `readcsv`/`readjson`/`readbin` aliases — desugar to this
+    /// attach here without re-stratifying I/O by format. The one surface
+    /// form — `open PATH [as FMT] (schema) [with …]` (`as bin` for binary;
+    /// the legacy `readcsv`/`readjson`/`readbin` aliases are retired
+    /// teaching errors since the design/38 flip) — desugars to this
     /// (`Discovery::Fixed` + `Transport::Local` + the matching `Codec`), and
     /// `to_source` renders the canonical surface form (reversible).
     ///
@@ -830,7 +831,7 @@ pub enum Op {
     /// `dropna [col ...]` — drop rows with a missing (empty) value in any of the
     /// named columns (or any column when none named). Streaming, stateless.
     DropNa { cols: Vec<String> },
-    /// `explode COL` (alias `unnest COL`) — multiply rows over a `List` column
+    /// `explode COL` (the `unnest` alias is retired) — multiply rows over a `List` column
     /// (§32 s4c): one output row per list element, with the other columns
     /// repeated and `COL` replaced by the element (its lane = the list's element
     /// type). An empty or null list contributes **zero** rows (Arrow `UNNEST` /
@@ -844,8 +845,8 @@ pub enum Op {
     /// (they carry state across rows and chunks) → serial path.
     Fill { col: String, method: FillMethod },
     /// Session windows (§36.5 / #60) — canonical spelling (design/38 P3):
-    /// `|> * (session(TS, "30m") over BY…) as OUT` (the retired `sessionize
-    /// TS gap "30m" [by …]` verb still parses this release and rewrites).
+    /// `|> * (session(TS, "30m") over BY…) as OUT` (the retired `sessionize`
+    /// verb is a teaching error since the design/38 flip).
     /// Appends `out` carrying each row's **session start** (a
     /// datetime on `ts`'s lane — the same "window start as key" shape as
     /// `bucket`/`hops`, so `|# session …` aggregates per session). A new
@@ -953,8 +954,9 @@ pub enum Op {
     /// output mirror of [`Op::Source`]. One composable node replacing the
     /// former format-specific `SinkCsv`/`SinkJsonl`/`SinkJson`, so routing
     /// (slice 4b's template / `by key` split, issue #143) and remote transports
-    /// (slice 5) attach here without re-stratifying output by format. The v1
-    /// surface forms — `save PATH [as FMT]`, `writecsv`/`writejson` — desugar
+    /// (slice 5) attach here without re-stratifying output by format. The one
+    /// surface form — `save PATH [as FMT]` (`writecsv`/`writejson` are retired
+    /// teaching errors since the design/38 flip) — desugars
     /// to this (`Route::Fixed` + `Transport::Local` + the matching codec), and
     /// `to_source` restores the original surface form (reversible).
     Sink {
@@ -1520,11 +1522,10 @@ impl Op {
                 }
             }
             Op::Explode { col } => format!("explode {col}"),
-            // design/38 P3: the window verbs render in their canonical
+            // design/38 P3: the window ops render in their canonical
             // function form — `|> *` keeps every column and appends the
-            // window output (the verbs' keep-all semantics, so the retired
-            // `sessionize`/`shift` spellings migrate mechanically through
-            // `rivus fmt`); `over` is the uniform partition clause.
+            // window output (the retired `sessionize`/`shift` verbs' keep-all
+            // semantics); `over` is the uniform partition clause.
             Op::Sessionize { ts, gap, by, out } => {
                 format!(
                     "|> * (session({ts}, \"{gap}\"){}) as {out}",

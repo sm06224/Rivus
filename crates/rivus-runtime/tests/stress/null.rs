@@ -370,7 +370,7 @@ fn cast_propagates_null() {
     for cz in [1usize, 2, 4096] {
         assert_eq!(
             col_strings(
-                &format!("N:\n open {p} (id:int age:int)\n |> (age:f64) as af\n;"),
+                &format!("N:\n open {p} (id:int age:int)\n |> age :af :f64\n;"),
                 cz,
                 "N",
                 "af"
