@@ -1,4 +1,4 @@
-# 37. 正準縮約木 — f64 並列 sum/avg/std の byte-identity 化（#45 / #41 の残り半分・批准依頼）
+# 37. 正準縮約木 — f64 並列 sum/avg/std の byte-identity 化（#45 — 裁定済み・実装済み）
 
 > **状態：Q1 許容済（#240 キュー1）→ 方式 (b) 裁定（issuecomment-5039548220）→
 > 実装済み（file-major 正準・serial mirror = P=1 同一機械・条件 5 点対応、
@@ -97,7 +97,7 @@ parallel_canonical(v, P):
 `group_parallel_safe` を開けるだけでは不十分**で、`AggAcc` を「部分ブロック和ツリー状態」に
 持ち替え、`merge` に境界位置を渡すシグネチャ拡張が要る（実装は別 PR）。
 
-## 37.5 実装スケッチ（批准後・別 PR）
+## 37.5 実装スケッチ（**解決済み** — 実装は方式(b) file-major で #249 に着地。本節の単一ファイル byte-range プリパス＋carry は未採用のまま将来スライス）
 
 1. `AggAcc`（`aggregate.rs`）の f64 `sum`/`sum_sq` を**ブロック和ツリー状態**へ（std も同じ木＝
    Σx と Σx² 両方）。std は現行の素朴二モーメント（`(Σx² − Σx·mean)/(n−1)`）を**ブロック和で
@@ -109,7 +109,7 @@ parallel_canonical(v, P):
 5. **stress**：正準の serial==parallel==chunk-size を bit で pin、素朴 partition が壊れる
    ことを対照 pin（`byte_identity.rs` の既存 `canonical()` テスト資産を拡張）。
 
-## 37.6 批准を仰ぐ問い（統括の専権）
+## 37.6 批准を仰いだ問い（**裁定済み**: Q1 許容＝統括 2026-07-21・方式(b) file-major＝issuecomment-5039548220。以下は記録）
 
 **Q1. f64 sum/avg/std の値が採用バージョンで一度 ~1 ULP シフトすることを許容するか？**
 - 許容する → 37.5 を別 PR で実装（並列 byte-identity ＋ 精度向上を獲得）。

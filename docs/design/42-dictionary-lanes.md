@@ -1,4 +1,4 @@
-# 42 — Dictionary-encoded Str lanes（提案・批准待ち）
+# 42 — Dictionary-encoded Str lanes（批准済み・全段着地）
 
 Status: **批准済み（2026-07-19、#180 記録 → 現運用は #240）・第 (a) 段着地
 （#241）・第 (b)(c) 段実装済み（(b) reader 低カード検出＋escape hatch＋発動
@@ -65,10 +65,30 @@ write_cell バイト一致）②高カード escape hatch 必須 ③(a)→(b)→
   （今日と同コスト、リグレッションなし — 閾値超過で辞書化を打ち切り
   `Str` へフォールバックする escape hatch を必須とする）。
 
-## 5. 批准を求める点
+## 5. 批准を求めた点（裁定記録 — 全て #180/#240 で承認済み）
 
 1. `ColumnData` への variant 追加の可否（§2 の不変条件つき）。
 2. 実装順: (a) ColumnData variant＋value()/gather/write_cell 対応、
    (b) CSV/JSONL reader の低カード検出＋辞書化（sample 開に同居）、
    (c) fused loop の id 直引き group/join、各段で従来ガード＋計測。
 3. 名称・閾値のデフォルト（distinct ≤ 4096 / セル長制限なし）。
+
+## 6. ランタイム契約（着地後の正典 — 2026-07-25 追記）
+
+- **表現**: `ColumnData::StrDict(DictColumn { dict: StrColumn, codes: Vec<u32> })`。
+  辞書は **chunk-local**（chunk 毎に作り直し）・小さい（下記 cap）。null 行も
+  interned `""` の実 code を持つ（validity が null を担い、bulk 経路は code を読む）。
+- **閾値**: `DICT_CAP = 4096`（chunk 内 distinct 上限。4097 個目で **escape**＝
+  その chunk は plain Str で出る・lossless）・`SAMPLE_DICT_MAX = 256`（open 時
+  sample での候補判定窓）。定数は `csv.rs`（JSONL は共有）。
+- **候補選定は plan-aware**: IR の join `on`／group キー（projection 越し）に
+  現れる列だけが候補（非キー列の辞書化は純コストで却下済み — 計測 §BENCHMARKS）。
+- **発動面**: 投機（speculative）fused 経路のみ（canonical/直列 oracle 側は常に
+  plain — dict-vs-plain の byte-identity ガードの片翼を保つ）。fused loop は
+  dict chunk を整数 id 直引き（join probe memo・group slot cache、
+  `fused_id_rows_total()` が発動カウンタ）、escape した plain chunk は同じ
+  ループの汎用 arm へ（混在 oracle は observability::dict_escape_chunks_…）。
+- **可観測性**: `RIVUS_WORKER_PROF` で `[WPROF] dict=Ncols(esc=M) idloop=Nrows`。
+- **不変条件**: dict と plain は**同一バイト**（write_cell / group キー / join
+  キー — property test で pin）。`Chunk::concat_reconciling` は Str/StrDict 対を
+  不一致扱いしない（同一論理レーン）。

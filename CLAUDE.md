@@ -169,3 +169,19 @@ crates/rivus-runtime    single-thread chunk engine, operators, telemetry, gendat
 crates/rivus-cli        rivus run|explain|check (ASCII viz)
 docs/design/            17-section design  ·  docs/BENCHMARKS.md  ·  docs/SUPPLY-CHAIN.md
 ```
+
+## 共有運用資産（`.claude/` — 全セッション共通の型）
+
+運用の実証済みの型は `.claude/` に財産化してある。**該当する作業ではこれらを既定で使う**:
+
+- **commands**: `/gate [ref]`（独立フル gate・数値チェックポイント）・
+  `/postverify <sha>`（着地の bit 同一検証・interdiff 手順）・
+  `/interleave A B flow`（same-window A/B 実測の規律）
+- **skills**: `landing-review`（レビュー兼指揮の審査の型・判定原則）・
+  `landing-exec`（実装担当の着地の型・禁じ手）・
+  `research-pr`（研究 PR のスライス設計・裁可依頼・正直申告の規律）
+- **agents**: `gate-runner`（読み取り専用の gate 並行実行係）
+
+これらは実際の事故と成功から蒸留した規律（発動 assert・投資段は net win まで未マージ・
+申告と disk の乖離は差し戻し理由・負の結果は台帳へ）を含む。更新は通常の PR フロー
+（裁可 → gate → 着地）で行い、勝手に緩めない。

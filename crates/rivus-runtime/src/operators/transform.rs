@@ -443,16 +443,14 @@ impl Operator for Sort {
         }
         self.emitted = true;
 
-        // Concatenate buffered chunks into one set of columns (source order).
-        let mut iter = std::mem::take(&mut self.buf).into_iter();
-        let first = iter.next().unwrap();
-        let schema = first.schema.clone();
-        let mut cols = first.columns;
-        for c in iter {
-            for (i, col) in c.columns.iter().enumerate() {
-                cols[i].append(col);
-            }
-        }
+        // Concatenate buffered chunks into one set of columns (source order),
+        // reconciling per-chunk lane drift (a computed sort input can shift
+        // its lane; the naive append silently truncated it into a ragged
+        // chunk — audit 2026-07-24). See `Chunk::concat_reconciling`.
+        let merged = Chunk::concat_reconciling(std::mem::take(&mut self.buf))
+            .expect("buf checked non-empty");
+        let schema = merged.schema.clone();
+        let cols = merged.columns;
         let total = cols.first().map(|c| c.len()).unwrap_or(0);
 
         // Resolve each sort key to (column index, descending). §32 s4b: a bare

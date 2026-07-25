@@ -389,6 +389,51 @@ fn zstd_csv_matches_uncompressed_oracle() {
     }
 }
 
+#[cfg(feature = "gzip")]
+#[test]
+fn gzip_jsonl_bare_open_decodes_as_jsonl() {
+    // Audit 2026-07-24: a bare `open d.jsonl.gz` used to resolve its format
+    // from the RAW extension (".gz" matches nothing → CSV default) while the
+    // transport still decompressed — gzipped JSONL decoded as garbage CSV
+    // with an EMPTY error stream (silent wrong decode). The data extension
+    // now decides the codec: same rows as the uncompressed twin.
+    use std::io::Write as _;
+    let rows = 3_000usize;
+    let mut text = String::new();
+    let mut ge = 0u64;
+    let mut rng = Rng::new(23);
+    for i in 0..rows {
+        let age = rng.below(100);
+        text.push_str(&format!("{{\"id\":{i},\"age\":{age}}}\n"));
+        if age >= 50 {
+            ge += 1;
+        }
+    }
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("rivus_gzj_{}.jsonl.gz", std::process::id()));
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        enc.write_all(text.as_bytes()).unwrap();
+        enc.finish().unwrap();
+    }
+    let _guard = TempCsv(path.clone());
+    let p = path.display();
+    for cs in [7usize, 1024] {
+        let res = run_src(&format!("G:\n open {p}\n |? age >= 50\n;"), cs);
+        assert_eq!(
+            res.total_rows_out(),
+            ge,
+            "bare .jsonl.gz must decode as JSONL @cs={cs}"
+        );
+        assert!(
+            res.errors.is_empty(),
+            "clean gzipped JSONL must not error @cs={cs}: {:?}",
+            res.errors
+        );
+    }
+}
+
 #[test]
 fn route_save_partitions_deterministically_and_byte_identically() {
     // §28.7 route (#143): Hive layout + template + flat, the null-key
@@ -432,11 +477,12 @@ fn route_save_partitions_deterministically_and_byte_identically() {
     let tmpl = format!(
         "R:\n open {p} (id:int country:str score:int)\n |> id country\n save \"{base}/t/{{country}}.csv\"\n;"
     );
+    let _env = crate::env_guard();
     let bytes_for = |pref: rivus_runtime::MemoryPref| {
         let _ = std::fs::remove_dir_all(&dir);
         let g = rivus_parser::parse(&tmpl).expect("parse");
         std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
-        run(
+        let res = run(
             &g,
             RunOptions {
                 chunk_size: 2,
@@ -446,6 +492,20 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            // This shape is not partitionable today, so Fast runs serial — the
+            // engine must SAY so (never-silent). Under the env lock a size-gate
+            // downgrade is impossible, so the only legitimate outcomes are real
+            // workers or the explicit structural fallback note; if this shape
+            // ever becomes partitionable, this pin fails and real parallel
+            // identity coverage must be added.
+            let strat = res.strategy.clone().unwrap_or_default();
+            assert!(
+                !res.workers.is_empty() || strat.contains("not partitionable"),
+                "parallel side must engage or explicitly report the serial \
+                 fallback: {strat}"
+            );
+        }
         format!("{}|{}", read("t/JP.csv"), read("t/a%2Fb.csv"))
     };
     let serial = bytes_for(rivus_runtime::MemoryPref::Low);
@@ -539,6 +599,20 @@ fn route_save_partitions_deterministically_and_byte_identically() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            // Route-template saves are not partitionable today, so Fast runs
+            // serial — the engine must SAY so (never-silent). Under the env
+            // lock a size-gate downgrade is impossible; if this shape ever
+            // becomes partitionable, this pin fails and real parallel
+            // identity coverage must be added.
+            let strat = res.strategy.clone().unwrap_or_default();
+            assert!(
+                !res.workers.is_empty() || strat.contains("not partitionable"),
+                "parallel side must engage or explicitly report the serial \
+                 fallback: {strat}"
+            );
+        }
+
         assert!(
             res.errors
                 .iter()
@@ -886,8 +960,10 @@ fn parquet_nested_schema_is_refused_with_guidance() {
 #[cfg(not(feature = "parquet"))]
 #[test]
 fn parquet_without_the_feature_refuses_the_plan_pre_run() {
-    // The default (zero-dependency) build must refuse a Parquet plan before
-    // running — never a silent empty read (same shape as regex/gzip).
+    // A parquet-less build must refuse a Parquet plan before running —
+    // never a silent empty read (the same pre-run-refusal shape as the
+    // other feature gates; parquet stays a niche-backend opt-in under
+    // policy v2).
     let g = rivus_parser::parse("P:\n open data.parquet\n;").expect("parse is always std-only");
     let err = run(&g, RunOptions::default()).expect_err("must refuse pre-run");
     let msg = err.to_string();

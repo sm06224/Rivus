@@ -1209,6 +1209,7 @@ fn date_groupby_parallel_matches_serial() {
     // agg name would parse as a phantom group key (now a plan_validate error).
     let flow = format!("D:\n open {p} (d:date v:int)\n |# d max:v\n;");
 
+    let _env = crate::env_guard();
     let snapshot = |pref: rivus_runtime::MemoryPref| {
         let g = rivus_parser::parse(&flow).expect("parse");
         std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
@@ -1222,6 +1223,13 @@ fn date_groupby_parallel_matches_serial() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            assert!(
+                !res.workers.is_empty(),
+                "the parallel side must actually engage (a vacuous serial-vs-serial \
+                 pass is exactly the env-race bug this guards)"
+            );
+        }
         let mut rows: Vec<(String, i64, i64)> = {
             let days = collect_strings(&res, "D", "d");
             let cnt = collect_i64(&res, "D", "count");
@@ -1263,6 +1271,7 @@ fn date_minmax_keeps_date_type_and_parallel_matches_serial() {
     let p = f.0.display();
     let flow = format!("M:\n open {p} (k:str d:date)\n |# k min:d max:d\n;");
 
+    let _env = crate::env_guard();
     let snapshot = |pref: rivus_runtime::MemoryPref| {
         let g = rivus_parser::parse(&flow).expect("parse");
         std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
@@ -1276,6 +1285,13 @@ fn date_minmax_keeps_date_type_and_parallel_matches_serial() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            assert!(
+                !res.workers.is_empty(),
+                "the parallel side must actually engage (a vacuous serial-vs-serial \
+                 pass is exactly the env-race bug this guards)"
+            );
+        }
         // The min/max columns must render as ISO dates (Date lane preserved).
         for col in ["min_d", "max_d"] {
             for s in collect_strings(&res, "M", col) {
@@ -1631,7 +1647,8 @@ fn validate_reject_parallel_summary_counts_sum_to_total() {
     ));
     let p = f.0.display();
     let flow = format!("V:\n open {p} (id:int age:int)\n |! age >= 0 reject\n |> id\n;");
-    let run_pref = |pref| {
+    let _env = crate::env_guard();
+    let run_pref = |pref: rivus_runtime::MemoryPref| {
         let g = rivus_parser::parse(&flow).expect("parse");
         std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
         let res = run(
@@ -1644,6 +1661,20 @@ fn validate_reject_parallel_summary_counts_sum_to_total() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            // This shape is not partitionable today, so Fast runs serial — the
+            // engine must SAY so (never-silent). Under the env lock a size-gate
+            // downgrade is impossible, so the only legitimate outcomes are real
+            // workers or the explicit structural fallback note; if this shape
+            // ever becomes partitionable, this pin fails and real parallel
+            // identity coverage must be added.
+            let strat = res.strategy.clone().unwrap_or_default();
+            assert!(
+                !res.workers.is_empty() || strat.contains("not partitionable"),
+                "parallel side must engage or explicitly report the serial \
+                 fallback: {strat}"
+            );
+        }
         res
     };
     let par = run_pref(rivus_runtime::MemoryPref::Fast);

@@ -469,7 +469,7 @@ fn flatten_and_chain(pred: &Expr) -> Vec<String> {
 /// would render as a bare `open d.weird` and re-parse as CSV (a silent
 /// semantic flip; found by the design/38 P1 migration audit).
 fn ext_codec_of(path: &str) -> &'static str {
-    let l = path.to_ascii_lowercase();
+    let l = strip_compression_suffix(path).to_ascii_lowercase();
     if l.ends_with(".parquet") {
         "parquet"
     } else if l.ends_with(".jsonl") || l.ends_with(".ndjson") || l.ends_with(".json") {
@@ -843,8 +843,10 @@ pub enum Op {
     /// A constant fill is streaming/stateless; `ffill`/`bfill` are stateful
     /// (they carry state across rows and chunks) → serial path.
     Fill { col: String, method: FillMethod },
-    /// `sessionize TS gap "30m" [by COL ...]` — session windows (§36.5 / #60):
-    /// append a `session` column carrying each row's **session start** (a
+    /// Session windows (§36.5 / #60) — canonical spelling (design/38 P3):
+    /// `|> * (session(TS, "30m") over BY…) as OUT` (the retired `sessionize
+    /// TS gap "30m" [by …]` verb still parses this release and rewrites).
+    /// Appends `out` carrying each row's **session start** (a
     /// datetime on `ts`'s lane — the same "window start as key" shape as
     /// `bucket`/`hops`, so `|# session …` aggregates per session). A new
     /// session starts when the gap to the previous row's ts (per `by` group)
@@ -861,8 +863,11 @@ pub enum Op {
         /// `sessionize` verb always produced `session`).
         out: String,
     },
-    /// `shift COL lag|diff|pct_change [N] [by COL ...] as ALIAS` — time-series
-    /// shift/difference primitives (#65): append `out` carrying a value derived
+    /// Time-series shift/difference primitives (#65) — canonical spelling
+    /// (design/38 P3): `|> (lag(COL, N) over BY…) as OUT` and the
+    /// `diff`/`pct_change` window functions (the retired `shift COL
+    /// lag|diff|pct_change [N] [by …] as ALIAS` verb still parses this
+    /// release and rewrites). Appends `out` carrying a value derived
     /// from an earlier row **within the same `by` group, in source order**.
     /// `Lag(n)` = the value `n` rows back (null for the first `n`); `Diff(n)` =
     /// `col − lag(col, n)` (a datetime column yields an exact `Duration`, #57);
@@ -924,8 +929,10 @@ pub enum Op {
         right_keys: Vec<PathExpr>,
         kind: JoinKind,
     },
-    /// `&` **as-of / temporal join** (#64): `Left & Right [on KEY…] asof TS
-    /// [within "DUR"]`. Enrich each left row with the right row whose `ts` is
+    /// **As-of / temporal join** (#64) — canonical spelling (design/38 P4):
+    /// `Left &asof Right [on KEY…] by TS [within "DUR"]` (the retired grafted
+    /// `Left & Right [on …] asof TS [within]` form still parses this release
+    /// and rewrites). Enrich each left row with the right row whose `ts` is
     /// the **nearest ≤** the left's (backward), matched exactly on the `by`
     /// keys. Left-outer: every left row is kept (no match → null right
     /// columns). `tolerance` (a duration string) drops matches older than the
@@ -981,19 +988,48 @@ pub fn join_on_clause(left_keys: &[PathExpr], right_keys: &[PathExpr]) -> String
     format!("on {}", parts.join(" "))
 }
 
-/// Pick the field delimiter for a path by extension: `.tsv`/`.tab` use a tab,
-/// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
-/// feature — `open f.tsv` and `save out.tsv` just work.
-pub fn delim_for_path(path: &str) -> u8 {
-    let mut lower = path.to_ascii_lowercase();
-    // A compression suffix doesn't change the field delimiter: `.tsv.gz` is
-    // still tab-delimited. Strip it before checking the data extension.
+/// Strip one trailing compression suffix (`.gz`/`.zst`/`.zstd`, any case) so
+/// extension-based inference sees the DATA extension: `d.jsonl.gz` is a
+/// gzipped JSONL stream, not a file of format "gz". The transport layer
+/// decompresses independently of the codec, so **every** extension ladder
+/// (format inference, the `ext_codec_of` to_source mirror, the delimiter)
+/// must strip before matching — two of the three had drifted (audit
+/// 2026-07-24: `open d.jsonl.gz` silently decoded the gzipped JSONL as CSV
+/// with an empty error stream).
+pub fn strip_compression_suffix(path: &str) -> &str {
+    let l = path.to_ascii_lowercase();
     for suf in [".gz", ".zst", ".zstd"] {
-        if let Some(stripped) = lower.strip_suffix(suf) {
-            lower = stripped.to_string();
-            break;
+        if l.ends_with(suf) {
+            return &path[..path.len() - suf.len()];
         }
     }
+    path
+}
+
+/// The as-of join's clause — `[on k…] by ts [within "dur"]` (design/38 P4
+/// canonical: `by` names the temporal axis, the `on` keys stay the
+/// exact-match group, `within` the one option). The ONE construction shared
+/// by `to_src_line` (`&asof {clause}`) and `write_chain`'s fan-in head
+/// (`A &asof B {clause}`) — three verbatim copies once drifted apart here
+/// (audit 2026-07-24).
+fn asof_clause(by: &[String], ts: &str, tolerance: &Option<String>) -> String {
+    let mut s = String::new();
+    if !by.is_empty() {
+        s.push_str(&format!("on {} ", by.join(" ")));
+    }
+    s.push_str(&format!("by {ts}"));
+    if let Some(t) = tolerance {
+        s.push_str(&format!(" within \"{t}\""));
+    }
+    s
+}
+
+/// Pick the field delimiter for a path by extension: `.tsv`/`.tab` use a tab,
+/// everything else (including `.csv`) a comma. Keeps TSV a std-only, zero-config
+/// feature — `open f.tsv` and `save out.tsv` just work. A compression suffix
+/// doesn't change the delimiter: `.tsv.gz` is still tab-delimited.
+pub fn delim_for_path(path: &str) -> u8 {
+    let lower = strip_compression_suffix(path).to_ascii_lowercase();
     if lower.ends_with(".tsv") || lower.ends_with(".tab") {
         b'\t'
     } else {
@@ -1558,18 +1594,8 @@ impl Op {
             } => format!("{} {}", kind.amp(), join_on_clause(left_keys, right_keys)),
             Op::AsofJoin { by, ts, tolerance } => {
                 // `&asof [on k…] by ts [within "dur"]` (design/38 P4) — the
-                // as-of kind is a peer of `&left`/`&right`/`&full`; `by`
-                // names the temporal axis, the `on` keys stay the exact-match
-                // group, `within` the one option.
-                let mut s = String::from("&asof");
-                if !by.is_empty() {
-                    s.push_str(&format!(" on {}", by.join(" ")));
-                }
-                s.push_str(&format!(" by {ts}"));
-                if let Some(t) = tolerance {
-                    s.push_str(&format!(" within \"{t}\""));
-                }
-                s
+                // as-of kind is a peer of `&left`/`&right`/`&full`.
+                format!("&asof {}", asof_clause(by, ts, tolerance))
             }
             Op::SinkPrint => "print".to_string(),
             // The v1 `save` forms restore byte-identically: codec/route carry
@@ -1989,49 +2015,14 @@ impl PlanGraph {
 
         for node in labeled {
             let label = node.label.as_ref().unwrap();
-            let inputs = self.inputs_of(node.id);
-
-            // Merge / join scopes render as `Label: A + B ;`.
-            match &node.op {
-                Op::Merge => {
-                    let names = self.input_labels(&inputs).join(" + ");
-                    let _ = writeln!(out, "{label}:\n    {names}\n;");
-                    continue;
-                }
-                Op::Join {
-                    left_keys,
-                    right_keys,
-                    kind,
-                } => {
-                    let sep = format!(" {} ", kind.amp());
-                    let names = self.input_labels(&inputs).join(&sep);
-                    let on = join_on_clause(left_keys, right_keys);
-                    let _ = writeln!(out, "{label}:\n    {names} {on}\n;");
-                    continue;
-                }
-                Op::AsofJoin { by, ts, tolerance } => {
-                    // Canonical as-of spelling (design/38 P4):
-                    // `Label: Left &asof Right [on k…] by ts [within "dur"] ;`
-                    // — `&asof` is a peer of `&left`/`&right`/`&full`, `by`
-                    // names the temporal axis. The retired `& … asof ts` form
-                    // still parses this release and rewrites to this.
-                    let names = self.input_labels(&inputs).join(" &asof ");
-                    let mut clause = String::new();
-                    if !by.is_empty() {
-                        clause.push_str(&format!("on {} ", by.join(" ")));
-                    }
-                    clause.push_str(&format!("by {ts}"));
-                    if let Some(t) = tolerance {
-                        clause.push_str(&format!(" within \"{t}\""));
-                    }
-                    let _ = writeln!(out, "{label}:\n    {names} {clause}\n;");
-                    continue;
-                }
-                _ => {}
-            }
-
-            // Otherwise walk the linear chain ending at this node, inlining any
-            // branch children that fan out from it.
+            // Walk the chain ending at this node, inlining branch children
+            // that fan out from it. A bare merge/join/as-of scope is just the
+            // single-node case: `write_chain`'s fan-in head renders the
+            // binary `A + B` / `A &kind B on k` line AND the node's leading
+            // comments and hooks. (These scopes used to have their own
+            // head-only arms here, which silently dropped a hook or comment
+            // attached to the fan-in node — audit 2026-07-24; `rivus fmt`
+            // deleted user error hooks on a bare merge scope.)
             let _ = writeln!(out, "{label}:");
             self.write_chain(&mut out, node.id, 1);
             let _ = writeln!(out, ";");
@@ -2078,15 +2069,7 @@ impl PlanGraph {
                     // removal-release blocker recorded in CHANGELOG/design38.
                     Op::AsofJoin { by, ts, tolerance } => {
                         let names = self.input_labels(&self.inputs_of(nid)).join(" &asof ");
-                        let mut clause = String::new();
-                        if !by.is_empty() {
-                            clause.push_str(&format!("on {} ", by.join(" ")));
-                        }
-                        clause.push_str(&format!("by {ts}"));
-                        if let Some(t) = tolerance {
-                            clause.push_str(&format!(" within \"{t}\""));
-                        }
-                        Some(format!("{names} {clause}"))
+                        Some(format!("{names} {}", asof_clause(by, ts, tolerance)))
                     }
                     _ => None,
                 };

@@ -1096,6 +1096,12 @@ Ids:
   ~1.6 秒 → 並列 **~0.4 秒**。`RIVUS_PARALLEL_MIN_BYTES`（バイト、`0` で常時）で
   調整、`RIVUS_NO_PARALLEL=1` で直列強制。圧縮入力（`.gz`/`.zst`）はシーク
   不可なので直列。
+- **辞書レーン（design/42）。** 低カーディナリティの join/group キー列は reader で
+  辞書符号化され、fused ループが join probe / group 更新を整数 id 直引きで行います。
+  完全自動・plain 経路と byte-identical。`RIVUS_WORKER_PROF=1` で worker 毎の
+  `[WPROF] dict=Ncols(esc=M) idloop=Nrows` が観測できます — `dict` は符号化列数
+  （`esc` は chunk 内 distinct 4096 個の cap を超えて plain へ lossless に逃げた
+  chunk 数）、`idloop` は整数 id 高速路を通った行数。
 - **`--memory low|auto|fast|unbounded`。** メモリ/速度の knob。`low`＝直列強制
   （最小資源）、`auto`（既定）＝CPU 数・入力サイズで自律調律、`fast`＝より積極的に
   並列（閾値を下げる）— **この 3 つは有界メモリのまま**。`unbounded` は **明示的に**
@@ -1170,6 +1176,26 @@ fan-out（tee・単一・ネスト）** はすべて忠実に往復します。f
 正直**で、自身の出力を再パースして検証し、まだ無損失に描けない構文（例：匿名の
 ラベルなしスコープ）を含む場合は、別物に書き換えず非ゼロ終了でソースを変更せず
 拒否します。
+
+**廃止予定の綴り（design/38 移行）。** 以下は本リリースでは parse 可能で、
+`rivus fmt` が正典形へ書き換えます。**次リリースで never-silent の
+did-you-mean エラーになります** — アップグレード前に `rivus fmt --write` を
+実行してください:
+
+| 廃止綴り | 正典 |
+|---|---|
+| `readcsv P` / `readjson P` | `open P [as csv\|jsonl]` |
+| `readbin P … (…)` | `open P as bin … (…)` |
+| `gci` / `dir` | `ls` |
+| `limit` / `head` | `take` |
+| `unnest` | `explode` |
+| `writecsv P` / `writejson P` | `save P [as csv\|jsonl]` |
+| `where EXPR` | `\|? EXPR` |
+| `name as alias` / `(name:type) as alias`（project） | `:` チェーン（`name :alias :type`） |
+| `a and b`（filter 最上位 AND） | カンマ（`a, b`） |
+| `sessionize ts gap "30m" by u` | `\|> * (session(ts, "30m") over u) as s` |
+| `shift col lag 1 by u as p` | `\|> (lag(col, 1) over u) as p`（`diff`/`pct_change` も） |
+| `A & B on k asof ts [within]` | `A &asof B on k by ts [within]` |
 
 ---
 

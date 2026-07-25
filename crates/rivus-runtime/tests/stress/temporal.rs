@@ -222,6 +222,7 @@ fn time_column_reads_minmax_and_surfaces_bad() {
     let f = TempCsv(gendata::write_temp_bytes("stress_time", text.as_bytes()));
     let p = f.0.display();
     let flow = format!("T:\n open {p} (k:str t:time)\n |# k min:t max:t\n;");
+    let _env = crate::env_guard();
     let snapshot = |pref: rivus_runtime::MemoryPref, cz: usize| {
         let g = rivus_parser::parse(&flow).expect("parse");
         std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
@@ -235,6 +236,14 @@ fn time_column_reads_minmax_and_surfaces_bad() {
         )
         .expect("run");
         std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+        if !matches!(pref, rivus_runtime::MemoryPref::Low) {
+            assert!(
+                !res.workers.is_empty(),
+                "the parallel side must actually engage (a vacuous serial-vs-serial \
+                 pass is exactly the env-race bug this guards)"
+            );
+        }
+
         // The bad cell (a) is surfaced verbatim; empty is not counted.
         let fails = res
             .errors

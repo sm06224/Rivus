@@ -190,67 +190,50 @@ pub(crate) fn write_cell(line: &mut String, col: &Column, row: usize, delim: u8)
             }
         }
         // A resource handle renders its uri (text), with the same CSV quoting.
-        // The dict lane writes the same bytes as the plain Str arm below —
-        // only the cell lookup differs (design/42 §2, pinned by property test).
-        ColumnData::StrDict(d) => {
-            let cell = d.get(row);
-            if cell.is_empty()
-                || cell.bytes().any(|b| b == delim)
-                || cell.contains('"')
-                || cell.contains('\n')
-            {
-                line.push('"');
-                for ch in cell.chars() {
-                    if ch == '"' {
-                        line.push_str("\"\"");
-                    } else {
-                        line.push(ch);
-                    }
-                }
-                line.push('"');
-            } else {
-                line.push_str(cell);
-            }
-        }
-        ColumnData::Str(s) | ColumnData::Resource(s) => {
-            let cell = s.get(row);
-            // A real empty string is written **quoted** (`""`) so it round-trips
-            // back to an empty string — an *unquoted* empty field is reserved for
-            // `null` (handled above). Design 26 §26.5.
-            if cell.is_empty()
-                || cell.bytes().any(|b| b == delim)
-                || cell.contains('"')
-                || cell.contains('\n')
-            {
-                line.push('"');
-                for ch in cell.chars() {
-                    if ch == '"' {
-                        line.push_str("\"\"");
-                    } else {
-                        line.push(ch);
-                    }
-                }
-                line.push('"');
-            } else {
-                line.push_str(cell);
-            }
-        }
+        // The dict lane writes the same bytes as the plain Str arm — only the
+        // cell lookup differs (design/42 §2, pinned by property test); both
+        // call the ONE escaping routine so quoting can never drift between
+        // representations (audit 2026-07-24).
+        ColumnData::StrDict(d) => push_csv_text(line, d.get(row), delim),
+        ColumnData::Str(s) | ColumnData::Resource(s) => push_csv_text(line, s.get(row), delim),
         // §32 s3a: a nested lane renders its `Value` text form (e.g. `{a: 1}` /
-        // `[1, 2]`), quoted like any other text cell. No flow yields a nested
-        // column to CSV today, so this is here for exhaustiveness.
+        // `[1, 2]`), quoted like any other text cell (always-quote variant of
+        // the shared escape loop). No flow yields a nested column to CSV
+        // today, so this is here for exhaustiveness.
         ColumnData::Struct(_) | ColumnData::List(_) => {
-            let cell = col.value_at(row).to_string();
-            line.push('"');
-            for ch in cell.chars() {
-                if ch == '"' {
-                    line.push_str("\"\"");
-                } else {
-                    line.push(ch);
-                }
-            }
-            line.push('"');
+            push_csv_quoted(line, &col.value_at(row).to_string());
         }
     }
+}
+
+/// Append one text cell with the CSV quoting rule shared by every text-family
+/// lane (plain Str, dict, resource uri): quote when the cell is empty (a real
+/// empty string round-trips as `""` — an *unquoted* empty field is reserved
+/// for `null`, design 26 §26.5), or contains the delimiter, a quote, or a
+/// newline; a `"` doubles inside quotes.
+fn push_csv_text(line: &mut String, cell: &str, delim: u8) {
+    if cell.is_empty()
+        || cell.bytes().any(|b| b == delim)
+        || cell.contains('"')
+        || cell.contains('\n')
+    {
+        push_csv_quoted(line, cell);
+    } else {
+        line.push_str(cell);
+    }
+}
+
+/// The always-quoted form of [`push_csv_text`]'s escape loop.
+fn push_csv_quoted(line: &mut String, cell: &str) {
+    line.push('"');
+    for ch in cell.chars() {
+        if ch == '"' {
+            line.push_str("\"\"");
+        } else {
+            line.push(ch);
+        }
+    }
+    line.push('"');
 }
 
 // ----------------------------------------------------------------- sink: jsonl

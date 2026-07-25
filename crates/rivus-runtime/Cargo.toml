@@ -12,14 +12,16 @@ rivus-ir.workspace = true
 # zero-dependency; opt in with `--features regex`. rust-lang/regex is pure-Rust,
 # linear-time (no catastrophic backtracking), MIT/Apache-2.0. See SUPPLY-CHAIN.md.
 regex = { version = "1", optional = true }
-# Off-by-default: gzip (`.gz`) input. `flate2` with its pure-Rust `miniz_oxide`
+# Default-on (policy v2, 統括指示 2026-07-09 — compressed streams are
+# first-class): gzip (`.gz`) input. `flate2` with its pure-Rust `miniz_oxide`
 # backend (no C toolchain), MIT/Apache-2.0, de-facto standard. See SUPPLY-CHAIN.md.
 flate2 = { version = "1", optional = true, default-features = false, features = [
     "rust_backend",
 ] }
-# Off-by-default: zstd (`.zst`) input. `ruzstd` is a pure-Rust zstd *decoder*
-# (no C), MIT. Decode-only is all a reader needs; default features (std + the
-# pure-Rust `twox-hash` checksum) are all pure-Rust. See SUPPLY-CHAIN.md.
+# Default-on (policy v2): zstd (`.zst`) input. `ruzstd` is a pure-Rust zstd
+# *decoder* (no C), MIT. Decode-only is all a reader needs; default features
+# (std + the pure-Rust `twox-hash` checksum) are all pure-Rust. See
+# SUPPLY-CHAIN.md.
 ruzstd = { version = "0.8", optional = true }
 # Off-by-default (#149 ② amended ruling): OS file-change notification for the
 # unbounded `watch` discovery — subscribe to inotify / kqueue / FSEvents /

@@ -263,13 +263,19 @@ impl Validity {
     /// Gather with optional indices: `None` (an unmatched outer-join side)
     /// contributes a **null** (validity = 0), matching `Column::gather_opt`.
     pub fn gather_opt(&self, indices: &[Option<usize>]) -> Self {
-        let bits: Vec<bool> = indices
-            .iter()
-            .map(|o| match o {
-                Some(i) => !self.is_null(*i),
-                None => false,
-            })
-            .collect();
+        // All-valid source (the common dense case, mirroring `gather`):
+        // output validity is just index presence — no per-element bit reads.
+        let bits: Vec<bool> = if self.0.is_none() {
+            indices.iter().map(Option::is_some).collect()
+        } else {
+            indices
+                .iter()
+                .map(|o| match o {
+                    Some(i) => !self.is_null(*i),
+                    None => false,
+                })
+                .collect()
+        };
         Validity::from_bits(&bits)
     }
 
@@ -378,7 +384,10 @@ pub enum ColumnData {
 /// `dict`, one `u32` code per row. The dictionary is chunk-owned and small by
 /// construction (the reader's escape hatch caps distinct counts), so `Clone`
 /// is a bounded copy. Row nullability rides the column's `Validity` exactly
-/// like the plain Str lane — a null row's code is 0 and never read.
+/// like the plain Str lane; a null row still carries a real code (the
+/// reader interns `""` for it), and bulk paths (`materialize`, `append`)
+/// DO read it — only per-cell consumers check `is_null` first. So the
+/// dictionary always contains every referenced entry, null rows included.
 #[derive(Debug, Clone)]
 pub struct DictColumn {
     pub dict: StrColumn,
@@ -397,9 +406,16 @@ impl DictColumn {
     pub fn is_empty(&self) -> bool {
         self.codes.is_empty()
     }
-    /// Decode into the plain lane — row-for-row the same bytes.
+    /// Decode into the plain lane — row-for-row the same bytes. Pre-sized
+    /// exactly (rows and the summed byte total are both known up front), so
+    /// the copy never re-allocates mid-way (audit 2026-07-24).
     pub fn materialize(&self) -> StrColumn {
-        let mut out = StrColumn::with_capacity(self.len(), 0);
+        let bytes: usize = self
+            .codes
+            .iter()
+            .map(|&c| self.dict.get(c as usize).len())
+            .sum();
+        let mut out = StrColumn::with_capacity(self.len(), bytes);
         for &c in &self.codes {
             out.push(self.dict.get(c as usize));
         }
@@ -876,6 +892,16 @@ impl Column {
     /// Gather with optional indices: a `None` (unmatched outer-join row) is a
     /// **null** in both the value lane (type default) and the validity bitmap.
     pub fn gather_opt(&self, indices: &[Option<usize>]) -> Column {
+        // All-`Some` (an inner join, or the fully-matched side of an outer
+        // join) is exactly `gather`: one unwrapped index pass with no
+        // per-element Option branch — and the dict lane KEEPS its
+        // representation (gather's StrDict arm) instead of decaying to plain
+        // Str (audit 2026-07-24; the representations are byte-equal
+        // downstream by the design/42 §2 property pins).
+        if indices.iter().all(Option::is_some) {
+            let idx: Vec<usize> = indices.iter().map(|o| o.unwrap_or(0)).collect();
+            return self.gather(&idx);
+        }
         Column {
             data: self.data.gather_opt(indices),
             validity: self.validity.gather_opt(indices),
@@ -889,6 +915,31 @@ impl Column {
         let other_len = other.data.len();
         self.data.append(&other.data);
         self.validity.append(self_len, &other.validity, other_len);
+    }
+
+    /// Rebuild this column on the plain Str lane: every non-null cell becomes
+    /// its `Value` Display text — the exact bytes group keys, join keys, and
+    /// the CSV writer already render for a non-Str lane — and nulls stay null
+    /// ("" under a null validity bit, like the readers produce). Used by
+    /// [`Chunk::concat_reconciling`] to merge buffered chunks whose lanes
+    /// disagree.
+    pub fn widen_to_str(&self) -> Column {
+        if matches!(self.data, ColumnData::Str(_)) {
+            return self.clone();
+        }
+        let n = self.data.len();
+        let mut s = StrColumn::default();
+        for i in 0..n {
+            if self.is_null(i) {
+                s.push("");
+            } else {
+                s.push(&self.value_at(i).to_string());
+            }
+        }
+        Column {
+            data: ColumnData::Str(s),
+            validity: self.validity.clone(),
+        }
     }
 }
 
@@ -927,6 +978,52 @@ impl Chunk {
 
     pub fn value(&self, row: usize, col: usize) -> Value {
         self.columns[col].value_at(row)
+    }
+
+    /// Concatenate buffered chunks (source order) into one, **reconciling
+    /// lane drift**. Chunks of one stream normally share their lanes, but a
+    /// computed column's lane is data-dependent per chunk (a `case` over
+    /// mixed branches: an all-int chunk infers I64, a mixed one Str), and a
+    /// variant-mismatched `ColumnData::append` is a silent no-op — the
+    /// column truncates and the result is a ragged chunk (debug assert /
+    /// corrupt in release; audit 2026-07-24). When lanes disagree, both
+    /// sides widen to the plain Str lane ([`Column::widen_to_str`] — each
+    /// non-null cell its `Value` Display, the same bytes keys and the CSV
+    /// writer render) and the schema field's dtype follows. The Str/StrDict
+    /// pair is NOT a mismatch (design/42: one logical lane; `append`
+    /// materializes). Returns `None` for an empty buffer.
+    pub fn concat_reconciling(bufs: Vec<Chunk>) -> Option<Chunk> {
+        let mut it = bufs.into_iter();
+        let first = it.next()?;
+        let mut schema = first.schema.clone();
+        let mut cols = first.columns;
+        let mut widened: Vec<usize> = Vec::new();
+        for c in it {
+            for (i, col) in c.columns.iter().enumerate() {
+                let str_family =
+                    |d: &ColumnData| matches!(d, ColumnData::Str(_) | ColumnData::StrDict(_));
+                let compat = std::mem::discriminant(cols[i].data())
+                    == std::mem::discriminant(col.data())
+                    || (str_family(cols[i].data()) && str_family(col.data()));
+                if compat {
+                    cols[i].append(col);
+                } else {
+                    if !matches!(cols[i].data(), ColumnData::Str(_)) {
+                        cols[i] = cols[i].widen_to_str();
+                    }
+                    cols[i].append(&col.widen_to_str());
+                    widened.push(i);
+                }
+            }
+        }
+        if !widened.is_empty() {
+            let mut fields = schema.fields.clone();
+            for &i in &widened {
+                fields[i].dtype = DataType::Str;
+            }
+            schema = Arc::new(Schema::new(fields));
+        }
+        Some(Chunk::new(0, schema, cols))
     }
 
     /// Keep only the rows whose index appears in `indices`, preserving schema

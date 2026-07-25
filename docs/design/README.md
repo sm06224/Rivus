@@ -73,39 +73,44 @@ hidden serialization / opaque optimizer / runtime magic without observability。
 | 27 | [filesystem-io](27-filesystem-io.md) | 一部（§28 に吸収） | ファイルシステム統合のユースケース集（`filename`・再帰グロブ・動的/分割出力・長パス・Unicode）。**§28 I/O サブストレートに吸収・一般化**（§28.11 に対応表）。slice 1=PR #114 は park |
 | 28 | [io-substrate](28-io-substrate.md) | 設計中（§00 Phase 1） | **I/O サブストレート（ピラー1）**：`Resource` handle 第一級値型 ＋ Discovery/Transport/Codec/Provenance 直交4層 ＋ discovery-as-flow ＋ 形式非依存 codec。ファイル中心 I/O 結合を壊して再建、既存の byte-identity/null/zero-dep を保存して載せ替え。§27 を吸収。**批准必須・自己マージ禁止**。批准後 §28.10 のスライス |
 | 29 | [surface-convergence-and-union-views](29-surface-convergence-and-union-views.md) | 設計中（phase-0） | **Surface 収束 ＋ 共用体的ユーザー型**：cast/rename/projection の複数入口を `\|>`（`Op::ProjectExpr`）の **`:` 定義チェーン**一本に収束（byte-identity 不変）。記号原則（`()`=式・`{}`=ブロック・`:`=定義・軽→重）。**共用体的ユーザー型**＝「物理1列＋多重論理ビュー」（struct lane 物理新設なし・zero-copy オフセットビュー・§28 binary 統合）。テキスト複合 vs 構造体複合の3軸差異。**批准必須・自己マージ禁止**。批准後 s1〜s4 |
-| 30 | [windowing](30-windowing.md) | 設計中（phase-0・#157 で書き直し） | **窓スライス（有界 event-time のみ）**：#157 裁定で **`over` 句を却下**し、窓＝**派生グループ化キー**で表す（既存 `trunc(ts,"hour")` を計算列にして `\|#` で集約・新キーワード/新 `Op` なし・byte-identity 自明）。任意幅は `bucket(ts, dur)` の小 Func 追加のみ（i64 ticks・境界ハザード無し）。**スコープは有界窓のみ**＝非有界 watermark/late（旧 6c）と arrival（旧 6d・#154 (c)）は**対象外**（"そこは SQL エンジンの領分"）。#41 f64 制約は継承、決定性タグ/メモリは既存 group-by 継承（`unbounded_nodes` 一般化は不要）。sliding/session は真に新しい意味論で後送り。**批准必須・自己マージ禁止**。#157/#154 反映・批准後 `bucket` 実装 |
+| 30 | [windowing](30-windowing.md) | 着地（bucket/hops/date_bin 実装済み。※`over` 句の #157 却下は SQL 式 OVER 全文法の話 — design/38 P3 の**パーティションのみ** `over` は別物で両立、38 参照） | **窓スライス（有界 event-time のみ）**：#157 裁定で **`over` 句を却下**し、窓＝**派生グループ化キー**で表す（既存 `trunc(ts,"hour")` を計算列にして `\|#` で集約・新キーワード/新 `Op` なし・byte-identity 自明）。任意幅は `bucket(ts, dur)` の小 Func 追加のみ（i64 ticks・境界ハザード無し）。**スコープは有界窓のみ**＝非有界 watermark/late（旧 6c）と arrival（旧 6d・#154 (c)）は**対象外**（"そこは SQL エンジンの領分"）。#41 f64 制約は継承、決定性タグ/メモリは既存 group-by 継承（`unbounded_nodes` 一般化は不要）。sliding/session は真に新しい意味論で後送り。**批准必須・自己マージ禁止**。#157/#154 反映・批准後 `bucket` 実装 |
 | 31 | [literate-and-structured](31-literate-and-structured.md) | 一部（段階1 実装・#161 批准） | **構文大改革 v2**：`.riv.md`（Rivus Literate）を正式 authoring 形式に。**段階1 landed**：`.riv.md` パーサ（frontmatter＋散文＋` ```flow ` フェンス）・run/check/fmt 配線・`chunk_size` カスケード・`explain --write` の Mermaid DAG 埋め込み（センチネル冪等）。意味論ゼロ改造（IR 実行不変）。**層分け**＝YAML frontmatter（設定/スキーマ/要求 capability の宣言）／Markdown（強化コメント・意味なし・inert・round-trip 保存）／` ```flow ` フェンス（実行）。**式/パイプラインを散文に潰さない**（§29 記号原則の拡張・SQL `OVER` 却下と同理由）。**構造化データ一級化**＝Arrow nested（Struct/List・columnar 維持）＋ドットを**パス式へ一般化**（`Vec<String>`→path）＋degrade-to-string 廃止（型付き null＋計上）。**設定カスケード** `frontmatter ← #\| ← CLI`（Quarto 流）＋三分類 (S)in-script/(R)frontmatter/(I)CLI/(C)外部・**capability は外部付与**（`needs:` は宣言止まり・§0.15）。**explain を生成器に**（Mermaid DAG＝出力専用・defaulted frontmatter・正準フロー書き戻し・センチネル冪等）。**`.riv`⇄`.riv.md` は jupytext 流ペア**（往復検証を fmt 契約に・Quarto/jupytext 相乗り・レンダリング/UI は下流に借りる・コア無改造）。段階：1 Literate＋explain 生成器（意味論ゼロ改造・ここから）→2 構造化（§32）→3 設定（§33）→4 ノートブック（将来・コア外）。後方互換は無視可（v2 は v1 を壊してよい）。**批准必須・自己マージ禁止**。#158/#157/#154 反映・批准後 段階1 実装 |
 | 32 | [structured-data-and-schema](32-structured-data-and-schema.md) | 設計中（phase-0・#161 ②③④） | **§31 段階2＝構造化データ ＋ 静的スキーマ伝播**。土台＝**静的スキーマ伝播パス**（各ノードの出力スキーマを IR レベルで算出・現状は schema-blind＝runtime のみ・§06 structural 層を IR へ・**実行不変の読み取り専用**）。**構造化**＝Arrow nested Struct（子列束）/List（offsets＋子列）・columnar 維持・degrade-to-string 廃止→**型付き null＋計上**。**パス式キー `PathExpr`**（group/sort/join/distinct のキーを `Vec<String>`→path 一般化・bare name は深さ0退化形・**退化形不変を byte-identity ＋ to_source round-trip まで pin**＝bare name は `name` のまま復元）。**パス解決**（`.field`/`[i]`/`$_..`/`explode`・欠損/範囲外は null＋計上）。**データセット中心 explain**（render_mermaid 作り直し・ノード＝全列付き型付きデータセット＋絵文字 🗄️/📦/📄・辺＝操作 🔍/🔗/📋/📊/🔀/🏆・目標図 #161）。スライス s1 静的スキーマ→s2 PathExpr→s3 Struct/List→s4 解決/explode→s5 explain。`Map`/Parquet/Arrow 物理は後段。**批准必須・自己マージ禁止**。#161 反映・批准後 実装 |
 | 33 | [networking-execution](33-networking-execution.md) | 設計批准済（#173・実装は段階着地中：B1 `net`→B2 `quic`→B3 `cpubudget`） | **保護チャネル分散実行（ピラー3）**＝#149 裁定附記に忠実。**IR を配備成果物として遠隔ワーカで実行し結果を byte-identical に返す**（`rivus serve`／`run --on`・`interpret == distribute`）。**素のリスナー無し**（wg-iface/loopback バインド＋peer allowlist）・**暗号はカーネル WireGuard へ委譲（クレート内に暗号を持たない・§28.12.5-2）**・credit bounded pull。loopback 例外層＝`open http://`（有界 GET）／`subscribe tcp://`（無界 feed）。本命トランスポート＝**std/依存ゼロ**（`net`）。QUIC（`quic`・quinn/rustls/rcgen/ring）＝feature 代替＝**ring 0.17 ライセンス裁定後**に着地（B2）。 |
 | 34 | [transport-architecture](34-transport-architecture.md) | 設計批准済（#173・実装段階着地中） | **トランスポート層の CPU 予算化**（統括意見具申）。中心命題＝通信は速くするより**CPU 消費を制御**（暗号 SIMD vs Rivus SIMD 競合）。PMCN の**通信責務集約**＋QUIC の**チャネル論理分離**（1 接続上の Control/Data/Telemetry・フレーム先頭チャネルバイト）＋**イベント中心可観測性**（`flow.started`/`flow.completed`/`transfer.done`）。**段階実装**：チャネル分離＋可観測性（B1 と同時）／CPU affinity 予算（feature `cpubudget`・Linux・B3＝ベンチで効果実証後）／ホスト共有 Transport Service（UDS/SHM）・DPU offload（後段）。byte-identity 不変。 |
 | 35 | [transport-dep-zero-strategy](35-transport-dep-zero-strategy.md) | 研究メモ（§33/§34 追補候補・批准待ち・#210） | **分散トランスポートの dep-zero 戦略**＝QUIC 要否と B2 進退の立証。結論：§33 分散実行（WireGuard 上）に QUIC の多重ストリーム/マイグレーション/0-RTT/内蔵TLS は**いずれも不要**（チャネル分離は論理タグ・暗号は WireGuard 委譲・遅延はフロー実行支配）。非 WireGuard 環境は **sidecar 終端（§34.4 一般化）で dep-zero 維持**。pure-Rust QUIC（rustls+RustCrypto）は未成熟＋成熟しても feature-gated。**勧告：B2（quic→full）は委譲で close、`quic` は opt-in 温存・`full` 非搭載。** |
-| 38 | [syntax-simplification](38-syntax-simplification.md) | 提案（破壊的変更許可・#180 で項目別批准） | **構文簡素化＝「一つの明快なやり方」の回復**（統括指摘「構文が難しくなった・シンプルさが損なわれた」への棚卸しと提案）。複雑さの5源＝①エイリアス族（`readcsv/gci/limit/unnest/writecsv/where`…機能ゼロ増の別名11語）②同一操作の二綴り（project `as`⇄`:`・filter `,`⇄`and`・`fmt`が正規化＝冗長の証）③**窓/時系列が二文法に分裂**（scalar func `bucket/hops/date_bin` vs bespoke 動詞 `sessionize/shift/asof`＝主に先行研究の積み増し）④合成で足りるのに新キーワード⑤`\|>` 内の `:` 定義チェーン sub-DSL。提案 **P1** エイリアス族削除（44→約33 語・`fmt` 自動移行）**P2** project/filter 綴り一本化 **P3**（本命）窓・時系列を **`over` 窓関数**へ統一（`lag/lead/session` を Func 化・新キーワード不要・#228/#232 変換）**P4** `&asof` を `&left` 対等のジョイン種へ正則化 **P5** 制御系動詞棚卸し（保留・要使用調査）。不変条件（IR 可逆・byte-identity・dep-zero・continue-first）維持。**批准必須・自己マージ禁止**。 |
+| 36 | [sliding-windows-hops](36-sliding-windows-hops.md) | 批准・着地 | **sliding/session 窓**＝派生キー複数化：`hops(ts,size,hop)`＋explode（sliding）と session。※session/lag は design/38 P3 で `over` 窓 item（`\|> * (session(…) over …)`）へ吸収済み — hops/bucket/date_bin は関数のまま |
+| 37 | [canonical-reduction-tree](37-canonical-reduction-tree.md) | 裁定済み・実装済み（#45 方式(b)） | **f64 並列 sum/avg/std の byte-identity 化**＝固定ブロック正準縮約木（BLOCK=128）＋file-major fold（uri 順 merge）。P=1 mirror が oracle。単一ファイル byte-range 経路は対象外＝将来スライス。精度も向上（39/40 seeds） |
+| 40 | [three-plane-flow](40-three-plane-flow.md) | 提案（Q1-Q4 裁可待ち） | **三面フロー**＝制御・テレメトリ・データの統一（OTel T1 / QUIC B2 の進退を含む） |
+| 41 | [deep-fused-worker](41-deep-fused-worker.md) | Stage A・C 着地／B 不採用（計測負け・破棄） | **形状選択の単一行ループ worker**＝probe projection pushdown＋FusedReadGroup（Stage A）・投機 sample 開＋矛盾検出＋局所再走（Stage C・C-eq が理論核）。mmap 窓（Stage B）は全設定で負け→不採用の負の結果を記録 |
+| 42 | [dictionary-lanes](42-dictionary-lanes.md) | 批准済み・全段着地（CSV+JSONL） | **辞書レーン**＝低カード Str 列を dict 符号化し fused loop を整数 id 直引き化（DICT_CAP=4096・chunk-local escape・plan-aware 候補選定・発動可観測性 `dict=`/`idloop=`）。CSV group median −10%・JSONL −4〜5% |
+| 38 | [syntax-simplification](38-syntax-simplification.md) | P1-P4＋readbin 吸収 実装済み（移行リリース — 旧綴りは parse 可＋fmt 正典化・次リリースでエラー化。P5 は使用調査待ち） | **構文簡素化＝「一つの明快なやり方」の回復**（統括指摘「構文が難しくなった・シンプルさが損なわれた」への棚卸しと提案）。複雑さの5源＝①エイリアス族（`readcsv/gci/limit/unnest/writecsv/where`…機能ゼロ増の別名11語）②同一操作の二綴り（project `as`⇄`:`・filter `,`⇄`and`・`fmt`が正規化＝冗長の証）③**窓/時系列が二文法に分裂**（scalar func `bucket/hops/date_bin` vs bespoke 動詞 `sessionize/shift/asof`＝主に先行研究の積み増し）④合成で足りるのに新キーワード⑤`\|>` 内の `:` 定義チェーン sub-DSL。提案 **P1** エイリアス族削除（44→約33 語・`fmt` 自動移行）**P2** project/filter 綴り一本化 **P3**（本命）窓・時系列を **`over` 窓関数**へ統一（`lag/lead/session` を Func 化・新キーワード不要・#228/#232 変換）**P4** `&asof` を `&left` 対等のジョイン種へ正則化 **P5** 制御系動詞棚卸し（保留・要使用調査）。不変条件（IR 可逆・byte-identity・dep-zero・continue-first）維持。**批准必須・自己マージ禁止**。 |
 
 ## 段階設計（MVP → 最適化 → JIT/分散）
 
 ```
-Phase 0  MVP            : Parser → DAG IR → single-thread chunk runtime → telemetry → ASCII viz   ← 現状ここ
-Phase 1  Optimization   : DAG rewrite (fusion/pushdown/branch-prune) + 並列スケジューラ + Arrow backing
+Phase 0  MVP            : Parser → DAG IR → single-thread chunk runtime → telemetry → ASCII viz
+Phase 1  Optimization   : DAG rewrite (fusion/pushdown/branch-prune) + 並列スケジューラ + Arrow backing   ← 現状ここ（並列 driver・fused loop・dict レーン・正準縮約木まで着地。Arrow backing は未着手）
 Phase 2  JIT            : observed-type specialization → Cranelift で hot predicate/projection を JIT
 Phase 3  Distributed    : graph partition → shuffle → 複数 worker・control plane の分散化
 ```
 
 各ドキュメントの末尾に「**MVP / 次 / 将来**」の段階表を置く。
 
-## 現状の実装（動く MVP）
+## 現状の実装
 
 ```
 crates/
   rivus-core     Chunk / Column / Schema / Value / Mode / ErrorEvent
   rivus-ir       PlanGraph(DAG) / Op / Expr / to_source()（可逆）
   rivus-parser   Unified Flow Syntax → DAG IR（lexer + recursive descent）
-  rivus-runtime  単一スレッド chunk 実行エンジン / operators / telemetry
+  rivus-runtime  chunk 実行エンジン（直列＋並列 driver 群）/ operators / telemetry / gendata
   rivus-cli      `rivus run | explain | check`（ASCII 可視化つき）
 examples/        *.riv サンプル + users.csv
 ```
 
 ```sh
-cargo test           # 11 tests
+cargo test --workspace              # 530+ tests（--all-features で更に増える）
 cargo run -p rivus-cli -- run     examples/branch.riv
 cargo run -p rivus-cli -- explain examples/branch.riv   # IR + 再生成 source
 ```

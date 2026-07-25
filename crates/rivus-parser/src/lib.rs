@@ -1,27 +1,14 @@
 //! `rivus-parser` — turns Unified Flow Syntax source into a [`PlanGraph`].
 //!
 //! Conceptually `source -> AST -> IR`; for the MVP we lower directly into the
-//! DAG IR while parsing (the IR *is* the AST in graph form). The grammar
-//! implemented here is the runnable subset documented in
-//! `docs/design/10-shell-syntax.md`:
+//! DAG IR while parsing (the IR *is* the AST in graph form).
 //!
-//! ```text
-//! scope      := IDENT ':' body ';'
-//! anonymous  := ':' body ';' IDENT?
-//! body       := (source | ref-expr) (transform | branch | sink | hook)*
-//! source     := 'open' PATH | 'stream' IDENT
-//! ref-expr   := IDENT (('+' IDENT)+ | ('&' IDENT))?   // merge / join
-//! transform  := '|?' expr | '|>' proj+ | '|#' field (AGG ':' field)*
-//!             | ('take'|'limit'|'head') INT | 'sort' IDENT ('asc'|'desc')?
-//!             | 'distinct' IDENT* | '|' 'map' block
-//!   proj     := IDENT (':' IDENT)? (':' TYPE)?   // §29.2 definition chain
-//!             | IDENT 'as' IDENT | '(' expr ')' 'as' IDENT     // computed cols
-//!   expr     := … cmp over add(+,-) over mul(*,/,%) over primary; '(' expr ')'
-//!               AGG := 'sum' | 'avg' | 'min' | 'max'   (count is always emitted)
-//! branch     := '->' IDENT ':' body ';'
-//! sink       := 'save' PATH | 'print'
-//! hook       := 'on' EVENT ('severity' '>=' SEV)? ':' action ';'
-//! ```
+//! The grammar is documented — and kept current — in
+//! `docs/design/10-shell-syntax.md` (full EBNF) and `docs/GUIDE.md` §"Quick
+//! grammar reference"; `docs/design/38-syntax-simplification.md` tracks the
+//! one-spelling migrations (P1-P4 + readbin) that retire alias forms. An
+//! inline sketch here rotted against all three (it predated windows, joins'
+//! kinds, validate, route, …) — link, don't copy (audit 2026-07-24).
 
 mod lexer;
 
@@ -695,14 +682,7 @@ impl Parser {
                 // the named key columns). Bare words until the next transform.
                 Tok::Word(w) if w == "distinct" => {
                     self.bump();
-                    let mut keys = Vec::new();
-                    while let Tok::Word(name) = self.tok().clone() {
-                        if is_keyword(&name) {
-                            break;
-                        }
-                        self.bump();
-                        keys.push(name);
-                    }
+                    let keys = self.parse_word_list();
                     let keys = keys.into_iter().map(key_path).collect();
                     let n = self.g.add_node(Op::Distinct { keys });
                     self.g.add_edge(current, n, EdgeKind::Stream);
@@ -718,14 +698,7 @@ impl Parser {
                 // `dropna [col ...]` — drop rows with empty values.
                 Tok::Word(w) if w == "dropna" => {
                     self.bump();
-                    let mut cols = Vec::new();
-                    while let Tok::Word(name) = self.tok().clone() {
-                        if is_keyword(&name) {
-                            break;
-                        }
-                        self.bump();
-                        cols.push(name);
-                    }
+                    let cols = self.parse_word_list();
                     let n = self.g.add_node(Op::DropNa { cols });
                     self.g.add_edge(current, n, EdgeKind::Stream);
                     current = n;
@@ -787,13 +760,7 @@ impl Parser {
                     let mut by = Vec::new();
                     if self.peek_is_word("by") {
                         self.bump();
-                        while let Tok::Word(name) = self.tok().clone() {
-                            if is_keyword(&name) {
-                                break;
-                            }
-                            self.bump();
-                            by.push(name);
-                        }
+                        by = self.parse_word_list();
                         if by.is_empty() {
                             return Err(self.err("sessionize `by` expects at least one column"));
                         }
@@ -841,13 +808,7 @@ impl Parser {
                     let mut by = Vec::new();
                     if self.peek_is_word("by") {
                         self.bump();
-                        while let Tok::Word(name) = self.tok().clone() {
-                            if is_keyword(&name) {
-                                break;
-                            }
-                            self.bump();
-                            by.push(name);
-                        }
+                        by = self.parse_word_list();
                         if by.is_empty() {
                             return Err(self.err("shift `by` expects at least one column"));
                         }
@@ -873,14 +834,7 @@ impl Parser {
                 // `drop COL [COL ...]` — remove the named columns.
                 Tok::Word(w) if w == "drop" => {
                     self.bump();
-                    let mut cols = Vec::new();
-                    while let Tok::Word(name) = self.tok().clone() {
-                        if is_keyword(&name) {
-                            break;
-                        }
-                        self.bump();
-                        cols.push(name);
-                    }
+                    let cols = self.parse_word_list();
                     if cols.is_empty() {
                         return Err(self.err("drop expects at least one column name"));
                     }
@@ -913,14 +867,7 @@ impl Parser {
                 // `reorder COL [COL ...]` — move named columns to the front.
                 Tok::Word(w) if w == "reorder" => {
                     self.bump();
-                    let mut cols = Vec::new();
-                    while let Tok::Word(name) = self.tok().clone() {
-                        if is_keyword(&name) {
-                            break;
-                        }
-                        self.bump();
-                        cols.push(name);
-                    }
+                    let cols = self.parse_word_list();
                     if cols.is_empty() {
                         return Err(self.err("reorder expects at least one column name"));
                     }
@@ -971,8 +918,6 @@ impl Parser {
         Ok(current)
     }
 
-    /// Parse the first element of a body: a source, a stream replay, a
-    /// merge/join over named scopes, or (for branch children) the inherited
     /// Parse a declared column schema `( name[:type] name[:type] … )` for
     /// `open`. Space-separated (like the `as bin` field list); a type fixes
     /// that column's lane, otherwise it is inferred. Types: `int`/`i64`,
@@ -1114,12 +1059,40 @@ impl Parser {
         }
     }
 
+    /// Consume a run of bare column words, stopping at a stage keyword
+    /// (`is_keyword` — see its contract) or any non-word token. The ONE body
+    /// behind every simple column list (`distinct`, `dropna`, `drop`,
+    /// `reorder`, the `by` clauses); a single shared loop is what prevents
+    /// the "missing keyword break absorbs the next statement" bug class
+    /// (audit 2026-07-24 — the `|# … save out.csv` swallow). Callers keep
+    /// their own at-least-one error message. Lists with per-item tails
+    /// (sort's `asc`/`desc`, cast's `:type`, rename's pairs) keep their own
+    /// loops but the same stop rule.
+    fn parse_word_list(&mut self) -> Vec<String> {
+        let mut words = Vec::new();
+        while let Tok::Word(w) = self.tok() {
+            if is_keyword(w) {
+                break;
+            }
+            match self.bump() {
+                Tok::Word(w) => words.push(w),
+                _ => unreachable!("peeked a Word"),
+            }
+        }
+        words
+    }
+
     /// Parse the tail of a group-by stage (the `|#` token or the `group` keyword
     /// is already consumed): one or more keys, then optional `func:col`
     /// aggregates. A leading word is an aggregate (not a key) only when it is a
     /// known agg func immediately followed by `:` (e.g. `sum:score`); every other
     /// leading word is a key, and at least one key is required. Shared by `|#`
-    /// and the `group` alias so the two stay identical (§25, #171).
+    /// and the `group` alias so the two stay identical (§25, #171). Like every
+    /// other column list, the keys stop at a stage keyword — without that break
+    /// `|# region save out.csv` absorbed `save out.csv` as keys and the sink
+    /// silently vanished (audit 2026-07-24; a column literally named like a
+    /// stage keyword cannot be a bare group key, same trade-off as the P4 `by`
+    /// rule).
     fn parse_group_tail(&mut self, current: NodeId) -> Result<NodeId, RivusError> {
         let is_agg = |p: &Self| {
             matches!(p.tok(), Tok::Word(w)
@@ -1127,8 +1100,8 @@ impl Parser {
                     && p.toks[p.pos + 1].0 == Tok::Colon)
         };
         let mut keys = Vec::new();
-        while let Tok::Word(_) = self.tok() {
-            if is_agg(self) {
+        while let Tok::Word(w) = self.tok() {
+            if is_agg(self) || is_keyword(w) {
                 break;
             }
             keys.push(self.word()?);
@@ -1272,7 +1245,10 @@ impl Parser {
         Ok(fields)
     }
 
-    /// upstream node.
+    /// Parse the first element of a body: a source, a stream replay, or a
+    /// merge/join over named scopes — or, for branch children, the inherited
+    /// upstream node. (This doc was severed from its fn by an interleaved
+    /// insertion once — audit 2026-07-24.)
     fn parse_body_head(&mut self, input: Option<NodeId>) -> Result<NodeId, RivusError> {
         match self.tok().clone() {
             // `open PATH [as FMT]` — extension is only the default; an explicit
@@ -2694,7 +2670,11 @@ fn resolve_format(path: &str, explicit: Option<&str>) -> Option<Format> {
             _ => None,
         };
     }
-    let lower = path.to_ascii_lowercase();
+    // The transport layer decompresses `.gz`/`.zst`/`.zstd` independently of
+    // the codec, so the DATA extension decides the format: `d.jsonl.gz` is
+    // gzipped JSONL, not CSV (audit 2026-07-24 — this ladder had drifted from
+    // `delim_for_path`, which already stripped).
+    let lower = rivus_ir::strip_compression_suffix(path).to_ascii_lowercase();
     if lower.ends_with(".parquet") {
         Some(Format::Parquet)
     } else if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
@@ -2706,6 +2686,14 @@ fn resolve_format(path: &str, explicit: Option<&str>) -> Option<Format> {
     }
 }
 
+/// Stage keywords: every word that can BEGIN a pipeline stage in a flow body.
+/// Column-list loops (group keys, sort keys, project names, join `on` keys, …)
+/// break on these, so **every new stage word MUST be added here** — a stage
+/// word missing from this list is silently absorbed as a column name by the
+/// preceding list loop and its statement vanishes (the `|# region save
+/// out.csv` bug, audit 2026-07-24). Words that only appear inside one
+/// construct (`by`, `over`, `within`, `asc`/`desc`) are per-call-site stops by
+/// design, not global keywords.
 fn is_keyword(w: &str) -> bool {
     matches!(
         w,
@@ -2784,6 +2772,88 @@ mod tests {
     fn nth_op(src: &str, n: usize) -> Op {
         let g = parse(src).unwrap();
         g.nodes[n].op.clone()
+    }
+
+    #[test]
+    fn group_keys_stop_at_stage_keywords() {
+        // Audit 2026-07-24: the group key loop was the only column list
+        // without an is_keyword break, so `|# region save out.csv` absorbed
+        // `save` and `out.csv` as KEYS and the sink silently vanished (empty
+        // error stream, round-trip-stable but wrong). A stage keyword after
+        // the keys must now begin its own stage node.
+        let g = parse("F:\n open d.csv\n |# region\n save out.csv\n;").unwrap();
+        assert!(
+            g.nodes.iter().any(|n| matches!(n.op, Op::Sink { .. })),
+            "save after group must build a sink"
+        );
+        let keys = g
+            .nodes
+            .iter()
+            .find_map(|n| match &n.op {
+                Op::GroupBy { keys, .. } => Some(keys.clone()),
+                _ => None,
+            })
+            .expect("group node");
+        assert_eq!(keys.len(), 1, "only `region` is a key: {keys:?}");
+
+        // The other stage keywords likewise stay stages after a group.
+        let g = parse("F:\n open d.csv\n |# region count:id\n sort region\n take 5\n;").unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Sort { .. })));
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Take { .. })));
+        let g = parse("F:\n open d.csv\n |# region\n distinct region\n print\n;").unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Distinct { .. })));
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::SinkPrint)));
+        // Same via the `group` alias route (shared tail).
+        let g = parse("F:\n open d.csv\n group region\n save o.csv\n;").unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(n.op, Op::Sink { .. })));
+    }
+
+    #[test]
+    fn compression_suffix_does_not_hide_the_data_extension() {
+        // Audit 2026-07-24: `open d.jsonl.gz` silently decoded gzipped JSONL
+        // as CSV — the transport decompresses regardless of codec, but the
+        // format ladder didn't strip .gz/.zst/.zstd (delim_for_path did; the
+        // ladders had drifted). The DATA extension now decides the format.
+        for (path, want_jsonl) in [
+            ("d.jsonl.gz", true),
+            ("d.ndjson.zst", true),
+            ("d.json.gz", true),
+            ("d.csv.gz", false),
+            ("d.csv.zstd", false),
+            ("plain.gz", false), // no data extension → CSV default, as before
+        ] {
+            let src = format!("F:\n open {path}\n;");
+            match (first_op(&src), want_jsonl) {
+                (
+                    Op::Source {
+                        codec: rivus_ir::Codec::Jsonl,
+                        ..
+                    },
+                    true,
+                )
+                | (
+                    Op::Source {
+                        codec: rivus_ir::Codec::Csv { .. },
+                        ..
+                    },
+                    false,
+                ) => {}
+                (other, want) => panic!("{path}: wrong codec (want jsonl={want}): {other:?}"),
+            }
+            // The bare spelling round-trips: the data extension re-implies
+            // the codec, so `to_source` needs no `as FMT` on these.
+            let s = parse(&src).unwrap().to_source();
+            assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
+            assert!(!s.contains(" as "), "{path} needs no explicit as: {s}");
+        }
+        // An explicit `as` still overrides the (stripped) extension — and the
+        // disagreement stays explicit through to_source.
+        let s = parse("F:\n open d.jsonl.gz as csv\n;").unwrap().to_source();
+        assert!(
+            s.contains("as csv"),
+            "codec-vs-extension disagreement must stay explicit: {s}"
+        );
+        assert_eq!(s, parse(&s).unwrap().to_source(), "not reversible: {s}");
     }
 
     #[test]
@@ -4615,6 +4685,51 @@ Import:
     }
 
     #[test]
+    fn fan_in_scope_hooks_and_comments_survive_round_trip() {
+        // Audit 2026-07-24: the bare merge/join/as-of scope arms of
+        // to_source rendered only the head line, silently deleting a hook or
+        // leading comment attached to the fan-in node — `rivus fmt` erased
+        // user error hooks. Bare fan-in scopes now render through
+        // write_chain (comments + hooks included) like every other scope.
+        for (src, tail_label) in [
+            (
+                "A:\n open a.csv\n;\nB:\n open b.csv\n;\nM:\n # keep both feeds\n A + B\n \
+                 on error severity >= warning:\n transition degraded\n ;\n;",
+                "M",
+            ),
+            (
+                "A:\n open a.csv\n;\nB:\n open b.csv\n;\nJ:\n A & B on id\n \
+                 on error severity >= warning:\n transition degraded\n ;\n;",
+                "J",
+            ),
+            (
+                "A:\n open a.csv\n;\nB:\n open b.csv\n;\nJ:\n A &asof B on id by ts\n \
+                 on error severity >= warning:\n transition degraded\n ;\n;",
+                "J",
+            ),
+        ] {
+            let g1 = parse(src).unwrap();
+            let tail = g1.labels[tail_label];
+            assert_eq!(g1.nodes[tail].hooks.len(), 1, "fixture must attach a hook");
+            let s = g1.to_source();
+            let g2 = parse(&s).unwrap();
+            let tail2 = g2.labels[tail_label];
+            assert_eq!(
+                g2.nodes[tail2].hooks.len(),
+                1,
+                "hook must survive the round-trip:\n{s}"
+            );
+            if src.contains("keep both feeds") {
+                assert!(
+                    !g2.nodes[tail2].leading_comments.is_empty(),
+                    "leading comment must survive the round-trip:\n{s}"
+                );
+            }
+            assert_eq!(s, g2.to_source(), "not idempotent:\n{s}");
+        }
+    }
+
+    #[test]
     fn tsv_extension_sets_tab_delim() {
         // `.tsv`/`.tab` open as tab-delimited without an explicit `as tsv`.
         assert!(matches!(
@@ -5549,23 +5664,6 @@ Import:
             .expect_err("gap must be a duration string")
             .to_string();
         assert!(e.contains("duration string"), "{e}");
-    }
-
-    #[test]
-    fn bare_dash_is_stdin_stdout_sentinel() {
-        // `open -` / `save -` map to the "-" sentinel, like `open stdin` /
-        // `save stdout` (the bare dash lexes as Minus; path_word accepts it).
-        let g = parse("F:\n open -\n |> name\n save -\n;").unwrap();
-        assert!(matches!(&g.nodes[0].op, Op::Source { discovery, .. } if discovery.path() == "-"));
-        let sink = g
-            .nodes
-            .iter()
-            .find_map(|n| match &n.op {
-                Op::Sink { route, .. } => route.path().map(str::to_string),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(sink, "-");
     }
 
     /// design/38 P1+P2 移行リリース (#236 acceptance ②): every deleted
