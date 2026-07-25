@@ -92,15 +92,14 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH.parquet` | **Apache Parquet** (opt-in `--features parquet`, read-only): typed lanes come straight from the file's schema — int64→int, double→float, utf8→str, DATE→date, TIMESTAMP millis/micros→datetime, DECIMAL→decimal — with real nulls. Uncompressed/snappy/gzip codecs; row-group streaming (bounded memory); nested columns error with guidance. The default (zero-dependency) build errors with `rebuild with --features parquet` |
 | `open PATH noheader` | CSV with **no header row** — every line is data, columns are named `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), `duration` (signed time spans), `date` (ISO `yyyy-MM-dd` calendar dates), or `time` (`HH:mm:ss` time-of-day; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
-| `readcsv PATH` | CSV, explicitly |
-| `readjson PATH` | JSON / JSON Lines, explicitly |
+| `readcsv PATH` / `readjson PATH` | deprecated aliases of `open PATH [as csv\|jsonl]` — still parse; `rivus fmt` rewrites them (§12 migration table) |
 | `open PATH as bin [be] [aligned] (name:type …)` | fixed-width binary records (a C-struct dump). Defaults `le`/`packed` are not written; no extension implies `bin` (always spell `as bin`). Legacy `readbin PATH …` still parses and `rivus fmt` rewrites it |
 | `open stdin` / `open -` | read CSV (or `as FMT`) from standard input |
 | `stream NAME` | replay a named flow (MVP: reference) |
 
-Format detection deliberately **does not over-trust the extension**: use
-`open data.dat as json` when the extension lies, or the `readcsv`/`readjson`
-verbs when you want it obvious at a glance.
+Format detection deliberately **does not over-trust the extension**: use an
+explicit `as csv` / `as json` / `as jsonl` when the extension lies (or when
+you want the format obvious at a glance).
 
 **Headerless files: names + types together.** `open data.csv noheader (id:int
 name:str age:int)` gives a headerless file both column **names and types** in one
@@ -159,8 +158,8 @@ open sales.csv with source |> id amount (source.uri) as src
 ### `ls` — discovery (list files as a stream)
 
 `ls "glob"` turns a directory walk into a **flow**: it emits one row per matching
-file, which you filter / project / feed onward like any other stream. Aliases:
-`gci`, `dir`.
+file, which you filter / project / feed onward like any other stream. (`gci` /
+`dir` are deprecated aliases — `rivus fmt` rewrites them to `ls`.)
 
 ```
 ls "logs/**/*.csv"            # recursive glob → a row per match
@@ -270,13 +269,15 @@ Applied left to right; each consumes the stream and produces a new one.
 
 Keep rows where the predicate is true.
 
-You can use `where` as a readable alias, and **commas mean AND**:
+**Commas mean AND** (the one top-level conjunction); `and`/`or` still work
+*inside* a boolean expression where precedence matters. (`where` and a
+top-level `and` between predicates are deprecated spellings — `rivus fmt`
+rewrites them, §12.)
 
 ```
 |? age >= 20
-where age >= 20, country == "JP"      # comma = AND (same as `and`)
-|? country == "JP" and active == true
-|? score > 90 or age < 18
+|? age >= 20, country == "JP"         # comma = AND
+|? score > 90 or age < 18             # or/and inside one expression
 |? (score / age) > 3          # arithmetic in parens (see §6)
 ```
 
@@ -398,13 +399,13 @@ column, before `count`). Output columns are named `count` and `<func>_<col>` (e.
 `p90_score`). `std`/percentiles buffer each group's values (a pipeline-breaker
 like `sort`); the rest stream in O(1) memory per group.
 
-### `take` / `limit` / `head` — cap rows
+### `take` — cap rows
 
 ```
 take 100        # keep the first 100 rows, then stop
-limit 100       # alias
-head 100        # alias
 ```
+
+(`limit` / `head` are deprecated aliases — `rivus fmt` rewrites them.)
 
 ### `sort` — order by one or more keys
 
@@ -604,15 +605,17 @@ Merged:
   orphan right row never loses its key.
 - `A &full B on key` — **full outer join**: every row from both sides; unmatched
   rows are padded on the missing side.
-- `A & B [on key…] asof ts [within "5m"]` — **as-of / temporal join** (#64):
-  enrich each left row with the right row whose datetime `ts` is the **nearest at
-  or before** the left's, matched exactly on the `on` keys (a `by` group, e.g.
-  `on sym`); left-outer, so an unmatched left row keeps `null` right columns. The
-  optional `within "DUR"` drops a match older than the bound (closed threshold).
-  The right `ts` and `on` columns are dropped from the output (the left carries
-  them). Both sides are assumed time-ascending; the right side is sorted per
-  group so the result is chunk-size independent (serial). Datetime `≤` is exact
-  (i64 ticks). Example: `Trades & Quotes on sym asof ts within "1m"`.
+- `A &asof B [on key…] by ts [within "5m"]` — **as-of / temporal join** (#64,
+  design/38 P4): enrich each left row with the right row whose datetime `ts`
+  is the **nearest at or before** the left's, matched exactly on the `on`
+  keys; `by` names the temporal axis. Left-outer, so an unmatched left row
+  keeps `null` right columns. The optional `within "DUR"` drops a match older
+  than the bound (closed threshold). The right `ts` and `on` columns are
+  dropped from the output (the left carries them). Both sides are assumed
+  time-ascending; the right side is sorted per group so the result is
+  chunk-size independent (serial). Datetime `≤` is exact (i64 ticks).
+  Example: `Trades &asof Quotes on sym by ts within "1m"`. (The old grafted
+  `A & B … asof ts` spelling is deprecated — `rivus fmt` rewrites it, §12.)
 
 ```
 # inner join two CSVs on `id`
@@ -828,16 +831,17 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   it *is* `bucket`; the resample / gap-fill boundary primitive, #62); `hops(ts, size, hop)` (→ the *list*
   of **sliding-window** start keys containing `ts` — explode it and group:
   `|> (hops(ts, "5m", "1m")) as w price` → `explode w` → `|# w avg:price`;
-  `hops(x, s, s)` degenerates to `bucket`, §36); **session windows**:
-  `sessionize ts gap "30m" [by user]` appends a `session` column (the session's
-  start datetime — group on it: `|# user session …`; a new session starts when
-  the per-group gap exceeds the duration, out-of-order input is surfaced, §36.5);
-  **shift / diff** (#65): `shift col lag|diff|pct_change [N] [by keys] as alias`
-  appends a column derived from a value `N` rows back within each `by` group, in
-  source order — `lag` = the earlier value (null for the first `N`), `diff` =
-  `col − lag` (a `datetime` column yields an exact `Duration`, e.g.
-  `shift ts diff as gap`), `pct_change` = `(col − lag)/lag` as float
-  (`shift price diff by sym as delta`); chunk-size independent, serial;
+  `hops(x, s, s)` degenerates to `bucket`, §36); **session windows** (§36.5,
+  design/38 P3): `|> * (session(ts, "30m") over user) as session` appends the
+  session's start datetime (`|> *` keeps every column and appends the window
+  outputs) — group on it: `|# user session …`; a new session starts when the
+  per-group gap exceeds the duration, out-of-order input is surfaced;
+  **lag / diff / pct_change** (#65): window items in `|>` — `|> * (lag(price,
+  1) over sym) as prev` (the value `N` rows back within each `over` group, in
+  source order; null for the first `N`), `|> * (diff(ts)) as gap` (`col −
+  lag`; a `datetime` column yields an exact `Duration`), `pct_change` =
+  `(col − lag)/lag` as float; chunk-size independent, serial (the retired
+  `sessionize`/`shift` verbs still parse and `rivus fmt` rewrites them, §12);
   `format(ts, "fmt")` (→ text, same tokens incl.
   `ddd`/`[ja-jp]`/`n…n` — `format(ts, "[ja-jp]ddd")` renders `水`). Default
   rendering is ISO-8601 `yyyy-MM-ddTHH:mm:ss` (+ full-width fraction on a
@@ -930,7 +934,7 @@ open events.csv (ts:datetime)
 |---|---|
 | `save PATH` | format from the extension (mirrors the sources; `.tsv`/`.tab` → tab-delimited; `.json` → JSON array; `.jsonl`/`.ndjson` → NDJSON) |
 | `save PATH as FMT` | force the format (`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`) |
-| `writecsv PATH` / `writejson PATH` | explicit verbs (`writejson` = NDJSON) |
+| `writecsv PATH` / `writejson PATH` | deprecated aliases of `save PATH [as csv\|jsonl]` — still parse; `rivus fmt` rewrites them (§12) |
 | `save stdout` / `save -` | write to standard output |
 | `print` | capture for the on-screen preview |
 
@@ -944,9 +948,8 @@ open events.csv (ts:datetime)
 
 A flow can read and write the same format ("write what you can read"): CSV/TSV,
 JSON array and JSON Lines are all symmetric. **`as json` is a single bracketed
-array**; **`as jsonl`/`.jsonl`** is one object per line (and what `writejson`
-emits). Both stream in bounded memory; an empty result is `[]` (json) or no
-lines (jsonl).
+array**; **`as jsonl`/`.jsonl`** is one object per line. Both stream in
+bounded memory; an empty result is `[]` (json) or no lines (jsonl).
 
 ### Partitioned / dynamic output (route)
 

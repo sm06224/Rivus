@@ -94,14 +94,13 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH.parquet` | **Apache Parquet**（`--features parquet`・読み取りのみ）：ファイル埋め込みスキーマから型付きレーンへ直行 — int64→int・double→float・utf8→str・DATE→date・TIMESTAMP millis/micros→datetime・DECIMAL→decimal、null も本物。非圧縮/snappy/gzip、row-group ストリーミング（有界メモリ）、ネスト列は誘導付きエラー。既定（依存ゼロ）ビルドは `--features parquet` を促すエラー |
 | `open PATH noheader` | ヘッダ行なし CSV — 全行がデータ、列名は `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定 — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点）, `datetime[("fmt")]`（厳密な時刻）, `duration`（符号付き時間量）, `date`（ISO `yyyy-MM-dd` の暦日）, `time`（`HH:mm:ss` の時刻、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む。`open log.csv (ts:datetime("yyMMddHHmmss"))` は `ts` を時刻として読む |
-| `readcsv PATH` | CSV を明示 |
-| `readjson PATH` | JSON / JSON Lines を明示 |
+| `readcsv PATH` / `readjson PATH` | `open PATH [as csv\|jsonl]` の廃止予定別名 — parse 可・`rivus fmt` が書換（§12 移行表） |
 | `open PATH as bin [be] [aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ）。既定の `le`/`packed` は書かない。拡張子は `bin` を暗示しない（常に `as bin` を明示）。旧 `readbin PATH …` も本リリースは parse 可・`rivus fmt` が正典へ書換 |
 | `open stdin` / `open -` | 標準入力から CSV（または `as FMT`）を読む |
 | `stream NAME` | 名前付きフローを再生（MVP: 参照） |
 
 形式判定は拡張子を **過信しません**。拡張子が嘘をつくときは `open data.dat as json`、
-ひと目で分かるようにしたいときは `readcsv`/`readjson` 動詞を使ってください。
+ひと目で分かるようにしたいときも明示の `as csv` / `as jsonl` を使ってください。
 
 **ヘッダ無しファイル：名前と型を同時に。** `open data.csv noheader (id:int name:str
 age:int)` で列名と型を同時に与えられます（先頭行はデータとして読まれます）。`noheader`
@@ -156,7 +155,7 @@ open sales.csv with source |> id amount (source.uri) as src
 
 `ls "glob"` はディレクトリ走査を**フロー**にします。マッチした各ファイルを 1 行
 として emit し、通常のストリームと同様に絞る/射影する/後段へ流せます。エイリアス：
-`gci`・`dir`。
+（`gci`・`dir` は廃止予定別名 — `rivus fmt` が `ls` へ書換）。
 
 ```
 ls "logs/**/*.csv"            # 再帰グロブ → マッチ毎に1行
@@ -252,13 +251,14 @@ watch "in/*.csv"        # 作成/変更されたファイルごとに 1 行、�
 
 ### `|?` — フィルタ
 
-述語が真の行を残します。`where` を読みやすい別名として使え、**カンマは AND**：
+述語が真の行を残します。**カンマが AND**（最上位の連言はこれ一本）。`and`/`or` は
+優先順位が要る**式の内側**では引き続き使えます（`where` と述語間の最上位 `and` は
+廃止予定綴り — `rivus fmt` が書換、§12）：
 
 ```
 |? age >= 20
-where age >= 20, country == "JP"      # カンマ = AND（`and` と同じ）
-|? country == "JP" and active == true
-|? score > 90 or age < 18
+|? age >= 20, country == "JP"         # カンマ = AND
+|? score > 90 or age < 18             # 式内の or/and
 |? (score / age) > 3          # 括弧内で算術（§6 参照）
 ```
 
@@ -376,13 +376,13 @@ datetime の**パース書式**は source のスキーマ宣言に属し、キ�
 `std`/パーセンタイルはグループの値をバッファ（`sort` 同様のパイプラインブレーカ）、
 他はグループ毎 O(1) メモリでストリームします。
 
-### `take` / `limit` / `head` — 行数を制限
+### `take` — 行数を制限
 
 ```
 take 100        # 先頭 100 行を残して停止
-limit 100       # 別名
-head 100        # 別名
 ```
+
+（`limit`・`head` は廃止予定別名 — `rivus fmt` が書換。）
 
 ### `sort` — 1 つ以上のキーで整列
 
@@ -567,12 +567,14 @@ Merged:
 - `A &right B on key` — **右外部結合**：右の全行を保持（左列をデフォルト埋め）。
   結合キー列は右キーを保持するので、孤立した右行もキーを失いません。
 - `A &full B on key` — **完全外部結合**：両側の全行。未マッチ側はデフォルト埋め。
-- `A & B [on key…] asof ts [within "5m"]` — **as-of / 時間結合**（#64）：各左行を、
-  datetime `ts` が**左以下で最も近い**右行で補完（`on` キー＝`by` グループで厳密一致、
-  例 `on sym`）。左外部結合なので未マッチ左行は右列 `null`。`within "DUR"` は許容差
-  超のマッチを落とす（閉閾値）。右の `ts`・`on` 列は出力から除外（左が保持）。両側は
-  時刻昇順前提、右をグループ毎にソートするので chunk-size 非依存（直列）。datetime の
-  `≤` は正確（i64 ticks）。例：`Trades & Quotes on sym asof ts within "1m"`。
+- `A &asof B [on key…] by ts [within "5m"]` — **as-of / 時間結合**（#64・design/38
+  P4）：各左行を、datetime `ts` が**左以下で最も近い**右行で補完（`on` キーで厳密
+  一致・`by` が時間軸を指名）。左外部結合なので未マッチ左行は右列 `null`。
+  `within "DUR"` は許容差超のマッチを落とす（閉閾値）。右の `ts`・`on` 列は出力から
+  除外（左が保持）。両側は時刻昇順前提、右をグループ毎にソートするので chunk-size
+  非依存（直列）。datetime の `≤` は正確（i64 ticks）。
+  例：`Trades &asof Quotes on sym by ts within "1m"`。（旧接ぎ木形
+  `A & B … asof ts` は廃止予定 — `rivus fmt` が書換、§12。）
 
 ```
 # 2 つの CSV を id で内部結合
@@ -773,14 +775,16 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   `hops(ts, size, hop)`（`ts` を含む **sliding 窓**開始キーの *List* —
   explode して group する：`|> (hops(ts, "5m", "1m")) as w price` →
   `explode w` → `|# w avg:price`。`hops(x, s, s)` は `bucket` に退化、§36）、
-  **session 窓**：`sessionize ts gap "30m" [by user]` が `session` 列
-  （セッション開始 datetime）を付与 — そのまま `|# user session …` で集計。
-  グループ内 gap 超過で新セッション、時刻逆行は surface（§36.5）、
-  **シフト / 差分**（#65）：`shift col lag|diff|pct_change [N] [by keys] as alias`
-  が、各 `by` グループ内で source 順に `N` 行前の値から導いた列を付与 —
-  `lag`＝N 行前の値（先頭 N 行は null）、`diff`＝`col − lag`（`datetime` 列は
-  **正確な Duration**、例 `shift ts diff as gap`）、`pct_change`＝`(col − lag)/lag`
-  を float で（`shift price diff by sym as delta`）。chunk-size 非依存・直列、
+  **session 窓**（§36.5・design/38 P3）：`|> * (session(ts, "30m") over user)
+  as session` がセッション開始 datetime を付与（`|> *` は全列保持＋窓出力追加）—
+  そのまま `|# user session …` で集計。グループ内 gap 超過で新セッション、
+  時刻逆行は surface、
+  **lag / diff / pct_change**（#65）：`|>` の窓 item —
+  `|> * (lag(price, 1) over sym) as prev`（各 `over` グループ内・source 順で
+  `N` 行前の値、先頭 `N` 行は null）、`|> * (diff(ts)) as gap`（`col − lag`。
+  `datetime` 列は**正確な Duration**）、`pct_change`＝`(col − lag)/lag` を float
+  で。chunk-size 非依存・直列（退役した `sessionize`/`shift` 動詞は parse 可・
+  `rivus fmt` が書換、§12）、
   `format(ts, "fmt")`（文字列。`ddd`/`[ja-jp]`/`n…n` も同じトークンで使えます —
   `format(ts, "[ja-jp]ddd")` は `水` を返す）。既定の整形は ISO-8601
   `yyyy-MM-ddTHH:mm:ss`（サブ秒レーンは全幅の小数付き）。
@@ -869,7 +873,7 @@ open events.csv (ts:datetime)
 |---|---|
 | `save PATH` | 拡張子で形式判定（ソースと対称。`.tsv`/`.tab`→タブ区切り、`.json`→JSON 配列、`.jsonl`/`.ndjson`→NDJSON） |
 | `save PATH as FMT` | 形式を強制（`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`） |
-| `writecsv PATH` / `writejson PATH` | 明示動詞（`writejson` = NDJSON） |
+| `writecsv PATH` / `writejson PATH` | `save PATH [as csv\|jsonl]` の廃止予定別名 — parse 可・`rivus fmt` が書換（§12） |
 | `save stdout` / `save -` | 標準出力へ |
 | `print` | 画面プレビュー用にキャプチャ |
 
@@ -882,9 +886,8 @@ open events.csv (ts:datetime)
 ```
 
 「読める形式は書ける」：CSV/TSV、JSON 配列、JSON Lines はすべて対称です。
-**`as json` は単一の角括弧配列**、**`as jsonl`/`.jsonl`** は 1 行 1 オブジェクト
-（`writejson` が出すもの）。どちらも有界メモリでストリーム。空結果は `[]`（json）
-または行なし（jsonl）です。
+**`as json` は単一の角括弧配列**、**`as jsonl`/`.jsonl`** は 1 行 1 オブジェクト。
+どちらも有界メモリでストリーム。空結果は `[]`（json）または行なし（jsonl）です。
 
 ### 分割・動的出力（route）
 
