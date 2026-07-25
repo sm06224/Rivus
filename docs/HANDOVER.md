@@ -8,11 +8,11 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 > 全体監査 hardening — 確定バグ 6 件封鎖・stress の env-race 実体化・重複一本化・
 > コメント/CHANGELOG/design 台帳/GUIDE の現実同期。監査の全結果と却下/延期リストは
 > PR #253 本文）が着地。**#252**（design/38 readbin 吸収 `open … as bin`・条件 8 点＋
-> codec×オプション整合検査）も**着地済み** — GUIDE 本文例の旧綴り全面書換えが
-> follow-up の適地（#253 で移行表のみ追加済み）。**#255**（JSONL スキャナ SWAR/AVX2 —
-> decode 中央値 −23%・wall floor −10%・bit-identical）は裁可待ちで open。CLAUDE.md の乖離 3 点
-> （dev ブランチ節・gate バイナリの CI 委譲・#41 旧記述）は #253 本文で maintainer へ
-> 報告済み・未編集。
+> codec×オプション整合検査）・**#254**（CLAUDE.md 乖離 3 点の改訂・指揮起案）・
+> **#255**（JSONL スキャナ SWAR/AVX2 — decode 中央値 −23%・wall floor −10%・
+> bit-identical）・**#256**（GUIDE 本文例の旧綴り正典一掃）も**すべて着地済み**。
+> **#257**（design/38 flip 本体 — 旧綴りエラー化・recognize-but-refuse）を提出済み・
+> 裁可待ち（着地順は #250 の後）。
 
 ---
 
@@ -61,9 +61,9 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 | #249 | **#45 正準縮約木**（方式(b)・file-major 正準）— f64 sum/avg/std が並列化: f64 集計フロー wall 2.2〜3.4×・RSS 53× 改善 |
 
 **エラー化リリース（P1〜P4 の旧綴り一括 flip）**: 前提は**全充足**（asof チェーン
-描画 = #247・readbin 文法 = #252 で `open … as bin` 着地済み）。**flip 本体も統括 GO 済み**
-（2026-07-25・仕様正典 = #240 issuecomment-5078743131 — recognize-but-refuse・
-受入条件 7 点・着地順は #255→#250 の後）。
+描画 = #247・readbin 文法 = #252 で `open … as bin` 着地済み）。**flip 本体は
+PR #257 として提出済み・裁可待ち**（2026-07-25・仕様正典 = #240
+issuecomment-5078743131 — recognize-but-refuse・受入条件 7 点・着地順は #250 の後）。
 
 **標準フィクスチャの注意（2026-07-23）**: scratchpad がコンテナ再生成で消失し、
 10M×9 files 標準は文書仕様（BENCHMARKS「standard fixture」節・dirty mix 込み）から
@@ -76,8 +76,8 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 - **design/41（深層融合 worker）**: Stage A・C 着地済み・B（mmap）は計測負けで破壊済み。
 - **design/42（辞書レーン）**: **批准スコープ完全着地**（(a)(b)(c) × CSV+JSONL）。
   producer 契約 2 点（空辞書×非空 codes 構成上不可能・append 物質化前の fused 消費）維持。
-- **design/38（構文簡素化）**: P1〜P4 移行リリース着地（旧綴りは parse 可＋fmt 正典化、
-  次リリースでエラー化）。P5 は使用調査待ち（統括判断）。
+- **design/38（構文簡素化）**: P1〜P4 移行リリース着地済み・**flip 本体（旧綴りの
+  never-silent エラー化）は PR #257 で提出済み・裁可待ち**。P5 は使用調査待ち（統括判断）。
 - **design/37／#45（正準縮約木）**: 方式(b) で着地。CanonTree（BLOCK=128）＋file-major
   spine。force-serial 時は plain-safe 集合→generic oracle（design/42 ガード保全）、
   f64 モーメント集合→同一機械 P=1（serial mirror）。**単一ファイル byte-range 経路は
@@ -88,7 +88,7 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 | 形状 | wall | RSS | worker 内訳（/file） |
 |---|---|---|---|
 | CSV group | ~420ms | 10.1MB | decode 63-78ms・feed 36-44ms（idloop 発動 ~99.5%） |
-| JSONL group | ~683ms | 10.1MB | **decode 171-174ms**・feed ~43ms |
+| JSONL group | ~683ms | 10.1MB | **decode 171-174ms**・feed ~43ms（#255 SWAR で decode 中央値 −23%・wall floor −10% — 表は #255 前の snapshot） |
 | f64 集計（cast float sum/avg/std） | 675-718ms | 12.6MB | （#249 前は 1.5-2.5s / 670MB） |
 
 - **decode が feed の 2〜4 倍 = 次のレバーは decode 側**。feed は id 直引きで実質床。
@@ -99,21 +99,21 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 ## 5. 開いている判断（勝手に決めない）
 
 1. **P5（制御プレーン verb の整理）** — 使用調査待ち・統括判断。（readbin 文法は
-   #252 で裁可・着地済み — flip 本体も GO 済み・issuecomment-5078743131 が仕様正典。）
+   #252 で裁可・着地済み — flip 本体は #257 提出済み・issuecomment-5078743131 が仕様正典。）
 2. **design/40 Q1-Q4**（OTel T1 / QUIC B2）— 引き続き裁可待ち。
 3. **#45 の将来スライス**: 単一ファイル byte-range の file-major 化（§37.5）・BLOCK 掃引（Q2）。
 5. #229 Parquet の full 搭載可否・`unbounded` full 搭載 — 従来どおり保留。
 
 ## 6. 次のレバー候補（優先順・2026-07-24 実測に基づく）
 
-1. **JSONL decode（171ms/file — 最大単一レバー）**: scan_row_fast のテンプレート一致後も
-   全バイト走査＋数値 parse が残る。スキャナ内 SWAR／値スパンの遅延 parse が候補。
+1. **JSONL decode（最大単一レバー）**: スキャナ内 SWAR/AVX2 は #255 で着地
+   （decode 中央値 −23%）。残りは値スパンの遅延 parse・数値 parse の μopt。
 2. **CSV decode 残差（63-78ms/file）**: field parse の μopt・辞書 intern コスト
    （+5-8ms/file — dict 列の probe 頻度削減や前行 memo は fixture 次第）。
 3. fused 対応集合の拡張（複数 join・数値 coalesce — 適用面を広げる）。
 4. 圧縮標準（csv.gz/jsonl.gz）の decode 側（Stage C 非対象だった領域）。
 5. Track C 残り: resample/gap-fill（#62 agg 側）・rolling（#63）・lead（#65 follow-up）。
-6. エラー化リリース本体（readbin 裁可後・fmt 移行網羅テストは P1〜P4 で pin 済み）。
+6. ~~エラー化リリース本体~~ → **#257 提出済み**（全綴り 3 要素文言 pin 込み・裁可待ち）。
 
 ## 7. 落とし穴（実際に踏んだもの）
 
