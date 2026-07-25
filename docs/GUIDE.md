@@ -86,7 +86,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | syntax | reads |
 |---|---|
 | `open PATH` | format from the extension (`.csv` → CSV, `.jsonl`/`.ndjson`/`.json` → JSON, `.parquet` → Parquet) |
-| `open PATH as FMT` | force the format (`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson` \| `parquet`) |
+| `open PATH as FMT` | force the format (`FMT` = `csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson` \| `parquet` \| `bin` — `bin` also takes the binary field list, next row) |
 | `open PATH` (`.tsv`/`.tab`) | **TSV** — tab-delimited, picked up from the extension (std-only). `as tsv` forces it on any path; `as csv` forces commas back |
 | `open PATH.gz` / `PATH.zst` | **compressed** CSV/TSV — gzip (`.gz`, opt-in `--features gzip`) or zstd (`.zst`/`.zstd`, `--features zstd`). Serial single-pass, bounded memory. The default (zero-dependency) build errors with `rebuild with --features gzip`/`zstd` |
 | `open PATH.parquet` | **Apache Parquet** (opt-in `--features parquet`, read-only): typed lanes come straight from the file's schema — int64→int, double→float, utf8→str, DATE→date, TIMESTAMP millis/micros→datetime, DECIMAL→decimal — with real nulls. Uncompressed/snappy/gzip codecs; row-group streaming (bounded memory); nested columns error with guidance. The default (zero-dependency) build errors with `rebuild with --features parquet` |
@@ -94,7 +94,7 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH (col[:type] …)` | **declare a schema**: name columns positionally (overrides the header / `c0…`) and optionally fix a column's type — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)` (exact fixed-point), `datetime[("fmt")]` (exact timestamps), `duration` (signed time spans), `date` (ISO `yyyy-MM-dd` calendar dates), or `time` (`HH:mm:ss` time-of-day; see §6). e.g. `open f.csv (id:int zip:str age)` keeps `zip`'s leading zeros; `open sales.csv (id amount:decimal(2))` reads `amount` exactly; `open log.csv (ts:datetime("yyMMddHHmmss"))` reads `ts` as instants |
 | `readcsv PATH` | CSV, explicitly |
 | `readjson PATH` | JSON / JSON Lines, explicitly |
-| `readbin PATH [le\|be] [packed\|aligned] (name:type …)` | fixed-width binary records (a C-struct dump) |
+| `open PATH as bin [be] [aligned] (name:type …)` | fixed-width binary records (a C-struct dump). Defaults `le`/`packed` are not written; no extension implies `bin` (always spell `as bin`). Legacy `readbin PATH …` still parses and `rivus fmt` rewrites it |
 | `open stdin` / `open -` | read CSV (or `as FMT`) from standard input |
 | `stream NAME` | replay a named flow (MVP: reference) |
 
@@ -118,7 +118,7 @@ binary. JSON/JSONL/NDJSON all go through the same reader.
 **Binary example** — decode `(i32 id, i32 age, f64 score, u8 active)` records:
 
 ```
-B: readbin dump.bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
+B: open dump.bin as bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
 ```
 
 `le`/`be` choose byte order (default little-endian); `packed` (default) vs
@@ -127,7 +127,7 @@ B: readbin dump.bin (id:i32 age:i32 score:f64 active:u8) |? age >= 18 ;
 `N`-byte text field (a C `char[N]`) decoded as UTF-8. All `N` bytes are kept as
 the value (trailing NUL / padding included; `char[N]` aligns to 1 byte), so
 `name:char[16]` reads a 16-byte name field. e.g.
-`readbin people.bin (id:i32 name:char[16])`.
+`open people.bin as bin (id:i32 name:char[16])`.
 
 ### Provenance — `with source` / `with filename`
 
@@ -1285,8 +1285,9 @@ scope      = IDENT ':' body ';'  |  ':' body ';' IDENT? ;     (named / anonymous
 body       = source transform* ;
 
 source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
-           | 'readcsv' PATH | 'readjson' PATH
-           | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
+           | 'open' PATH 'as' 'bin' ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
+           | 'readcsv' PATH | 'readjson' PATH                       (legacy; fmt rewrites)
+           | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'   (legacy; fmt rewrites)
            | 'stream' IDENT
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 

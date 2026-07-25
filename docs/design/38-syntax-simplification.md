@@ -2,8 +2,13 @@
 
 **Status:** P1+P2 GO 済（#236 issuecomment-5017506345）・**P1+P2 移行リリース実装済み**
 （削除綴りは本リリースは parse 可＋`fmt` が正典へ自動書換、次リリースで
-did-you-mean エラー化。`readbin` は `open … as bin` 文法の裁可待ちでエラー化
-リリースへ繰延べ）。**P3（`over` 窓統一）実装済み**（同じ移行方式 —
+did-you-mean エラー化）。**readbin 吸収実装済み**（`open … as bin` 文法は
+#240 issuecomment-5074891399/5075090723 で裁可 — 正典は
+`open PATH as bin [be] [aligned] (name:bintype …) [with source]`、既定値
+`le`/`packed` は非描画。`readbin` は同じ移行方式: 本リリース parse 可＋fmt
+正典化・次リリースで did-you-mean エラー化。拡張子は bin を暗示しない —
+`as bin` 常時明示。同梱で codec×オプション整合検査 — JSONL/JSON/Parquet の
+`open` に付いた `noheader`・宣言スキーマの無音無視を正典形を教えるエラー化）。**P3（`over` 窓統一）実装済み**（同じ移行方式 —
 `session`/`lag`/`diff`/`pct_change` は `|>` の窓 item＋一様な `over` 句、
 keep-all は新設の `|> *`（窓 item 専用）が担い旧 verb を機械移行。
 `sessionize`/`shift` verb は本リリース parse 可・次リリースでエラー化。
@@ -42,14 +47,18 @@ sources:
 
 1. **Alias families** — three spellings that do one thing, kept for
    PowerShell muscle-memory:
-   - `read` = `readcsv` = `readjson` = `readbin`
+   - `read` = `readcsv` = `readjson`（**訂正**: `readbin` を当初ここに数えたのは
+     誤分類 — bin 型の括弧スキーマ＋`le/be/packed/aligned` という**独自文法**を
+     持つ binary source であり、純別名ではない。扱いは「削除」でなく
+     `open … as bin` への**吸収**（§38.3 注記））
    - `ls` = `gci` = `dir`
    - `take` = `limit` = `head`
    - `explode` = `unnest`
    - `save` = `writecsv` = `writejson`
    - `|?` = `where`
    Each alias is another word to learn, document, format, and test — with **zero
-   added power**. ~11 keywords are pure aliases.
+   added power**. ~10 keywords are pure aliases (readbin excluded per the
+   correction above).
 
 2. **Two spellings for one operation** (so `fmt` must normalize):
    - project rename: `name as alias` **and** `name :alias`
@@ -99,16 +108,23 @@ then they are hard errors with a "did you mean" pointing at the survivor.
 
 | remove | keep | note |
 |---|---|---|
-| `readcsv` `readjson` `readbin` | `read` | format via `as csv/json/bin` or extension |
+| `readcsv` `readjson` | `open` | format via `as csv/json` or extension |
 | `gci` `dir` | `ls` | discovery |
 | `limit` `head` | `take` | bound |
 | `unnest` | `explode` | list → rows |
 | `writecsv` `writejson` | `save` | format via `as` |
 | `where` | `\|?` | one filter spelling (the symbol is the identity) |
 
-Net: 44 → ~33 keywords, no capability lost. (If 統括 prefers the *word* over the
-*symbol* anywhere — e.g. keep `where`, drop `|?` — that is a fine inversion; the
-point is **pick one**.)
+**訂正（2026-07-24）**: `readbin` は当初この表の別名族に含めていたが誤分類 —
+独自文法（bin 型フィールド・スキーマ＋`le/be/packed/aligned` 修飾子）を持つ
+binary source であり、純別名の削除ではなく **`open … as bin` への吸収**が
+正しい扱い（#240 で文法裁可・移行リリース実装済み）。そのため P1 単独の
+純別名は ~10 語で 44 → **~34**（当初の「44 → ~33」は 1 ずれ）; readbin 吸収
+スライスと合わせて ~33 に到達する。
+
+Net: 44 → ~33 keywords（P1 ＋ readbin 吸収の合算）, no capability lost.
+(If 統括 prefers the *word* over the *symbol* anywhere — e.g. keep `where`,
+drop `|?` — that is a fine inversion; the point is **pick one**.)
 
 ---
 
