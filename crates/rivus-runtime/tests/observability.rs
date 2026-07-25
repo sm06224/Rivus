@@ -773,6 +773,90 @@ fn fused_id_path_activates_and_matches_serial() {
     );
 }
 
+/// design/42 stage (c) extension (2026-07-25): the fused id loop also
+/// ACTIVATES on a JOIN-LESS `read → cast → group` chain (発動 assert — the
+/// join-less fusion is gated on the dict lane, so this pins that the gate
+/// actually opens), and the parallel output is byte-identical to the
+/// forced-serial oracle, which never fuses NOR dictionary-encodes — one
+/// comparison pins joinless-fused + dict + id-loop against the fully
+/// generic path.
+#[test]
+fn joinless_fused_id_path_activates_and_matches_serial() {
+    let dir = std::env::temp_dir().join(format!("rivus_jlidloop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // 3 files → 3 workers; low-cardinality `category` (group key) samples as
+    // a dictionary candidate; `amount` mixes signs so sums do real work.
+    for f in 0..3usize {
+        let mut t = String::from("order_id,category,amount\n");
+        for i in 0..20_000usize {
+            t.push_str(&format!("{i},c{},{}\n", (i + f) % 7, (i % 100) as i64 - 5));
+        }
+        std::fs::write(dir.join(format!("jl_{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("jl_*.csv");
+    let out_par = dir.join("jlpar.csv");
+    let out_ser = dir.join("jlser.csv");
+    let src = |out: &std::path::Path| {
+        format!(
+            "G: ls \"{}\" read as csv cast amount :int\n \
+             |# category sum:amount count:amount\n \
+             sort category\n \
+             save {} ;\n",
+            glob.display(),
+            out.display()
+        )
+    };
+    let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
+    let gp = parse_opt(&src(&out_par));
+    let gs = parse_opt(&src(&out_ser));
+
+    let _env = env_guard();
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let before = rivus_runtime::fused_id_rows_total();
+    run(
+        &gp,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("parallel run");
+    let id_delta = rivus_runtime::fused_id_rows_total() - before;
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    run(
+        &gs,
+        RunOptions {
+            chunk_size: 4096,
+            ..Default::default()
+        },
+    )
+    .expect("serial run");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    let a = std::fs::read_to_string(&out_par).unwrap();
+    let b = std::fs::read_to_string(&out_ser).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(a.lines().count() > 1, "expected real grouped output");
+    assert_eq!(
+        a, b,
+        "join-less fused id path must be byte-identical to serial"
+    );
+    if std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        < 2
+    {
+        eprintln!("skipping activation assert: <2 CPUs available");
+        return;
+    }
+    assert!(
+        id_delta > 0,
+        "a dict-keyed join-less group must engage the fused id fast path (0 rows took it)"
+    );
+}
+
 /// Decode-column pruning (#240 キュー3, 対称方式): parallel and forced-serial
 /// runs of a prunable read→sink chain — dirty data included — produce
 /// byte-identical output AND identical error streams, because the SAME
