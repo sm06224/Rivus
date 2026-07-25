@@ -83,6 +83,19 @@ fn collect_strings(res: &rivus_runtime::RunResult, label: &str, col: &str) -> Ve
     out
 }
 
+/// Engine env vars (`RIVUS_PARALLEL_MIN_BYTES`, `RIVUS_NO_PARALLEL`, …) are
+/// process-global and the harness runs tests on threads: every set→run→remove
+/// span must hold this lock, or a neighbor's `remove_var` can land mid-run and
+/// silently downgrade a parallel side to serial — the Low-vs-Fast identity
+/// assertion then passes vacuously (the measured 2026-07-19 CI flake class;
+/// observability.rs carries the same lock, but a Mutex cannot cross test
+/// binaries). A poisoned lock (a panicked test) still leaves the env
+/// consistent (paired set/remove), so just take the guard.
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // --- Split test modules (design 26 §26.8.1; move-only). New null-model
 // tests land in `stress/null.rs` per the staged plan. ---
 mod bug_specs;

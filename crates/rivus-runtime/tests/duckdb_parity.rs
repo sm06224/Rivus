@@ -5,9 +5,10 @@
 //! Rivus and in DuckDB and asserts the row counts agree.
 //!
 //! DuckDB is an **external** oracle: the test shells out to the `duckdb` CLI
-//! only when it is on `PATH`, and **skips** (does not fail) otherwise — so the
-//! default build and CI gate need **no third-party dependency** (zero-dep
-//! default is preserved). To run it live: install the `duckdb` CLI (official
+//! only when it is on `PATH`, and **skips** (does not fail) otherwise — so
+//! the default build and CI gate need no EXTERNAL tool (the crate's own
+//! vetted default deps are policy-v2 normal). To run it live: install the
+//! `duckdb` CLI (official
 //! release binary) and `cargo test --test duckdb_parity`.
 //!
 //! Each case writes CSV input(s), evaluates the Rivus flow, and compares

@@ -1,6 +1,8 @@
-# 36. sliding window ＝ 派生キーの複数化 — `hops(ts, size, hop)` ＋ explode（§30.4 の続き・批准依頼）
+# 36. sliding window ＝ 派生キーの複数化 — `hops(ts, size, hop)` ＋ explode（批准済み・着地）
 
-> **状態：提案（先行研究・sliding＋session 両プロトタイプ実装済み・批准待ち）。** §30（#157 裁定）は
+> **状態：批准・着地（hops/bucket は関数のまま現役）。session はその後 design/38 P3 で
+> `over` 窓 item（`|> * (session(ts,"gap") over by…) as s`）へ吸収 — 本書の sessionize
+> 動詞綴りは移行リリース中の旧綴り（fmt が正典化）。** §30（#157 裁定）は
 > tumbling を「窓＝派生グループ化キー」1 個（`bucket`）に還元して close し、
 > **sliding / session を「別スライス・別批准」として残した**（§30.4）。本メモは sliding と session の提案。§30 の裁定（watermark／非有界解除＝永続対象外、§30.5）は
 > **一切覆さない**。

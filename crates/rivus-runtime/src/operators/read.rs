@@ -276,15 +276,13 @@ impl Read {
             Some(ReadFmt::Tsv) => FileFmt::Csv(b'\t'),
             Some(ReadFmt::Jsonl) => FileFmt::Jsonl,
             None => {
-                let l = uri.to_ascii_lowercase();
-                let l = l
-                    .strip_suffix(".gz")
-                    .or_else(|| l.strip_suffix(".zst"))
-                    .unwrap_or(&l);
+                // Shared ladder (audit 2026-07-24): the inline strip here
+                // missed `.zstd`, so `ls "*.jsonl.zstd" read` fell to CSV.
+                let l = rivus_ir::strip_compression_suffix(uri).to_ascii_lowercase();
                 if l.ends_with(".jsonl") || l.ends_with(".ndjson") || l.ends_with(".json") {
                     FileFmt::Jsonl
                 } else {
-                    FileFmt::Csv(rivus_ir::delim_for_path(l))
+                    FileFmt::Csv(rivus_ir::delim_for_path(&l))
                 }
             }
         }

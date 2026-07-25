@@ -1163,6 +1163,13 @@ Ids:
   `RIVUS_PARALLEL_MIN_BYTES` (bytes; `0` = always) or force serial with
   `RIVUS_NO_PARALLEL=1`. Compressed (`.gz`/`.zst`) sources can't be seeked, so
   they read serially.
+- **Dictionary lanes (design/42).** Low-cardinality join/group key columns are
+  dictionary-encoded at the reader and the fused loop probes joins / updates
+  groups by integer id. It is fully automatic and byte-identical to the plain
+  path; observe it with `RIVUS_WORKER_PROF=1`, which prints per-worker
+  `[WPROF] dict=Ncols(esc=M) idloop=Nrows` — `dict` counts encoded columns
+  (`esc` = chunks that overflowed the 4096-distinct cap and fell back to plain,
+  losslessly), `idloop` counts rows that rode the integer-id fast path.
 - **`--memory low|auto|fast|unbounded`.** The memory/speed knob. `low` forces
   serial (lowest resource use); `auto` (default) autotunes serial-vs-parallel
   from CPU count + input size; `fast` parallelizes more aggressively (lower size
@@ -1247,6 +1254,26 @@ about round-trip**: it re-parses its own output and, if a program still uses a
 construct it cannot yet render losslessly (e.g. an anonymous, unlabeled scope),
 refuses with a non-zero exit and leaves the source untouched rather than rewrite
 it into something different.
+
+**Deprecated spellings (design/38 migration).** The following still parse in
+this release; `rivus fmt` rewrites each to its canonical form, and **the next
+release turns them into never-silent did-you-mean errors** — run `rivus fmt
+--write` on your programs before upgrading:
+
+| deprecated | canonical |
+|---|---|
+| `readcsv P` / `readjson P` | `open P [as csv\|jsonl]` |
+| `readbin P … (…)` | `open P as bin … (…)` |
+| `gci` / `dir` | `ls` |
+| `limit` / `head` | `take` |
+| `unnest` | `explode` |
+| `writecsv P` / `writejson P` | `save P [as csv\|jsonl]` |
+| `where EXPR` | `\|? EXPR` |
+| `name as alias` / `(name:type) as alias` (project) | the `:` chain (`name :alias :type`) |
+| `a and b` (top-level filter AND) | the comma (`a, b`) |
+| `sessionize ts gap "30m" by u` | `\|> * (session(ts, "30m") over u) as s` |
+| `shift col lag 1 by u as p` | `\|> (lag(col, 1) over u) as p` (also `diff`/`pct_change`) |
+| `A & B on k asof ts [within]` | `A &asof B on k by ts [within]` |
 
 ---
 

@@ -7,6 +7,17 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **Dependency policy v2 — vetted external crates are allowed, compression is
+  default-on（統括指示 2026-07-09）.** The former zero-dependency-default rule
+  is retired: the invariants are now (a) a single-binary release, (b) the
+  dependency tree explicitly documented in `docs/SUPPLY-CHAIN.md`, (c)
+  `cargo deny check` green. gzip (`.gz`, via pure-Rust `flate2`/
+  `miniz_oxide`) and zstd (`.zst`/`.zstd`, via pure-Rust `ruzstd`) input are
+  **compiled into the default build** so compressed streams are first-class
+  (the "everything flows" directive); niche backends (regex, parquet, net,
+  unbounded watch) stay feature-gated. Earlier entries below that say
+  "opt-in `--features gzip`/`zstd`" or "the default build stays
+  zero-dependency" predate this flip and are amended in place.
 - **f64 `sum`/`avg`/`std` are now parallel — and their values shift ONCE (#45,
   canonical reduction trees).** Group-by f64 moments are computed with a
   fixed-block canonical reduction tree (BLOCK=128) plus a file-major fold:
@@ -57,18 +68,6 @@ All notable changes to Rivus. Format loosely follows
   `Shift` ops (serial, order-dependent, chunk-size independent), and
   `Sessionize` gained an output-name field so the alias names the appended
   column (`session` remains the default). `lead` stays a follow-up (#65).
-- **Decode-column pruning on join-free `read`→…→`save` chains — contract
-  narrowing.** When a flow's downstream is a linear filter/cast/projection
-  chain into a sink (no join, no group), the CSV readers now decode only the
-  columns the chain consumes — on BOTH the serial and parallel paths
-  (対称方式: one shared analysis feeds both, so their error streams stay in
-  parity). Consequence: **parse failures in never-consumed columns are no
-  longer counted or reported** (they were "… set to null" notes for cells the
-  flow provably never reads; structural malformed-*row* counting is
-  width-based and unchanged). Output bytes are identical to an unpruned run.
-  `rivus explain` surfaces the decision as a `decode prune` section listing
-  the kept columns. JSONL decodes fully (its readers take no allow-list), and
-  any join/group/rename in the chain disables pruning entirely.
 - **design/38 P1+P2 — the syntax surface has ONE spelling per operation
   (migration release, breaking next release).** The alias families
   (`readcsv`/`readjson`→`open [as jsonl]`, `gci`/`dir`→`ls`,
@@ -86,6 +85,18 @@ All notable changes to Rivus. Format loosely follows
   `readjson d.weird` renders `open d.weird as jsonl` (it used to render bare
   and re-parse as CSV, a silent semantic flip), and a CSV `save` onto a
   `.jsonl`/`.json` path keeps `as csv`.
+- **Decode-column pruning on join-free `read`→…→`save` chains — contract
+  narrowing.** When a flow's downstream is a linear filter/cast/projection
+  chain into a sink (no join, no group), the CSV readers now decode only the
+  columns the chain consumes — on BOTH the serial and parallel paths
+  (対称方式: one shared analysis feeds both, so their error streams stay in
+  parity). Consequence: **parse failures in never-consumed columns are no
+  longer counted or reported** (they were "… set to null" notes for cells the
+  flow provably never reads; structural malformed-*row* counting is
+  width-based and unchanged). Output bytes are identical to an unpruned run.
+  `rivus explain` surfaces the decision as a `decode prune` section listing
+  the kept columns. JSONL decodes fully (its readers take no allow-list), and
+  any join/group/rename in the chain disables pruning entirely.
 - **Expression `cast` to a temporal lane now parses a string source (BUG-D) —
   behavior change.** `cast ts:datetime` / `(ts:datetime) as t` (and `date`/`time`)
   previously reinterpreted a string as raw epoch ticks (`"2026-06-01"` → epoch-0,
@@ -155,7 +166,65 @@ All notable changes to Rivus. Format loosely follows
   numeric filter to stdout drops **3.33 s → 0.91 s (3.7×)**; output stays
   byte-identical to serial.
 
+### Fixed
+- **Silent data loss on a failed segment write/flush (parallel read→sink).**
+  A worker whose 256 KiB segment buffer failed to flush (ENOSPC/EDQUOT)
+  counted rows that never reached disk and the finalizer concatenated the
+  truncated segment with no error. Now: one sticky Critical per failed
+  worker, the whole segment is dropped (a truncated tail can end mid-line
+  and would garble the next segment's first row), telemetry counts only
+  landed rows, and a missing segment with counted rows aborts the write
+  instead of being silently skipped.
+- **`|# key` swallowed the next statement.** The group key list was the one
+  column list without a stage-keyword break, so `|# region save out.csv`
+  parsed as three keys and the `save` silently vanished (empty error
+  stream). Stage keywords now end the key list (a column named like a stage
+  keyword can't be a bare group key — same trade-off as the join `by` rule).
+- **`open d.jsonl.gz` decoded as CSV (silent garbage).** Format inference
+  read the raw extension while the transport decompressed regardless, and
+  the serial JSONL source couldn't ride a compressed stream at all. All
+  extension ladders now share one compression-suffix strip
+  (`.gz`/`.zst`/`.zstd`), and compressed JSONL decodes on the streaming
+  reader — same rows as the uncompressed twin (oracle-pinned).
+- **`rivus fmt` deleted hooks/comments on a bare merge/join/as-of scope.**
+  The fan-in scope arms of `to_source` rendered only the head line; they now
+  render through the same chain writer as every other scope, so error hooks
+  and leading comments survive the round-trip (IR reversibility).
+- **A mid-stream lane shift broke joins and the fused loop.** A computed
+  column's lane is data-dependent per chunk (a `case` over mixed branches:
+  all-int chunk → I64, mixed → Str). A buffered join/sort concatenating
+  such chunks silently truncated the column (ragged chunk — a debug-build
+  panic on valid input); the fused loop kept a plan resolved against the
+  first chunk's lanes and could group later rows under the coalesce
+  LITERAL, diverging from the generic chain. Now: buffering operators
+  reconcile a lane mismatch by widening both sides to the Str lane (each
+  cell its exact Display bytes), and the fused loop validates every chunk
+  against its resolved plan, falling back losslessly on a shift —
+  byte-identity serial vs parallel restored (red→green pinned).
+- **One empty group degraded a whole exact aggregate column to f64.** A
+  group whose cast-to-decimal failed on every row (all cells null) made
+  `GroupBy::finish` drop the entire column off its exact lane — float
+  money against the #202 contract, raw ticks instead of datetimes, and a
+  serial-vs-parallel byte divergence on the drivers that admit
+  decimal/duration sum/avg statically. An empty group now emits a NULL
+  cell and never vetoes the lane; a duration i128 overflow is null + one
+  surfaced error (the decimal rule), not a column-wide degrade.
+
 ### Added
+- **Dictionary-encoded Str lanes (design/42, ratified).** The CSV and JSONL
+  readers dictionary-encode low-cardinality join/group key columns
+  (plan-aware candidacy; cap 4096 distincts per chunk with a lossless
+  escape to plain), and the fused loop probes joins and updates group slots
+  by integer id (`[WPROF] dict=… idloop=…` observability). Measured on the
+  10M×9-file standards: CSV group median −10%, JSONL −4-5%, ETL −5-7%
+  (decode pruning); parallel vs serial byte-identity pinned including the
+  dict-vs-plain and escape paths.
+- **`date_bin(ts, dur, origin)`** — DuckDB-style aligned time bucketing as
+  an ordinary scalar function (design/23; composes with `|#` like
+  `bucket`/`hops`).
+- **Apache Parquet reader (opt-in `--features parquet`).** Typed lanes
+  straight from the file schema with real nulls; row-group streaming
+  (bounded memory); nested columns error with guidance.
 - **`:` definition chain in `|>` projections (design §29.2, s1, std-only).**
   `col :alias :type` stacks definitions left→right, light→heavy: `:identifier`
   renames, `:type` casts (`|> amount :amt :decimal(2)`), at most one of each in
@@ -364,13 +433,15 @@ All notable changes to Rivus. Format loosely follows
   (a live feed for an external viewer; falls back to stderr on a connection
   error). In JSON mode the ASCII banner, optimizer report and live progress are
   suppressed. A tiny hand-rolled JSON writer + `std::net` — no serde, no deps.
-- **zstd input: `open data.csv.zst` (opt-in `--features zstd`).** Reads
+- **zstd input: `open data.csv.zst` (now DEFAULT-ON — policy v2; originally
+  shipped opt-in `--features zstd`).** Reads
   zstd-compressed CSV/TSV (`.zst` / `.zstd`) through the **pure-Rust `ruzstd`
   decoder** (no C toolchain). Same serial single-pass, sample-inference path as
   gzip (the compressed reader is now format-agnostic over `.gz`/`.zst`), bounded
-  memory, forced serial (no byte-range parallel). **The default build stays
-  zero-dependency**: a default binary opening a `.zst` raises an actionable error
-  (`rebuild with --features zstd`). The runtime decode tree is all pure-Rust
+  memory, forced serial (no byte-range parallel). (Amended: under policy v2
+  the feature is in the default set; a `--no-default-features` build still
+  gets the actionable `rebuild with --features zstd` error.) The runtime
+  decode tree is all pure-Rust
   (`ruzstd`→`twox-hash`); the `.zst` test fixtures are written with the `zstd`
   crate as an **encode-only `[dev-dependency]`** that never ships. Oracle-tested
   across chunk sizes. The `.zst`/`.zstd` suffix is stripped before the delimiter
@@ -385,15 +456,16 @@ All notable changes to Rivus. Format loosely follows
   Oracle-tested (right rows = matched + orphan-right; full = matched +
   unmatched-left + orphan-right; key never empty), chunk-size independent. No
   new dependencies.
-- **gzip input: `open data.csv.gz` (opt-in `--features gzip`).** Reads
+- **gzip input: `open data.csv.gz` (now DEFAULT-ON — policy v2; originally
+  shipped opt-in `--features gzip`).** Reads
   gzip-compressed CSV/TSV (`.csv.gz` / `.tsv.gz`) through `flate2`'s pure-Rust
   `miniz_oxide` backend (no C toolchain). A compressed stream can't be seeked,
   so this uses a **serial, single-pass** reader with *sample inference* (buffer
   the first chunk of rows, infer the schema, then stream the rest) — bounded
   memory, no byte-range parallelism (the engine forces `.gz` sources serial).
-  **The default build stays zero-dependency**: the dependency is optional and
-  feature-gated, and a default binary reading a `.gz` raises an actionable error
-  (`rebuild with --features gzip`). The `.gz` suffix is stripped before the
+  (Amended: under policy v2 the feature is in the default set; a
+  `--no-default-features` build still gets the actionable `rebuild with
+  --features gzip` error.) The `.gz` suffix is stripped before the
   delimiter is chosen, so `.tsv.gz` is still tab-delimited. Vetted per
   `docs/SUPPLY-CHAIN.md` (flate2 + its pure-Rust tree; `cargo deny check
   --all-features` green). Oracle-tested across chunk sizes. Sample inference is

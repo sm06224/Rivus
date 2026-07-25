@@ -18,7 +18,8 @@ mod jsonl;
 mod kernel;
 // §33 networking transport (feature `net`): a std-only HTTP/1.1 GET client and a
 // TCP subscribe dial — `open "http://…"` (bounded GET) and `subscribe "tcp://…"`
-// (unbounded feed). The default build does not compile it (zero-dep invariant).
+// (unbounded feed). The default build does not compile it (niche backend
+// gate — policy v2 allows vetted default deps, but net stays opt-in).
 // Distributed execution (`serve` / `run --on`) is a later slice on this feature.
 #[cfg(feature = "net")]
 mod net;
@@ -37,7 +38,7 @@ pub mod cpu_budget;
 mod operators;
 // SUPPLY-CHAIN selected adapter (read-only slice): Apache Parquet input behind
 // the off-by-default `parquet` feature. The default build does not compile it
-// (zero-dep invariant); a feature-less run refuses the plan pre-run.
+// (niche-backend gate; policy v2); a feature-less run refuses the plan pre-run.
 #[cfg(feature = "parquet")]
 mod parquet_read;
 mod route;

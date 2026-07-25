@@ -49,28 +49,23 @@ impl Join {
 /// an outer join — so a null key never folds rows together (which would inflate
 /// the output count vs DuckDB).
 fn join_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> Option<String> {
+    // One serializer for every composite key ([`fill_join_key`]): build/probe
+    // key byte-equality is structural, not a convention to keep in sync
+    // (audit 2026-07-24 — this was a verbatim copy of the fill loop, minus
+    // the Str/dict borrow arms).
     let mut s = String::new();
-    for (n, &ci) in idxs.iter().enumerate() {
-        if chunk.columns[ci].is_null(row) {
-            return None;
-        }
-        if n > 0 {
-            s.push('\u{1f}');
-        }
-        s.push_str(&chunk.value(row, ci).to_string());
-    }
-    Some(s)
+    fill_join_key(chunk, idxs, row, &mut s).then_some(s)
 }
 
-/// Like [`join_key_at`] but appends the composite key into a **reused** buffer
-/// instead of allocating a fresh `String` per call — the probe side calls this
-/// once per row, so avoiding the per-row heap allocation (and the `Value` box a
-/// bare column would otherwise pay) is decisive on a large probe. Returns
-/// `false` (buffer left as-is) if any key part is null (a null key matches
-/// nothing, as in [`join_key_at`]). The bytes written are **identical** to
-/// [`join_key_at`]'s string for the same row (a str part borrows the column
-/// directly; any other lane falls back to the same `Value::to_string` form), so
-/// the key — and therefore every match — is byte-for-byte unchanged.
+/// THE composite-key serializer — every key (equi-join build & probe, as-of
+/// `by`, group scratch via its own twin) appends into a **reused** buffer:
+/// the probe side calls this once per row, so avoiding the per-row heap
+/// allocation (and the `Value` box a bare column would otherwise pay) is
+/// decisive on a large probe. Returns `false` (buffer left as-is) if any key
+/// part is null (a null key matches nothing). A str/dict part borrows the
+/// column directly; any other lane writes the exact `Value` Display form —
+/// [`join_key_at`]/[`by_key_at`] are thin allocating wrappers, so build and
+/// probe keys are byte-identical structurally.
 pub(crate) fn fill_join_key(chunk: &Chunk, idxs: &[usize], row: usize, buf: &mut String) -> bool {
     use std::fmt::Write;
     for (n, &ci) in idxs.iter().enumerate() {
@@ -97,18 +92,12 @@ pub(crate) fn fill_join_key(chunk: &Chunk, idxs: &[usize], row: usize, buf: &mut
     true
 }
 
-/// Concatenate buffered chunks (sharing a schema) into one.
+/// Concatenate buffered chunks into one — reconciling per-chunk lane drift
+/// (a computed column's lane is data-dependent per chunk; the naive append
+/// silently truncated it into a ragged chunk — audit 2026-07-24). See
+/// [`Chunk::concat_reconciling`].
 fn concat_chunks(bufs: Vec<Chunk>) -> Option<Chunk> {
-    let mut it = bufs.into_iter();
-    let first = it.next()?;
-    let schema = first.schema.clone();
-    let mut cols = first.columns;
-    for c in it {
-        for (i, col) in c.columns.iter().enumerate() {
-            cols[i].append(col);
-        }
-    }
-    Some(Chunk::new(0, schema, cols))
+    Chunk::concat_reconciling(bufs)
 }
 
 impl Join {
@@ -629,19 +618,12 @@ fn ts_nanos(chunk: &Chunk, ci: usize, row: usize) -> Option<i128> {
 }
 
 /// The composite `by` key of `row` (0x1F-joined), or `None` if any part is null
-/// (a null key matches nothing, like an equi-join key).
+/// (a null key matches nothing, like an equi-join key). Byte-for-byte the
+/// equi-join serializer ([`fill_join_key`] — one routine for every composite
+/// key, audit 2026-07-24).
 fn by_key_at(chunk: &Chunk, idxs: &[usize], row: usize) -> Option<String> {
     let mut s = String::new();
-    for (n, &ci) in idxs.iter().enumerate() {
-        if chunk.columns[ci].is_null(row) {
-            return None;
-        }
-        if n > 0 {
-            s.push('\u{1f}');
-        }
-        s.push_str(&chunk.value(row, ci).to_string());
-    }
-    Some(s)
+    fill_join_key(chunk, idxs, row, &mut s).then_some(s)
 }
 
 impl Operator for AsofJoin {

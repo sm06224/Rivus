@@ -2594,3 +2594,22 @@ Measured (regenerated 10M standards, same-window interleave vs main
   (parallel == mirror bytes, chunk-size independence 条件①, mirror
   activation assert) and `decimal_exact_lane_unaffected_by_canonical_
   trees` (条件④ — i128 answers pinned exact across paths).
+
+## 2026-07-25 — post-arc hardening: allocation micro-perf (audit #11) — NEUTRAL
+
+`Column::gather_opt` gained an all-`Some` fast path delegating to `gather`
+(one unwrapped index pass, and the dict lane now KEEPS its representation
+through inner-join gathers instead of decaying to plain Str);
+`Validity::gather_opt` skips per-element bit reads on an all-valid source;
+`DictColumn::materialize` pre-sizes its byte buffer exactly.
+
+Measured (10M×9-file standards, dirty mix, same-window interleave vs main
+`13d8cb2`, warm):
+
+- CSV group: floor **388 vs 389 ms** (5 pairs — inside noise). JSONL
+  group: floor **678 vs 677 ms** (4 pairs — inside noise). RSS unchanged
+  (10.1 MB both). **No speedup is claimed** — the standard shapes ride the
+  fused loop, which never builds the intermediate chunks these paths
+  serve; the change is justified as allocation removal + structural dict
+  preservation on the generic join path, not as a measured win.
+- Bit-identity: `cmp` of both shapes' outputs main-vs-branch identical.
