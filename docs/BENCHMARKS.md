@@ -2639,3 +2639,44 @@ vs main `3d9eb5f`, warm, 8 pairs):
 - Guards: swar unit tests sweep every hit position across the 8/32-byte
   stride boundaries against the scalar oracle (find/rfind/find-either);
   all existing JSONL byte-identity, dict-lane, and gz-oracle suites green.
+
+## 2026-07-25 — JSONL decode residual: single-pass int accumulate ＋ borrowed-string revalidation removal
+
+HANDOVER §6 lever 1 residual (post-SWAR #255). Two `scan_cell` (pass-2
+value scan) micro-optimizations, both with **identical semantics by
+construction**:
+
+1. **Single-pass i64 accumulate.** The number arm's digit walk now
+   accumulates the value as it classifies; an integer of ≤ 18 digits
+   (cannot overflow i64) returns directly, skipping the
+   `str::parse::<i64>` re-scan of the same bytes. Floats, ≥ 19-digit
+   runs, and malformed runs fall through to the exact previous code, so
+   classification (incl. the int-overflow→f64 fallback and the
+   leading-`+`→Float quirk) is unchanged.
+2. **Borrowed-string revalidation removal.** The escape-free string fast
+   path borrowed `&line[start..j]` through `std::str::from_utf8` — a
+   per-byte revalidation of bytes that came out of an already-validated
+   `&str` (both callers pass `line.as_bytes()`; `start`/`j` sit on ASCII
+   quote bytes = char boundaries). Now `from_utf8_unchecked` behind a
+   `debug_assert!` (repo already carries unsafe in `swar`/`csv` AVX2).
+
+Measured (10M×9-file JSONL standard, dirty mix, regenerated-fixture
+lineage — absolute values comparable within this window only;
+same-window interleave vs main `2e89a67`, warm, box 4 cores):
+
+- JSONL group (`ls … read as jsonl` → `|# category sum+count` → sort →
+  save): **8/8 pairs won, median 1059 → 952 ms (−10%), floor
+  1042 → 912 ms**; +3 confirmation pairs after rebuild, same direction
+  (1026-1082 vs 924-945). Per-file decode (WPROF) median
+  **156 → 112 ms (−28%)**.
+- JSONL ETL standard (`rivus_10mj.riv`: &left join + filter + group +
+  sort): **4/4 pairs won, median ~756 → ~613 ms (−19%)**.
+- CSV group: neutral (3/4 pairs cand ≤ main; the CSV path is untouched).
+- Bit-identity: group AND ETL outputs `cmp`-identical to main.
+
+Negative result (tried, measured, destroyed): riding pass-1's
+`scan_string` on the shared `find_either` probe regressed the open
+(inference) phase on the short-string standard — open= 292→451,
+316→340, 300→313 ms across three interleaved samples (call overhead ≫
+the 2-char scalar loop). Revisit only with a wide-string fixture that
+shows a win.
