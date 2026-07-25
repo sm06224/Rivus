@@ -29,7 +29,7 @@ fn binary_source_matches_oracle() {
 
     for cs in [1, 1000, 8192] {
         let src =
-            format!("F:\n readbin {p} (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n;");
+            format!("F:\n open {p} as bin (id:i32 age:i32 score:f64 active:u8)\n |? age >= 45\n;");
         let res = run_src(&src, cs);
         assert_eq!(res.total_rows_out(), ge, "binary filter chunk_size={cs}");
         assert!(res.errors.is_empty(), "clean binary should not error");
@@ -47,7 +47,7 @@ fn binary_big_endian_decodes() {
     let f = TempCsv(gendata::write_temp_bytes("be", &bytes));
     let res = run_src(
         &format!(
-            "F:\n readbin {} be (id:i32 age:i32)\n |? age >= 20\n;",
+            "F:\n open {} as bin be (id:i32 age:i32)\n |? age >= 20\n;",
             f.0.display()
         ),
         4096,
@@ -68,7 +68,7 @@ fn binary_c_alignment_decodes() {
     // With `aligned`, the reader skips the padding and reads v at offset 4.
     let res = run_src(
         &format!(
-            "F:\n readbin {} aligned (flag:u8 v:i32)\n |? v >= 150\n;",
+            "F:\n open {} as bin aligned (flag:u8 v:i32)\n |? v >= 150\n;",
             f.0.display()
         ),
         4096,
@@ -96,7 +96,7 @@ fn binary_char_field_decodes_to_text() {
     let p = f.0.display();
     for cs in [1usize, 2, 4096] {
         let res = run_src(
-            &format!("F:\n readbin {p} (id:i32 name:char[8])\n |> id name\n;"),
+            &format!("F:\n open {p} as bin (id:i32 name:char[8])\n |> id name\n;"),
             cs,
         );
         assert!(
