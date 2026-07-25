@@ -1323,3 +1323,118 @@ fn exact_lane_survives_an_all_null_group() {
     );
     assert_eq!(a, b, "serial and parallel bytes must be identical");
 }
+
+/// Audit 2026-07-24 (coverage gap #8): the dict-escape ↔ fused-id-loop
+/// interaction had no engine-level oracle — every fused engine test ran
+/// chunk_size 4096 == DICT_CAP, and the escape needs a 4097th distinct
+/// inside ONE chunk, so it was structurally unreachable there (escapes were
+/// covered only at decoder level, with no join/group/id-caches involved).
+/// This drives a run that MIXES dict-encoded chunks and escaped plain chunks
+/// through fused_feed_chunk's per-chunk caches (user-reachable via
+/// --chunk-size) and pins byte-identity against forced serial. The escape is
+/// proven structurally: if the middle all-distinct chunk had NOT escaped,
+/// every fused row would ride the id loop and `id_delta` would exceed the
+/// asserted upper bound.
+#[test]
+fn dict_escape_chunks_mix_with_id_loop_and_match_serial() {
+    let dir = std::env::temp_dir().join(format!("rivus_dictesc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let right = dir.join("regions.csv");
+    let mut rtext = String::from("region,country\n");
+    for r in 0..5 {
+        rtext.push_str(&format!("r{r},C{}\n", r % 3));
+    }
+    std::fs::write(&right, rtext).unwrap();
+    const CHUNK: usize = 8192; // > DICT_CAP (4096): an escape becomes possible
+    for f in 0..3usize {
+        let mut t = String::from("order_id,region,category,amount\n");
+        for i in 0..(3 * CHUNK) {
+            // Chunk 1 (rows 0..8192): low-cardinality → samples as a dict
+            // candidate and dict-encodes. Chunk 2: ALL-DISTINCT (8192 > cap)
+            // → the chunk-local dict overflows and escapes to plain Str.
+            // Chunk 3: low-cardinality again → back to dict encoding.
+            let cat = if (CHUNK..2 * CHUNK).contains(&i) {
+                format!("u{f}_{i}")
+            } else {
+                format!("c{}", i % 7)
+            };
+            t.push_str(&format!(
+                "{i},r{},{cat},{}\n",
+                (i + f) % 5,
+                (i % 100) as i64 - 5
+            ));
+        }
+        std::fs::write(dir.join(format!("esc_{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("esc_*.csv");
+    let out_par = dir.join("out_par.csv");
+    let out_ser = dir.join("out_ser.csv");
+    let src = |out: &std::path::Path| {
+        format!(
+            "R: open {} (region:str country:str) ;\n\
+             S: ls \"{}\" read as csv cast amount :int ;\n\
+             J: S &left R on region\n \
+             |? amount > 0\n \
+             |> (coalesce(country, \"@\")) as country (coalesce(category, \"@\")) as category amount\n \
+             |# country category sum:amount count:amount\n \
+             sort country category\n \
+             save {} ;\n",
+            right.display(),
+            glob.display(),
+            out.display()
+        )
+    };
+    let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
+    let gp = parse_opt(&src(&out_par));
+    let gs = parse_opt(&src(&out_ser));
+
+    let _env = env_guard();
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let before = rivus_runtime::fused_id_rows_total();
+    let rp = run(
+        &gp,
+        RunOptions {
+            chunk_size: CHUNK,
+            ..Default::default()
+        },
+    )
+    .expect("parallel run");
+    let id_delta = rivus_runtime::fused_id_rows_total() - before;
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    run(
+        &gs,
+        RunOptions {
+            chunk_size: CHUNK,
+            ..Default::default()
+        },
+    )
+    .expect("serial run");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    let a = std::fs::read_to_string(&out_par).unwrap();
+    let b = std::fs::read_to_string(&out_ser).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(a.lines().count() > 1, "expected real grouped output");
+    assert_eq!(
+        a, b,
+        "mixed dict/escaped chunks must stay byte-identical to serial"
+    );
+    // 1-CPU hosts legitimately stay serial (no id loop) — same guard as the
+    // sibling fused tests.
+    if rp
+        .strategy
+        .as_deref()
+        .is_some_and(|s| s.contains("parallel read group-by"))
+    {
+        let total_rows = (3 * 3 * CHUNK) as u64;
+        assert!(id_delta > 0, "dict chunks must drive the fused id loop");
+        assert!(
+            id_delta <= total_rows - (3 * CHUNK) as u64,
+            "the all-distinct chunks must ESCAPE the id loop (id_delta {id_delta} \
+             leaves no room for 3 escaped chunks out of {total_rows} rows — \
+             the escape hatch did not fire)"
+        );
+    }
+}
