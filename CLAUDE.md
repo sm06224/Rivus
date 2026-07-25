@@ -15,20 +15,23 @@ binding unless the user overrides it.
   decisions in PR descriptions, not as blocking questions.
 - **Keep momentum.** Land work as a chain of small, reviewable PRs.
 
-## Workflow: ONE integration branch, squash-merge (minimize maintainer effort)
+## Workflow: branch-per-PR ＋ 裁可フロー, squash-merge（改訂 2026-07-25・統括裁可）
 
-The maintainer squash-merges and wants near-zero merge effort. So:
+体制は 4 役（統括＝最終決定・裁可・タグ cut 専権／レビュー兼指揮＝独立 gate → GO 判定・
+事後検証／実装担当＝着地実行／先行研究＝PR 作成）。**自己マージは誰もしない。**
+指揮拠点イシュー（現行 #240）が裁可・GO・着地記録の一元台帳。
 
-- **Single long-lived branch `dev`, linear history.** Commit features
-  sequentially on `dev` (never parallel feature branches → never internal merge
-  conflicts). `git push` is free (not rate-limited); push often.
-- **Exactly ONE open PR** (`dev` → `main`), kept updated by pushes. Do not open
-  a second PR. After the maintainer squash-merges it, `git fetch origin main`
-  then `git reset --hard origin/main` on `dev` and keep committing.
-- **On every merge to `main`, surface the release tag.** Cutting a release is the
-  maintainer's alone (`docs/RELEASE.md`), so after a merge tell them the suggested
-  next tag — version + the `git tag … && git push origin <tag>` command — they
-  decide when to cut it (standing request, 2026-06-03).
+- **branch-per-PR・origin/main 基点。** `git fetch origin main` してから
+  `claude/<topic>` を切る。並行 PR は互いのファイル衝突面を裁可依頼に明記
+  （後着側が merge-forward・解消は加算的に限る）。
+  ※旧「単一 dev ブランチ・Exactly ONE open PR」運用は 2026-07 に廃止。
+- **1 PR の型**: 研究が PR ＋指揮拠点へ裁可依頼（実測・破壊的変更・gate 数値明記）→
+  指揮が独立 gate → GO（PR 1 コメント＋拠点記録）→ 実装担当が head 不変確認・
+  本機 gate・squash-merge・拠点に 1 コメント → 指揮が事後検証（bit 同一）。
+  詳細は `.claude/skills/`（landing-review / landing-exec / research-pr）。
+- **Release tag cut は統括専権。** 未タグの蓄積キューはレビュー兼指揮が管理し、
+  cut 再開時にその時点の HEAD で 1 本提示する（着地毎のタグ提案は書かない）。
+  手順は `docs/RELEASE.md`。
 - **GitHub API is the scarce resource** (secondary rate limit on PR/comment
   creation). So: never poll CI via API — rely on the `<github-webhook-activity>`
   events; don't open/close PRs in bursts; don't repeatedly edit PR bodies.
@@ -45,6 +48,9 @@ The maintainer squash-merges and wants near-zero merge effort. So:
   cargo test --workspace --all-features    # runs the gzip/zstd oracle tests
   gitleaks detect --no-git --source .
   cargo deny check bans sources licenses    # advisories needs network → CI
+  # gitleaks / cargo-deny がコンテナに無い場合（再生成で消える・proxy 制約で
+  # 再導入不可のことがある）: 代替せず「CI gate で充足を確認」と明記して CI に
+  # 委譲してよい（済ませたふりが最悪）。CI は cargo deny --all-features を走らせる。
   ```
 
 ## Tool & edit discipline (hard-won; violating this has shipped broken pushes)
@@ -137,26 +143,35 @@ Concretely:
   `chunk_size` (stress-tested).
 - **Byte-identical across execution strategies:** serial vs parallel vs any
   backend must produce the *same bytes*. Floating-point is the trap — f64
-  addition is **non-associative**, so a parallel partition-then-merge `sum`/
-  `avg`/`std` drifts by a ULP and is NOT byte-identical (measured; #41). Exact
-  reductions (`min`/`max`/`count`/`first`/`last`/`percentile`) and **integer /
-  decimal** lanes *are* associative and safe to parallelize. Exact money math is
-  the opt-in **decimal lane** (i128 scaled integer, `docs/design/21`): `--exact`
-  / `:decimal`. Never silently relax byte-identity for f64 — keep it serial or
-  route through decimal.
+  addition is **non-associative**, so a naive partition-then-merge `sum`/`avg`/
+  `std` drifts by a ULP (measured; #41). Exact reductions (`min`/`max`/`count`/
+  `first`/`last`/`percentile`) and **integer / decimal** lanes *are* associative
+  and always safe. Exact money math is the opt-in **decimal lane** (i128 scaled
+  integer, `docs/design/21`): `--exact` / `:decimal`.
+  **Resolved for f64 moments（#45/#249, 2026-07-23）**: f64 `sum`/`avg`/`std` now
+  parallelize via the **canonical reduction tree**（fixed-block, file-major fold,
+  `docs/design/37`）— the result is a pure function of the data (thread-count /
+  chunk-size / serial-vs-parallel independent), so serial == parallel holds
+  bit-for-bit **by construction**（強制直列は同一機械の P=1 mirror）。値は旧
+  naive left fold から一度きり ~1 ULP 級シフト済み（Q1・統括裁可・CHANGELOG 記録・
+  精度はむしろ向上）。exact レーンは 1 バイトも不変。原則は不変: **byte-identity を
+  無言で緩める変更は今後も禁止**（新バックエンドは正準木と同じ「構成的に決定的」で
+  あることを証明してから）。
 
 ## Roadmap (staged: MVP → optimize → JIT → distributed)
 
 Live backlog with measured status is in `docs/BENCHMARKS.md` and
 `docs/ROADMAP.md`. **Read `docs/HANDOVER.md` for the current cross-session
-context** (what's landed, the open #41 question, measured findings, next levers).
+context** (what's landed, measured findings, next levers) — HANDOVER が正典で、
+本節は静的スナップショットを持たない（過去に本節の focus 記述が実装から 2 世代
+遅れて混乱を生んだため、2026-07-25 改訂で「HANDOVER を読め」に一本化）。
 
-Measured current focus (the 1 GB profile points here): **SIMD CSV scan + faster
-field parse** (parse is ~75% of wall, not inference) → buffered output → the
-opt-in **decimal lane** at the reader (unblocks byte-identical parallel
-group-by, #41) → datetime lane / list-agg / pivot (`docs/design/23`). Heavy
-optional backends (Arrow, Cranelift JIT, GPU `docs/design/22`) stay
-feature-gated behind the operator/eval boundary with a CPU fallback.
+現在地の要約だけ最小限に: 10M×9 ファイル標準は全 5 形状で DuckDB の 0.5〜0.7×
+（byte-identity 契約下・一桁 MB RSS）・#41/#45 は正準縮約木で解決済み・
+辞書レーン design/42 全段着地・構文 design/38 P1〜P4 移行リリース済み（旧綴り
+エラー化 flip が次の大物）。Heavy optional backends (Arrow, Cranelift JIT, GPU
+`docs/design/22`) stay feature-gated behind the operator/eval boundary with a
+CPU fallback.
 
 ## Repo map
 
