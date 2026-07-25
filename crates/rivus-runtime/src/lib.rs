@@ -16,6 +16,7 @@ mod eval;
 mod fxhash;
 mod jsonl;
 mod kernel;
+mod swar;
 // §33 networking transport (feature `net`): a std-only HTTP/1.1 GET client and a
 // TCP subscribe dial — `open "http://…"` (bounded GET) and `subscribe "tcp://…"`
 // (unbounded feed). The default build does not compile it (niche backend
