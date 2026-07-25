@@ -2639,3 +2639,44 @@ vs main `3d9eb5f`, warm, 8 pairs):
 - Guards: swar unit tests sweep every hit position across the 8/32-byte
   stride boundaries against the scalar oracle (find/rfind/find-either);
   all existing JSONL byte-identity, dict-lane, and gz-oracle suites green.
+
+## 2026-07-25 — Fused loop coverage: join-less read→group chains (design/42 (c) extension)
+
+The design/41-A/42-(c) fused machinery (dict lane + integer-id group loop
++ slot memo) required a broadcast join — the plain multi-file
+`read → [stateless]* → group` standard ran fully generic (WPROF:
+`fused=0ms`, no `dict=`, group feed rebuilt + hashed a composite string
+key per row). This slice makes the join optional end to end:
+`FusedShapePlan.join: Option<…>`, join-less resolution (left-only
+namespace, `keeps_left`, no probe), and a join-less feed that emits each
+row exactly once through the SAME `observe_row`/slot-memo path.
+
+**Runtime guard (measured, not assumed)**: join-less fusion pays only
+through the dict-id loop. Without a dict lane under the key cells the
+per-row feed *loses* to the generic chunk loop — measured **+5-7%** on
+the no-cast plain-group standard — so the worker bails (sticky, lossless,
+same shape as the dtype validation) unless the first chunk's left key
+cells all ride dict lanes. After the guard the no-cast shapes are
+neutral (8-pair + reversed-order interleaves, both directions within
+noise).
+
+Measured (10M×9-file standards, dirty mix, same-window interleave vs
+main `2e89a67`, warm, box 4 cores; flow = `ls … read as csv|jsonl cast
+amount :int |# category sum:amount count:amount sort save`):
+
+- CSV cast plain group: **6/6 pairs won, median ~706 → ~521 ms (−26%)**
+  (post-guard confirmation 4/4, ~744 → ~498, −33%); WPROF shows
+  `fused … (active) dict=1cols idloop=~1.1M rows` per file.
+- JSONL cast plain group: **4/4 pairs won, median ~1026 → ~701 ms
+  (−32%)** (post-guard confirmation 2/2).
+- ETL standards (join shapes, the previously-fused path): neutral —
+  CSV 4 pairs and JSONL 4 pairs mixed within noise.
+- Bit-identity: all four shapes' outputs `cmp`-identical to main; the
+  new `joinless_fused_id_path_activates_and_matches_serial` pins
+  activation (id_delta > 0) AND byte-identity against the never-fusing,
+  never-dict serial oracle.
+
+Where the win comes from: stage-C speculative sampled opens (now
+reachable for join-less shapes), the dict lane on the group key, and the
+id loop replacing per-row composite-key build + hash with a code-indexed
+slot lookup.

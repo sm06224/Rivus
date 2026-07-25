@@ -3186,41 +3186,82 @@ enum FusedCell {
     LitStr(String),
 }
 
-/// The graph-level half of fused eligibility (design/41 Stage A): exactly one
-/// broadcast join; after it only predicate-only filters and at most one
-/// TRAILING `ProjectExpr`. Predicates are `Compare`/`And` over bare column
-/// refs and literals only — no `Cast`/`Arith`/`Func` — so the interpreter's
-/// cast-fail counter provably stays 0 and evaluating a pred once per LEFT row
-/// (instead of once per joined row) is unobservable. Group keys must be bare.
-/// Everything before the join stays on the generic per-op path.
+/// The graph-level half of fused eligibility (design/41 Stage A): at most one
+/// broadcast join; after it (or, join-less, after the longest generic prefix)
+/// only predicate-only filters and at most one TRAILING `ProjectExpr`.
+/// Predicates are `Compare`/`And` over bare column refs and literals only —
+/// no `Cast`/`Arith`/`Func` — so the interpreter's cast-fail counter provably
+/// stays 0 and evaluating a pred once per LEFT row (instead of once per
+/// joined row) is unobservable. Group keys must be bare. Everything before
+/// the split stays on the generic per-op path. A join-less chain
+/// (`read → [stateless]* → group`) fuses as a pure group feed: no probe, the
+/// same slot-memo / dict-id loop over the source lanes (design/42 stage (c)
+/// extended, 2026-07-25).
 struct FusedShapePlan {
-    /// Index of the broadcast step in `shape.path` (ops before it run generic).
+    /// Index of the first fused step in `shape.path` (ops before it run
+    /// generic). With a join this is the broadcast step; join-less it may
+    /// equal `path.len()` (nothing absorbed — the fused loop is group-only).
     split: usize,
-    join_id: NodeId,
-    right_src: NodeId,
+    /// `(join_id, right_src)` of the fused broadcast join; `None` for a
+    /// join-less chain.
+    join: Option<(NodeId, NodeId)>,
     preds: Vec<rivus_ir::Expr>,
     items: Option<Vec<(rivus_ir::Expr, String)>>,
 }
 
 fn fused_shape_plan(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<FusedShapePlan> {
     use rivus_ir::Expr as E;
-    let mut split = None;
+    let mut bsplit = None;
     for (i, step) in shape.path.iter().enumerate() {
         if matches!(step, ReadPathStep::Broadcast { .. }) {
-            if split.is_some() {
+            if bsplit.is_some() {
                 return None; // one join only in this slice
             }
-            split = Some(i);
+            bsplit = Some(i);
         }
     }
-    let split = split?;
-    let ReadPathStep::Broadcast { join_id, right_src } = shape.path[split] else {
-        unreachable!("split indexes a broadcast step");
+    // Join-less chain: fuse the longest absorbable SUFFIX (predicate-only
+    // filters, then at most one trailing `ProjectExpr`); everything before it
+    // runs generic. `split == path.len()` (nothing absorbable) still fuses
+    // the group feed itself — that is where the slot-memo / dict-id loop
+    // lives.
+    let (split, join) = match bsplit {
+        Some(i) => {
+            let ReadPathStep::Broadcast { join_id, right_src } = shape.path[i] else {
+                unreachable!("split indexes a broadcast step");
+            };
+            (i, Some((join_id, right_src)))
+        }
+        None => {
+            let absorbable = |i: usize, nid: NodeId| {
+                matches!(
+                    &graph.nodes[nid].op,
+                    Op::Filter { .. } | Op::FilterProject { fields: None, .. }
+                ) || (i == shape.path.len() - 1
+                    && matches!(&graph.nodes[nid].op, Op::ProjectExpr { .. }))
+            };
+            let mut s = shape.path.len();
+            while s > 0 {
+                let ReadPathStep::Stateless(nid) = shape.path[s - 1] else {
+                    unreachable!("join-less path is all stateless");
+                };
+                if absorbable(s - 1, nid) {
+                    s -= 1;
+                } else {
+                    break;
+                }
+            }
+            (s, None)
+        }
     };
     let mut preds: Vec<E> = Vec::new();
     let mut items = None;
-    let last = shape.path.len() - 1;
-    for (i, step) in shape.path.iter().enumerate().skip(split + 1) {
+    let last = shape.path.len().wrapping_sub(1);
+    let first_fused = match join {
+        Some(_) => split + 1, // ops after the broadcast step
+        None => split,        // the absorbable suffix itself
+    };
+    for (i, step) in shape.path.iter().enumerate().skip(first_fused) {
         let ReadPathStep::Stateless(nid) = step else {
             return None;
         };
@@ -3262,8 +3303,7 @@ fn fused_shape_plan(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<FusedSh
     }
     Some(FusedShapePlan {
         split,
-        join_id,
-        right_src,
+        join,
         preds,
         items,
     })
@@ -3299,9 +3339,11 @@ fn fused_dict_key_names(
         }
     }
     let mut set = std::collections::HashSet::new();
-    if let Op::Join { left_keys, .. } = &graph.nodes[sp.join_id].op {
-        for k in left_keys.iter().filter(|k| k.segs.is_empty()) {
-            set.insert(k.root.clone());
+    if let Some((join_id, _)) = sp.join {
+        if let Op::Join { left_keys, .. } = &graph.nodes[join_id].op {
+            for k in left_keys.iter().filter(|k| k.segs.is_empty()) {
+                set.insert(k.root.clone());
+            }
         }
     }
     if let Op::GroupBy { keys, .. } = &graph.nodes[shape.group_id].op {
@@ -3671,24 +3713,32 @@ fn resolve_fused_plan(
     graph: &PlanGraph,
     shape: &ReadGroupShape,
     left: &rivus_core::Schema,
-    right: &Chunk,
-    rk: &[usize],
+    // `(right chunk, right key indices)` of the fused join; `None` for a
+    // join-less chain (every cell then resolves against the left schema).
+    jctx: Option<(&Chunk, &[usize])>,
 ) -> Option<FusedPlan> {
     use rivus_core::{DataType, Value};
     use rivus_ir::Expr as E;
-    let Op::Join {
-        left_keys, kind, ..
-    } = &graph.nodes[sp.join_id].op
-    else {
-        return None;
+    let (lk, keeps_left) = match sp.join {
+        Some((join_id, _)) => {
+            let Op::Join {
+                left_keys, kind, ..
+            } = &graph.nodes[join_id].op
+            else {
+                return None;
+            };
+            if left_keys.iter().any(|k| !k.segs.is_empty()) {
+                return None;
+            }
+            let mut lk = Vec::with_capacity(left_keys.len());
+            for k in left_keys {
+                lk.push(left.index_of(&k.root)?);
+            }
+            (lk, kind.keeps_left())
+        }
+        // Join-less: no probe; every row "keeps left" (emitted exactly once).
+        None => (Vec::new(), true),
     };
-    if left_keys.iter().any(|k| !k.segs.is_empty()) {
-        return None;
-    }
-    let mut lk = Vec::with_capacity(left_keys.len());
-    for k in left_keys {
-        lk.push(left.index_of(&k.root)?);
-    }
     // Every predicate column must be a LEFT column: the pred is then evaluated
     // on the left chunk with the SHARED interpreter (zero semantics
     // duplication) and its result is identical for every match of that row.
@@ -3709,10 +3759,12 @@ fn resolve_fused_plan(
     // name -> cell over the joined-output naming: left columns first, then
     // right non-key columns with the `_r` collision suffix judged against the
     // FULL left schema — exactly `BroadcastProbe`'s schema construction.
+    // Join-less: left columns are the whole namespace.
     let resolve_name = |name: &str| -> Option<FusedCell> {
         if let Some(ci) = left.index_of(name) {
             return Some(FusedCell::Left(ci));
         }
+        let (right, rk) = jctx?;
         for (ci, f) in right.schema.fields.iter().enumerate() {
             if rk.contains(&ci) {
                 continue;
@@ -3747,7 +3799,11 @@ fn resolve_fused_plan(
                     FusedCell::Left(ci) if left.fields[ci].dtype == DataType::Str => {
                         Some(FusedCell::CoalesceLeft(ci, lit.clone()))
                     }
-                    FusedCell::Right(ci) if right.schema.fields[ci].dtype == DataType::Str => {
+                    // A Right cell can only resolve when a join context exists.
+                    FusedCell::Right(ci)
+                        if jctx
+                            .is_some_and(|(r, _)| r.schema.fields[ci].dtype == DataType::Str) =>
+                    {
                         Some(FusedCell::CoalesceRight(ci, lit.clone()))
                     }
                     _ => None,
@@ -3786,26 +3842,30 @@ fn resolve_fused_plan(
             )
         })
         .count();
-    let right_prefix = if plen > 0 && right.len <= 4096 {
-        let dummy = right; // Left cells never occur in the prefix; `li` unused.
-        let mut frags = Vec::with_capacity(right.len + 1);
-        for ri in (0..right.len).map(Some).chain(std::iter::once(None)) {
-            let mut s = String::new();
-            for (j, cell) in key_cells[..plen].iter().enumerate() {
-                if j > 0 {
-                    s.push('\u{1f}');
+    let right_prefix = match jctx {
+        Some((right, _)) if plen > 0 && right.len <= 4096 => {
+            let dummy = right; // Left cells never occur in the prefix; `li` unused.
+            let mut frags = Vec::with_capacity(right.len + 1);
+            for ri in (0..right.len).map(Some).chain(std::iter::once(None)) {
+                let mut s = String::new();
+                for (j, cell) in key_cells[..plen].iter().enumerate() {
+                    if j > 0 {
+                        s.push('\u{1f}');
+                    }
+                    fused_push_key(cell, dummy, 0, right, ri, &mut s);
                 }
-                fused_push_key(cell, dummy, 0, right, ri, &mut s);
+                frags.push(s);
             }
-            frags.push(s);
+            Some((plen, frags))
         }
-        Some((plen, frags))
-    } else {
-        None
+        // Join-less: a "right-only prefix" can only be LitStr cells; skipping
+        // the precompute keeps them on the per-row push (correct, just not
+        // prebuilt).
+        _ => None,
     };
     Some(FusedPlan {
         lk,
-        keeps_left: kind.keeps_left(),
+        keeps_left,
         preds: sp.preds.clone(),
         key_cells,
         agg_cells,
@@ -3942,8 +4002,9 @@ struct FusedScratch {
 fn fused_feed_chunk(
     ch: &Chunk,
     plan: &FusedPlan,
-    right: &Chunk,
-    table: &operators::JoinTable,
+    // `(right chunk, hash table)` of the fused join; `None` = join-less feed
+    // (no probe — every row emits exactly once, `ri = None`).
+    jctx: Option<(&Chunk, &operators::JoinTable)>,
     group: &mut operators::GroupBy,
     rows: &mut u64,
     sc: &mut FusedScratch,
@@ -3951,6 +4012,11 @@ fn fused_feed_chunk(
 ) {
     use rivus_core::ColumnData;
     debug_assert_eq!(plan.agg_cells.len(), group.agg_count());
+    // Join-less feeds still flow through the shared `fused_push_key` /
+    // `fused_value` (whose signatures take a right chunk); no `Right` cell
+    // can resolve without a join, so the empty stand-in is never read.
+    let empty_right = Chunk::new(0, rivus_core::Schema::empty(), Vec::new());
+    let right: &Chunk = jctx.map_or(&empty_right, |(r, _)| r);
     // Left-only predicates, evaluated ONCE per chunk through the vectorized
     // kernel when they compile (the sink-fusion negative result measured the
     // row-wise interpreter losing to the columnar kernel; kernel and
@@ -4028,34 +4094,39 @@ fn fused_feed_chunk(
 
     let mut predf = 0u64;
     let mut row = |li: usize, pre_passed: bool, predf: &mut u64, sc: &mut FusedScratch| {
-        let matched = match jdict {
-            // A null key matches nothing — the same branch `fill_join_key`
-            // takes (its bytes are never built for a null part).
-            Some((jci, _)) if ch.columns[jci].is_null(li) => None,
-            Some((_, jd)) => {
-                let code = jd.codes[li] as usize;
-                match jmemo[code] {
-                    Some(m) => m,
-                    None => {
-                        sc.keybuf.clear();
-                        let m = if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
-                            table.get(sc.keybuf.as_str())
-                        } else {
-                            None
-                        };
-                        jmemo[code] = Some(m);
-                        m
+        let matched = match jctx {
+            // Join-less feed: no probe. `matched = None` + `keeps_left`
+            // (always true here) emits the row exactly once below.
+            None => None,
+            Some((_, table)) => match jdict {
+                // A null key matches nothing — the same branch `fill_join_key`
+                // takes (its bytes are never built for a null part).
+                Some((jci, _)) if ch.columns[jci].is_null(li) => None,
+                Some((_, jd)) => {
+                    let code = jd.codes[li] as usize;
+                    match jmemo[code] {
+                        Some(m) => m,
+                        None => {
+                            sc.keybuf.clear();
+                            let m = if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
+                                table.get(sc.keybuf.as_str())
+                            } else {
+                                None
+                            };
+                            jmemo[code] = Some(m);
+                            m
+                        }
                     }
                 }
-            }
-            None => {
-                sc.keybuf.clear();
-                if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
-                    table.get(sc.keybuf.as_str())
-                } else {
-                    None
+                None => {
+                    sc.keybuf.clear();
+                    if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
+                        table.get(sc.keybuf.as_str())
+                    } else {
+                        None
+                    }
                 }
-            }
+            },
         };
         // Left-only predicates: one evaluation per left row covers every
         // match (the joined row's left cells are this row's cells). The
@@ -4217,13 +4288,15 @@ fn worker_feed(
         t_ops[i] += t.elapsed();
         i += 1;
     }
-    if i == fused_at && i < ops.len() {
-        let (right, table, rk) = fu.ctx.expect("fused ctx present when sp is");
-        let sp = fu.sp.expect("checked above");
+    if i == fused_at {
+        // `(right, table, rk)` present iff the fused shape has a join; a
+        // join-less chain fuses with no probe context.
+        let sp = fu.sp.expect("fused_at is set only when sp is");
         let mut fallback: Vec<Chunk> = Vec::new();
         for c in level {
             if fu.plan.is_none() && !fu.off {
-                match resolve_fused_plan(sp, graph, shape, &c.schema, right, rk) {
+                let jresolve = fu.ctx.map(|(r, _, rk)| (r, rk));
+                match resolve_fused_plan(sp, graph, shape, &c.schema, jresolve) {
                     Some(p) => fu.plan = Some(p),
                     None => fu.off = true,
                 }
@@ -4247,13 +4320,35 @@ fn worker_feed(
                     fu.off = true;
                 }
             }
+            // Join-less fusion pays only through the dict-id group loop
+            // (design/42 stage (c)): without a dict lane under the key
+            // cells, the per-row feed measurably loses to the generic chunk
+            // loop (+5-7% on the no-cast plain-group standard). Bail —
+            // sticky, lossless, same shape as the dtype validation above —
+            // unless every left key cell of THIS chunk rides a dict lane
+            // (and at least one does; dict flagging is decided at open, so
+            // the first chunk is representative).
+            if let (Some(plan), false) = (&fu.plan, fu.off) {
+                if fu.ctx.is_none() {
+                    let mut lefts = 0usize;
+                    let all_dict = plan.key_cells.iter().all(|cell| match cell {
+                        FusedCell::Left(ci) | FusedCell::CoalesceLeft(ci, _) => {
+                            lefts += 1;
+                            matches!(c.columns[*ci].data(), rivus_core::ColumnData::StrDict(_))
+                        }
+                        _ => true,
+                    });
+                    if !all_dict || lefts == 0 {
+                        fu.off = true;
+                    }
+                }
+            }
             if let (Some(plan), false) = (&fu.plan, fu.off) {
                 let t = Instant::now();
                 fused_feed_chunk(
                     &c,
                     plan,
-                    right,
-                    table,
+                    fu.ctx.map(|(r, t, _)| (r, t)),
                     group,
                     rows,
                     &mut fu.scratch,
@@ -4385,9 +4480,10 @@ fn worker_read_partial_group(
     let mut fu = FusedState {
         sp: fused_sp.as_ref(),
         ctx: fused_sp.as_ref().and_then(|sp| {
+            let (_, right_src) = sp.join?;
             rights
                 .iter()
-                .find(|(id, _)| *id == sp.right_src)
+                .find(|(id, _)| *id == right_src)
                 .map(|(_, (r, t, rk))| (r.as_ref(), t.as_ref(), rk.as_slice()))
         }),
         plan: None,
@@ -4396,7 +4492,9 @@ fn worker_read_partial_group(
         t_fused: std::time::Duration::ZERO,
         id_rows: 0,
     };
-    if fu.ctx.is_none() {
+    // A joined shape whose right side was not prebuilt cannot fuse; a
+    // join-less shape needs no probe context.
+    if fused_sp.as_ref().is_some_and(|sp| sp.join.is_some()) && fu.ctx.is_none() {
         fu.off = true;
     }
 
