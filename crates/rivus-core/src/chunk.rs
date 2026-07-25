@@ -384,7 +384,10 @@ pub enum ColumnData {
 /// `dict`, one `u32` code per row. The dictionary is chunk-owned and small by
 /// construction (the reader's escape hatch caps distinct counts), so `Clone`
 /// is a bounded copy. Row nullability rides the column's `Validity` exactly
-/// like the plain Str lane — a null row's code is 0 and never read.
+/// like the plain Str lane; a null row still carries a real code (the
+/// reader interns `""` for it), and bulk paths (`materialize`, `append`)
+/// DO read it — only per-cell consumers check `is_null` first. So the
+/// dictionary always contains every referenced entry, null rows included.
 #[derive(Debug, Clone)]
 pub struct DictColumn {
     pub dict: StrColumn,

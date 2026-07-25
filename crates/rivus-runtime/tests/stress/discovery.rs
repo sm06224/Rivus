@@ -160,9 +160,9 @@ fn watch_blocking_op_is_refused_pre_run_with_guidance() {
 #[cfg(not(feature = "unbounded"))]
 #[test]
 fn watch_without_the_feature_is_refused_pre_run() {
-    // §28.12 (ratified #149 ⑤): the default (zero-dep) build cannot evaluate
-    // `watch` — explicit pre-run refusal with rebuild guidance (the
-    // `regex`/`gzip` shape), never a silent wrong answer. Parse/to_source
+    // §28.12 (ratified #149 ⑤): a build without `unbounded` cannot evaluate
+    // `watch` — explicit pre-run refusal with rebuild guidance (the shared
+    // feature-gate shape), never a silent wrong answer. Parse/to_source
     // stay always-std (exercised by the parser round-trip tests).
     let g = rivus_parser::parse("W:\n watch \"in/*.csv\"\n read as csv\n take 1\n;")
         .expect("parse is always-std");

@@ -361,17 +361,15 @@ impl AggAcc {
         }
     }
 
-    /// Fold another partial accumulator (covering a *later* run of source rows)
-    /// into this one — the deterministic merge that lets a group-by run on
-    /// per-partition workers and recombine in **source order** (#41). `other`
-    /// must be the same `func` and follow `self` in source order (so `first`
-    /// keeps the earliest and `last` the latest). Exact lanes (i128 decimal sum,
-    /// counts, min/max, buffered percentile values) merge byte-identically; the
-    /// f64 moments are folded too but a *parallel* group-by is only enabled when
-    /// no aggregate depends on f64 associativity (the engine gates that).
-    /// Fold `other` (a LATER partition in source/uri order) into this
-    /// accumulator. The f64 sums use the file-major canonical fold (#45):
-    /// callers merge single-file partials sequentially in uri order.
+    /// Fold `other` (a partial accumulator covering a LATER run of source
+    /// rows — same `func`) into this one. Two live invariants:
+    /// 1. **Source order**: `other` follows `self` (`first` keeps the
+    ///    earliest, `last` the latest, buffers append in order) — #41.
+    /// 2. **File-major f64 fold**: the f64 CanonTree sums collapse and
+    ///    left-fold IN CALL ORDER, so callers merge single-file partials
+    ///    sequentially in uri order — #45. The exact lanes (i128 int/
+    ///    decimal/duration, tick min/max, counts) are associative and merge
+    ///    byte-identically under any partitioning.
     pub(crate) fn merge(&mut self, other: &AggAcc) {
         if matches!(self.func, AggFunc::Sum | AggFunc::Avg | AggFunc::Std) {
             self.sum.merge(&other.sum);
@@ -769,6 +767,10 @@ impl GroupBy {
     /// slot [`GroupBy::observe_row`] returned for this exact composite key,
     /// so the update is an index instead of a key rebuild + string hash.
     /// Identical to `observe_row`'s existing-group arm by construction.
+    /// **Slot ids die at `seal()`** (finish / merge_from drain the scratch
+    /// into the canonical store): a memoized slot must never be replayed
+    /// across a seal — the fused loop's caches are per-chunk, well inside
+    /// that window.
     pub(crate) fn observe_slot(&mut self, slot: u32, vals: &[Option<Value>]) {
         let state = &mut self.slot_states[slot as usize];
         state.count += 1;
@@ -842,13 +844,16 @@ impl GroupBy {
     }
 }
 
-/// Whether a group-by over these aggregates is **byte-identical** under a
+/// Whether a group-by over these aggregates is **byte-identical** under any
 /// partition→merge (parallel) execution, given the resolved type of each
-/// aggregated column (#41). `min`/`max`/`count`/`count_distinct`/`first`/`last`/
-/// percentile are always safe (associative or buffered+sorted); `sum`/`avg` are
-/// safe only on an exact lane (decimal — i128 associative); `std` and `sum`/`avg`
-/// on f64/integer columns are NOT (f64 addition is non-associative; integer sum
-/// rides the f64 accumulator) and keep the serial path.
+/// aggregated column (#41). `min`/`max`/`count`/`count_distinct`/`first`/
+/// `last`/`array_agg`/percentile are always safe (associative or
+/// buffered+sorted); `sum`/`avg` are safe on the exact lanes — **I64** (i128
+/// int accumulator with the correctly-rounded f64 output), **Decimal**
+/// (i128), **Duration** (i128 ticks). f64 `sum`/`avg`/`std` are NOT
+/// partition-safe (f64 addition is non-associative): flows needing them run
+/// serial or take the per-file driver's FILE-MAJOR canonical fold, whose
+/// merge order is fixed (uri order) rather than partition-shaped — #45.
 pub(crate) fn group_parallel_safe(
     aggs: &[(AggFunc, String)],
     col_type: impl Fn(&str) -> Option<DataType>,

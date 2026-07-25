@@ -253,8 +253,10 @@ fn run_dispatch(
     // view is coarser but the *processing* stays fully parallel.
     // Parallel read→group (slice 6, 統括指示: 負けるな): a
     // `ls → read → [stateless/broadcast-join]* → group → [sort]* → [sink]`
-    // flow runs one streaming worker per FILE with partial GroupBys merged like
-    // #41 (associative lanes only — checked; bails to serial else). The
+    // flow runs one streaming worker per FILE with partial GroupBys merged in
+    // uri order. Associative agg lanes merge under any partitioning (#41);
+    // f64 sum/avg/std ride the FILE-MAJOR canonical fold (#45 — same bytes
+    // as the P=1 mirror, which is the oracle). The
     // size-based strategy chooser can't see a multi-file input's size (there is
     // no single file source), so the shape is detected here and the size/memory
     // threshold is honored inside the runner (sum of file sizes vs the same

@@ -1,27 +1,14 @@
 //! `rivus-parser` — turns Unified Flow Syntax source into a [`PlanGraph`].
 //!
 //! Conceptually `source -> AST -> IR`; for the MVP we lower directly into the
-//! DAG IR while parsing (the IR *is* the AST in graph form). The grammar
-//! implemented here is the runnable subset documented in
-//! `docs/design/10-shell-syntax.md`:
+//! DAG IR while parsing (the IR *is* the AST in graph form).
 //!
-//! ```text
-//! scope      := IDENT ':' body ';'
-//! anonymous  := ':' body ';' IDENT?
-//! body       := (source | ref-expr) (transform | branch | sink | hook)*
-//! source     := 'open' PATH | 'stream' IDENT
-//! ref-expr   := IDENT (('+' IDENT)+ | ('&' IDENT))?   // merge / join
-//! transform  := '|?' expr | '|>' proj+ | '|#' field (AGG ':' field)*
-//!             | ('take'|'limit'|'head') INT | 'sort' IDENT ('asc'|'desc')?
-//!             | 'distinct' IDENT* | '|' 'map' block
-//!   proj     := IDENT (':' IDENT)? (':' TYPE)?   // §29.2 definition chain
-//!             | IDENT 'as' IDENT | '(' expr ')' 'as' IDENT     // computed cols
-//!   expr     := … cmp over add(+,-) over mul(*,/,%) over primary; '(' expr ')'
-//!               AGG := 'sum' | 'avg' | 'min' | 'max'   (count is always emitted)
-//! branch     := '->' IDENT ':' body ';'
-//! sink       := 'save' PATH | 'print'
-//! hook       := 'on' EVENT ('severity' '>=' SEV)? ':' action ';'
-//! ```
+//! The grammar is documented — and kept current — in
+//! `docs/design/10-shell-syntax.md` (full EBNF) and `docs/GUIDE.md` §"Quick
+//! grammar reference"; `docs/design/38-syntax-simplification.md` tracks the
+//! one-spelling migrations (P1-P4 + readbin) that retire alias forms. An
+//! inline sketch here rotted against all three (it predated windows, joins'
+//! kinds, validate, route, …) — link, don't copy (audit 2026-07-24).
 
 mod lexer;
 
@@ -931,8 +918,6 @@ impl Parser {
         Ok(current)
     }
 
-    /// Parse the first element of a body: a source, a stream replay, a
-    /// merge/join over named scopes, or (for branch children) the inherited
     /// Parse a declared column schema `( name[:type] name[:type] … )` for
     /// `open`. Space-separated (like `readbin`); a type fixes that column's
     /// lane, otherwise it is inferred. Types: `int`/`i64`, `float`/`f64`,
@@ -1142,7 +1127,10 @@ impl Parser {
         Ok(n)
     }
 
-    /// upstream node.
+    /// Parse the first element of a body: a source, a stream replay, or a
+    /// merge/join over named scopes — or, for branch children, the inherited
+    /// upstream node. (This doc was severed from its fn by an interleaved
+    /// insertion once — audit 2026-07-24.)
     fn parse_body_head(&mut self, input: Option<NodeId>) -> Result<NodeId, RivusError> {
         match self.tok().clone() {
             // `open PATH [as FMT]` — extension is only the default; an explicit

@@ -842,8 +842,10 @@ pub enum Op {
     /// A constant fill is streaming/stateless; `ffill`/`bfill` are stateful
     /// (they carry state across rows and chunks) → serial path.
     Fill { col: String, method: FillMethod },
-    /// `sessionize TS gap "30m" [by COL ...]` — session windows (§36.5 / #60):
-    /// append a `session` column carrying each row's **session start** (a
+    /// Session windows (§36.5 / #60) — canonical spelling (design/38 P3):
+    /// `|> * (session(TS, "30m") over BY…) as OUT` (the retired `sessionize
+    /// TS gap "30m" [by …]` verb still parses this release and rewrites).
+    /// Appends `out` carrying each row's **session start** (a
     /// datetime on `ts`'s lane — the same "window start as key" shape as
     /// `bucket`/`hops`, so `|# session …` aggregates per session). A new
     /// session starts when the gap to the previous row's ts (per `by` group)
@@ -860,8 +862,11 @@ pub enum Op {
         /// `sessionize` verb always produced `session`).
         out: String,
     },
-    /// `shift COL lag|diff|pct_change [N] [by COL ...] as ALIAS` — time-series
-    /// shift/difference primitives (#65): append `out` carrying a value derived
+    /// Time-series shift/difference primitives (#65) — canonical spelling
+    /// (design/38 P3): `|> (lag(COL, N) over BY…) as OUT` and the
+    /// `diff`/`pct_change` window functions (the retired `shift COL
+    /// lag|diff|pct_change [N] [by …] as ALIAS` verb still parses this
+    /// release and rewrites). Appends `out` carrying a value derived
     /// from an earlier row **within the same `by` group, in source order**.
     /// `Lag(n)` = the value `n` rows back (null for the first `n`); `Diff(n)` =
     /// `col − lag(col, n)` (a datetime column yields an exact `Duration`, #57);
@@ -923,8 +928,10 @@ pub enum Op {
         right_keys: Vec<PathExpr>,
         kind: JoinKind,
     },
-    /// `&` **as-of / temporal join** (#64): `Left & Right [on KEY…] asof TS
-    /// [within "DUR"]`. Enrich each left row with the right row whose `ts` is
+    /// **As-of / temporal join** (#64) — canonical spelling (design/38 P4):
+    /// `Left &asof Right [on KEY…] by TS [within "DUR"]` (the retired grafted
+    /// `Left & Right [on …] asof TS [within]` form still parses this release
+    /// and rewrites). Enrich each left row with the right row whose `ts` is
     /// the **nearest ≤** the left's (backward), matched exactly on the `by`
     /// keys. Left-outer: every left row is kept (no match → null right
     /// columns). `tolerance` (a duration string) drops matches older than the

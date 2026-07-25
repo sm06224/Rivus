@@ -960,8 +960,10 @@ fn parquet_nested_schema_is_refused_with_guidance() {
 #[cfg(not(feature = "parquet"))]
 #[test]
 fn parquet_without_the_feature_refuses_the_plan_pre_run() {
-    // The default (zero-dependency) build must refuse a Parquet plan before
-    // running — never a silent empty read (same shape as regex/gzip).
+    // A parquet-less build must refuse a Parquet plan before running —
+    // never a silent empty read (the same pre-run-refusal shape as the
+    // other feature gates; parquet stays a niche-backend opt-in under
+    // policy v2).
     let g = rivus_parser::parse("P:\n open data.parquet\n;").expect("parse is always std-only");
     let err = run(&g, RunOptions::default()).expect_err("must refuse pre-run");
     let msg = err.to_string();
