@@ -263,13 +263,19 @@ impl Validity {
     /// Gather with optional indices: `None` (an unmatched outer-join side)
     /// contributes a **null** (validity = 0), matching `Column::gather_opt`.
     pub fn gather_opt(&self, indices: &[Option<usize>]) -> Self {
-        let bits: Vec<bool> = indices
-            .iter()
-            .map(|o| match o {
-                Some(i) => !self.is_null(*i),
-                None => false,
-            })
-            .collect();
+        // All-valid source (the common dense case, mirroring `gather`):
+        // output validity is just index presence — no per-element bit reads.
+        let bits: Vec<bool> = if self.0.is_none() {
+            indices.iter().map(Option::is_some).collect()
+        } else {
+            indices
+                .iter()
+                .map(|o| match o {
+                    Some(i) => !self.is_null(*i),
+                    None => false,
+                })
+                .collect()
+        };
         Validity::from_bits(&bits)
     }
 
@@ -397,9 +403,16 @@ impl DictColumn {
     pub fn is_empty(&self) -> bool {
         self.codes.is_empty()
     }
-    /// Decode into the plain lane — row-for-row the same bytes.
+    /// Decode into the plain lane — row-for-row the same bytes. Pre-sized
+    /// exactly (rows and the summed byte total are both known up front), so
+    /// the copy never re-allocates mid-way (audit 2026-07-24).
     pub fn materialize(&self) -> StrColumn {
-        let mut out = StrColumn::with_capacity(self.len(), 0);
+        let bytes: usize = self
+            .codes
+            .iter()
+            .map(|&c| self.dict.get(c as usize).len())
+            .sum();
+        let mut out = StrColumn::with_capacity(self.len(), bytes);
         for &c in &self.codes {
             out.push(self.dict.get(c as usize));
         }
@@ -876,6 +889,16 @@ impl Column {
     /// Gather with optional indices: a `None` (unmatched outer-join row) is a
     /// **null** in both the value lane (type default) and the validity bitmap.
     pub fn gather_opt(&self, indices: &[Option<usize>]) -> Column {
+        // All-`Some` (an inner join, or the fully-matched side of an outer
+        // join) is exactly `gather`: one unwrapped index pass with no
+        // per-element Option branch — and the dict lane KEEPS its
+        // representation (gather's StrDict arm) instead of decaying to plain
+        // Str (audit 2026-07-24; the representations are byte-equal
+        // downstream by the design/42 §2 property pins).
+        if indices.iter().all(Option::is_some) {
+            let idx: Vec<usize> = indices.iter().map(|o| o.unwrap_or(0)).collect();
+            return self.gather(&idx);
+        }
         Column {
             data: self.data.gather_opt(indices),
             validity: self.validity.gather_opt(indices),
