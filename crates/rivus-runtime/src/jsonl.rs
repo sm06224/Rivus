@@ -1176,7 +1176,7 @@ impl JsonlChunker {
 
             // Complete a carried block-straddling line first (rare).
             if !self.carry.is_empty() {
-                match buf.iter().position(|&b| b == b'\n') {
+                match crate::swar::find_byte(buf, 0, b'\n') {
                     None => {
                         self.carry.extend_from_slice(buf);
                         self.reader.consume(avail);
@@ -1214,7 +1214,7 @@ impl JsonlChunker {
                 }
             }
 
-            let last_nl = match buf.iter().rposition(|&b| b == b'\n') {
+            let last_nl = match crate::swar::rfind_byte(buf, b'\n') {
                 None => {
                     self.carry.extend_from_slice(buf);
                     self.reader.consume(avail);
@@ -1251,10 +1251,7 @@ impl JsonlChunker {
                         break;
                     }
                     let rest = &text[cur..];
-                    let nl = rest
-                        .as_bytes()
-                        .iter()
-                        .position(|&b| b == b'\n')
+                    let nl = crate::swar::find_byte(rest.as_bytes(), 0, b'\n')
                         .expect("region ends with newline");
                     let raw = &rest[..nl];
                     cur += nl + 1;
@@ -1848,28 +1845,24 @@ fn scan_key<'a>(b: &'a [u8], i: &mut usize) -> Option<std::borrow::Cow<'a, str>>
         return None;
     }
     let start = *i + 1;
-    let mut j = start;
-    while j < b.len() {
-        match b[j] {
-            b'"' => {
-                *i = j + 1;
-                // SAFETY-free: the line came from &str, so the slice is UTF-8.
-                return Some(std::borrow::Cow::Borrowed(
-                    std::str::from_utf8(&b[start..j]).ok()?,
-                ));
-            }
-            b'\\' => {
-                // Escapes present: fall back to the allocating parser (rare).
-                let mut k = start - 1;
-                return parse_string(b, &mut k).map(|s| {
-                    *i = k;
-                    std::borrow::Cow::Owned(s)
-                });
-            }
-            _ => j += 1,
+    match crate::swar::find_either(b, start, b'"', b'\\') {
+        Some(j) if b[j] == b'"' => {
+            *i = j + 1;
+            // SAFETY-free: the line came from &str, so the slice is UTF-8.
+            Some(std::borrow::Cow::Borrowed(
+                std::str::from_utf8(&b[start..j]).ok()?,
+            ))
         }
+        Some(_) => {
+            // Escapes present: fall back to the allocating parser (rare).
+            let mut k = start - 1;
+            parse_string(b, &mut k).map(|s| {
+                *i = k;
+                std::borrow::Cow::Owned(s)
+            })
+        }
+        None => None,
     }
-    None
 }
 
 /// Scan a string VALUE without materializing it. Byte-for-byte the same
@@ -2475,26 +2468,25 @@ fn scan_row<'a>(line: &'a str, names: &[String], scratch: &mut Vec<ScVal<'a>>) -
 fn scan_cell<'a>(b: &'a [u8], i: &mut usize) -> Option<ScVal<'a>> {
     match *b.get(*i)? {
         b'"' => {
-            // Fast path: escape-free string borrows the line.
+            // Fast path: escape-free string borrows the line. One vectorized
+            // probe for the closing quote OR the first escape (identical
+            // accept/branch decision to the old byte loop).
             let start = *i + 1;
-            let mut j = start;
-            while j < b.len() {
-                match b[j] {
-                    b'"' => {
-                        *i = j + 1;
-                        return std::str::from_utf8(&b[start..j]).ok().map(ScVal::S);
-                    }
-                    b'\\' => {
-                        let mut k = start - 1;
-                        return parse_string(b, &mut k).map(|s| {
-                            *i = k;
-                            ScVal::SOwned(s)
-                        });
-                    }
-                    _ => j += 1,
+            match crate::swar::find_either(b, start, b'"', b'\\') {
+                Some(j) if b[j] == b'"' => {
+                    *i = j + 1;
+                    std::str::from_utf8(&b[start..j]).ok().map(ScVal::S)
                 }
+                Some(_) => {
+                    // Escapes present: fall back to the allocating parser (rare).
+                    let mut k = start - 1;
+                    parse_string(b, &mut k).map(|s| {
+                        *i = k;
+                        ScVal::SOwned(s)
+                    })
+                }
+                None => None,
             }
-            None
         }
         b'{' | b'[' => {
             // Heterogeneous cell in a Str column: parse + render as JSON text
