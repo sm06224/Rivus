@@ -2205,38 +2205,9 @@ impl ColBuilder {
 /// Split an unquoted record into field byte-ranges `(start, end)` into `out`
 /// (cleared first), allocating nothing — `out` is reused across rows. Returns
 /// `false` when the line contains a `"` (the caller takes the owned slow path).
-// SWAR (SIMD-within-a-register) byte search: process 8 bytes per step with
-// plain u64 arithmetic — no `core::arch`, no feature gate, host-endian
-// independent (words are read little-endian so byte `i` maps to bits
-// `i*8..i*8+7`).
-const SWAR_LO: u64 = 0x0101_0101_0101_0101;
-const SWAR_HI: u64 = 0x8080_8080_8080_8080;
-const SWAR_LO7: u64 = 0x7F7F_7F7F_7F7F_7F7F; // !SWAR_HI
-
-/// Broadcast byte `b` into every lane of a u64.
-#[inline(always)]
-fn swar_splat(b: u8) -> u64 {
-    SWAR_LO.wrapping_mul(b as u64)
-}
-
-/// For each byte of `word` equal to the byte broadcast in `splat`, set that
-/// lane's high bit (`0x80`) and clear the rest — **exactly one bit per match,
-/// with no cross-byte contamination**, so `trailing_zeros() >> 3` yields the
-/// matching byte index and `m &= m - 1` advances to the next.
-///
-/// The naive `(x - LO) & ~x & HI` zero-byte trick is only reliable as a
-/// *boolean* ("any match?"); its per-byte bits are corrupted by subtraction
-/// borrows (a zero byte followed by a `0x01` lane false-positives), which makes
-/// it wrong for *locating* matches. This borrow-free variant is exact:
-/// `(b & 0x7F) + 0x7F` stays ≤ `0xFE`, so no carry crosses a byte boundary.
-#[inline(always)]
-fn swar_eq_mask(word: u64, splat: u64) -> u64 {
-    let t = word ^ splat; // 0x00 lanes where the byte matches
-                          // 0x80 per lane iff that lane is non-zero (carry-free), then flip so 0x80
-                          // marks the matching (zero) lanes.
-    let nonzero = ((t & SWAR_LO7).wrapping_add(SWAR_LO7) | t) & SWAR_HI;
-    nonzero ^ SWAR_HI
-}
+// SWAR byte-search primitives live in `crate::swar` (shared with the JSONL
+// scanner); the CSV-specific structural splits below build on them.
+use crate::swar::{swar_eq_mask, swar_splat};
 
 /// Split an unquoted record into field byte-ranges. Dispatches to a SIMD
 /// (AVX2, 32 bytes/step) scan when the host supports it, else the SWAR

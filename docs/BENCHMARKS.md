@@ -2613,3 +2613,29 @@ Measured (10M×9-file standards, dirty mix, same-window interleave vs main
   serve; the change is justified as allocation removal + structural dict
   preservation on the generic join path, not as a measured win.
 - Bit-identity: `cmp` of both shapes' outputs main-vs-branch identical.
+
+## 2026-07-25 — JSONL scanner SWAR/AVX2 (the measured next lever)
+
+HANDOVER §6 first lever: JSONL decode was the largest per-file cost
+(warm 222 ms median/file on the 10M standards; the scanner walked every
+byte twice — once finding the newline, once scanning values). Extracted
+the CSV splitter's vetted SWAR primitives into a shared `swar` module
+(AVX2 32 B/step dispatch, SWAR 8 B/step fallback, scalar tail) and wired
+the JSONL block walk (per-line newline scan, carry completion, block
+last-newline) plus `scan_cell`/`scan_key`'s closing-quote-or-escape probe
+onto it. The accepted language and every scanned value are unchanged —
+only the stride.
+
+Measured (10M×9-file JSONL standard, dirty mix, same-window interleave
+vs main `3d9eb5f`, warm, 8 pairs):
+
+- JSONL group wall: **6/8 pairs won, floor 806 → 726 ms (−10%)**;
+  per-file decode (WPROF) median **222 → 170 ms (−23%)**. RSS unchanged
+  (10.1 MB).
+- CSV group: no regression (4 pairs, swar side ≤ main in all; the CSV
+  splitter's own code is untouched — it now imports the shared
+  primitives).
+- Bit-identity: both shapes' outputs `cmp`-identical to main.
+- Guards: swar unit tests sweep every hit position across the 8/32-byte
+  stride boundaries against the scalar oracle (find/rfind/find-either);
+  all existing JSONL byte-identity, dict-lane, and gz-oracle suites green.
