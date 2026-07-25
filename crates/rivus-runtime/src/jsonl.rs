@@ -2475,7 +2475,16 @@ fn scan_cell<'a>(b: &'a [u8], i: &mut usize) -> Option<ScVal<'a>> {
             match crate::swar::find_either(b, start, b'"', b'\\') {
                 Some(j) if b[j] == b'"' => {
                     *i = j + 1;
-                    std::str::from_utf8(&b[start..j]).ok().map(ScVal::S)
+                    // SAFETY: `b` is the byte view of a `&str` (both callers
+                    // pass `line.as_bytes()`), and `start`/`j` sit just after /
+                    // on ASCII quote bytes — ASCII bytes are char boundaries in
+                    // valid UTF-8, so the subslice is valid UTF-8 by
+                    // construction. This skips a per-byte revalidation of
+                    // every borrowed string cell.
+                    debug_assert!(std::str::from_utf8(&b[start..j]).is_ok());
+                    Some(ScVal::S(unsafe {
+                        std::str::from_utf8_unchecked(&b[start..j])
+                    }))
                 }
                 Some(_) => {
                     // Escapes present: fall back to the allocating parser (rare).
@@ -2518,21 +2527,38 @@ fn scan_cell<'a>(b: &'a [u8], i: &mut usize) -> Option<ScVal<'a>> {
             }
         }
         _ => {
-            // Numbers: identical classification to `parse_number`.
+            // Numbers: identical classification to `parse_number`. The digit
+            // walk accumulates the integer value in the same pass; ≤ 18
+            // digits cannot overflow an i64, so the common integer cell skips
+            // the `str::parse` re-scan entirely. Everything else (floats,
+            // ≥ 19 digits, malformed runs) falls to the exact previous code.
             let start = *i;
+            let neg = b.get(*i) == Some(&b'-');
             let mut is_float = false;
-            if b.get(*i) == Some(&b'-') {
+            let mut acc: u64 = 0;
+            let mut digits = 0usize;
+            if neg {
                 *i += 1;
             }
             while *i < b.len() {
                 match b[*i] {
-                    b'0'..=b'9' => *i += 1,
+                    c @ b'0'..=b'9' => {
+                        acc = acc.wrapping_mul(10).wrapping_add(u64::from(c - b'0'));
+                        digits += 1;
+                        *i += 1;
+                    }
                     b'.' | b'e' | b'E' | b'+' | b'-' => {
                         is_float = true;
                         *i += 1;
                     }
                     _ => break,
                 }
+            }
+            if !is_float && digits > 0 && digits <= 18 {
+                // Exactly `[-]<digits>`: the accumulated value IS what
+                // `str::parse::<i64>` would return (≤ 18 digits < i64::MAX).
+                let n = acc as i64;
+                return Some(ScVal::I(if neg { -n } else { n }));
             }
             let text = std::str::from_utf8(&b[start..*i]).ok()?;
             if text.is_empty() || text == "-" {
