@@ -1395,8 +1395,10 @@ impl crate::codec::Decoder for JsonlChunker {
 /// only appears (or widens) past the sample is missed (documented, §33). The
 /// Stage C speculative path (#239) closes exactly that hole for PLAIN files —
 /// via [`JsonlChunker::open_speculative`], which re-decodes from byte 0 with
-/// the block walk and counts `lane_mismatches`; this read_line-based stream
-/// stays what it is: the non-seekable transport's reader.
+/// the block walk and counts `lane_mismatches`; this stream stays the
+/// non-seekable transport's reader. Its fused flat-scalar decode rides the
+/// same in-place block walk as the plain-file reader (2026-07-25); the
+/// general (nested-schema) decode keeps the `read_line` loop.
 #[cfg(any(feature = "net", feature = "gzip", feature = "zstd"))]
 pub struct StreamJsonlReader {
     /// Key-order template for the fused fast scan (see [`RowTemplate`]).
@@ -1409,6 +1411,10 @@ pub struct StreamJsonlReader {
     pending: Vec<String>,
     pending_pos: usize,
     line: String,
+    /// Partial-line carry for the fused block walk (raw bytes; a line that
+    /// straddles two decompressed blocks is completed here). The general
+    /// (nested-schema) path keeps its `read_line` loop and never touches it.
+    carry: Vec<u8>,
     eof: bool,
     pub bad_rows: usize,
 }
@@ -1468,6 +1474,7 @@ impl StreamJsonlReader {
                 pending,
                 pending_pos: 0,
                 line: String::new(),
+                carry: Vec::new(),
                 eof: false,
                 bad_rows,
             },
@@ -1504,31 +1511,147 @@ impl StreamJsonlReader {
                 got += 1;
             }
         }
+        // Block-based stream walk (mirrors `JsonlChunker::next_columns_fused`,
+        // which itself mirrors the `read_line` loop byte-for-byte): lines are
+        // scanned IN PLACE inside the decompressed block — one UTF-8
+        // validation per block, no per-line copy — and the `ScVal` scratch is
+        // allocated once per block instead of once per row (the per-row
+        // `read_line` + `Vec` pair was ~1M heap allocations + copies per
+        // compressed standard file). Only a block-straddling line is copied
+        // into the byte carry.
         while got < self.chunk_size && !self.eof {
-            self.line.clear();
-            match self.reader.read_line(&mut self.line) {
-                Ok(0) => {
+            let buf = match self.reader.fill_buf() {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => {
+                    // EOF: a trailing unterminated line sits in the carry —
+                    // decoded exactly as `read_line` returned it (trailing
+                    // `\r`s trimmed with or without a newline). An
+                    // invalid-UTF-8 tail is dropped, as a `read_line` error
+                    // stopped the old loop.
                     self.eof = true;
+                    if !self.carry.is_empty() {
+                        let bytes = std::mem::take(&mut self.carry);
+                        if let Ok(s) = std::str::from_utf8(&bytes) {
+                            let l = s.trim_end_matches(['\n', '\r']);
+                            if !l.trim().is_empty() {
+                                let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
+                                if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                                    for (b, v) in builders.iter_mut().zip(&scratch) {
+                                        b.push(v);
+                                    }
+                                    got += 1;
+                                } else {
+                                    self.bad_rows += 1;
+                                }
+                            }
+                        }
+                    }
                     break;
                 }
-                Ok(_) => {}
                 Err(_) => {
                     self.eof = true;
                     break;
                 }
-            }
-            let l = self.line.trim_end_matches(['\n', '\r']);
-            if l.trim().is_empty() {
-                continue;
-            }
-            let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
-            if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
-                for (b, v) in builders.iter_mut().zip(&scratch) {
-                    b.push(v);
+            };
+            // Complete a carried block-straddling line first (rare).
+            if !self.carry.is_empty() {
+                match crate::swar::find_byte(buf, 0, b'\n') {
+                    None => {
+                        self.carry.extend_from_slice(buf);
+                        let n = buf.len();
+                        self.reader.consume(n);
+                        continue;
+                    }
+                    Some(nl) => {
+                        self.carry.extend_from_slice(&buf[..nl]);
+                        let bytes = std::mem::take(&mut self.carry);
+                        self.reader.consume(nl + 1);
+                        match std::str::from_utf8(&bytes) {
+                            Ok(s) => {
+                                let l = s.trim_end_matches(['\n', '\r']);
+                                if !l.trim().is_empty() {
+                                    let mut scratch: Vec<ScVal> =
+                                        Vec::with_capacity(self.names.len());
+                                    if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                                        for (b, v) in builders.iter_mut().zip(&scratch) {
+                                            b.push(v);
+                                        }
+                                        got += 1;
+                                    } else {
+                                        self.bad_rows += 1;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                self.eof = true;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                 }
-                got += 1;
-            } else {
-                self.bad_rows += 1;
+            }
+            let last_nl = match crate::swar::rfind_byte(buf, b'\n') {
+                None => {
+                    self.carry.extend_from_slice(buf);
+                    let n = buf.len();
+                    self.reader.consume(n);
+                    continue;
+                }
+                Some(p) => p,
+            };
+            // One UTF-8 validation per complete-lines region ('\n' is a char
+            // boundary). On an invalid byte: decode the valid lines before it,
+            // then stop exactly where `read_line` errored.
+            let region = &buf[..=last_nl];
+            let (text, stop_after) = match std::str::from_utf8(region) {
+                Ok(t) => (t, false),
+                Err(e) => match region[..e.valid_up_to()].iter().rposition(|&b| b == b'\n') {
+                    Some(c) => (
+                        std::str::from_utf8(&region[..=c]).expect("valid prefix"),
+                        true,
+                    ),
+                    None => {
+                        self.eof = true;
+                        break;
+                    }
+                },
+            };
+            let mut cur = 0usize;
+            let mut walked = 0usize;
+            {
+                // Per-block scratch: `ScVal` borrows `text`, which outlives
+                // every line in this block.
+                let mut scratch: Vec<ScVal> = Vec::with_capacity(self.names.len());
+                while cur < text.len() {
+                    if got >= self.chunk_size {
+                        break;
+                    }
+                    let rest = &text[cur..];
+                    let nl = crate::swar::find_byte(rest.as_bytes(), 0, b'\n')
+                        .expect("region ends with newline");
+                    let raw = &rest[..nl];
+                    cur += nl + 1;
+                    walked = cur;
+                    let l = raw.trim_end_matches(['\n', '\r']);
+                    if l.trim().is_empty() {
+                        continue;
+                    }
+                    if scan_row_fast(l, &self.tmpl, &self.names, &mut scratch) {
+                        for (b, v) in builders.iter_mut().zip(&scratch) {
+                            b.push(v);
+                        }
+                        got += 1;
+                    } else {
+                        self.bad_rows += 1;
+                    }
+                }
+            }
+            let text_len = text.len();
+            self.reader.consume(walked);
+            if stop_after && walked == text_len {
+                self.eof = true;
+                break;
             }
         }
         if got == 0 {
