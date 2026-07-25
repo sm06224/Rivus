@@ -8,8 +8,9 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 > 全体監査 hardening — 確定バグ 6 件封鎖・stress の env-race 実体化・重複一本化・
 > コメント/CHANGELOG/design 台帳/GUIDE の現実同期。監査の全結果と却下/延期リストは
 > PR #253 本文）が着地。**#252**（design/38 readbin 吸収 `open … as bin`・条件 8 点＋
-> codec×オプション整合検査）は裁可待ちで open — 着地後は GUIDE 本文例の旧綴り
-> 全面書換えが follow-up の適地（#253 で移行表のみ追加済み）。CLAUDE.md の乖離 3 点
+> codec×オプション整合検査）も**着地済み** — GUIDE 本文例の旧綴り全面書換えが
+> follow-up の適地（#253 で移行表のみ追加済み）。**#255**（JSONL スキャナ SWAR/AVX2 —
+> decode 中央値 −23%・wall floor −10%・bit-identical）は裁可待ちで open。CLAUDE.md の乖離 3 点
 > （dev ブランチ節・gate バイナリの CI 委譲・#41 旧記述）は #253 本文で maintainer へ
 > 報告済み・未編集。
 
