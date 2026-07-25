@@ -361,17 +361,15 @@ impl AggAcc {
         }
     }
 
-    /// Fold another partial accumulator (covering a *later* run of source rows)
-    /// into this one — the deterministic merge that lets a group-by run on
-    /// per-partition workers and recombine in **source order** (#41). `other`
-    /// must be the same `func` and follow `self` in source order (so `first`
-    /// keeps the earliest and `last` the latest). Exact lanes (i128 decimal sum,
-    /// counts, min/max, buffered percentile values) merge byte-identically; the
-    /// f64 moments are folded too but a *parallel* group-by is only enabled when
-    /// no aggregate depends on f64 associativity (the engine gates that).
-    /// Fold `other` (a LATER partition in source/uri order) into this
-    /// accumulator. The f64 sums use the file-major canonical fold (#45):
-    /// callers merge single-file partials sequentially in uri order.
+    /// Fold `other` (a partial accumulator covering a LATER run of source
+    /// rows — same `func`) into this one. Two live invariants:
+    /// 1. **Source order**: `other` follows `self` (`first` keeps the
+    ///    earliest, `last` the latest, buffers append in order) — #41.
+    /// 2. **File-major f64 fold**: the f64 CanonTree sums collapse and
+    ///    left-fold IN CALL ORDER, so callers merge single-file partials
+    ///    sequentially in uri order — #45. The exact lanes (i128 int/
+    ///    decimal/duration, tick min/max, counts) are associative and merge
+    ///    byte-identically under any partitioning.
     pub(crate) fn merge(&mut self, other: &AggAcc) {
         if matches!(self.func, AggFunc::Sum | AggFunc::Avg | AggFunc::Std) {
             self.sum.merge(&other.sum);
@@ -626,6 +624,21 @@ impl AggAcc {
         }
     }
 
+    /// Zero numeric observations for this aggregate — every cell in the group
+    /// was null (e.g. a failed cast) or non-numeric (numeric aggs ignore
+    /// those). Such a group neither vetoes a column's exact output lane nor
+    /// fakes a value: its output cell is null, the #202 precedent (audit
+    /// 2026-07-24 — one such group used to drop the WHOLE column to f64).
+    pub(crate) fn is_empty_numeric(&self) -> bool {
+        self.n == 0
+    }
+    /// Whether this accumulator engaged the exact duration lane (observed at
+    /// least one `Value::Duration`). Lane membership for `GroupBy::finish` —
+    /// a member whose `dur_value()` is `None` overflowed (null + error), a
+    /// non-member with observations vetoes the lane.
+    pub(crate) fn dur_unit_opt(&self) -> Option<TimeUnit> {
+        self.dur_unit
+    }
     pub(crate) fn distinct_count(&self) -> i64 {
         self.distinct.len() as i64
     }
@@ -754,6 +767,10 @@ impl GroupBy {
     /// slot [`GroupBy::observe_row`] returned for this exact composite key,
     /// so the update is an index instead of a key rebuild + string hash.
     /// Identical to `observe_row`'s existing-group arm by construction.
+    /// **Slot ids die at `seal()`** (finish / merge_from drain the scratch
+    /// into the canonical store): a memoized slot must never be replayed
+    /// across a seal — the fused loop's caches are per-chunk, well inside
+    /// that window.
     pub(crate) fn observe_slot(&mut self, slot: u32, vals: &[Option<Value>]) {
         let state = &mut self.slot_states[slot as usize];
         state.count += 1;
@@ -827,13 +844,16 @@ impl GroupBy {
     }
 }
 
-/// Whether a group-by over these aggregates is **byte-identical** under a
+/// Whether a group-by over these aggregates is **byte-identical** under any
 /// partition→merge (parallel) execution, given the resolved type of each
-/// aggregated column (#41). `min`/`max`/`count`/`count_distinct`/`first`/`last`/
-/// percentile are always safe (associative or buffered+sorted); `sum`/`avg` are
-/// safe only on an exact lane (decimal — i128 associative); `std` and `sum`/`avg`
-/// on f64/integer columns are NOT (f64 addition is non-associative; integer sum
-/// rides the f64 accumulator) and keep the serial path.
+/// aggregated column (#41). `min`/`max`/`count`/`count_distinct`/`first`/
+/// `last`/`array_agg`/percentile are always safe (associative or
+/// buffered+sorted); `sum`/`avg` are safe on the exact lanes — **I64** (i128
+/// int accumulator with the correctly-rounded f64 output), **Decimal**
+/// (i128), **Duration** (i128 ticks). f64 `sum`/`avg`/`std` are NOT
+/// partition-safe (f64 addition is non-associative): flows needing them run
+/// serial or take the per-file driver's FILE-MAJOR canonical fold, whose
+/// merge order is fixed (uri order) rather than partition-shaped — #45.
 pub(crate) fn group_parallel_safe(
     aggs: &[(AggFunc, String)],
     col_type: impl Fn(&str) -> Option<DataType>,
@@ -1077,79 +1097,157 @@ impl Operator for GroupBy {
                 // overflowed i128 the whole column degrades to f64 (continue-first,
                 // §21.7) so the column stays one uniform type.
                 _ => {
+                    // Shared empty-group rule for the exact output lanes
+                    // (audit 2026-07-24): a group with ZERO numeric
+                    // observations (`is_empty_numeric` — every cell null
+                    // after a failed cast, or non-numeric) neither vetoes the
+                    // column's exact lane nor fakes a value: its cell is
+                    // NULL, the #202 precedent. One such group used to drop
+                    // the WHOLE column to the f64 path — a silent type
+                    // degrade (Decimal → float money, DateTime → raw ticks)
+                    // and, for sum/avg admitted onto the partition-shaped
+                    // parallel drivers by the static sampled type, a
+                    // serial-vs-parallel byte divergence (the f64 CanonTree
+                    // fold is file-major, not partition-shaped). A lane
+                    // engages when every group is a member or empty, and at
+                    // least one is a member.
                     // Exact date min/max → keep the Date lane (i32 epoch-day),
                     // never a raw f64/int column. #58.
                     let date_ok = matches!(func, AggFunc::Min | AggFunc::Max)
                         && !self.groups.is_empty()
+                        && self.groups.values().all(|s| {
+                            s.accs[j].date_value().is_some() || s.accs[j].is_empty_numeric()
+                        })
                         && self
                             .groups
                             .values()
-                            .all(|s| s.accs[j].date_value().is_some());
+                            .any(|s| s.accs[j].date_value().is_some());
                     if date_ok {
-                        let epoch_days = self
+                        let cells: Vec<Option<i32>> = self
                             .groups
                             .values()
-                            .map(|s| s.accs[j].date_value().unwrap().epoch_day)
+                            .map(|s| s.accs[j].date_value().map(|d| d.epoch_day))
                             .collect();
+                        let valid: Vec<bool> = cells.iter().map(Option::is_some).collect();
+                        let epoch_days = cells.iter().map(|c| c.unwrap_or(0)).collect();
                         fields.push(Field::new(name, DataType::Date));
-                        columns.push(Column::date(epoch_days));
+                        columns.push(Column::new(
+                            ColumnData::Date(epoch_days),
+                            Validity::from_bits(&valid),
+                        ));
                         continue;
                     }
                     // Exact time-of-day min/max → keep the Time lane (i64 ticks),
                     // never a raw int. #58.
                     let time_ok = matches!(func, AggFunc::Min | AggFunc::Max)
                         && !self.groups.is_empty()
+                        && self.groups.values().all(|s| {
+                            s.accs[j].time_value().is_some() || s.accs[j].is_empty_numeric()
+                        })
                         && self
                             .groups
                             .values()
-                            .all(|s| s.accs[j].time_value().is_some());
+                            .any(|s| s.accs[j].time_value().is_some());
                     if time_ok {
-                        let ticks = self
+                        let cells: Vec<Option<i64>> = self
                             .groups
                             .values()
-                            .map(|s| s.accs[j].time_value().unwrap().ticks)
+                            .map(|s| s.accs[j].time_value().map(|t| t.ticks))
                             .collect();
+                        let valid: Vec<bool> = cells.iter().map(Option::is_some).collect();
+                        let ticks = cells.iter().map(|c| c.unwrap_or(0)).collect();
                         fields.push(Field::new(name, DataType::Time));
-                        columns.push(Column::time(ticks));
+                        columns.push(Column::new(
+                            ColumnData::Time(ticks),
+                            Validity::from_bits(&valid),
+                        ));
                         continue;
                     }
                     // Exact datetime min/max → keep the DateTime lane (i64 ticks,
                     // same unit), never an f64 column. #53.
                     let dt_ok = matches!(func, AggFunc::Min | AggFunc::Max)
                         && !self.groups.is_empty()
-                        && self.groups.values().all(|s| s.accs[j].dt_value().is_some());
+                        && self.groups.values().all(|s| {
+                            s.accs[j].dt_value().is_some() || s.accs[j].is_empty_numeric()
+                        })
+                        && self.groups.values().any(|s| s.accs[j].dt_value().is_some());
                     if dt_ok {
-                        let dts: Vec<DateTime> = self
-                            .groups
-                            .values()
-                            .map(|s| s.accs[j].dt_value().unwrap())
-                            .collect();
-                        let unit = dts[0].unit;
-                        let ticks = dts.iter().map(|d| d.ticks).collect();
+                        let cells: Vec<Option<DateTime>> =
+                            self.groups.values().map(|s| s.accs[j].dt_value()).collect();
+                        let unit = cells.iter().flatten().next().expect("any() above").unit;
+                        let valid: Vec<bool> = cells.iter().map(Option::is_some).collect();
+                        let ticks = cells.iter().map(|c| c.map_or(0, |d| d.ticks)).collect();
                         fields.push(Field::new(name, DataType::DateTime { unit }));
-                        columns.push(Column::datetime(DtColumn { ticks, unit }));
+                        columns.push(Column::new(
+                            ColumnData::DateTime(DtColumn { ticks, unit }),
+                            Validity::from_bits(&valid),
+                        ));
                         continue;
                     }
                     // Exact duration sum/avg/min/max → keep the Duration lane
-                    // (i128 sum / i64 extremes), never an f64 column. #57.
+                    // (i128 sum / i64 extremes), never an f64 column. #57. An
+                    // i128 overflow no longer degrades the column either — the
+                    // overflowed group's cell is null and the loss is surfaced
+                    // once, exactly the decimal lane's #202 contract.
                     let dur_ok = matches!(
                         func,
                         AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
                     ) && !self.groups.is_empty()
+                        && self.groups.values().all(|s| {
+                            s.accs[j].dur_unit_opt().is_some() || s.accs[j].is_empty_numeric()
+                        })
                         && self
                             .groups
                             .values()
-                            .all(|s| s.accs[j].dur_value().is_some());
+                            .any(|s| s.accs[j].dur_unit_opt().is_some());
                     if dur_ok {
-                        let durs: Vec<rivus_core::Duration> = self
-                            .groups
-                            .values()
-                            .map(|s| s.accs[j].dur_value().unwrap())
+                        let mut overflowed = 0usize;
+                        let mut cells: Vec<Option<rivus_core::Duration>> =
+                            Vec::with_capacity(self.groups.len());
+                        for s in self.groups.values() {
+                            let acc = &s.accs[j];
+                            if acc.dur_unit_opt().is_some() {
+                                let v = acc.dur_value();
+                                if v.is_none() {
+                                    overflowed += 1;
+                                }
+                                cells.push(v);
+                            } else {
+                                cells.push(None); // empty group: null, not overflow
+                            }
+                        }
+                        if overflowed > 0 {
+                            ctx.raise(
+                                ErrorEvent::new(
+                                    Severity::Recoverable,
+                                    ErrorScope::Chunk,
+                                    format!(
+                                        "duration {} of column '{col}' overflowed i128 in \
+                                         {overflowed} group(s); those cells are null — the \
+                                         exact lane cannot represent the value",
+                                        func.label()
+                                    ),
+                                )
+                                .at_node(ctx.label.clone()),
+                            );
+                        }
+                        let unit = cells
+                            .iter()
+                            .flatten()
+                            .next()
+                            .map(|d| d.unit)
+                            .or_else(|| self.groups.values().find_map(|s| s.accs[j].dur_unit_opt()))
+                            .unwrap_or(TimeUnit::Sec);
+                        let valid: Vec<bool> = cells.iter().map(Option::is_some).collect();
+                        let ticks = cells
+                            .iter()
+                            .map(|c| c.as_ref().map_or(0, |d| d.ticks))
                             .collect();
-                        let unit = durs[0].unit;
-                        let ticks = durs.iter().map(|d| d.ticks).collect();
                         fields.push(Field::new(name, DataType::Duration { unit }));
-                        columns.push(Column::duration(rivus_core::DurColumn { ticks, unit }));
+                        columns.push(Column::new(
+                            ColumnData::Duration(rivus_core::DurColumn { ticks, unit }),
+                            Validity::from_bits(&valid),
+                        ));
                         continue;
                     }
                     // Exact decimal lane (sum/avg/min/max). Exactness is the
@@ -1163,17 +1261,29 @@ impl Operator for GroupBy {
                         func,
                         AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
                     ) && !self.groups.is_empty()
+                        && self.groups.values().all(|s| {
+                            s.accs[j].dec_scale().is_some() || s.accs[j].is_empty_numeric()
+                        })
                         && self
                             .groups
                             .values()
-                            .all(|s| s.accs[j].dec_scale().is_some());
+                            .any(|s| s.accs[j].dec_scale().is_some());
                     if is_dec_lane {
-                        let vals: Vec<Option<rivus_core::Decimal>> = self
-                            .groups
-                            .values()
-                            .map(|s| s.accs[j].dec_value())
-                            .collect();
-                        let overflowed = vals.iter().filter(|v| v.is_none()).count();
+                        let mut overflowed = 0usize;
+                        let mut vals: Vec<Option<rivus_core::Decimal>> =
+                            Vec::with_capacity(self.groups.len());
+                        for s in self.groups.values() {
+                            let acc = &s.accs[j];
+                            if acc.dec_scale().is_some() {
+                                let v = acc.dec_value();
+                                if v.is_none() {
+                                    overflowed += 1;
+                                }
+                                vals.push(v);
+                            } else {
+                                vals.push(None); // empty group: null, not overflow
+                            }
+                        }
                         if overflowed > 0 {
                             ctx.raise(
                                 ErrorEvent::new(
@@ -1189,22 +1299,18 @@ impl Operator for GroupBy {
                                 .at_node(ctx.label.clone()),
                             );
                         }
-                        // All groups share the column's scale (sum/min/max) or
-                        // scale+extra (avg), so the output scale is uniform;
-                        // take it from any exact cell, else (all overflowed)
-                        // from the accumulator's base scale — display-only then,
-                        // since every cell is null.
+                        // All in-lane groups share the column's scale
+                        // (sum/min/max) or scale+extra (avg), so the output
+                        // scale is uniform; take it from any exact cell, else
+                        // (all overflowed/empty) from the first in-lane
+                        // accumulator's base scale — display-only then, since
+                        // every cell is null.
                         let scale = vals
                             .iter()
                             .flatten()
                             .next()
                             .map(|d| d.scale)
-                            .or_else(|| {
-                                self.groups
-                                    .values()
-                                    .next()
-                                    .and_then(|s| s.accs[j].dec_scale())
-                            })
+                            .or_else(|| self.groups.values().find_map(|s| s.accs[j].dec_scale()))
                             .unwrap_or(0);
                         let unscaled: Vec<i128> =
                             vals.iter().map(|v| v.map_or(0, |d| d.unscaled)).collect();

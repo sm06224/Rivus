@@ -975,7 +975,7 @@ fn f64_group_file_major_parallel_matches_serial_mirror() {
     let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
     let run_one = |out: &std::path::Path, serial: bool, chunk: usize| {
         let g = parse_opt(&mk(out));
-        let _guard = ();
+        // The real env_guard is taken by the caller around all run_one calls.
         if serial {
             std::env::set_var("RIVUS_NO_PARALLEL", "1");
         } else {
@@ -1073,4 +1073,368 @@ fn decimal_exact_lane_unaffected_by_canonical_trees() {
         a.contains("1500.00") || a.contains("1500.0"),
         "decimal sum must be arithmetically exact: {a}"
     );
+}
+
+/// A segment write/flush failure on the parallel read→sink driver is
+/// never-silent (audit 2026-07-24): the worker surfaces exactly ONE Critical
+/// error (sticky — not one per chunk), drops its possibly-mid-line segment,
+/// and reports zero rows, so the final file keeps a valid structure (here:
+/// header only, since the injection hits every worker) instead of silently
+/// concatenating a truncated tail. `RIVUS_TEST_SEG_WRITE_FAIL` injects the
+/// failure — a real ENOSPC is not portably reproducible in a test.
+#[test]
+fn segment_write_failure_is_surfaced_not_silent() {
+    let dir = std::env::temp_dir().join(format!("rivus_segfail_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in 0..2usize {
+        let mut t = String::from("id,region\n");
+        for i in 0..2_000usize {
+            t.push_str(&format!("{i},r{}\n", i % 3));
+        }
+        std::fs::write(dir.join(format!("sf{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("sf*.csv");
+    let out = dir.join("out_segfail.csv");
+    let src = format!(
+        "S: ls \"{}\" read as csv save {} ;",
+        glob.display(),
+        out.display()
+    );
+    let g = rivus_parser::parse(&src).expect("parse");
+    // chunk_size 64 → many emit calls per worker; the sticky flag must keep
+    // the error count at one per file, not one per chunk.
+    let opts = || RunOptions {
+        chunk_size: 64,
+        ..Default::default()
+    };
+
+    let _env = env_guard();
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+
+    // Control: the parallel sink driver engages and writes every row.
+    let ok = run(&g, opts()).expect("control run");
+    assert!(
+        ok.strategy
+            .as_deref()
+            .is_some_and(|s| s.contains("parallel read sink")),
+        "the parallel sink driver must engage (else this guards nothing): {:?}",
+        ok.strategy
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().lines().count(),
+        1 + 4_000,
+        "control run must write all rows"
+    );
+
+    // Injected write failure in every segment worker.
+    std::env::set_var("RIVUS_TEST_SEG_WRITE_FAIL", "1");
+    let bad = run(&g, opts()).expect("failure run");
+    std::env::remove_var("RIVUS_TEST_SEG_WRITE_FAIL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    assert!(
+        bad.strategy
+            .as_deref()
+            .is_some_and(|s| s.contains("parallel read sink")),
+        "the failure run must still ride the parallel sink driver: {:?}",
+        bad.strategy
+    );
+    let seg_errs: Vec<_> = bad
+        .errors
+        .iter()
+        .filter(|e| e.message.contains("segment write failed"))
+        .collect();
+    assert_eq!(
+        seg_errs.len(),
+        2,
+        "exactly one sticky Critical per failed worker (2 files): {:?}",
+        bad.errors
+    );
+    assert!(
+        seg_errs
+            .iter()
+            .all(|e| e.severity == rivus_core::Severity::Critical),
+        "segment write failures must be Critical: {seg_errs:?}"
+    );
+    let bytes = std::fs::read_to_string(&out).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        bytes.lines().count(),
+        1,
+        "failed segments must be dropped whole (header only), not \
+         concatenated as truncated tails: {bytes:?}"
+    );
+    // Telemetry must not claim rows that never reached the disk.
+    let read_rows = bad
+        .telemetry
+        .iter()
+        .find(|t| t.kind == "read")
+        .map(|t| t.rows_out);
+    assert_eq!(
+        read_rows,
+        Some(0),
+        "counted rows must be reset when their segment is dropped"
+    );
+}
+
+/// Audit 2026-07-24 (confirmed bug #2): a pre-join ProjectExpr re-derives its
+/// schema PER CHUNK (a `case` lane is data-dependent: all-int chunk → I64,
+/// mixed → Str), but resolve_fused_plan's Str gate checks only the first
+/// chunk per worker. A later all-int chunk then hit fused_push_key's
+/// CoalesceLeft `_ => lit` fallback: the composite key said "na" while
+/// fused_value rendered the actual int — fused bytes diverged from the
+/// generic chain, breaking the fused==generic contract. The fallback now
+/// Display-writes the cell (like push_col's `_` arm), so key and value stay
+/// coherent and fused == generic again.
+#[test]
+fn fused_coalesce_key_matches_generic_when_lane_shifts_mid_worker() {
+    let dir = std::env::temp_dir().join(format!("rivus_coal_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("dim.csv"), "region,country\nr0,JP\nr1,US\n").unwrap();
+    for f in 0..2usize {
+        let mut t = String::from("region,tag,amt\n");
+        // Rows 0..64 (chunk 1 at chunk_size=64): mixed case results → the
+        // projected `x` lane is Str, so the fused plan resolves CoalesceLeft.
+        for i in 0..64usize {
+            let tag = if i % 2 == 0 { "x" } else { "y" };
+            t.push_str(&format!("r{},{},{}\n", i % 2, tag, i % 10));
+        }
+        // Rows 64..128 (chunk 2): all "x" → every case result is the int 1 →
+        // the re-derived `x` lane is I64 (non-null) — the reachable fallback.
+        for i in 64..128usize {
+            t.push_str(&format!("r{},x,{}\n", i % 2, i % 10));
+        }
+        std::fs::write(dir.join(format!("cx{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("cx*.csv");
+    let mk = |out: &std::path::Path| {
+        format!(
+            "D: open {} (region:str country:str) ;\n\
+             S: ls \"{}\" read as csv\n |> region (case when tag == \"x\" then 1 else tag end) as x amt ;\n\
+             J: S &left D on region\n |> (coalesce(x, \"na\")) as k amt\n |# k sum:amt\n save {} ;\n",
+            dir.join("dim.csv").display(),
+            glob.display(),
+            out.display()
+        )
+    };
+    let run_flow = |out: &std::path::Path| {
+        let g = rivus_parser::parse(&mk(out)).expect("parse");
+        run(
+            &g,
+            RunOptions {
+                chunk_size: 64,
+                ..Default::default()
+            },
+        )
+        .expect("run")
+    };
+
+    let _env = env_guard();
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    let out_ser = dir.join("out_ser.csv");
+    run_flow(&out_ser);
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let out_par = dir.join("out_par.csv");
+    let rp = run_flow(&out_par);
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    assert!(
+        rp.strategy
+            .as_deref()
+            .is_some_and(|s| s.contains("parallel read group-by")),
+        "the parallel group driver must engage (else this guards nothing): {:?}",
+        rp.strategy
+    );
+    let a = std::fs::read_to_string(&out_ser).unwrap();
+    let b = std::fs::read_to_string(&out_par).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The generic chain keys chunk-2 rows under "1" (coalesce of a non-null
+    // int); the broken fused arm keyed them under "na".
+    assert!(
+        a.contains("1,"),
+        "oracle must contain the int-keyed group: {a}"
+    );
+    assert_eq!(a, b, "fused must be byte-identical to the generic chain");
+}
+
+/// Audit 2026-07-24 (confirmed bug #6): GroupBy::finish required EVERY group
+/// to carry the runtime-observed exact lane (dec_scale/dur_unit/…), so one
+/// group whose cast-to-decimal failed on every row (all cells null → zero
+/// observations) silently dropped the WHOLE column to the f64 path — float
+/// money against the #202 contract, and a serial-vs-parallel byte divergence
+/// on the drivers that admit decimal sum/avg from the static sampled type.
+/// The rule is now: an empty group emits a NULL cell and does not veto; the
+/// exact lane holds for everyone else, byte-identically on every path.
+#[test]
+fn exact_lane_survives_an_all_null_group() {
+    let dir = std::env::temp_dir().join(format!("rivus_declane_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (f, rows) in [
+        (0, "a,12.34\na,10.00\nb,5.50\nbad,oops\n"),
+        (1, "a,2.34\nb,4.50\nbad,nope\n"),
+    ] {
+        std::fs::write(dir.join(format!("dl{f}.csv")), format!("k,amt\n{rows}")).unwrap();
+    }
+    let glob = dir.join("dl*.csv");
+    let mk = |out: &std::path::Path| {
+        format!(
+            "S: ls \"{}\" read as csv\n cast amt :decimal(2)\n |# k sum:amt avg:amt min:amt max:amt\n sort k\n save {} ;",
+            glob.display(),
+            out.display()
+        )
+    };
+    let run_flow = |out: &std::path::Path| {
+        let g = rivus_parser::parse(&mk(out)).expect("parse");
+        run(&g, RunOptions::default()).expect("run")
+    };
+
+    let _env = env_guard();
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    let out_ser = dir.join("out_ser.csv");
+    run_flow(&out_ser);
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let out_par = dir.join("out_par.csv");
+    let rp = run_flow(&out_par);
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    assert!(
+        rp.strategy
+            .as_deref()
+            .is_some_and(|s| s.contains("parallel read group-by")),
+        "the parallel group driver must engage (else this guards nothing): {:?}",
+        rp.strategy
+    );
+    let a = std::fs::read_to_string(&out_ser).unwrap();
+    let b = std::fs::read_to_string(&out_par).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The exact decimal lane must hold: sum(a) = 24.68 exactly, two decimals.
+    assert!(
+        a.contains("24.68"),
+        "decimal lane must survive (exact sum, not a float collapse): {a}"
+    );
+    // The all-null group emits null cells (empty), not fake zeros.
+    assert!(
+        a.lines()
+            .any(|l| l.starts_with("bad,") && l.ends_with(",,,,")),
+        "the empty group's exact cells must be null: {a}"
+    );
+    assert_eq!(a, b, "serial and parallel bytes must be identical");
+}
+
+/// Audit 2026-07-24 (coverage gap #8): the dict-escape ↔ fused-id-loop
+/// interaction had no engine-level oracle — every fused engine test ran
+/// chunk_size 4096 == DICT_CAP, and the escape needs a 4097th distinct
+/// inside ONE chunk, so it was structurally unreachable there (escapes were
+/// covered only at decoder level, with no join/group/id-caches involved).
+/// This drives a run that MIXES dict-encoded chunks and escaped plain chunks
+/// through fused_feed_chunk's per-chunk caches (user-reachable via
+/// --chunk-size) and pins byte-identity against forced serial. The escape is
+/// proven structurally: if the middle all-distinct chunk had NOT escaped,
+/// every fused row would ride the id loop and `id_delta` would exceed the
+/// asserted upper bound.
+#[test]
+fn dict_escape_chunks_mix_with_id_loop_and_match_serial() {
+    let dir = std::env::temp_dir().join(format!("rivus_dictesc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let right = dir.join("regions.csv");
+    let mut rtext = String::from("region,country\n");
+    for r in 0..5 {
+        rtext.push_str(&format!("r{r},C{}\n", r % 3));
+    }
+    std::fs::write(&right, rtext).unwrap();
+    const CHUNK: usize = 8192; // > DICT_CAP (4096): an escape becomes possible
+    for f in 0..3usize {
+        let mut t = String::from("order_id,region,category,amount\n");
+        for i in 0..(3 * CHUNK) {
+            // Chunk 1 (rows 0..8192): low-cardinality → samples as a dict
+            // candidate and dict-encodes. Chunk 2: ALL-DISTINCT (8192 > cap)
+            // → the chunk-local dict overflows and escapes to plain Str.
+            // Chunk 3: low-cardinality again → back to dict encoding.
+            let cat = if (CHUNK..2 * CHUNK).contains(&i) {
+                format!("u{f}_{i}")
+            } else {
+                format!("c{}", i % 7)
+            };
+            t.push_str(&format!(
+                "{i},r{},{cat},{}\n",
+                (i + f) % 5,
+                (i % 100) as i64 - 5
+            ));
+        }
+        std::fs::write(dir.join(format!("esc_{f}.csv")), t).unwrap();
+    }
+    let glob = dir.join("esc_*.csv");
+    let out_par = dir.join("out_par.csv");
+    let out_ser = dir.join("out_ser.csv");
+    let src = |out: &std::path::Path| {
+        format!(
+            "R: open {} (region:str country:str) ;\n\
+             S: ls \"{}\" read as csv cast amount :int ;\n\
+             J: S &left R on region\n \
+             |? amount > 0\n \
+             |> (coalesce(country, \"@\")) as country (coalesce(category, \"@\")) as category amount\n \
+             |# country category sum:amount count:amount\n \
+             sort country category\n \
+             save {} ;\n",
+            right.display(),
+            glob.display(),
+            out.display()
+        )
+    };
+    let parse_opt = |s: &str| rivus_optimizer::optimize(rivus_parser::parse(s).expect("parse")).0;
+    let gp = parse_opt(&src(&out_par));
+    let gs = parse_opt(&src(&out_ser));
+
+    let _env = env_guard();
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::set_var("RIVUS_PARALLEL_MIN_BYTES", "0");
+    let before = rivus_runtime::fused_id_rows_total();
+    let rp = run(
+        &gp,
+        RunOptions {
+            chunk_size: CHUNK,
+            ..Default::default()
+        },
+    )
+    .expect("parallel run");
+    let id_delta = rivus_runtime::fused_id_rows_total() - before;
+    std::env::set_var("RIVUS_NO_PARALLEL", "1");
+    run(
+        &gs,
+        RunOptions {
+            chunk_size: CHUNK,
+            ..Default::default()
+        },
+    )
+    .expect("serial run");
+    std::env::remove_var("RIVUS_NO_PARALLEL");
+    std::env::remove_var("RIVUS_PARALLEL_MIN_BYTES");
+
+    let a = std::fs::read_to_string(&out_par).unwrap();
+    let b = std::fs::read_to_string(&out_ser).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(a.lines().count() > 1, "expected real grouped output");
+    assert_eq!(
+        a, b,
+        "mixed dict/escaped chunks must stay byte-identical to serial"
+    );
+    // 1-CPU hosts legitimately stay serial (no id loop) — same guard as the
+    // sibling fused tests.
+    if rp
+        .strategy
+        .as_deref()
+        .is_some_and(|s| s.contains("parallel read group-by"))
+    {
+        let total_rows = (3 * 3 * CHUNK) as u64;
+        assert!(id_delta > 0, "dict chunks must drive the fused id loop");
+        assert!(
+            id_delta <= total_rows - (3 * CHUNK) as u64,
+            "the all-distinct chunks must ESCAPE the id loop (id_delta {id_delta} \
+             leaves no room for 3 escaped chunks out of {total_rows} rows — \
+             the escape hatch did not fire)"
+        );
+    }
 }

@@ -945,6 +945,58 @@ impl SourceJsonl {
             self.load_http(ctx);
             return;
         }
+        // A compressed source rides the decompression stream (2026-07-09
+        // stream-IO directive): decode single-pass, like the CSV twin. Before
+        // this branch a `.jsonl.gz` open parsed the RAW gzip bytes and died
+        // with "JSON has no valid objects" (audit 2026-07-24).
+        if Scheme::of(&self.path).is_compressed() {
+            #[cfg(any(feature = "gzip", feature = "zstd"))]
+            {
+                let reader = match crate::transport::open_compressed(&self.path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.raise(
+                            ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
+                                .at_node(ctx.label.clone()),
+                        );
+                        return;
+                    }
+                };
+                match jsonl::StreamJsonlReader::from_reader(reader, self.chunk_size) {
+                    Ok((schema, rdr)) => {
+                        if rdr.bad_rows > 0 {
+                            ctx.raise(
+                                ErrorEvent::new(
+                                    Severity::Recoverable,
+                                    ErrorScope::Item,
+                                    format!("{} malformed JSONL line(s) skipped", rdr.bad_rows),
+                                )
+                                .at_node(ctx.label.clone()),
+                            );
+                        }
+                        self.schema = Arc::new(schema);
+                        self.decoder = Some(Box::new(rdr));
+                    }
+                    Err(e) => ctx.raise(
+                        ErrorEvent::new(Severity::Fatal, ErrorScope::Graph, e)
+                            .at_node(ctx.label.clone()),
+                    ),
+                }
+            }
+            #[cfg(not(any(feature = "gzip", feature = "zstd")))]
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Fatal,
+                    ErrorScope::Graph,
+                    format!(
+                        "'{}' is compressed; rebuild with `--features gzip`/`zstd` to read it",
+                        self.path
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+            return;
+        }
         // Line-oriented JSONL → bounded streaming reader; top-level array → the
         // whole-file parse (can't be streamed).
         if !jsonl::is_json_array(&self.path) {

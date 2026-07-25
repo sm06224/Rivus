@@ -253,8 +253,10 @@ fn run_dispatch(
     // view is coarser but the *processing* stays fully parallel.
     // Parallel read→group (slice 6, 統括指示: 負けるな): a
     // `ls → read → [stateless/broadcast-join]* → group → [sort]* → [sink]`
-    // flow runs one streaming worker per FILE with partial GroupBys merged like
-    // #41 (associative lanes only — checked; bails to serial else). The
+    // flow runs one streaming worker per FILE with partial GroupBys merged in
+    // uri order. Associative agg lanes merge under any partitioning (#41);
+    // f64 sum/avg/std ride the FILE-MAJOR canonical fold (#45 — same bytes
+    // as the P=1 mirror, which is the oracle). The
     // size-based strategy chooser can't see a multi-file input's size (there is
     // no single file source), so the shape is detected here and the size/memory
     // threshold is honored inside the runner (sum of file sizes vs the same
@@ -423,9 +425,6 @@ fn build_ops(
         .collect()
 }
 
-/// Drive the DAG to completion with a pre-built operator set (the chunk-granular
-/// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
-#[allow(clippy::too_many_arguments)]
 /// Could a chunk pulled from `src` still have an observable effect — is there a
 /// path from `src` to a sink / leaf capture that does not pass a **saturated**
 /// operator (a `take N` that has emitted its N)? When no such path remains, an
@@ -460,6 +459,8 @@ fn unbounded_effect_remains(graph: &PlanGraph, src: NodeId, ops: &[Box<dyn Opera
         .any(|m| effect(graph, m, ops, &mut memo))
 }
 
+/// Drive the DAG to completion with a pre-built operator set (the chunk-granular
+/// scheduler). `chunk_id_base` seeds chunk ids so parallel workers don't collide.
 fn drive(
     graph: &PlanGraph,
     mut ops: Vec<Box<dyn Operator>>,
@@ -1171,6 +1172,10 @@ impl ParProgress {
     }
 }
 
+/// Byte-range parallel run of a single-file STATELESS flow (source → row-wise
+/// ops → optional sink): split the file into ranges, one worker per range,
+/// results concatenated in range order. Returns `None` (caller falls back to
+/// serial) for previews, non-splittable sources, or ineligible shapes.
 fn try_parallel(
     graph: &PlanGraph,
     opts: &RunOptions,
@@ -1442,8 +1447,6 @@ fn expr_used_cols(e: &rivus_ir::Expr, out: &mut Vec<String>) -> bool {
 }
 
 fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<String>> {
-    let add = add_used;
-    let expr_cols = expr_used_cols;
     let mut used = Vec::new();
     for step in &shape.path {
         let nid = match step {
@@ -1457,39 +1460,39 @@ fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<S
             // the first join; over-approximation is safe.)
             Op::Join { left_keys, .. } => {
                 for k in left_keys {
-                    add(&k.root, &mut used);
+                    add_used(&k.root, &mut used);
                 }
             }
             Op::Cast { casts } => {
                 for (n, _) in casts {
-                    add(n, &mut used);
+                    add_used(n, &mut used);
                 }
             }
             Op::Filter { pred } => {
-                if !expr_cols(pred, &mut used) {
+                if !expr_used_cols(pred, &mut used) {
                     return None;
                 }
             }
             Op::FilterProject { preds, fields } => {
                 for p in preds {
-                    if !expr_cols(p, &mut used) {
+                    if !expr_used_cols(p, &mut used) {
                         return None;
                     }
                 }
                 if let Some(fs) = fields {
                     for f in fs {
-                        add(f, &mut used);
+                        add_used(f, &mut used);
                     }
                 }
             }
             Op::Project { fields } => {
                 for f in fields {
-                    add(f, &mut used);
+                    add_used(f, &mut used);
                 }
             }
             Op::ProjectExpr { items, .. } => {
                 for (e, _) in items {
-                    if !expr_cols(e, &mut used) {
+                    if !expr_used_cols(e, &mut used) {
                         return None;
                     }
                 }
@@ -1503,10 +1506,10 @@ fn fused_used_columns(graph: &PlanGraph, shape: &ReadGroupShape) -> Option<Vec<S
         return None;
     };
     for k in keys {
-        add(&k.root, &mut used);
+        add_used(&k.root, &mut used);
     }
     for (_, c) in aggs {
-        add(c, &mut used);
+        add_used(c, &mut used);
     }
     Some(used)
 }
@@ -1630,9 +1633,10 @@ fn try_parallel_read_group(
         return None;
     }
     let threads = if force_serial { 1 } else { threads };
-    if opts.max_capture.is_some() && !must_drain(graph) {
-        return None;
-    }
+    // A preview (capture cap, no drain) can't reach this driver: the shape
+    // requires a group, which is blocking, so `must_drain` is always true
+    // here — the preview guard lives on the stateless `try_parallel` path.
+    debug_assert!(opts.max_capture.is_none() || must_drain(graph));
     let Op::Read { fmt, provenance } = &graph.nodes[shape.read_id].op else {
         return None;
     };
@@ -2310,10 +2314,21 @@ fn worker_read_to_segment(
     let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
     let sep = delim as char;
     let mut line = String::new();
+    // A write/flush failure is sticky: the first one is surfaced as Critical
+    // and the segment is dropped at the end (a failed BufWriter can hold a
+    // partial line, and concatenating a truncated tail would garble the next
+    // segment's first row in the final file). `RIVUS_TEST_SEG_WRITE_FAIL`
+    // injects the failure for tests — ENOSPC is not portably reproducible.
+    let mut write_failed = false;
+    let inject_fail = std::env::var_os("RIVUS_TEST_SEG_WRITE_FAIL").is_some();
     let mut emit = |chunks: Vec<Chunk>,
                     header: &mut Option<String>,
                     rows: &mut u64,
-                    errors: &mut Vec<ErrorEvent>| {
+                    errors: &mut Vec<ErrorEvent>,
+                    write_failed: &mut bool| {
+        if *write_failed {
+            return; // already surfaced; don't stack one Critical per chunk
+        }
         for ch in chunks {
             if header.is_none() {
                 *header = Some(format!(
@@ -2330,7 +2345,12 @@ fn worker_read_to_segment(
                     operators::write_cell(&mut line, &ch.columns[c], row, delim);
                 }
                 line.push('\n');
-                if let Err(e) = w.write_all(line.as_bytes()) {
+                let res = if inject_fail {
+                    Err(std::io::Error::other("injected segment write failure"))
+                } else {
+                    w.write_all(line.as_bytes())
+                };
+                if let Err(e) = res {
                     errors.push(
                         ErrorEvent::new(
                             Severity::Critical,
@@ -2339,6 +2359,7 @@ fn worker_read_to_segment(
                         )
                         .at_node(read_label.to_string()),
                     );
+                    *write_failed = true;
                     return;
                 }
                 *rows += 1;
@@ -2384,7 +2405,7 @@ fn worker_read_to_segment(
         let out = run_level(&mut ops, 0, vec![ch], &mut errors, &mut next_id);
         t_ops += t2.elapsed();
         let t3 = Instant::now();
-        emit(out, &mut header, &mut rows, &mut errors);
+        emit(out, &mut header, &mut rows, &mut errors, &mut write_failed);
         t_emit += t3.elapsed();
     }
     if std::env::var_os("RIVUS_WORKER_PROF").is_some() {
@@ -2408,10 +2429,32 @@ fn worker_read_to_segment(
         };
         if !fin.is_empty() {
             let out = run_level(&mut ops, i + 1, fin, &mut errors, &mut next_id);
-            emit(out, &mut header, &mut rows, &mut errors);
+            emit(out, &mut header, &mut rows, &mut errors, &mut write_failed);
         }
     }
-    let _ = w.flush();
+    // A flush failure (ENOSPC/EDQUOT at the 256 KiB buffer boundary) is the
+    // same silent-loss hole as a failed write_all: rows were counted but the
+    // bytes never landed. Surface it (never-silent) instead of discarding.
+    if let Err(e) = w.flush() {
+        if !write_failed {
+            errors.push(
+                ErrorEvent::new(
+                    Severity::Critical,
+                    ErrorScope::Graph,
+                    format!("segment flush failed for '{uri}': {e}"),
+                )
+                .at_node(read_label.to_string()),
+            );
+        }
+        write_failed = true;
+    }
+    if write_failed {
+        // Drop the whole segment: its tail may end mid-line, and the row
+        // count no longer matches what is on disk. The Critical above is the
+        // never-silent record; the finalizer skips a rows==0 missing segment.
+        let _ = std::fs::remove_file(seg);
+        rows = 0;
+    }
     let bad = dec.bad_rows();
     if bad > 0 {
         errors.push(
@@ -2775,6 +2818,7 @@ fn try_parallel_read_sink(
     let mut total_rows = 0u64;
     let mut header: Option<String> = None;
     let nseg = worker_results.len();
+    let seg_rows: Vec<u64> = worker_results.iter().map(|r| r.1).collect();
     for (errs, rows, hdr, _) in worker_results.into_iter() {
         errors.extend(errs);
         total_rows += rows;
@@ -2792,9 +2836,18 @@ fn try_parallel_read_sink(
         if let Some(h) = &header {
             w.write_all(h.as_bytes())?;
         }
-        for i in 0..nseg {
-            if let Ok(mut rf) = std::fs::File::open(seg_path(i)) {
-                std::io::copy(&mut rf, &mut w)?;
+        for (i, &rows) in seg_rows.iter().enumerate() {
+            match std::fs::File::open(seg_path(i)) {
+                Ok(mut rf) => {
+                    std::io::copy(&mut rf, &mut w)?;
+                }
+                // A missing segment whose worker reported zero rows is an
+                // already-surfaced case (create failed / vanished file /
+                // dropped after a write failure — each pushed its own error).
+                // A missing segment with counted rows is real, un-surfaced
+                // data loss: propagate instead of silently skipping.
+                Err(_) if rows == 0 => {}
+                Err(e) => return Err(e),
             }
         }
         w.flush()
@@ -3604,6 +3657,13 @@ struct FusedPlan {
     /// unmatched-left (`ri = None`) variant; `None` = no right-only prefix
     /// (or an unusually large right side, capped to bound the precompute).
     right_prefix: Option<(usize, Vec<String>)>,
+    /// The left-schema dtypes this plan resolved against. A pre-join computed
+    /// column re-derives its lane PER CHUNK (a `case` over mixed branches:
+    /// all-int chunk → I64, mixed → Str), so a later chunk can arrive with
+    /// lanes the resolved cells no longer describe — the fused loop validates
+    /// each chunk against this and turns itself off (sticky, lossless
+    /// fallback) on a shift (audit 2026-07-24).
+    left_dtypes: Vec<rivus_core::DataType>,
 }
 
 fn resolve_fused_plan(
@@ -3750,6 +3810,7 @@ fn resolve_fused_plan(
         key_cells,
         agg_cells,
         right_prefix,
+        left_dtypes: left.fields.iter().map(|f| f.dtype).collect(),
     })
 }
 
@@ -3788,11 +3849,24 @@ fn fused_push_key(
         },
         FusedCell::CoalesceLeft(ci, lit) => {
             key.push('\u{1}');
-            match l.columns[*ci].data() {
-                ColumnData::Str(s) if !l.columns[*ci].is_null(li) => key.push_str(s.get(li)),
-                // Dict lane is the same Str lane (design/42): cell, not literal.
-                ColumnData::StrDict(d) if !l.columns[*ci].is_null(li) => key.push_str(d.get(li)),
-                _ => key.push_str(lit),
+            if l.columns[*ci].is_null(li) {
+                key.push_str(lit);
+            } else {
+                match l.columns[*ci].data() {
+                    ColumnData::Str(s) => key.push_str(s.get(li)),
+                    // Dict lane is the same Str lane (design/42): cell, not
+                    // literal.
+                    ColumnData::StrDict(d) => key.push_str(d.get(li)),
+                    // A non-null non-Str cell renders itself (Display), like
+                    // push_col's `_` arm and `fused_value` — encoding the
+                    // LITERAL here made key and value disagree when a chunk
+                    // arrived with a shifted lane (audit 2026-07-24). The
+                    // per-chunk plan validation now bails before this can
+                    // happen; this arm keeps key/value coherent regardless.
+                    _ => {
+                        let _ = write!(key, "{}", l.value(li, *ci));
+                    }
+                }
             }
         }
         FusedCell::CoalesceRight(ci, lit) => {
@@ -3801,7 +3875,12 @@ fn fused_push_key(
                 Some(r_) if !r.columns[*ci].is_null(r_) => match r.columns[*ci].data() {
                     ColumnData::Str(s) => key.push_str(s.get(r_)),
                     ColumnData::StrDict(d) => key.push_str(d.get(r_)),
-                    _ => key.push_str(lit),
+                    // Same coherence rule as CoalesceLeft (the right side is
+                    // resolution-validated and prebuilt, so this is currently
+                    // unreachable — kept identical for symmetry).
+                    _ => {
+                        let _ = write!(key, "{}", r.value(r_, *ci));
+                    }
                 },
                 _ => key.push_str(lit),
             }
@@ -4149,6 +4228,25 @@ fn worker_feed(
                     None => fu.off = true,
                 }
             }
+            // A resolved plan only fits chunks whose lanes still match the
+            // schema it resolved against (a pre-join computed column can
+            // shift its lane per chunk — see FusedPlan::left_dtypes). A
+            // shifted chunk turns the fused loop OFF (sticky) and routes down
+            // the generic ops below — the same lossless fallback as an
+            // unresolvable plan. The fused prefix precedes the fallback
+            // suffix in file order (off is one-way), so group first-seen
+            // order stays the serial order.
+            if let (Some(plan), false) = (&fu.plan, fu.off) {
+                let same = plan.left_dtypes.len() == c.schema.fields.len()
+                    && plan
+                        .left_dtypes
+                        .iter()
+                        .zip(&c.schema.fields)
+                        .all(|(d, f)| *d == f.dtype);
+                if !same {
+                    fu.off = true;
+                }
+            }
             if let (Some(plan), false) = (&fu.plan, fu.off) {
                 let t = Instant::now();
                 fused_feed_chunk(
@@ -4434,6 +4532,9 @@ fn worker_read_partial_group(
     (group, errors, rows, dec.spec_contradicted())
 }
 
+/// A linear `source → [row-wise]* → group → [sort]* → [sink]` flow whose
+/// aggregates are safe under partition→merge (#41 associative lanes) —
+/// eligible for the byte-range parallel group driver. `(src, group, sink)`.
 fn eligible_group_flow(graph: &PlanGraph) -> Option<(NodeId, NodeId, Option<NodeId>)> {
     eligible_group_flow_inner(graph, true)
 }
@@ -4713,9 +4814,9 @@ fn try_parallel_group(
     if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
         return None;
     }
-    if opts.max_capture.is_some() && !must_drain(graph) {
-        return None;
-    }
+    // Preview runs can't reach a group driver (a group is blocking →
+    // `must_drain` is always true) — see `try_parallel` for the live guard.
+    debug_assert!(opts.max_capture.is_none() || must_drain(graph));
     // Plan a bounded byte-range read of the (splittable) source — CSV or JSONL.
     let plan = plan_parallel_source(&graph.nodes[src_id].op, threads)?;
     let path_nodes = pre_group_path(graph, src_id, group_id);
@@ -4929,7 +5030,11 @@ fn plan_parallel_source(op: &Op, threads: usize) -> Option<ParPlan> {
         }
         Codec::Jsonl => {
             let path = discovery.path();
-            if path == "-" {
+            // Same gate as the CSV arm: only a seekable plain file can be
+            // byte-range split (stdin can't re-read; a compressed stream has
+            // no meaningful byte ranges — it stays on the serial
+            // decompressing reader).
+            if !crate::transport::Scheme::of(path).is_seekable() {
                 return None;
             }
             let (schema, names, jtypes, ranges, bad_rows) =
@@ -5174,9 +5279,9 @@ fn try_unbounded_group(
     if threads < 2 || std::env::var_os("RIVUS_NO_PARALLEL").is_some() {
         return None;
     }
-    if opts.max_capture.is_some() && !must_drain(graph) {
-        return None;
-    }
+    // Preview runs can't reach a group driver (a group is blocking →
+    // `must_drain` is always true) — see `try_parallel` for the live guard.
+    debug_assert!(opts.max_capture.is_none() || must_drain(graph));
 
     // Materialize the source (the opt-in unbounded cost).
     let mut src_errors: Vec<ErrorEvent> = Vec::new();
