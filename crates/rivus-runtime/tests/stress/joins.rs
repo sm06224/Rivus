@@ -297,7 +297,7 @@ fn right_and_full_outer_join_match_oracle() {
     }
 }
 
-// --- as-of / temporal join `L & R on k asof ts [within "d"]` (#64): nearest
+// --- as-of / temporal join `L &asof R on k by ts [within "d"]` (#64): nearest
 // right row with ts ≤ the left's, matched on the by-keys, left-outer. ---
 
 #[test]
@@ -319,7 +319,7 @@ fn asof_join_nearest_earlier_by_group_matches_oracle() {
     let flow = format!(
         "Q: open {qp} (sym:str ts:datetime bid:int) ;\n\
          T: open {tp} (sym:str ts:datetime px:int) ;\n\
-         J: T & Q on sym asof ts sort sym ts ;"
+         J: T &asof Q on sym by ts sort sym ts ;"
     );
     // Chunk-size sweep: the right side is sorted per group on finish, so the
     // match is chunk-size independent.
@@ -361,7 +361,7 @@ fn asof_join_tolerance_is_closed_bound() {
     let flow = format!(
         "Q: open {qp} (sym:str ts:datetime bid:int) ;\n\
          T: open {tp} (sym:str ts:datetime px:int) ;\n\
-         J: T & Q on sym asof ts within \"5s\" sort ts ;"
+         J: T &asof Q on sym by ts within \"5s\" sort ts ;"
     );
     let res = run_src(&flow, 4096);
     assert_eq!(

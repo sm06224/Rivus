@@ -7,6 +7,33 @@ All notable changes to Rivus. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — design/38 flip: the retired spellings are now never-silent
+  did-you-mean errors (as announced in the migration release).** The parser
+  still *recognizes* every retired spelling but refuses it with a teaching
+  error that (1) names the retired form, (2) shows the canonical replacement
+  with an inline example, and (3) points at the migration path. Nothing falls
+  through to a silent "unknown word". The full list:
+  `readcsv`/`readjson`/`readbin` → `open PATH [as csv|jsonl|bin]`;
+  `gci`/`dir` → `ls "GLOB"`; `limit`/`head` → `take N`;
+  `unnest` → `explode COL`; `writecsv`/`writejson` → `save PATH [as FMT]`;
+  `where PRED` → `|? PRED`; project `name as alias` and
+  `(name:type) as alias` → the `:` definition chain (`name :alias :type`;
+  `(expr) as alias` for computed columns and the bare-field
+  `(name) as alias` escape hatch are unchanged); a top-level `and` between
+  `|?` predicates → the comma (`a, b`; `and`/`or` *inside* one boolean
+  expression are unchanged, and `|!` validate — whose canonical conjunction
+  *is* ` and ` — is untouched); `sessionize TS gap "DUR" [by …]` and
+  `shift COL lag|diff|pct_change …` → `|>` window items
+  (`|> * (session(ts, "30m") over user) as session`,
+  `|> * (lag(price, 1) over sym) as prev`); the grafted as-of form
+  `A & B [on k…] asof ts [within]` → the `&asof` join kind
+  (`A &asof B [on k…] by ts [within "DUR"]`). **Migration:** files that
+  still use an old spelling migrate mechanically with the PREVIOUS
+  release's (v1.4.x) `rivus fmt --write` — this release's `fmt` refuses
+  them with the same teaching error (the auto-migration pass retired
+  together with the spellings). Canonical spellings are byte-for-byte
+  unchanged (parser-only change; every retired spelling is pinned by a
+  test checking all three message elements).
 - **design/38 — the binary source joins `open` (`as bin`; migration release,
   breaking next release).** The canonical spelling is
   `open PATH as bin [be] [aligned] (name:bintype …) [with source]`: `bin` is

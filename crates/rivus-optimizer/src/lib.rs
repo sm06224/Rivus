@@ -994,7 +994,7 @@ B:\n open data.csv\n |# country\n;";
         // `age >= 20` (numeric atom) is lifted onto the reader; the
         // FilterProject still carries it (re-checks), so results are unchanged
         // (gated separately by tests/optimizer_equiv.rs).
-        let src = "F:\n open d.csv\n |? age >= 20 and country == \"JP\"\n |> name age\n;";
+        let src = "F:\n open d.csv\n |? age >= 20, country == \"JP\"\n |> name age\n;";
         let g = rivus_parser::parse(src).unwrap();
         let (opt, report) = optimize(g);
         let s = opt

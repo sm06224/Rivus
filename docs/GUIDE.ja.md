@@ -94,8 +94,8 @@ rivus run -c 'U: open users.csv |? age >= 20 |> name age save stdout as csv ;' |
 | `open PATH.parquet` | **Apache Parquet**（`--features parquet`・読み取りのみ）：ファイル埋め込みスキーマから型付きレーンへ直行 — int64→int・double→float・utf8→str・DATE→date・TIMESTAMP millis/micros→datetime・DECIMAL→decimal、null も本物。非圧縮/snappy/gzip、row-group ストリーミング（有界メモリ）、ネスト列は誘導付きエラー。既定（依存ゼロ）ビルドは `--features parquet` を促すエラー |
 | `open PATH noheader` | ヘッダ行なし CSV — 全行がデータ、列名は `c0, c1, c2, …` |
 | `open PATH (col[:type] …)` | **スキーマ宣言**：列名を位置で与え（ヘッダ / `c0…` を上書き）、任意で型を固定 — `int`/`i64`, `float`/`f64`, `str`/`string`, `bool`, `decimal(N)`（厳密固定小数点）, `datetime[("fmt")]`（厳密な時刻）, `duration`（符号付き時間量）, `date`（ISO `yyyy-MM-dd` の暦日）, `time`（`HH:mm:ss` の時刻、§6 参照）。例 `open f.csv (id:int zip:str age)` は `zip` の先頭ゼロを保持。`open sales.csv (id amount:decimal(2))` は `amount` を厳密に読む。`open log.csv (ts:datetime("yyMMddHHmmss"))` は `ts` を時刻として読む |
-| `readcsv PATH` / `readjson PATH` | `open PATH [as csv\|jsonl]` の廃止予定別名 — parse 可・`rivus fmt` が書換（§12 移行表） |
-| `open PATH as bin [be] [aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ）。既定の `le`/`packed` は書かない。拡張子は `bin` を暗示しない（常に `as bin` を明示）。旧 `readbin PATH …` も本リリースは parse 可・`rivus fmt` が正典へ書換 |
+| `readcsv PATH` / `readjson PATH` | `open PATH [as csv\|jsonl]` の退役綴り — design/38 flip 以降は never-silent エラー。前リリース (v1.4.x) の `rivus fmt --write` で機械移行（§12 移行表） |
+| `open PATH as bin [be] [aligned] (name:type …)` | 固定長バイナリレコード（C 構造体ダンプ）。既定の `le`/`packed` は書かない。拡張子は `bin` を暗示しない（常に `as bin` を明示）。旧 `readbin PATH …` は退役綴り — 正典形を教えるエラー（§12 移行表） |
 | `open stdin` / `open -` | 標準入力から CSV（または `as FMT`）を読む |
 | `stream NAME` | 名前付きフローを再生（MVP: 参照） |
 
@@ -253,7 +253,7 @@ watch "in/*.csv"        # 作成/変更されたファイルごとに 1 行、�
 
 述語が真の行を残します。**カンマが AND**（最上位の連言はこれ一本）。`and`/`or` は
 優先順位が要る**式の内側**では引き続き使えます（`where` と述語間の最上位 `and` は
-廃止予定綴り — `rivus fmt` が書換、§12）：
+退役綴り — design/38 flip 以降は正典を教える never-silent エラー、§12）：
 
 ```
 |? age >= 20
@@ -574,7 +574,7 @@ Merged:
   除外（左が保持）。両側は時刻昇順前提、右をグループ毎にソートするので chunk-size
   非依存（直列）。datetime の `≤` は正確（i64 ticks）。
   例：`Trades &asof Quotes on sym by ts within "1m"`。（旧接ぎ木形
-  `A & B … asof ts` は廃止予定 — `rivus fmt` が書換、§12。）
+  `A & B … asof ts` は退役 — 正典を教えるエラー、§12。）
 
 ```
 # 2 つの CSV を id で内部結合
@@ -783,8 +783,8 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   `|> * (lag(price, 1) over sym) as prev`（各 `over` グループ内・source 順で
   `N` 行前の値、先頭 `N` 行は null）、`|> * (diff(ts)) as gap`（`col − lag`。
   `datetime` 列は**正確な Duration**）、`pct_change`＝`(col − lag)/lag` を float
-  で。chunk-size 非依存・直列（退役した `sessionize`/`shift` 動詞は parse 可・
-  `rivus fmt` が書換、§12）、
+  で。chunk-size 非依存・直列（退役した `sessionize`/`shift` 動詞は design/38
+  flip 以降は正典を教えるエラー、§12）、
   `format(ts, "fmt")`（文字列。`ddd`/`[ja-jp]`/`n…n` も同じトークンで使えます —
   `format(ts, "[ja-jp]ddd")` は `水` を返す）。既定の整形は ISO-8601
   `yyyy-MM-ddTHH:mm:ss`（サブ秒レーンは全幅の小数付き）。
@@ -873,7 +873,7 @@ open events.csv (ts:datetime)
 |---|---|
 | `save PATH` | 拡張子で形式判定（ソースと対称。`.tsv`/`.tab`→タブ区切り、`.json`→JSON 配列、`.jsonl`/`.ndjson`→NDJSON） |
 | `save PATH as FMT` | 形式を強制（`csv` \| `tsv` \| `json` \| `jsonl` \| `ndjson`） |
-| `writecsv PATH` / `writejson PATH` | `save PATH [as csv\|jsonl]` の廃止予定別名 — parse 可・`rivus fmt` が書換（§12） |
+| `writecsv PATH` / `writejson PATH` | `save PATH [as csv\|jsonl]` の退役綴り — design/38 flip 以降は never-silent エラー（§12 移行表） |
 | `save stdout` / `save -` | 標準出力へ |
 | `print` | 画面プレビュー用にキャプチャ |
 
@@ -1180,12 +1180,13 @@ fan-out（tee・単一・ネスト）** はすべて忠実に往復します。f
 ラベルなしスコープ）を含む場合は、別物に書き換えず非ゼロ終了でソースを変更せず
 拒否します。
 
-**廃止予定の綴り（design/38 移行）。** 以下は本リリースでは parse 可能で、
-`rivus fmt` が正典形へ書き換えます。**次リリースで never-silent の
-did-you-mean エラーになります** — アップグレード前に `rivus fmt --write` を
-実行してください:
+**退役綴り（design/38 flip）。** 以下は本リリースで **never-silent の
+did-you-mean エラー**です — 各エラーは退役した綴りを名指しし、正典の置き換えを
+インライン例つきで教え、移行手段を指します。旧綴りが残るファイルは、
+アップグレード前に**前リリース (v1.4.x) の** `rivus fmt --write` で機械移行
+できます:
 
-| 廃止綴り | 正典 |
+| 退役綴り | 正典 |
 |---|---|
 | `readcsv P` / `readjson P` | `open P [as csv\|jsonl]` |
 | `readbin P … (…)` | `open P as bin … (…)` |
@@ -1211,17 +1212,15 @@ body       = source transform* ;
 
 source     = 'open' PATH ('as' FMT)? 'noheader'? ('(' (IDENT (':' TYPE)?)+ ')')?
            | 'open' PATH 'as' 'bin' ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'
-           | 'readcsv' PATH | 'readjson' PATH                       (旧綴り; fmt が書換)
-           | 'readbin' PATH ('le'|'be')? ('packed'|'aligned')? '(' (IDENT ':' BINTYPE)+ ')'   (旧綴り; fmt が書換)
            | 'stream' IDENT
            | IDENT (('+' IDENT)+ | ('&'('left'|'right'|'full')? IDENT 'on' KEY+))? ;  (merge / join)
 
-transform  = ('|?' | 'where') expr (',' expr)*                                        (filter)
+transform  = '|?' expr (',' expr)*                             (filter; カンマ = AND)
            | '|' IDENT (IDENT '=' VALUE)*                      (apply a named flow; bind value holes)
            | '|!' (contract | '{' (contract ';'?)+ '}')        (validate: row contract(s))
            | '|>' proj+                                       (project / compute)
            | '|#' IDENT+ ((AGG) ':' IDENT)*                    (group, 1+ keys)
-           | ('take'|'limit'|'head') INT
+           | 'take' INT
            | 'sort' (IDENT ('asc'|'desc')?)+
            | 'distinct' IDENT*
            | 'describe'
@@ -1230,10 +1229,10 @@ transform  = ('|?' | 'where') expr (',' expr)*                                  
            | 'cast' (IDENT ':' TYPE)+
            | '->' IDENT ':' body ';'                          (branch)
            | ('save' (PATH | TEMPLATE) ('as' FMT)? ('by' IDENT+)? ('as' 'flat')?
-              | 'writecsv' PATH | 'writejson' PATH | 'print')   (TEMPLATE = "…{col}…"・{{ }} エスケープ)
+              | 'print')                                       (TEMPLATE = "…{col}…"・{{ }} エスケープ)
            | 'on' EVENT ('severity' '>=' SEV)? ':' action ';' (hook)
 
-proj       = IDENT ('as' IDENT)? | '(' expr ')' 'as' IDENT ;
+proj       = IDENT (':' IDENT)? (':' TYPE)? | '(' expr ')' 'as' IDENT ;   （`:` チェーン）
 contract   = expr (',' expr)* ('warn'|'reject'|'halt') ;       (disposition は必須)
 expr       = or ; or = and ('or' and)* ; and = cmp ('and' cmp)* ;
 cmp        = add (CMP add | '~' (REGEX | add))? ;               (REGEX = raw '…' リテラル)

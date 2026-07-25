@@ -121,9 +121,9 @@ fn datetime_cast_in_expression_is_source_aware_bug_d() {
             cast.errors
         );
     }
-    // The same source-aware parse via a computed column `(ts:datetime) as t`.
+    // The same source-aware parse via the `:` definition chain `ts :t :datetime`.
     let proj = run_src(
-        &format!("P:\n open {p} (ts:str)\n |> (ts:datetime) as t\n;"),
+        &format!("P:\n open {p} (ts:str)\n |> ts :t :datetime\n;"),
         4096,
     );
     assert!(
@@ -209,7 +209,7 @@ fn numeric_expr_cast_failure_is_null_and_surfaced_not_silent_zero() {
         ));
         let p = f.0.display();
         let res = run_src(
-            &format!("C:\n open {p} (id:int v:str)\n |> id (v:int) as n\n;"),
+            &format!("C:\n open {p} (id:int v:str)\n |> id v :n :int\n;"),
             cs,
         );
         let o = res
