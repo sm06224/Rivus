@@ -14,6 +14,8 @@
 //! Each case writes CSV input(s), evaluates the Rivus flow, and compares
 //! `total_rows_out()` against DuckDB's `COUNT(*)` of the equivalent SQL.
 
+mod common;
+
 use rivus_runtime::{run, RunOptions};
 use std::process::Command;
 
@@ -72,10 +74,13 @@ fn parity_null_filter_join_group_counts() {
     // (DuckDB-equivalent) expected count, so a broken Rivus flow is caught even
     // without DuckDB. The DuckDB side runs **only when the CLI is present** and
     // must hit the same expected count — the live parity diff.
-    let live = duckdb_available();
-    if !live {
-        eprintln!("duckdb not on PATH — Rivus golden checks run; live diff skipped");
-    }
+    // S2: in CI the live diff is mandatory — a missing `duckdb` there means the
+    // parity check silently degrades to "Rivus agrees with itself".
+    let live = duckdb_available()
+        || common::skip_unless_duckdb_required(
+            "duckdb is not on PATH",
+            "only the Rivus-side golden checks run; the live parity diff goes unproven",
+        );
     let check = |flow: &str, sql: &str, expected: u64, label: &str| {
         let r = rivus_count(flow);
         assert_eq!(r, expected, "{label}: rivus={r} expected={expected}");

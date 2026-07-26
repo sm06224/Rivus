@@ -18,7 +18,11 @@
    - 発動確認（`RIVUS_WORKER_PROF=1` の `[WPROF]` 行・strategy 文字列）——
      **発動していないベンチは何も測っていない**（無音 fallback で identity テストが
      空洞化しかけた実例が R5）。
-4. A→B を rounds 往復（1 round 内で A, B の順に連続実行＝同窓）:
+4. **A/B の env・閾値・フラグは必ず対称**にする。片側だけ `RIVUS_PARALLEL_MIN_BYTES=0`
+   のように閾値をまたがせると、比べているのは A と B ではなく**別々の実行経路**で、
+   f64 集計なら fold 順の違いが ULP 差として出る（検証キャンペーン 2026-07-26 で実際に
+   「identity 破れ」と誤検出しかけた）。差が出たら、まず両側の env を揃えて再実行する。
+5. A→B を rounds 往復（1 round 内で A, B の順に連続実行＝同窓）:
    ```sh
    for i in $(seq $ROUNDS); do
      A=$( { /bin/bash -c "TIMEFORMAT=%R; time $BIN_A run $FLOW --memory unbounded >/dev/null 2>&1"; } 2>&1 )
