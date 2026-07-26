@@ -351,14 +351,14 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::StreamRef { name } => Box::new(StreamRef { name: name.clone() }),
         Op::Filter { pred } => Box::new(Filter {
             pred: pred.clone(),
-            cast_fails: 0,
+            cast_fails: eval::EvalFails::default(),
         }),
         Op::Validate { pred, disposition } => Box::new(Validate {
             pred: pred.clone(),
             disposition: *disposition,
             fails: 0,
             sample: None,
-            cast_fails: 0,
+            cast_fails: eval::EvalFails::default(),
         }),
         Op::Take { n } => Box::new(Take { remaining: *n }),
         // §32 s4b: keys are `PathExpr`. A bare key resolves on the existing flat
@@ -430,7 +430,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
         Op::FilterProject { preds, fields } => Box::new(FilterProject {
             preds: preds.clone(),
             fields: fields.clone(),
-            cast_fails: 0,
+            cast_fails: eval::EvalFails::default(),
         }),
         Op::GroupBy { keys, aggs } => Box::new(GroupBy::new(keys.clone(), aggs.clone())),
         Op::Merge => Box::new(Merge),
@@ -481,7 +481,7 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
                 exprs: exprs.clone(),
                 codec: *codec,
                 writer: None,
-                eval_fails: 0,
+                eval_fails: crate::eval::EvalFails::default(),
                 warned_missing: false,
             }),
         },

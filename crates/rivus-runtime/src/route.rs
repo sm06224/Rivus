@@ -93,7 +93,7 @@ pub fn group_by_path(
     flat: bool,
     codec: SinkCodec,
     exprs: &[Expr],
-    fails: &mut u64,
+    fails: &mut crate::eval::EvalFails,
 ) -> Vec<(String, Vec<Chunk>)> {
     // Validated at declaration time; an un-parseable template here would be a
     // parser bug — fall back to a single literal segment (never a panic).
@@ -430,7 +430,7 @@ pub fn write_routed(
     codec: SinkCodec,
     exprs: &[Expr],
     chunks: &[Chunk],
-    fails: &mut u64,
+    fails: &mut crate::eval::EvalFails,
 ) -> Vec<(String, std::io::Error)> {
     let mut failures = Vec::new();
     for (path, parts) in group_by_path(chunks, template, by, flat, codec, exprs, fails) {
@@ -510,7 +510,7 @@ mod tests {
     /// open-file budget — exactly what the serial operator and the parallel
     /// merge do.
     fn stream_with(cap: usize, codec: SinkCodec, template: &str, chunks: &[Chunk]) {
-        let mut eval_fails = 0u64;
+        let mut eval_fails = crate::eval::EvalFails::default();
         let mut w = RouteWriter::with_cap(codec, cap);
         for c in chunks {
             let groups = group_by_path(
@@ -524,7 +524,7 @@ mod tests {
             );
             w.write_groups(groups);
         }
-        assert_eq!(eval_fails, 0, "no computed keys in this fixture");
+        assert!(eval_fails.is_empty(), "no computed keys in this fixture");
         let failures = w.finish();
         assert!(failures.is_empty(), "unexpected failures: {failures:?}");
     }
@@ -572,7 +572,7 @@ mod tests {
             }
             let tmpl = |d: &std::path::Path| format!("{}/{{k}}.out", d.display());
 
-            let mut eval_fails = 0u64;
+            let mut eval_fails = crate::eval::EvalFails::default();
             let failures = write_routed(
                 &tmpl(&dirs[0]),
                 &[],
@@ -583,7 +583,7 @@ mod tests {
                 &mut eval_fails,
             );
             assert!(failures.is_empty(), "oracle failures: {failures:?}");
-            assert_eq!(eval_fails, 0);
+            assert!(eval_fails.is_empty());
             stream_with(512, codec, &tmpl(&dirs[1]), &chunks);
             stream_with(1, codec, &tmpl(&dirs[2]), &chunks);
 
@@ -615,7 +615,7 @@ mod tests {
         let chunks = sample_chunks();
         let base = std::env::temp_dir().join(format!("rivus_route_anchor_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let mut eval_fails = 0u64;
+        let mut eval_fails = crate::eval::EvalFails::default();
         let failures = write_routed(
             &format!("{}/{{k}}.csv", base.display()),
             &[],

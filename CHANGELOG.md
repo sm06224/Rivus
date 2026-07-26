@@ -6,6 +6,28 @@ All notable changes to Rivus. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+- **A numeric comparison against an inferred text column no longer answers a
+  silent `false` for every row (never-silent violation; S1).** Type inference
+  widens a column to the string lane as soon as ONE cell is unparseable — a
+  single `N/A` in a column of numbers. Until now `|? a > 100` on such a column
+  compared `Str` against a number, fell through to equality-only semantics, and
+  returned **false for every row**: the flow emitted nothing, the error stream
+  was **empty**, and the reader was told "no rows match" when the truth was
+  "this comparison never happened". Now the text cell is parsed with the same
+  rule `cast` and the reader's prefilter already use (`trim().parse`): a cell
+  that parses takes part in the numeric comparison; a cell that does not still
+  compares false (continue-first) but is **counted per column and reported once
+  on finish** — `3 cell(s) could not be compared numerically (3 in 'a'); …`.
+  **This changes results in the "more rows" direction** for flows that relied on
+  inference: rows that were being dropped in silence now appear. Text-vs-text
+  comparisons are untouched (a genuine string column keeps lexicographic
+  ordering and exact `Eq`/`Ne`, so `"0010" != "10"` still holds), and a
+  **declared schema behaves exactly as before** — its parse failures are still
+  counted and reported by the reader. The dictionary lane follows the plain
+  string lane through the same path (design/42 §2 observational equivalence).
+  (#240 issuecomment-5083011529; found by the 520158a verification campaign.)
+
 ### Changed
 - **BREAKING — design/38 flip: the retired spellings are now never-silent
   did-you-mean errors (as announced in the migration release).** The parser

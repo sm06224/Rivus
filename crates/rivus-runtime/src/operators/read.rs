@@ -927,7 +927,7 @@ pub(crate) fn reconcile_chunk(
         // union-by-name widening is a lane coercion (int⊆float⊆…⊆str), not a
         // user temporal cast — a parse never fails, the count is unused. Each
         // matched column MOVES out exactly once (union names are unique).
-        let mut _widen_fails = 0u64;
+        let mut _widen_fails = eval::EvalFails::default();
         let mut slots: Vec<Option<Column>> = cols.into_iter().map(Some).collect();
         union
             .iter()

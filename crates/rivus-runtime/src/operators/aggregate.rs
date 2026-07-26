@@ -700,7 +700,7 @@ pub(crate) struct GroupBy {
     emitted: bool,
     /// Nested key-path structural misses (§32.8③), accumulated across chunks and
     /// surfaced once on finish (never-silent, not per-chunk spam).
-    key_fails: u64,
+    key_fails: eval::EvalFails,
 }
 
 impl GroupBy {
@@ -712,7 +712,7 @@ impl GroupBy {
             scratch: std::collections::HashMap::default(),
             slot_states: Vec::new(),
             emitted: false,
-            key_fails: 0,
+            key_fails: eval::EvalFails::default(),
         }
     }
 
@@ -827,7 +827,7 @@ impl GroupBy {
         other.seal();
         // Nested key-path misses (§32.8③) sum across merged partitions, like the
         // per-group counts, so the finish-time surface is the true total.
-        self.key_fails += other.key_fails;
+        self.key_fails += &other.key_fails;
         for (key, ostate) in other.groups {
             match self.groups.get_mut(&key) {
                 Some(s) => {
@@ -904,9 +904,9 @@ impl Operator for GroupBy {
         // the chunk. An unknown *bare* key warns once and drops the chunk
         // (continue-first — a later, well-formed chunk still aggregates).
         let mut chunk = chunk;
-        let mut nested_fails = 0u64;
+        let mut nested_fails = eval::EvalFails::default();
         let resolved = eval::resolve_key_indices(&mut chunk, &self.keys, &mut nested_fails);
-        self.key_fails += nested_fails;
+        self.key_fails += &nested_fails;
         let mut key_idx = Vec::with_capacity(self.keys.len());
         for (k, idx) in self.keys.iter().zip(&resolved) {
             match idx {
@@ -998,7 +998,7 @@ impl Operator for GroupBy {
         // Fold the row-hot scratch into the sorted store: every emit below
         // iterates `groups` in composite-key order, exactly as before.
         self.seal();
-        super::surface_key_path_fails(self.key_fails, "group", ctx);
+        super::surface_key_path_fails(self.key_fails.casts, "group", ctx);
 
         // One Str column per group key (values pulled from each group's stored
         // key parts), then the count, then the aggregate columns.
