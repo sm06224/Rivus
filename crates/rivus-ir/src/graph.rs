@@ -133,6 +133,44 @@ impl ShiftKind {
     }
 }
 
+/// The aggregate a rolling row window computes (design/43, #63). The window
+/// width `n` (rows, trailing, current row included) is carried on
+/// [`Op::Rolling`], not here. `rolling_count`/`rolling_std`/`min_periods`
+/// are deferred (§43.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollFunc {
+    /// `rolling_sum(col, n)` — exact lanes (i64/decimal/duration) keep their
+    /// lane (i128 accumulation); f64 stays f64.
+    Sum,
+    /// `rolling_avg(col, n)` — mirrors `|#` avg lanes (f64; exact decimal
+    /// quotient rules mirrored from the group aggregate).
+    Avg,
+    /// `rolling_min(col, n)` — keeps the source lane.
+    Min,
+    /// `rolling_max(col, n)` — keeps the source lane.
+    Max,
+}
+
+impl RollFunc {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RollFunc::Sum => "rolling_sum",
+            RollFunc::Avg => "rolling_avg",
+            RollFunc::Min => "rolling_min",
+            RollFunc::Max => "rolling_max",
+        }
+    }
+    pub fn parse(s: &str) -> Option<RollFunc> {
+        match s {
+            "rolling_sum" => Some(RollFunc::Sum),
+            "rolling_avg" => Some(RollFunc::Avg),
+            "rolling_min" => Some(RollFunc::Min),
+            "rolling_max" => Some(RollFunc::Max),
+            _ => None,
+        }
+    }
+}
+
 /// What a `|!` validator does with a row that fails its contract (#83, §24.2).
 /// Every disposition surfaces the failure on the error stream (never silent);
 /// they differ only in what happens to the row.
@@ -890,6 +928,23 @@ pub enum Op {
         by: Vec<String>,
         out: String,
     },
+    /// `|> * (rolling_sum|avg|min|max(COL, N) [over BY…]) as OUT` (design/43,
+    /// #63) — append `out` = the aggregate over the trailing window of `n`
+    /// rows (current included) **within the same `over` group, in source
+    /// order**. The first `n − 1` rows of each group are null (window not yet
+    /// full); null cells inside a full window are excluded like `|#`, and an
+    /// all-null window yields null. Trailing ⇒ past-only ⇒ streaming
+    /// per-chunk emit (no `lead`-style delay); order-dependent → serial path.
+    /// f64 sum/avg recompute the window per row (value = a pure function of
+    /// the window contents — the #41 sliding-accumulator trap is banned);
+    /// exact lanes slide on i128 (bit-equal to recompute, oracle-pinned).
+    Rolling {
+        col: String,
+        func: RollFunc,
+        n: u32,
+        by: Vec<String>,
+        out: String,
+    },
     /// `rename OLD NEW [OLD NEW ...]` — rename columns in place, preserving
     /// position, type and values. Unknown `OLD` names are skipped with a warning.
     /// Streaming, stateless.
@@ -1199,6 +1254,7 @@ impl Op {
             Op::Fill { .. } => "fill",
             Op::Sessionize { .. } => "sessionize",
             Op::Shift { .. } => "shift",
+            Op::Rolling { .. } => "rolling",
             Op::Rename { .. } => "rename",
             Op::Drop { .. } => "drop",
             Op::Cast { .. } => "cast",
@@ -1557,6 +1613,18 @@ impl Op {
                     over_clause(by)
                 )
             }
+            // N is required at parse time and always renders (design/43).
+            Op::Rolling {
+                col,
+                func,
+                n,
+                by,
+                out,
+            } => format!(
+                "|> * ({}({col}, {n}){}) as {out}",
+                func.as_str(),
+                over_clause(by)
+            ),
             Op::Fill { col, method } => match method {
                 FillMethod::Value(v) => format!("fill {col} \"{v}\""),
                 FillMethod::Ffill => format!("fill {col} ffill"),

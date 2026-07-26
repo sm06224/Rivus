@@ -1240,6 +1240,9 @@ fn try_parallel(
             // Shift depends on earlier rows per group (order-dependent state) →
             // not partitionable; serial keeps chunk-size independence (#65).
             Op::Shift { .. } => return None,
+            // Rolling windows likewise carry per-group order-dependent state
+            // (the trailing ring) → serial path (design/43).
+            Op::Rolling { .. } => return None,
             _ => {}
         }
     }
@@ -5845,6 +5848,10 @@ pub fn plan_validate(graph: &PlanGraph) -> Result<(), RivusError> {
                 refs.extend(by.iter().map(|c| (c.clone(), 0)));
             }
             Op::Shift { col, by, .. } => {
+                refs.push((col.clone(), 0));
+                refs.extend(by.iter().map(|c| (c.clone(), 0)));
+            }
+            Op::Rolling { col, by, .. } => {
                 refs.push((col.clone(), 0));
                 refs.extend(by.iter().map(|c| (c.clone(), 0)));
             }

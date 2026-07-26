@@ -1,6 +1,10 @@
 # Design 43 — Rolling row-window aggregates (#63)
 
-**Status:** 提案（裁可待ち）。**Author:** 先行研究担当.
+**Status:** **批准済み・実装済み（2026-07-26）** — 批准 = #240
+issuecomment-5083636087（§43.6 の 4 確認点すべて案どおり）。実装は
+`Op::Rolling`＋窓 item 文法（受入 gate §43.5 全充足）。`min_periods`・
+str min/max・`rolling_count`・`rolling_std` は保留のまま。
+**Author:** 先行研究担当.
 **Decision:** 統括／レビュー兼指揮（ratify per-item; 現運用 #240）.
 
 Track C の残り最後の大物。`lag`/`lead`/`diff`/`pct_change`（点参照）と

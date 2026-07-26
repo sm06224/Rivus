@@ -836,6 +836,15 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   session's start datetime (`|> *` keeps every column and appends the window
   outputs) — group on it: `|# user session …`; a new session starts when the
   per-group gap exceeds the duration, out-of-order input is surfaced;
+  **rolling_sum / rolling_avg / rolling_min / rolling_max** (#63, design/43):
+  window items — `|> * (rolling_avg(price, 5) over sym) as ma5` (the aggregate
+  over the trailing `N` rows incl. the current, per `over` group; the first
+  `N − 1` rows per group are null; null cells are excluded like `|#`; an
+  all-null window is null; `N` is required). `sum` keeps exact lanes
+  (i64/decimal/duration), `avg` is float, `min`/`max` keep the source lane
+  (datetime included). f64 windows are recomputed per row — the value is a
+  pure function of the window contents (never a drifting sliding
+  accumulator);
   **lag / lead / diff / pct_change** (#65): window items in `|>` — `|> * (lag(price,
   1) over sym) as prev` (the value `N` rows back within each `over` group, in
   source order; null for the first `N`), `|> * (lead(price, 1) over sym) as
