@@ -586,7 +586,7 @@ pub(crate) struct SinkRoute {
     pub(crate) exprs: Vec<Expr>,
     pub(crate) codec: rivus_ir::SinkCodec,
     pub(crate) writer: Option<crate::route::RouteWriter>,
-    pub(crate) eval_fails: u64,
+    pub(crate) eval_fails: crate::eval::EvalFails,
     pub(crate) warned_missing: bool,
 }
 
@@ -643,7 +643,7 @@ impl Operator for SinkRoute {
             Some(w) => w.finish(),
             None => Vec::new(),
         };
-        if self.eval_fails > 0 {
+        if self.eval_fails.casts > 0 {
             ctx.raise(
                 ErrorEvent::new(
                     Severity::Recoverable,
@@ -651,7 +651,7 @@ impl Operator for SinkRoute {
                     format!(
                         "save route: {} value(s) could not be evaluated in a \
                          computed placeholder; routed to the {} partition",
-                        self.eval_fails,
+                        self.eval_fails.casts,
                         crate::route::NULL_PARTITION
                     ),
                 )
