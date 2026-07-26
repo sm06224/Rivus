@@ -2721,3 +2721,38 @@ Where the win comes from: stage-C speculative sampled opens (now
 reachable for join-less shapes), the dict lane on the group key, and the
 id loop replacing per-row composite-key build + hash with a code-indexed
 slot lookup.
+
+## 2026-07-25 — Compressed-stream JSONL decode: block walk for `StreamJsonlReader`
+
+HANDOVER §6 lever 4 (the compressed side Stage C never covered). The
+compressed/non-seekable JSONL stream's fused flat-scalar decode still ran
+the per-line loop the PLAIN reader retired two slices ago: one
+`read_line` copy into a `String` per line plus one `ScVal` scratch `Vec`
+allocation per line (~1.1M copies + allocs per compressed standard
+file). This slice moves it onto the same in-place block walk as
+`JsonlChunker::next_columns_fused` — `fill_buf`/`consume` over the
+decompression stream, one UTF-8 validation per complete-lines region,
+SWAR line scan, per-block scratch, a byte carry for block-straddling
+lines — mirroring the `read_line` semantics byte-for-byte (EOF trailing
+line, `\r` trims, invalid-UTF-8 stop point, bad-line counting). The
+general nested-schema stream path keeps its `read_line` loop.
+
+Measurement note (honest): the first interleave window accidentally
+compared against a STALE main binary (built from the fused branch's
+pre-#258 base — the flip commit) — its plain-file decode medians
+(153-160 ms/file vs the #258 era's 110-116) exposed the mixup, the
+binary was rebuilt from true main `2282c2a`, and everything below is
+from the corrected window.
+
+Measured (10M×9-file gzip JSONL standard — 52 MB `.gz` of the 597 MB
+fixture, dirty mix; same-window interleave vs main `2282c2a`, warm):
+
+- gz JSONL group: **7/8 pairs won, median ~960 → ~804 ms (−16%), floor
+  903 → 795 ms**.
+- Plain JSONL group: neutral (4 pairs mixed — `JsonlChunker` untouched).
+- gz CSV group: neutral (3 pairs mixed — `CompressedCsvReader`
+  untouched).
+- Bit-identity: gz JSONL and gz CSV outputs `cmp`-identical to main;
+  gz row set equals the plain fixture's (sorted compare).
+- Guards: the all-features gz/zstd oracle suites and the full stress
+  suite green (197).
