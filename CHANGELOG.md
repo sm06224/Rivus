@@ -267,6 +267,15 @@ All notable changes to Rivus. Format loosely follows
   surfaced error (the decimal rule), not a column-wide degrade.
 
 ### Added
+- **`lead(col, N)` window item (#65 follow-up, design/38 §38.5).** The
+  forward mirror of `lag`: `|> * (lead(price, 1) over sym) as nxt` appends
+  the value `N` rows AHEAD within each `over` group (source order); each
+  group's last `N` rows are null — exactly mirroring `lag`'s first-`N`
+  nulls. The output keeps the source column's lane. Chunk-size independent
+  (pinned by a cz sweep incl. cz=1, which forces every chunk through the
+  delayed-emission queue) and order-dependent → serial, like the other
+  window items. No new keyword: `lead` is a window function, so a column
+  named `lead` still projects normally.
 - **Dictionary-encoded Str lanes (design/42, ratified).** The CSV and JSONL
   readers dictionary-encode low-cardinality join/group key columns
   (plan-aware candidacy; cap 4096 distincts per chunk with a lossless

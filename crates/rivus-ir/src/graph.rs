@@ -102,6 +102,10 @@ pub enum FillMethod {
 pub enum ShiftKind {
     /// `lag(col, n)` — the value `n` rows back (per group, source order).
     Lag,
+    /// `lead(col, n)` — the value `n` rows AHEAD (per group, source order);
+    /// the last `n` rows of each group are null. Emission is delayed until
+    /// the future value arrives (#65 follow-up, design/38 §38.5).
+    Lead,
     /// `diff(col, n)` — `col − lag(col, n)`; a datetime column yields an exact
     /// `Duration` (#57), otherwise the column's own numeric lane.
     Diff,
@@ -113,6 +117,7 @@ impl ShiftKind {
     pub fn as_str(self) -> &'static str {
         match self {
             ShiftKind::Lag => "lag",
+            ShiftKind::Lead => "lead",
             ShiftKind::Diff => "diff",
             ShiftKind::PctChange => "pct_change",
         }
@@ -120,6 +125,7 @@ impl ShiftKind {
     pub fn parse(s: &str) -> Option<ShiftKind> {
         match s {
             "lag" => Some(ShiftKind::Lag),
+            "lead" => Some(ShiftKind::Lead),
             "diff" => Some(ShiftKind::Diff),
             "pct_change" => Some(ShiftKind::PctChange),
             _ => None,
@@ -1539,7 +1545,7 @@ impl Op {
                 by,
                 out,
             } => {
-                // `lag`/`pct_change` always print N; `diff` omits the default 1.
+                // `lag`/`lead`/`pct_change` always print N; `diff` omits the default 1.
                 let arg = if *kind == ShiftKind::Diff && *n == 1 {
                     col.clone()
                 } else {

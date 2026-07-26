@@ -836,9 +836,11 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # parse "260601143000" exactly
   session's start datetime (`|> *` keeps every column and appends the window
   outputs) — group on it: `|# user session …`; a new session starts when the
   per-group gap exceeds the duration, out-of-order input is surfaced;
-  **lag / diff / pct_change** (#65): window items in `|>` — `|> * (lag(price,
+  **lag / lead / diff / pct_change** (#65): window items in `|>` — `|> * (lag(price,
   1) over sym) as prev` (the value `N` rows back within each `over` group, in
-  source order; null for the first `N`), `|> * (diff(ts)) as gap` (`col −
+  source order; null for the first `N`), `|> * (lead(price, 1) over sym) as
+  nxt` (the mirror: `N` rows AHEAD, null for each group's last `N`),
+  `|> * (diff(ts)) as gap` (`col −
   lag`; a `datetime` column yields an exact `Duration`), `pct_change` =
   `(col − lag)/lag` as float; chunk-size independent, serial (the retired
   `sessionize`/`shift` verbs are teaching errors since the design/38 flip, §12);

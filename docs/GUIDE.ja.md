@@ -779,9 +779,10 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   as session` がセッション開始 datetime を付与（`|> *` は全列保持＋窓出力追加）—
   そのまま `|# user session …` で集計。グループ内 gap 超過で新セッション、
   時刻逆行は surface、
-  **lag / diff / pct_change**（#65）：`|>` の窓 item —
+  **lag / lead / diff / pct_change**（#65）：`|>` の窓 item —
   `|> * (lag(price, 1) over sym) as prev`（各 `over` グループ内・source 順で
-  `N` 行前の値、先頭 `N` 行は null）、`|> * (diff(ts)) as gap`（`col − lag`。
+  `N` 行前の値、先頭 `N` 行は null）、`|> * (lead(price, 1) over sym) as nxt`
+  （鏡像：`N` 行先の値、各グループ末尾 `N` 行は null）、`|> * (diff(ts)) as gap`（`col − lag`。
   `datetime` 列は**正確な Duration**）、`pct_change`＝`(col − lag)/lag` を float
   で。chunk-size 非依存・直列（退役した `sessionize`/`shift` 動詞は design/38
   flip 以降は正典を教えるエラー、§12）、

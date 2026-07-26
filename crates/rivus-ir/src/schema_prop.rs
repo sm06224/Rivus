@@ -109,7 +109,7 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
             }
             s
         }),
-        // `shift col …` appends `out`: `lag` keeps the source column's lane;
+        // `shift col …` appends `out`: `lag`/`lead` keep the source column's lane;
         // `diff` of a datetime → `Duration` (exact, #57), else the source lane;
         // `pct_change` → `f64`. Unknown `col` leaves the schema unchanged
         // (runtime warns) — mirror the honesty of the sessionize/explode arms.
@@ -118,7 +118,7 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
             if let Some(i) = s.index_of(col) {
                 let src = s.fields[i].dtype;
                 let dtype = match kind {
-                    crate::graph::ShiftKind::Lag => src,
+                    crate::graph::ShiftKind::Lag | crate::graph::ShiftKind::Lead => src,
                     crate::graph::ShiftKind::Diff => {
                         if let DataType::DateTime { unit } = src {
                             DataType::Duration { unit }

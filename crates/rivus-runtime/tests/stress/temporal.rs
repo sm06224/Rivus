@@ -1073,3 +1073,90 @@ fn shift_lag_n_and_endpoints() {
         );
     }
 }
+
+// --- lead: value N rows AHEAD per group (#65 follow-up, design/38 §38.5) ---
+
+#[test]
+fn lead_n_and_endpoints_are_chunk_size_independent() {
+    // The mirror of `lag`: the LAST N rows per stream are null; every other
+    // row references N ahead. cz=1 forces every chunk through the delayed
+    // pending queue (each chunk waits for future chunks), so the sweep pins
+    // chunk-size independence of the emission machinery itself.
+    let text = "v\n1\n2\n3\n4\n5\n";
+    let f = TempCsv(gendata::write_temp_bytes("lead_n", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!("N:\n open {p} (v:int)\n |> * (lead(v, 2)) as n2\n;");
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "N", "n2"),
+            vec!["3", "4", "5", "", ""],
+            "lead 2 endpoints @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn lead_by_group_matches_oracle_with_interleaved_groups() {
+    // Two interleaved groups; lead is per-group in source order, and a row's
+    // forward value regularly lives several chunks ahead at small cz (the
+    // per-group waiting FIFO must resolve across chunk boundaries).
+    let mut text = String::from("sym,price\n");
+    for i in 0..8 {
+        text.push_str(&format!("a,{}\n", i + 1)); // a: 1..=8
+        text.push_str(&format!("b,{}\n", (i + 1) * 10)); // b: 10..=80
+    }
+    let f = TempCsv(gendata::write_temp_bytes("lead_grp", text.as_bytes()));
+    let p = f.0.display();
+    let flow =
+        format!("T:\n open {p} (sym:str price:int)\n |> * (lead(price, 1) over sym) as nxt\n;");
+    // Oracle: within each group the next value; last per group null. Rows
+    // stay in source order (a,b interleaved).
+    let mut want: Vec<String> = Vec::new();
+    for i in 0..8 {
+        want.push(if i < 7 {
+            (i + 2).to_string()
+        } else {
+            String::new()
+        });
+        want.push(if i < 7 {
+            ((i + 2) * 10).to_string()
+        } else {
+            String::new()
+        });
+    }
+    for cz in [1usize, 3, 4, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "T", "nxt"),
+            want,
+            "lead per-group oracle @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn lead_keeps_source_lane_and_nulls_propagate() {
+    // `lead` keeps the source lane (datetime stays datetime — pinned via
+    // format()-ability downstream), and a null source cell leads into its
+    // slot as null without disturbing neighbors.
+    let text = "ts,v\n2026-01-01T00:00:00,1\n2026-01-01T00:10:00,\n2026-01-01T00:20:00,3\n";
+    let f = TempCsv(gendata::write_temp_bytes("lead_lane", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "D:\n open {p} (ts:datetime v:int)\n |> * (lead(ts, 1)) as nts\n |> * (lead(v, 1)) as nv\n;"
+    );
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "D", "nts"),
+            vec!["2026-01-01T00:10:00", "2026-01-01T00:20:00", ""],
+            "lead datetime lane @cz={cz}"
+        );
+        assert_eq!(
+            collect_strings(&res, "D", "nv"),
+            vec!["", "3", ""],
+            "lead null propagation @cz={cz}"
+        );
+    }
+}
