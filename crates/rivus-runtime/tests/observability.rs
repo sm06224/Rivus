@@ -4,6 +4,8 @@
 //! changes the result. Pillar A is pure accounting, so every test here also
 //! checks the data is exactly what an unmeasured run would produce.
 
+mod common;
+
 use rivus_runtime::gendata::{self, Rng};
 use rivus_runtime::{run, run_with_progress, RunOptions, RuntimeSnapshot};
 
@@ -218,12 +220,7 @@ fn parallel_run_records_per_worker_telemetry() {
     // correctly chooses the serial path, so demanding workers there would
     // assert the wrong thing — the serial fallback is the *contract*, and the
     // row-count oracle below still validates the run.
-    if std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1)
-        < 2
-    {
-        eprintln!("skipping worker-telemetry assertions: <2 CPUs available");
+    if !common::require_parallel_host() {
         return;
     }
     assert!(
@@ -663,11 +660,7 @@ fn live_hook_stays_parallel() {
     );
     // On a real multicore host the parallel path actually engages under the
     // hook (the whole point): a per-worker breakdown is present.
-    if std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1)
-        >= 2
-    {
+    if common::require_parallel_host() {
         assert!(
             !res.workers.is_empty(),
             "a hooked, parallel-eligible run must still run parallel (got no workers)"
@@ -759,12 +752,7 @@ fn fused_id_path_activates_and_matches_serial() {
     assert_eq!(a, b, "fused id path must be byte-identical to serial");
     // Same guard as the worker-telemetry test: a 1-CPU host correctly stays
     // serial, where demanding activation would assert the wrong thing.
-    if std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1)
-        < 2
-    {
-        eprintln!("skipping activation assert: <2 CPUs available");
+    if !common::require_parallel_host() {
         return;
     }
     assert!(
@@ -843,12 +831,7 @@ fn joinless_fused_id_path_activates_and_matches_serial() {
         a, b,
         "join-less fused id path must be byte-identical to serial"
     );
-    if std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1)
-        < 2
-    {
-        eprintln!("skipping activation assert: <2 CPUs available");
+    if !common::require_parallel_host() {
         return;
     }
     assert!(
@@ -1010,12 +993,7 @@ fn jsonl_dict_lanes_activate_id_path_and_match_serial() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(a.lines().count() > 1, "expected real grouped output");
     assert_eq!(a, b, "JSONL dict/id path must be byte-identical to serial");
-    if std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1)
-        < 2
-    {
-        eprintln!("skipping activation assert: <2 CPUs available");
+    if !common::require_parallel_host() {
         return;
     }
     assert!(
@@ -1103,11 +1081,7 @@ fn f64_group_file_major_parallel_matches_serial_mirror() {
         !rs.workers.is_empty(),
         "the serial mirror must run the per-file driver at P=1"
     );
-    if std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1)
-        >= 2
-    {
+    if common::require_parallel_host() {
         assert!(!rp.workers.is_empty(), "parallel run must use workers");
     }
 }
@@ -1506,12 +1480,19 @@ fn dict_escape_chunks_mix_with_id_loop_and_match_serial() {
         "mixed dict/escaped chunks must stay byte-identical to serial"
     );
     // 1-CPU hosts legitimately stay serial (no id loop) — same guard as the
-    // sibling fused tests.
-    if rp
+    // sibling fused tests. S2: in CI the engagement is mandatory, so a host
+    // that quietly stayed serial fails instead of reporting a green escape proof.
+    let engaged = rp
         .strategy
         .as_deref()
-        .is_some_and(|s| s.contains("parallel read group-by"))
-    {
+        .is_some_and(|s| s.contains("parallel read group-by"));
+    if !engaged {
+        common::skip_unless_required(
+            "the parallel group driver did not engage on this host",
+            "the dict-escape id-loop proof goes unproven",
+        );
+    }
+    if engaged {
         let total_rows = (3 * 3 * CHUNK) as u64;
         assert!(id_delta > 0, "dict chunks must drive the fused id loop");
         assert!(

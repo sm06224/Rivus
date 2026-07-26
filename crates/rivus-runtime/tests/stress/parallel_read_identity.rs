@@ -157,11 +157,7 @@ fn regions_csv() -> String {
 /// engages the per-file group driver at any size) must reproduce it row-for-row
 /// at more than one chunk size.
 fn assert_gz_group_identity(dir: &TempDir, glob: &str, fmt: &str) {
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1);
-    if threads < 2 {
-        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+    if !crate::common::require_parallel_host() {
         return;
     }
     let rp = gendata::write_temp("pgz_regions", &regions_csv());
@@ -233,11 +229,7 @@ fn gz_jsonl_group_serial_parallel_byte_identical() {
 ///   nothing.
 #[test]
 fn stage_c_speculative_group_serial_parallel_byte_identical() {
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1);
-    if threads < 2 {
-        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+    if !crate::common::require_parallel_host() {
         return;
     }
     let dir = TempDir::new("stagec");
@@ -324,11 +316,7 @@ fn stage_c_speculative_group_serial_parallel_byte_identical() {
 /// canonical re-run, union widened I64→Str); file 02 lacks `amount` entirely.
 #[test]
 fn stage_c_speculative_jsonl_group_serial_parallel_byte_identical() {
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1);
-    if threads < 2 {
-        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+    if !crate::common::require_parallel_host() {
         return;
     }
     let dir = TempDir::new("stagecj");
@@ -375,11 +363,7 @@ fn stage_c_speculative_jsonl_group_serial_parallel_byte_identical() {
 /// strategy asserted so gate acceptance can't silently rot.
 #[test]
 fn stage_c_or_predicate_group_serial_parallel_byte_identical() {
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1);
-    if threads < 2 {
-        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+    if !crate::common::require_parallel_host() {
         return;
     }
     let dir = TempDir::new("stagec_or");
@@ -417,11 +401,7 @@ fn stage_c_or_predicate_group_serial_parallel_byte_identical() {
 /// still matches the oracle exactly.
 #[test]
 fn stage_c_numeric_widening_bails_to_serial() {
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1);
-    if threads < 2 {
-        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+    if !crate::common::require_parallel_host() {
         return;
     }
     let dir = TempDir::new("stagec_f64");
@@ -468,11 +448,7 @@ fn stage_c_numeric_widening_bails_to_serial() {
 /// swap) or in segment concatenation would break this exactly.
 #[test]
 fn parallel_sink_join_emits_left_row_order_without_sort() {
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1);
-    if threads < 2 {
-        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+    if !crate::common::require_parallel_host() {
         return;
     }
     let dir = TempDir::new("psink");
@@ -582,11 +558,7 @@ fn parallel_sink_join_emits_left_row_order_without_sort() {
 /// construction). The whole output file must equal the serial oracle's bytes.
 #[test]
 fn stage_c_speculative_sink_serial_parallel_byte_identical() {
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1);
-    if threads < 2 {
-        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+    if !crate::common::require_parallel_host() {
         return;
     }
     let dir = TempDir::new("stagec_sink");
@@ -644,11 +616,7 @@ fn stage_c_speculative_sink_serial_parallel_byte_identical() {
 /// output file still equals the oracle.
 #[test]
 fn stage_c_sink_numeric_widening_bails_to_serial() {
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(1);
-    if threads < 2 {
-        eprintln!("skipping: single-core runner cannot exercise the parallel path");
+    if !crate::common::require_parallel_host() {
         return;
     }
     let dir = TempDir::new("stagec_sinkf64");

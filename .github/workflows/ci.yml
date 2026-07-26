@@ -59,7 +59,25 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets
 
+      # S2 (test honesty): the activation asserts — "the parallel/fused/dict
+      # path really engaged" — sit behind a CPU-count check, so on a 1-core
+      # runner they would silently skip and still report a green tick. Verify
+      # the runner can actually satisfy them, then require it: with
+      # RIVUS_TEST_REQUIRE_ACTIVATION set, an environment-shaped skip becomes a
+      # test failure instead of a quiet pass. Local runs leave it unset and keep
+      # the explicit skip message.
+      - name: Verify runner has ≥2 CPUs (activation asserts need parallelism)
+        run: |
+          n=$(nproc)
+          echo "runner CPUs: $n"
+          test "$n" -ge 2 || {
+            echo "::error::single-core runner: the parallel activation asserts cannot run"
+            exit 1
+          }
+
       - name: Test
+        env:
+          RIVUS_TEST_REQUIRE_ACTIVATION: "1"
         run: cargo test --workspace
 
       # Exercise the off-by-default `regex` feature so the gated `regexp()`
@@ -115,6 +133,11 @@ jobs:
           case "$got" in *"${DUCKDB_VERSION#v}"*) : ;; *) echo "version mismatch"; exit 1 ;; esac
 
       - name: Run the DuckDB parity oracle
+        # S2: this job installs the pinned CLI, so here the live diff is
+        # mandatory — a missing/broken duckdb must fail rather than degrade the
+        # check to "Rivus agrees with itself" behind a skip message.
+        env:
+          RIVUS_TEST_REQUIRE_DUCKDB: "1"
         run: cargo test -p rivus-runtime --test duckdb_parity -- --nocapture
 
   bench-smoke:

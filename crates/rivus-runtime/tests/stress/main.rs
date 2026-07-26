@@ -8,6 +8,9 @@
 
 // Re-exported (`pub(crate)`) so the split submodules can pull these in with a
 // single `use super::*;` (design 26 §26.8.1, mechanical move-only split).
+#[path = "../common/mod.rs"]
+pub(crate) mod common;
+
 pub(crate) use rivus_runtime::gendata::{self, Rng};
 pub(crate) use rivus_runtime::{run, RunOptions};
 
