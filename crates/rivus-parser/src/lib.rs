@@ -1583,8 +1583,10 @@ impl Parser {
                 Tok::LParen if self.peek_window_fn() => {
                     let op = self.parse_window_item()?;
                     let out = match &op {
-                        Op::Sessionize { out, .. } | Op::Shift { out, .. } => out.clone(),
-                        _ => unreachable!("window items lower to Sessionize/Shift"),
+                        Op::Sessionize { out, .. }
+                        | Op::Shift { out, .. }
+                        | Op::Rolling { out, .. } => out.clone(),
+                        _ => unreachable!("window items lower to Sessionize/Shift/Rolling"),
                     };
                     items.push((Expr::field(&out), out));
                     win_ops.push(op);
@@ -1682,6 +1684,7 @@ impl Parser {
             (&self.toks[self.pos].0, self.toks.get(self.pos + 1).map(|t| &t.0)),
             (Tok::LParen, Some(Tok::Word(w)))
                 if matches!(w.as_str(), "session" | "lag" | "lead" | "diff" | "pct_change")
+                    || rivus_ir::RollFunc::parse(w).is_some()
         ) && matches!(self.toks.get(self.pos + 2).map(|t| &t.0), Some(Tok::LParen))
     }
 
@@ -1712,6 +1715,34 @@ impl Parser {
             Op::Sessionize {
                 ts: col,
                 gap,
+                by,
+                out,
+            }
+        } else if let Some(func) = rivus_ir::RollFunc::parse(&name) {
+            // design/43: the window width N is REQUIRED (rows; an implicit
+            // default window would be an accident magnet — §43.6 ②).
+            if !self.eat(&Tok::Comma) {
+                return Err(self.err(format!(
+                    "{name}(col, N) requires the window width N (rows), e.g. \
+                     `|> * ({name}(price, 5) over sym) as w5`"
+                )));
+            }
+            let n = match self.bump() {
+                Tok::Int(v) if v >= 1 => v as u32,
+                other => {
+                    return Err(self.err(format!(
+                        "{name}(col, N) expects a positive integer N (rows), found {other:?}"
+                    )))
+                }
+            };
+            self.expect(&Tok::RParen)?;
+            let by = self.parse_over()?;
+            self.expect(&Tok::RParen)?;
+            let out = self.window_alias(&format!("{name}(…)"))?;
+            Op::Rolling {
+                col,
+                func,
+                n,
                 by,
                 out,
             }
@@ -5537,6 +5568,52 @@ Import:
         assert!(e.contains("as <name>"), "{e}");
         // A column named `lead` not followed by `(` is still a plain field.
         assert!(parse("T:\n open t.csv\n |> lead price\n;").is_ok());
+    }
+
+    #[test]
+    fn rolling_parses_and_round_trips() {
+        // design/43 (#63): rolling row-window aggregates are window items.
+        // Parses to Op::Rolling, renders canonically (N always printed), and
+        // is idempotent.
+        let g = parse(
+            "T:\n open t.csv (sym:str price:int)\n |> * (rolling_sum(price, 5) over sym) as w5\n;",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &g.nodes[1].op,
+                Op::Rolling { func: rivus_ir::RollFunc::Sum, n: 5, out, .. } if out == "w5"
+            ),
+            "rolling_sum must build a Rolling op: {:?}",
+            g.nodes[1].op
+        );
+        let src = g.to_source();
+        assert!(
+            src.contains("|> * (rolling_sum(price, 5) over sym) as w5"),
+            "{src}"
+        );
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // All four funcs parse; avg/min/max spot-checked via round-trip.
+        for f in ["rolling_avg", "rolling_min", "rolling_max"] {
+            let flow = format!("T:\n open t.csv\n |> * ({f}(price, 3)) as w\n;");
+            let out = parse(&flow).unwrap().to_source();
+            assert!(out.contains(&format!("({f}(price, 3))")), "{out}");
+            assert_eq!(out, parse(&out).unwrap().to_source(), "idempotent {f}");
+        }
+        // N is REQUIRED (§43.6 ②) — the error teaches the shape.
+        let e = parse("T:\n open t.csv\n |> * (rolling_sum(price)) as w\n;")
+            .expect_err("window width required")
+            .to_string();
+        assert!(e.contains("requires the window width N"), "{e}");
+        // …and must be a positive integer.
+        assert!(parse("T:\n open t.csv\n |> * (rolling_sum(price, 0)) as w\n;").is_err());
+        // The alias stays required.
+        let e = parse("T:\n open t.csv\n |> * (rolling_max(price, 3) over sym)\n;")
+            .expect_err("window alias required")
+            .to_string();
+        assert!(e.contains("as <name>"), "{e}");
+        // A column named `rolling_sum` not followed by `(` is a plain field.
+        assert!(parse("T:\n open t.csv\n |> rolling_sum price\n;").is_ok());
     }
 
     #[test]

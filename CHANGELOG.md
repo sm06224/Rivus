@@ -289,6 +289,21 @@ All notable changes to Rivus. Format loosely follows
   surfaced error (the decimal rule), not a column-wide degrade.
 
 ### Added
+- **Rolling row-window aggregates (`rolling_sum`/`rolling_avg`/
+  `rolling_min`/`rolling_max`, design/43, #63).** Window items:
+  `|> * (rolling_avg(price, 5) over sym) as ma5` appends the aggregate over
+  the trailing `N` rows (current included) per `over` group in source order.
+  `N` is required (no implicit window width); the first `N − 1` rows of each
+  group are null; null cells inside a full window are excluded (`|#`
+  semantics) and an all-null window yields null. Lanes: `sum` keeps the
+  exact lanes (i64 / decimal(s) / duration — i128 sliding accumulation,
+  oracle-pinned bit-equal to recomputation), `avg` is always float, `min`/
+  `max` keep the source lane (datetime included). **f64 windows are
+  recomputed per row** so the value is a pure function of the window
+  contents — the sliding-accumulator drift (#41 class) is banned by
+  construction (pinned by a shared-window/different-prefix fixture).
+  Order-dependent → serial, chunk-size independent (cz-swept incl. cz=1).
+  No new keyword: a column named `rolling_sum` still projects normally.
 - **`lead(col, N)` window item (#65 follow-up, design/38 §38.5).** The
   forward mirror of `lag`: `|> * (lead(price, 1) over sym) as nxt` appends
   the value `N` rows AHEAD within each `over` group (source order); each

@@ -132,6 +132,29 @@ fn op_out_schema(op: &Op, inputs: &[Option<Schema>]) -> Option<Schema> {
             }
             s
         }),
+        // `rolling_*` appends `out` (design/43): `sum` keeps the exact lanes
+        // (i64 / decimal(s) / duration(u)) and is f64 otherwise; `avg` is
+        // always f64 (the exact-lane window sum still feeds it, so the
+        // quotient is a deterministic pure function of the window); `min`/
+        // `max` keep the source lane. MIRRORED EXACTLY by the runtime's
+        // `Rolling::out_dtype` — change both together (pinned by lane tests).
+        // Unknown `col` leaves the schema unchanged (runtime warns).
+        Op::Rolling { col, func, out, .. } => input.map(|s| {
+            let mut s = s;
+            if let Some(i) = s.index_of(col) {
+                let src = s.fields[i].dtype;
+                let dtype = match func {
+                    crate::graph::RollFunc::Sum => match src {
+                        DataType::I64 | DataType::Decimal { .. } | DataType::Duration { .. } => src,
+                        _ => DataType::F64,
+                    },
+                    crate::graph::RollFunc::Avg => DataType::F64,
+                    crate::graph::RollFunc::Min | crate::graph::RollFunc::Max => src,
+                };
+                s.fields.push(Field::new(out.clone(), dtype));
+            }
+            s
+        }),
         // `explode COL` keeps every column but replaces the `List` lane with its
         // element field (§32 s4c); other columns are unchanged. A non-list (or
         // unknown) `COL` leaves the schema untouched (runtime warns).

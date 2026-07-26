@@ -13,7 +13,8 @@ pub use graph::{
     delim_for_path, delim_modifier_for, is_http_url, parse_route_template,
     strip_compression_suffix, AggFunc, BinType, Codec, Discovery, Disposition, Edge, EdgeKind,
     Endian, FillMethod, Hook, HookAction, HookEvent, JoinKind, Node, NodeId, Op, PlanGraph,
-    Provenance, ReadFmt, Route, RouteSeg, ShiftKind, SinkCodec, SubView, Transport, ViewDef, COMMA,
+    Provenance, ReadFmt, RollFunc, Route, RouteSeg, ShiftKind, SinkCodec, SubView, Transport,
+    ViewDef, COMMA,
 };
 
 #[cfg(test)]

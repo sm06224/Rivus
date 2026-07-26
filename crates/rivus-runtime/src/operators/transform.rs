@@ -2270,6 +2270,338 @@ impl Operator for Shift {
     }
 }
 
+// ------------------------------------------------------------ rolling (design/43)
+
+/// Rolling row-window aggregate (`|> * (rolling_sum|avg|min|max(COL, N)
+/// [over BY…]) as OUT`, #63): append `out` = the aggregate over the trailing
+/// window of `n` rows (current included) per `by` group, in source order.
+/// The first `n − 1` rows of each group are null; null cells inside a full
+/// window are excluded (like `|#`); an all-null window yields null.
+/// Trailing ⇒ past-only ⇒ streaming per-chunk emit; order-dependent → serial
+/// path (like `shift`); chunk-size independent (per-group ring state).
+///
+/// Determinism (design/43 §43.3, the #41-class rule): every f64 output and
+/// every `avg` is **recomputed from the ring in fixed (window) order** — a
+/// pure function of the window contents, never a sliding f64 accumulator.
+/// Only the exact-lane `rolling_sum` (i64 / decimal / duration on i128)
+/// slides, where slide == recompute holds bit-for-bit (oracle-pinned).
+pub(crate) struct Rolling {
+    pub(crate) col: String,
+    pub(crate) func: rivus_ir::RollFunc,
+    pub(crate) n: usize,
+    pub(crate) by: Vec<String>,
+    pub(crate) out: String,
+    /// Composite `by` key (0x1F-joined, like GroupBy) → window state.
+    pub(crate) state: std::collections::BTreeMap<String, RollState>,
+    pub(crate) warned: bool,
+    pub(crate) overflow_warned: bool,
+}
+
+/// Per-group window state: the ring of the last ≤ n source cells (nulls
+/// included, so window membership is purely positional) plus the exact-lane
+/// sliding sum over the ring's non-null cells.
+#[derive(Default)]
+pub(crate) struct RollState {
+    ring: std::collections::VecDeque<rivus_core::Value>,
+    int_sum: i128,
+    nonnull: usize,
+}
+
+impl Rolling {
+    /// The output lane — MIRRORED EXACTLY by `schema_prop`'s `Op::Rolling`
+    /// arm (change both together; pinned by the lane tests).
+    fn out_dtype(func: rivus_ir::RollFunc, src: rivus_core::DataType) -> rivus_core::DataType {
+        use rivus_core::DataType as D;
+        use rivus_ir::RollFunc as F;
+        match func {
+            F::Sum => match src {
+                D::I64 | D::Decimal { .. } | D::Duration { .. } => src,
+                _ => D::F64,
+            },
+            F::Avg => D::F64,
+            F::Min | F::Max => src,
+        }
+    }
+
+    /// Is `src` a lane this func aggregates? Anything else warns once and
+    /// yields all-null output (never silent, continue-first).
+    fn lane_supported(func: rivus_ir::RollFunc, src: rivus_core::DataType) -> bool {
+        use rivus_core::DataType as D;
+        use rivus_ir::RollFunc as F;
+        match func {
+            F::Sum | F::Avg => matches!(
+                src,
+                D::I64 | D::F64 | D::Decimal { .. } | D::Duration { .. }
+            ),
+            F::Min | F::Max => matches!(
+                src,
+                D::I64 | D::F64 | D::Decimal { .. } | D::Duration { .. } | D::DateTime { .. }
+            ),
+        }
+    }
+
+    /// The exact-lane i128 image of a cell (i64 value / decimal unscaled /
+    /// duration ticks); `None` for null or any other lane.
+    fn exact_of(v: &rivus_core::Value) -> Option<i128> {
+        use rivus_core::Value as V;
+        match v {
+            V::I64(x) => Some(i128::from(*x)),
+            V::Dec(d) => Some(d.unscaled),
+            V::Duration(d) => Some(i128::from(d.ticks)),
+            _ => None,
+        }
+    }
+
+    /// The window aggregate for a FULL ring (`ring.len() == n`), computed per
+    /// design/43 §43.3. `st.int_sum`/`st.nonnull` are the sliding exact
+    /// accumulators; f64 paths fold the ring in window order.
+    fn window_value(
+        &mut self,
+        src: rivus_core::DataType,
+        key: &str,
+        ctx: &mut OpCtx,
+    ) -> rivus_core::Value {
+        use rivus_core::{DataType as D, Value as V};
+        use rivus_ir::RollFunc as F;
+        let st = self.state.get(key).expect("state exists for key");
+        if st.nonnull == 0 {
+            return V::Null; // all-null window (or unsupported lane)
+        }
+        match (self.func, src) {
+            // Exact-lane sum: the sliding i128 IS the window sum.
+            (F::Sum, D::I64) => match i64::try_from(st.int_sum) {
+                Ok(x) => V::I64(x),
+                Err(_) => {
+                    if !self.overflow_warned {
+                        self.overflow_warned = true;
+                        ctx.raise(
+                            ErrorEvent::new(
+                                Severity::Warn,
+                                ErrorScope::Chunk,
+                                format!(
+                                    "rolling_sum: window sum overflowed the i64 lane of '{}' \
+                                     (null output cell)",
+                                    self.col
+                                ),
+                            )
+                            .at_node(ctx.label.clone()),
+                        );
+                    }
+                    V::Null
+                }
+            },
+            (F::Sum, D::Decimal { scale }) => V::Dec(rivus_core::Decimal::new(st.int_sum, scale)),
+            (F::Sum, D::Duration { unit }) => match i64::try_from(st.int_sum) {
+                Ok(t) => V::Duration(rivus_core::Duration::new(t, unit)),
+                Err(_) => {
+                    if !self.overflow_warned {
+                        self.overflow_warned = true;
+                        ctx.raise(
+                            ErrorEvent::new(
+                                Severity::Warn,
+                                ErrorScope::Chunk,
+                                format!(
+                                    "rolling_sum: window sum overflowed the duration lane of \
+                                     '{}' (null output cell)",
+                                    self.col
+                                ),
+                            )
+                            .at_node(ctx.label.clone()),
+                        );
+                    }
+                    V::Null
+                }
+            },
+            // f64 sum: recompute — fold the ring's non-null cells in window
+            // order (pure function of the window; NO sliding accumulator).
+            (F::Sum, _) => {
+                let mut acc = 0.0f64;
+                for v in &st.ring {
+                    if let Some(x) = v.as_f64() {
+                        acc += x;
+                    }
+                }
+                V::F64(acc)
+            }
+            // avg: always the f64 fold (one code path for every lane — the
+            // quotient is a pure function of the window contents).
+            (F::Avg, _) => {
+                let mut acc = 0.0f64;
+                let mut cnt = 0u32;
+                for v in &st.ring {
+                    if let Some(x) = v.as_f64() {
+                        acc += x;
+                        cnt += 1;
+                    }
+                }
+                if cnt == 0 {
+                    V::Null
+                } else {
+                    V::F64(acc / f64::from(cnt))
+                }
+            }
+            // min/max: fold in window order, first non-null initializes,
+            // strict compare replaces (mirrors `|#`'s observe pattern).
+            (F::Min, _) | (F::Max, _) => {
+                let want_less = self.func == F::Min;
+                let mut best: Option<&rivus_core::Value> = None;
+                for v in &st.ring {
+                    if v.is_null() {
+                        continue;
+                    }
+                    best = match best {
+                        None => Some(v),
+                        Some(b) => {
+                            if Self::cmp_replaces(v, b, want_less) {
+                                Some(v)
+                            } else {
+                                Some(b)
+                            }
+                        }
+                    };
+                }
+                best.cloned().unwrap_or(V::Null)
+            }
+        }
+    }
+
+    /// Does `cur` replace `best` (strictly less for min / greater for max)?
+    /// Same-lane comparisons only (the column's lane is uniform post-
+    /// reconcile); a cross-lane straggler never replaces (continue-first).
+    fn cmp_replaces(cur: &rivus_core::Value, best: &rivus_core::Value, want_less: bool) -> bool {
+        use rivus_core::Value as V;
+        let ord = match (cur, best) {
+            (V::I64(a), V::I64(b)) => a.partial_cmp(b),
+            (V::F64(a), V::F64(b)) => a.partial_cmp(b),
+            (V::Dec(a), V::Dec(b)) if a.scale == b.scale => a.unscaled.partial_cmp(&b.unscaled),
+            (V::Duration(a), V::Duration(b)) if a.unit == b.unit => a.ticks.partial_cmp(&b.ticks),
+            (V::DateTime(a), V::DateTime(b)) if a.unit == b.unit => a.ticks.partial_cmp(&b.ticks),
+            _ => None,
+        };
+        match ord {
+            Some(std::cmp::Ordering::Less) => want_less,
+            Some(std::cmp::Ordering::Greater) => !want_less,
+            _ => false,
+        }
+    }
+}
+
+impl Operator for Rolling {
+    fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
+        let Some(ci) = chunk.schema.index_of(&self.col) else {
+            if !self.warned {
+                self.warned = true;
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!(
+                            "{}: unknown column '{}' (passed through)",
+                            self.func.as_str(),
+                            self.col
+                        ),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+            return vec![chunk];
+        };
+        let src_dtype = chunk.schema.fields[ci].dtype;
+        let out_dtype = Self::out_dtype(self.func, src_dtype);
+        let supported = Self::lane_supported(self.func, src_dtype);
+        if !supported && !self.warned {
+            self.warned = true;
+            ctx.raise(
+                ErrorEvent::new(
+                    Severity::Warn,
+                    ErrorScope::Chunk,
+                    format!(
+                        "{}: column '{}' is not a {} lane (null output)",
+                        self.func.as_str(),
+                        self.col,
+                        if matches!(self.func, rivus_ir::RollFunc::Min | rivus_ir::RollFunc::Max) {
+                            "comparable"
+                        } else {
+                            "numeric"
+                        }
+                    ),
+                )
+                .at_node(ctx.label.clone()),
+            );
+        }
+
+        // Resolve the `by` columns (missing ones warn once, group as empty).
+        let mut by_idx: Vec<Option<usize>> = Vec::with_capacity(self.by.len());
+        for c in self.by.clone() {
+            let i = chunk.schema.index_of(&c);
+            if i.is_none() && !self.warned {
+                self.warned = true;
+                ctx.raise(
+                    ErrorEvent::new(
+                        Severity::Warn,
+                        ErrorScope::Chunk,
+                        format!(
+                            "{}: unknown `over` column '{c}' (grouped as empty)",
+                            self.func.as_str()
+                        ),
+                    )
+                    .at_node(ctx.label.clone()),
+                );
+            }
+            by_idx.push(i);
+        }
+
+        let mut out_vals: Vec<rivus_core::Value> = Vec::with_capacity(chunk.len);
+        let mut key = String::new();
+        for r in 0..chunk.len {
+            if !supported {
+                out_vals.push(rivus_core::Value::Null);
+                continue;
+            }
+            key.clear();
+            for (k, idx) in by_idx.iter().enumerate() {
+                if k > 0 {
+                    key.push('\u{1f}');
+                }
+                if let Some(i) = idx {
+                    if !chunk.columns[*i].is_null(r) {
+                        key.push_str(&chunk.value(r, *i).to_string());
+                    }
+                }
+            }
+            let cur = chunk.value(r, ci);
+            let st = self.state.entry(key.clone()).or_default();
+            // Enter the current cell (trailing window includes this row) …
+            if let Some(x) = Self::exact_of(&cur) {
+                st.int_sum += x;
+            }
+            if !cur.is_null() {
+                st.nonnull += 1;
+            }
+            st.ring.push_back(cur);
+            // … evict the cell that left the window …
+            if st.ring.len() > self.n {
+                let old = st.ring.pop_front().expect("len > n >= 1");
+                if let Some(x) = Self::exact_of(&old) {
+                    st.int_sum -= x;
+                }
+                if !old.is_null() {
+                    st.nonnull -= 1;
+                }
+            }
+            // … and answer only once the window is full.
+            let v = if st.ring.len() == self.n {
+                self.window_value(src_dtype, &key, ctx)
+            } else {
+                rivus_core::Value::Null
+            };
+            out_vals.push(v);
+        }
+
+        vec![Shift::append_out(chunk, &out_vals, out_dtype, &self.out)]
+    }
+}
+
 /// Build a column of exactly `dtype` from row values (null-aware), preserving
 /// the lane even when every value is null. Values whose lane doesn't match the
 /// target become null (continue-first). Used by `shift` so the appended

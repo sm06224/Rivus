@@ -779,6 +779,13 @@ open log.csv (ts:datetime("yyMMddHHmmss") msg)  # "260601143000" を厳密にパ
   as session` がセッション開始 datetime を付与（`|> *` は全列保持＋窓出力追加）—
   そのまま `|# user session …` で集計。グループ内 gap 超過で新セッション、
   時刻逆行は surface、
+  **rolling_sum / rolling_avg / rolling_min / rolling_max**（#63・design/43）：
+  窓 item — `|> * (rolling_avg(price, 5) over sym) as ma5`（各 `over` グループ・
+  直近 `N` 行〔当該行含む〕の集計。グループ先頭 `N−1` 行は null・窓内 null は
+  `|#` と同じ除外・全 null 窓は null・`N` 必須）。`sum` は exact レーン維持
+  （i64/decimal/duration）・`avg` は float・`min`/`max` は source レーン維持
+  （datetime 可）。f64 窓は毎行再計算 — 値は窓内容の純関数（滑り累算の
+  ドリフトなし）、
   **lag / lead / diff / pct_change**（#65）：`|>` の窓 item —
   `|> * (lag(price, 1) over sym) as prev`（各 `over` グループ内・source 順で
   `N` 行前の値、先頭 `N` 行は null）、`|> * (lead(price, 1) over sym) as nxt`

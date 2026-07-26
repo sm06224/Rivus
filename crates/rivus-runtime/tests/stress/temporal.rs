@@ -1160,3 +1160,188 @@ fn lead_keeps_source_lane_and_nulls_propagate() {
         );
     }
 }
+
+// --- rolling row-window aggregates (design/43, #63) ---
+
+#[test]
+fn rolling_endpoints_and_groups_are_chunk_size_independent() {
+    // Trailing window of N rows per group: the first N−1 rows per group are
+    // null; the rest aggregate the window. Two interleaved groups so window
+    // membership crosses chunk boundaries at small cz.
+    let mut text = String::from("sym,price\n");
+    for i in 0..6 {
+        text.push_str(&format!("a,{}\n", i + 1)); // a: 1..=6
+        text.push_str(&format!("b,{}\n", (i + 1) * 10)); // b: 10..=60
+    }
+    let f = TempCsv(gendata::write_temp_bytes("roll_grp", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "T:\n open {p} (sym:str price:int)\n |> * (rolling_sum(price, 3) over sym) as s3\n;"
+    );
+    // Oracle: per-group trailing 3-row sums; rows in source order (a,b
+    // interleaved). a: _,_,6,9,12,15 ; b: _,_,60,90,120,150.
+    let mut want: Vec<String> = Vec::new();
+    for i in 0..6i64 {
+        want.push(if i < 2 {
+            String::new()
+        } else {
+            (3 * (i + 1) - 3).to_string()
+        });
+        want.push(if i < 2 {
+            String::new()
+        } else {
+            (10 * (3 * (i + 1) - 3)).to_string()
+        });
+    }
+    for cz in [1usize, 2, 3, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "T", "s3"),
+            want,
+            "rolling_sum per-group oracle @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn rolling_null_cells_are_excluded_and_all_null_window_is_null() {
+    // Null cells inside a full window are excluded (|# semantics); a window
+    // whose every cell is null yields null. v: 1,null,null,4 with N=2 →
+    // row1 null (window not full), row2 sum=1 (the null excluded),
+    // row3 null (both cells null → all-null window), row4 sum=4.
+    let f = TempCsv(gendata::write_temp_bytes(
+        "roll_null",
+        "id,v\n1,1\n2,\n3,\n4,4\n".as_bytes(),
+    ));
+    let p = f.0.display();
+    let flow = format!("N:\n open {p} (id:int v:int)\n |> * (rolling_sum(v, 2)) as s2\n;");
+    for cz in [1usize, 2, 4096] {
+        let res = run_src(&flow, cz);
+        assert_eq!(
+            collect_strings(&res, "N", "s2"),
+            vec!["", "1", "", "4"],
+            "null-exclusion + all-null window @cz={cz}"
+        );
+    }
+    // avg over the same fixture: same nullity, values averaged over the
+    // non-null members only.
+    let flow = format!("N:\n open {p} (id:int v:int)\n |> * (rolling_avg(v, 2)) as a2\n;");
+    let res = run_src(&flow, 4096);
+    assert_eq!(collect_strings(&res, "N", "a2"), vec!["", "1", "", "4"]);
+}
+
+#[test]
+fn rolling_lanes_are_pinned_per_func() {
+    // sum keeps exact lanes (i64 shown without decimals; decimal keeps its
+    // scale; duration stays a duration), avg is always float, min/max keep
+    // the source lane (datetime included).
+    let text = "i,d,ts\n1,1.25,2026-01-01T00:00:00\n2,2.25,2026-01-01T00:10:00\n3,3.25,2026-01-01T00:05:00\n";
+    let f = TempCsv(gendata::write_temp_bytes("roll_lane", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "L:\n open {p} (i:int d:decimal(2) ts:datetime)\n \
+         |> * (rolling_sum(i, 2)) as si\n \
+         |> * (rolling_sum(d, 2)) as sd\n \
+         |> * (rolling_avg(i, 2)) as ai\n \
+         |> * (rolling_max(ts, 2)) as mts\n;"
+    );
+    for cz in [1usize, 4096] {
+        let res = run_src(&flow, cz);
+        // i64 sum stays integer-rendered (no ".0").
+        assert_eq!(collect_strings(&res, "L", "si"), vec!["", "3", "5"]);
+        // decimal sum keeps scale 2.
+        assert_eq!(collect_strings(&res, "L", "sd"), vec!["", "3.50", "5.50"]);
+        // avg renders as float.
+        assert_eq!(collect_strings(&res, "L", "ai"), vec!["", "1.5", "2.5"]);
+        // datetime max keeps the datetime lane (ISO rendering) and compares
+        // by instant (row 3's window max is 00:10, not 00:05).
+        assert_eq!(
+            collect_strings(&res, "L", "mts"),
+            vec!["", "2026-01-01T00:10:00", "2026-01-01T00:10:00"],
+            "datetime max lane @cz={cz}"
+        );
+    }
+}
+
+#[test]
+fn rolling_exact_slide_matches_lag_recompute_oracle() {
+    // The exact-lane sliding i128 must equal a window recomputed through
+    // INDEPENDENT machinery: v + lag(v,1) + lag(v,2) (no nulls in the
+    // fixture, so exclusion semantics don't diverge). Byte-compare via the
+    // rendered strings — i64 and decimal both bit-exact.
+    let mut text = String::from("v,d\n");
+    let mut x: i64 = 7;
+    for _ in 0..200 {
+        x = (x * 31 + 17) % 1000 - 350; // deterministic, sign-mixed
+        text.push_str(&format!("{x},{}.{:02}\n", x, (x.unsigned_abs() % 100)));
+    }
+    let f = TempCsv(gendata::write_temp_bytes("roll_slide", text.as_bytes()));
+    let p = f.0.display();
+    let flow = format!(
+        "S:\n open {p} (v:int d:decimal(2))\n \
+         |> * (rolling_sum(v, 3)) as rs\n \
+         |> * (lag(v, 1)) as l1\n \
+         |> * (lag(v, 2)) as l2\n \
+         |> (v + l1 + l2) as oracle rs d\n;"
+    );
+    for cz in [1usize, 7, 4096] {
+        let res = run_src(&flow, cz);
+        let rs = collect_strings(&res, "S", "rs");
+        let oracle = collect_strings(&res, "S", "oracle");
+        // First two rows: rolling null (window not full) == oracle null (lag null).
+        assert_eq!(rs, oracle, "slide != lag-recompute oracle @cz={cz}");
+        assert!(rs.iter().skip(2).all(|s| !s.is_empty()), "windows full");
+    }
+}
+
+#[test]
+fn rolling_f64_is_a_pure_function_of_the_window_contents() {
+    // design/43 §43.3: an f64 window value depends ONLY on the window's
+    // cells — never on the prefix history (the sliding-accumulator drift the
+    // memo bans). Two streams share an identical 3-row window preceded by
+    // very different prefixes; the outputs at the shared windows must be
+    // byte-identical.
+    let shared = ["1.1", "2.2", "3.3"];
+    let prefix_a = ["1000000000.5", "-999999999.25"];
+    let prefix_b = ["0.000001", "7.5"];
+    let build = |prefix: &[&str]| {
+        let mut t = String::from("v\n");
+        for x in prefix.iter().chain(shared.iter()) {
+            t.push_str(&format!("{x}\n"));
+        }
+        t
+    };
+    let fa = TempCsv(gendata::write_temp_bytes(
+        "roll_pf_a",
+        build(&prefix_a).as_bytes(),
+    ));
+    let fb = TempCsv(gendata::write_temp_bytes(
+        "roll_pf_b",
+        build(&prefix_b).as_bytes(),
+    ));
+    let flow = |p: &std::path::Path| {
+        format!(
+            "F:\n open {} (v:float)\n |> * (rolling_sum(v, 3)) as s\n |> * (rolling_avg(v, 3)) as a\n;",
+            p.display()
+        )
+    };
+    let ra = run_src(&flow(&fa.0), 4096);
+    let rb = run_src(&flow(&fb.0), 4096);
+    // The last row's window is exactly `shared` in both streams.
+    let last = |res: &rivus_runtime::RunResult, col: &str| {
+        collect_strings(res, "F", col).last().unwrap().clone()
+    };
+    assert_eq!(
+        last(&ra, "s"),
+        last(&rb, "s"),
+        "f64 rolling_sum must be a pure function of the window"
+    );
+    assert_eq!(
+        last(&ra, "a"),
+        last(&rb, "a"),
+        "f64 rolling_avg must be a pure function of the window"
+    );
+    // And it equals the direct fold of the shared cells.
+    let direct = 1.1f64 + 2.2 + 3.3;
+    assert_eq!(last(&ra, "s"), format!("{direct}"));
+}

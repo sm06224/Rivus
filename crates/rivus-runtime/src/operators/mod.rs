@@ -417,6 +417,22 @@ pub fn build(op: &Op, inputs: &[NodeId], chunk_size: usize, preview: bool) -> Bo
             next_seq: 0,
             warned: false,
         }),
+        Op::Rolling {
+            col,
+            func,
+            n,
+            by,
+            out,
+        } => Box::new(Rolling {
+            col: col.clone(),
+            func: *func,
+            n: (*n).max(1) as usize,
+            by: by.clone(),
+            out: out.clone(),
+            state: std::collections::BTreeMap::new(),
+            warned: false,
+            overflow_warned: false,
+        }),
         Op::Reorder { cols } => Box::new(Reorder { cols: cols.clone() }),
         // `views` are metadata only (§29.3, s2): sub-view references are lowered
         // to `Expr::SubView` at parse time, so the operator needs just `items`.
