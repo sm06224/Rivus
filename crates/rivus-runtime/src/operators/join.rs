@@ -164,7 +164,7 @@ impl Operator for Join {
         // `right.schema.fields`), so only the left base count must be tracked.
         let (mut left, mut right) = (left, right);
         let base_left = left.columns.len();
-        let mut key_fails = 0u64;
+        let mut key_fails = eval::EvalFails::default();
         let lresolved = eval::resolve_key_indices(&mut left, &self.left_keys, &mut key_fails);
         let rresolved = eval::resolve_key_indices(&mut right, &self.right_keys, &mut key_fails);
         let mut lk = Vec::with_capacity(self.left_keys.len());
@@ -283,7 +283,7 @@ impl Operator for Join {
         for &ci in &right_cols {
             out.push(right.columns[ci].gather_opt(&ridx));
         }
-        super::surface_key_path_fails(key_fails, "join", ctx);
+        super::surface_key_path_fails(key_fails.casts, "join", ctx);
         vec![Chunk::new(
             ctx.fresh_id(),
             Arc::new(Schema::new(fields)),
@@ -370,7 +370,7 @@ pub(crate) struct BroadcastProbe {
     /// `0..base_left` unless `keep` pruned some), resolved with `lk`.
     left_out: Vec<usize>,
     right_cols: Vec<usize>,
-    key_fails: u64,
+    key_fails: eval::EvalFails,
 }
 
 impl BroadcastProbe {
@@ -381,7 +381,7 @@ impl BroadcastProbe {
         right_keys: &[PathExpr],
     ) -> Option<BuiltRight> {
         let mut right = concat_chunks(right_chunks.to_vec())?;
-        let mut key_fails = 0u64;
+        let mut key_fails = eval::EvalFails::default();
         let rresolved = eval::resolve_key_indices(&mut right, right_keys, &mut key_fails);
         let mut rk = Vec::with_capacity(right_keys.len());
         for idx in &rresolved {
@@ -419,7 +419,7 @@ impl BroadcastProbe {
             out_schema: None,
             left_out: Vec::new(),
             right_cols: Vec::new(),
-            key_fails: 0,
+            key_fails: eval::EvalFails::default(),
         }
     }
 }
@@ -597,7 +597,7 @@ impl Operator for BroadcastProbe {
     }
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        super::surface_key_path_fails(self.key_fails, "join", ctx);
+        super::surface_key_path_fails(self.key_fails.casts, "join", ctx);
         Vec::new()
     }
 }

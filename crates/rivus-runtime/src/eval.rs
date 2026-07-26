@@ -18,9 +18,70 @@ use rivus_core::{
 };
 use rivus_ir::{Access, ArithOp, CmpOp, Expr, Func, PathExpr, PathSeg};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
+/// What an expression evaluation lost, so the operator can surface it once on
+/// finish (never-silent). Two distinct kinds, reported separately because they
+/// mean different things to the reader of the message:
+///
+/// * `casts` — a value that failed to *convert* (an unparseable temporal cast,
+///   a division by zero); the cell became `null` (BUG-D §23.6).
+/// * `numeric_text` — a **non-numeric text cell that took part in a numeric
+///   comparison** and therefore could not be ordered (S1). Keyed by column so
+///   the report can name it: silently answering `false` for every row of a
+///   string-inferred column is exactly the "quiet wrong answer" the
+///   never-silent law forbids.
+///
+/// A clean run touches neither field; the map only allocates on the first
+/// failing cell, so the hot path pays nothing.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct EvalFails {
+    pub casts: u64,
+    pub numeric_text: BTreeMap<String, u64>,
+}
+
+impl EvalFails {
+    /// Record one text cell that could not be compared numerically.
+    fn note_numeric_text(&mut self, col: &str) {
+        if let Some(n) = self.numeric_text.get_mut(col) {
+            *n += 1;
+        } else {
+            self.numeric_text.insert(col.to_string(), 1);
+        }
+    }
+
+    /// True when nothing was lost (the common case).
+    pub fn is_empty(&self) -> bool {
+        self.casts == 0 && self.numeric_text.is_empty()
+    }
+
+    /// Total non-numeric text cells across all columns.
+    pub fn numeric_text_total(&self) -> u64 {
+        self.numeric_text.values().sum()
+    }
+
+    /// `"3 in 'a', 1 in 'b'"` — the columns named, in a deterministic order
+    /// (`BTreeMap`), so the message is chunk-order and thread independent.
+    pub fn numeric_text_detail(&self) -> String {
+        self.numeric_text
+            .iter()
+            .map(|(c, n)| format!("{n} in '{c}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::ops::AddAssign<&EvalFails> for EvalFails {
+    fn add_assign(&mut self, rhs: &EvalFails) {
+        self.casts += rhs.casts;
+        for (c, n) in &rhs.numeric_text {
+            *self.numeric_text.entry(c.clone()).or_insert(0) += n;
+        }
+    }
+}
 
 /// Apply a scalar function to argument values for one row.
-fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut u64) -> Value {
+fn call_func(func: Func, args: &[Expr], chunk: &Chunk, row: usize, fails: &mut EvalFails) -> Value {
     // All argument evaluation routes through `arg` so a cast failure anywhere in
     // an argument increments `fails` (never-silent, BUG-D §23.6). `arg` is FnMut
     // (it borrows `fails`), so every sub-eval below must go through it.
@@ -415,7 +476,7 @@ fn regex_literal(args: &[Expr]) -> Option<&str> {
 
 /// Columnar `regexp` with a literal pattern: compile once, test every row.
 #[cfg(feature = "regex")]
-fn regexp_column(args: &[Expr], chunk: &Chunk, fails: &mut u64) -> Column {
+fn regexp_column(args: &[Expr], chunk: &Chunk, fails: &mut EvalFails) -> Column {
     let pat = regex_literal(args).unwrap_or("");
     let col = eval_column(&args[0], chunk, fails);
     with_regex(pat, |re| match re {
@@ -430,7 +491,7 @@ fn regexp_column(args: &[Expr], chunk: &Chunk, fails: &mut u64) -> Column {
 }
 
 #[cfg(not(feature = "regex"))]
-fn regexp_column(_args: &[Expr], chunk: &Chunk, _fails: &mut u64) -> Column {
+fn regexp_column(_args: &[Expr], chunk: &Chunk, _fails: &mut EvalFails) -> Column {
     Column::bool(vec![false; chunk.len])
 }
 
@@ -652,7 +713,7 @@ fn is_temporal(ty: DataType) -> bool {
 /// Cast a value to a target lane. `fails` counts a **non-null string** that
 /// fails to parse into a temporal lane (→ `null`, continue-first); the operator
 /// surfaces the total (never-silent, BUG-D §23.6).
-fn cast_value(v: Value, ty: DataType, fails: &mut u64) -> Value {
+fn cast_value(v: Value, ty: DataType, fails: &mut EvalFails) -> Value {
     // Source-aware temporal parse: a *string* cast to datetime/date/time is
     // parsed (auto formats), not reinterpreted as ticks. A null stays null
     // (not a failure); a non-null string that won't parse → null + counted.
@@ -663,7 +724,7 @@ fn cast_value(v: Value, ty: DataType, fails: &mut u64) -> Value {
                 return match parse_temporal_str(s, ty) {
                     Some(val) => val,
                     None => {
-                        *fails += 1;
+                        fails.casts += 1;
                         Value::Null
                     }
                 };
@@ -691,21 +752,21 @@ fn cast_value(v: Value, ty: DataType, fails: &mut u64) -> Value {
                     {
                         Ok(x) => Value::I64(x),
                         Err(_) => {
-                            *fails += 1;
+                            fails.casts += 1;
                             Value::Null
                         }
                     },
                     DataType::F64 => match t.parse::<f64>() {
                         Ok(x) => Value::F64(x),
                         Err(_) => {
-                            *fails += 1;
+                            fails.casts += 1;
                             Value::Null
                         }
                     },
                     DataType::Decimal { scale } => match t.parse::<f64>() {
                         Ok(x) => Value::Dec(f64_to_decimal(x, scale)),
                         Err(_) => {
-                            *fails += 1;
+                            fails.casts += 1;
                             Value::Null
                         }
                     },
@@ -805,7 +866,7 @@ fn cast_str_column_temporal(
     col: &Column,
     n: usize,
     ty: DataType,
-    fails: &mut u64,
+    fails: &mut EvalFails,
 ) -> Column {
     let mut bits = Vec::with_capacity(n);
     macro_rules! parse_lane {
@@ -821,7 +882,7 @@ fn cast_str_column_temporal(
                 } else {
                     out.push($push_default);
                     bits.push(false);
-                    *fails += 1;
+                    fails.casts += 1;
                 }
             }
             Column::new($wrap(out), Validity::from_bits(&bits))
@@ -856,7 +917,7 @@ fn cast_str_column_temporal(
 /// Cast a whole column to a target lane (columnar path for computed columns).
 /// `fails` counts non-null string cells that fail a temporal parse (→ `null`,
 /// continue-first); the operator surfaces the total (never-silent, BUG-D §23.6).
-pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column {
+pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut EvalFails) -> Column {
     // Identity fast-path: a column already in the exact target lane (dtype
     // carries scale/unit, so this is precise) needs no work — returning it
     // verbatim is byte-identical and skips the per-cell `Value` round-trip that
@@ -911,7 +972,7 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
                                 valid.push(true);
                             }
                             Some(Err(_)) => {
-                                *fails += 1;
+                                fails.casts += 1;
                                 out.push(0);
                                 valid.push(false);
                             }
@@ -932,7 +993,7 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
                                 valid.push(true);
                             }
                             Some(Err(_)) => {
-                                *fails += 1;
+                                fails.casts += 1;
                                 out.push(0.0);
                                 valid.push(false);
                             }
@@ -953,7 +1014,7 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
                                 valid.push(true);
                             }
                             Some(Err(_)) => {
-                                *fails += 1;
+                                fails.casts += 1;
                                 unscaled.push(0);
                                 valid.push(false);
                             }
@@ -1057,7 +1118,7 @@ pub(crate) fn cast_column(col: Column, ty: DataType, fails: &mut u64) -> Column 
 /// rows (the columnar path used by computed-column projection). A `Field` is the
 /// underlying column; a `Literal` is a constant column; arithmetic combines
 /// numeric lanes; boolean-valued expressions become a `Bool` column.
-pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
+pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut EvalFails) -> Column {
     match expr {
         // `source.<field>` (Access::Source) → provenance, not a data column.
         Expr::Field {
@@ -1087,7 +1148,7 @@ pub fn eval_column(expr: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
         Expr::FieldAt(i) => match chunk.columns.get(*i as usize) {
             Some(c) => c.clone(),
             None => {
-                *fails += chunk.len as u64;
+                fails.casts += chunk.len as u64;
                 const_column(&Value::Null, chunk.len)
             }
         },
@@ -1546,7 +1607,13 @@ fn temporal_op(l: &Value, op: ArithOp, r: &Value) -> Option<Value> {
     }
 }
 
-fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, fails: &mut u64) -> Column {
+fn eval_arith(
+    left: &Expr,
+    op: ArithOp,
+    right: &Expr,
+    chunk: &Chunk,
+    fails: &mut EvalFails,
+) -> Column {
     let lc = eval_column(left, chunk, fails);
     let rc = eval_column(right, chunk, fails);
     let n = chunk.len;
@@ -1640,7 +1707,7 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, fails: &mut
     let mut bits: Vec<bool> = (0..n).map(|i| !out_validity.is_null(i)).collect();
     for &i in &div0 {
         if bits[i] {
-            *fails += 1;
+            fails.casts += 1;
             bits[i] = false;
         }
     }
@@ -1649,13 +1716,13 @@ fn eval_arith(left: &Expr, op: ArithOp, right: &Expr, chunk: &Chunk, fails: &mut
 
 /// Evaluate a predicate expression for a single row.
 pub fn eval_predicate(expr: &Expr, chunk: &Chunk, row: usize) -> bool {
-    let mut fails = 0;
+    let mut fails = EvalFails::default();
     eval_predicate_acc(expr, chunk, row, &mut fails)
 }
 
 /// Predicate eval that accumulates cast failures (`fails`) so the operator can
 /// surface them (never-silent, BUG-D §23.6). Mirrors [`eval_predicate`].
-pub fn eval_predicate_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> bool {
+pub fn eval_predicate_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut EvalFails) -> bool {
     match expr {
         Expr::Compare { left, op, right } => compare_fast(left, *op, right, chunk, row, fails),
         Expr::And(a, b) => {
@@ -1669,9 +1736,9 @@ pub fn eval_predicate_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u6
 }
 
 /// Row eval that accumulates cast failures (`fails`): a `Str` cast to a temporal
-/// lane that won't parse → `null` (continue-first) and `*fails += 1`, so the
+/// lane that won't parse → `null` (continue-first) and `fails.casts += 1`, so the
 /// operator can surface the count (never-silent, BUG-D §23.6). Mirrors [`eval`].
-pub fn eval_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> Value {
+pub fn eval_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut EvalFails) -> Value {
     match expr {
         Expr::Literal(v) => v.clone(),
         // An unbound `$x` hole should have been bound before execution; if one
@@ -1689,7 +1756,7 @@ pub fn eval_acc(expr: &Expr, chunk: &Chunk, row: usize, fails: &mut u64) -> Valu
         Expr::FieldAt(i) => match chunk.columns.get(*i as usize) {
             Some(c) => c.value_at(row),
             None => {
-                *fails += 1;
+                fails.casts += 1;
                 Value::Null
             }
         },
@@ -1741,7 +1808,7 @@ fn arith_value(
     right: &Expr,
     chunk: &Chunk,
     row: usize,
-    fails: &mut u64,
+    fails: &mut EvalFails,
 ) -> Value {
     let lv = eval_acc(left, chunk, row, fails);
     let rv = eval_acc(right, chunk, row, fails);
@@ -1814,7 +1881,7 @@ fn eval_subview(
     end: u32,
     chunk: &Chunk,
     row: usize,
-    fails: &mut u64,
+    fails: &mut EvalFails,
 ) -> Value {
     let Some(col) = chunk.column(base) else {
         return Value::Null; // base column absent → continue-first null
@@ -1831,7 +1898,7 @@ fn eval_subview(
     let (s, e) = (start as usize, end as usize);
     let char_count = cell.chars().count();
     if s > e || e > char_count {
-        *fails += 1;
+        fails.casts += 1;
         return Value::Null;
     }
     // Byte offset of the k-th character boundary (k == char_count → end of cell).
@@ -1850,7 +1917,7 @@ fn eval_subview(
 pub(crate) fn resolve_key_indices(
     chunk: &mut Chunk,
     keys: &[PathExpr],
-    fails: &mut u64,
+    fails: &mut EvalFails,
 ) -> Vec<Option<usize>> {
     keys.iter()
         .map(|k| match k.as_bare() {
@@ -1870,22 +1937,22 @@ pub(crate) fn resolve_key_indices(
 /// Multiple matches at the shallowest depth are **ambiguous**: counted (warn,
 /// never-silent) and resolved to the first in column/child order (deterministic).
 /// No field named `name` anywhere → counted null (continue-first).
-fn eval_deep(name: &str, chunk: &Chunk, row: usize, fails: &mut u64) -> Value {
+fn eval_deep(name: &str, chunk: &Chunk, row: usize, fails: &mut EvalFails) -> Value {
     match find_deep_path(&chunk.schema, name) {
         Some((root, segs, ambiguous)) => {
             if ambiguous {
-                *fails += 1; // multiple shallowest matches — never-silent
+                fails.casts += 1; // multiple shallowest matches — never-silent
             }
             match chunk.column(&root) {
                 Some(col) => resolve_in_column(col, row, &segs, fails),
                 None => {
-                    *fails += 1;
+                    fails.casts += 1;
                     Value::Null
                 }
             }
         }
         None => {
-            *fails += 1; // no field named `name` in the (nested) schema
+            fails.casts += 1; // no field named `name` in the (nested) schema
             Value::Null
         }
     }
@@ -1932,18 +1999,18 @@ fn find_deep_path(schema: &Schema, name: &str) -> Option<(String, Vec<PathSeg>, 
 /// missing field, an out-of-range index, or a type mismatch (`.field` on a
 /// non-struct, `[i]` on a non-list) is a never-silent failure — counted in
 /// `fails`, continue-first null.
-fn eval_path(p: &PathExpr, chunk: &Chunk, row: usize, fails: &mut u64) -> Value {
+fn eval_path(p: &PathExpr, chunk: &Chunk, row: usize, fails: &mut EvalFails) -> Value {
     match chunk.column(&p.root) {
         Some(col) => resolve_in_column(col, row, &p.segs, fails),
         None => {
-            *fails += 1; // missing root column → never-silent null
+            fails.casts += 1; // missing root column → never-silent null
             Value::Null
         }
     }
 }
 
 /// Walk `segs` into `col` at `row` (see [`eval_path`]).
-fn resolve_in_column(col: &Column, row: usize, segs: &[PathSeg], fails: &mut u64) -> Value {
+fn resolve_in_column(col: &Column, row: usize, segs: &[PathSeg], fails: &mut EvalFails) -> Value {
     // A null cell at this level → null (a valid §26 null, not a failure).
     if col.is_null(row) {
         return Value::Null;
@@ -1956,7 +2023,7 @@ fn resolve_in_column(col: &Column, row: usize, segs: &[PathSeg], fails: &mut u64
             match s.names.iter().position(|n| n == name) {
                 Some(ci) => resolve_in_column(&s.columns[ci], row, rest, fails),
                 None => {
-                    *fails += 1; // missing struct field
+                    fails.casts += 1; // missing struct field
                     Value::Null
                 }
             }
@@ -1968,13 +2035,13 @@ fn resolve_in_column(col: &Column, row: usize, segs: &[PathSeg], fails: &mut u64
                 // The child row for element `i` is its flattened offset.
                 resolve_in_column(&l.child, idx, rest, fails)
             } else {
-                *fails += 1; // index out of range
+                fails.casts += 1; // index out of range
                 Value::Null
             }
         }
         // Type mismatch: `.field` on a non-struct, or `[i]` on a non-list.
         _ => {
-            *fails += 1;
+            fails.casts += 1;
             Value::Null
         }
     }
@@ -2038,7 +2105,7 @@ fn compare_fast(
     right: &Expr,
     chunk: &Chunk,
     row: usize,
-    fails: &mut u64,
+    fails: &mut EvalFails,
 ) -> bool {
     // Null model (design 26 §26.2a): a comparison with a `null` operand is
     // **false** (a null is neither equal to nor ordered against anything). This
@@ -2061,10 +2128,83 @@ fn compare_fast(
     if let (Some(a), Some(b)) = (as_num(left, chunk, row), as_num(right, chunk, row)) {
         return cmp_ord(a.partial_cmp(&b), op);
     }
+    // S1 — text vs number: parse the text cell, the same rule `cast` and the
+    // reader's prefilter already use. Reached only when the pair is NOT
+    // text-vs-text (the string fast path above took that) and not both numeric,
+    // i.e. exactly the mixed shape that used to answer a silent `false` for
+    // every row of a string-inferred column. A cell that will not parse still
+    // compares false (continue-first) but is counted per column and surfaced by
+    // the operator on finish (never-silent).
+    if let Some(b) = compare_text_vs_number(left, op, right, chunk, row, fails) {
+        return b;
+    }
     // General fallback for mixed / null operands: owned-Value comparison.
     let l = eval_acc(left, chunk, row, fails);
     let r = eval_acc(right, chunk, row, fails);
     compare(&l, op, &r)
+}
+
+/// S1 — one side is text, the other a number: parse the text and compare
+/// numerically.
+///
+/// Why this exists: type inference widens a column to `Str` as soon as ONE cell
+/// is unparseable (`N/A` in a numeric column). Before this, `col > 100` on such
+/// a column produced `false` for **every** row — including the 999,999 rows
+/// that hold perfectly good numbers — and said nothing. That is a quiet wrong
+/// answer, which the never-silent law forbids; the same flow with a declared
+/// schema `(col:int)` has always worked and reported its parse failures.
+///
+/// Rules (spec: #240 issuecomment-5083011529):
+/// * text-vs-text never reaches here (the string fast path handles it), so
+///   genuine text columns keep their lexicographic `Eq`/`Ne`/ordering.
+/// * a cell that parses → numeric comparison.
+/// * a cell that does not parse → `false` (continue-first, unchanged) **and**
+///   one count against its column name, surfaced once on finish.
+/// * `None` when neither side is text-vs-number, so the caller falls through.
+///
+/// The parse is `str::parse::<f64>` — the same acceptance `cast` uses for the
+/// numeric lanes, so a value compares the same way whether it was declared at
+/// the source or coerced here.
+fn compare_text_vs_number(
+    left: &Expr,
+    op: CmpOp,
+    right: &Expr,
+    chunk: &Chunk,
+    row: usize,
+    fails: &mut EvalFails,
+) -> Option<bool> {
+    // Which side is borrowed text, and which is a number?
+    let (text, text_expr, num) = match (as_str(left, chunk, row), as_num(right, chunk, row)) {
+        (Some(t), Some(n)) => (t, left, n),
+        _ => match (as_num(left, chunk, row), as_str(right, chunk, row)) {
+            // `literal OP text_column` — flip so the text is always on the left.
+            (Some(n), Some(t)) => (t, right, n),
+            _ => return None,
+        },
+    };
+    match text.trim().parse::<f64>() {
+        Ok(v) => {
+            // Keep operand order: the text side was `left` iff `text_expr` is `left`.
+            let ord = if std::ptr::eq(text_expr, left) {
+                v.partial_cmp(&num)
+            } else {
+                num.partial_cmp(&v)
+            };
+            Some(cmp_ord(ord, op))
+        }
+        Err(_) => {
+            // An empty cell is "missing", not a failure (same rule as the
+            // reader's parse counting) — it just compares false.
+            if !text.trim().is_empty() {
+                if let Expr::Field { name, access } = text_expr {
+                    if access.is_column() {
+                        fails.note_numeric_text(name);
+                    }
+                }
+            }
+            Some(false)
+        }
+    }
 }
 
 /// `decimal_column OP numeric_literal` (either operand order) → exact `i128`
@@ -2122,6 +2262,12 @@ fn as_str<'a>(e: &'a Expr, chunk: &'a Chunk, row: usize) -> Option<&'a str> {
         // A `source.<field>` accessor is not a column borrow → general path.
         Expr::Field { name, access } if access.is_column() => match chunk.column(name)?.data() {
             ColumnData::Str(s) => Some(s.get(row)),
+            // The dictionary lane IS the Str lane (design/42 §2 observational
+            // equivalence): borrowing id→bytes here keeps a dict-encoded column
+            // on exactly the same comparison path as a plain one. Without this
+            // arm the two lanes would diverge the moment the path below them
+            // changes — as it does for S1's text-vs-number rule.
+            ColumnData::StrDict(d) => Some(d.get(row)),
             _ => None,
         },
         _ => None,
@@ -2234,17 +2380,38 @@ fn compare(l: &Value, op: CmpOp, r: &Value) -> bool {
         (Value::Str(a), Value::Str(b)) => a.partial_cmp(b),
         _ => match (l.as_f64(), r.as_f64()) {
             (Some(a), Some(b)) => a.partial_cmp(&b),
-            _ => {
-                // Fall back to equality semantics for mixed/null operands.
-                return match op {
-                    CmpOp::Eq => l == r,
-                    CmpOp::Ne => l != r,
-                    _ => false,
-                };
-            }
+            // S1 — text vs number: parse the text, the same rule the borrowed
+            // fast path uses (`compare_text_vs_number`). This arm catches the
+            // operands that never reach a column fast path — an expression
+            // result, a nested field, a `source.` accessor — so a value
+            // compares the same way however it was produced. Text-vs-text is
+            // already handled above, so genuine string ordering is untouched.
+            // Counting happens in the fast path, which knows the column name;
+            // here we only keep the semantics consistent.
+            _ => match (str_as_num(l), str_as_num(r)) {
+                (Some(a), Some(b)) => a.partial_cmp(&b),
+                _ => {
+                    // Fall back to equality semantics for mixed/null operands.
+                    return match op {
+                        CmpOp::Eq => l == r,
+                        CmpOp::Ne => l != r,
+                        _ => false,
+                    };
+                }
+            },
         },
     };
     cmp_ord(ord, op)
+}
+
+/// A numeric view of a value for a *mixed* comparison: numbers as themselves,
+/// text parsed with the cast rule. Returns `None` for text that is not a
+/// number, so the caller keeps the equality-only fallback.
+fn str_as_num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Str(s) => s.trim().parse::<f64>().ok(),
+        _ => v.as_f64(),
+    }
 }
 
 #[cfg(test)]

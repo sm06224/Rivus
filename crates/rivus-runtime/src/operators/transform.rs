@@ -10,27 +10,60 @@ use super::*;
 pub(crate) struct Filter {
     pub(crate) pred: Expr,
     /// Cast failures inside the predicate (BUG-D §23.6) — surfaced once on finish.
-    pub(crate) cast_fails: u64,
+    pub(crate) cast_fails: eval::EvalFails,
 }
 
-/// Surface predicate cast failures once on finish (never-silent, BUG-D §23.6):
-/// a `Str` cast inside a `|?` predicate that won't parse → null (so the row's
-/// comparison is false), counted and reported with the predicate for context.
+/// Surface what a predicate lost, once on finish (never-silent). Two separate
+/// reports because they are two different failures:
+///
+/// * cast failures (BUG-D §23.6) — a `Str` cast inside a `|?` predicate that
+///   won't parse → null, so the row's comparison is false.
+/// * **non-numeric text in a numeric comparison (S1)** — a text cell that could
+///   not be ordered against a number. Reported with the column name and count,
+///   because the alternative (answering `false` for every row of a
+///   string-inferred column and saying nothing) is a quiet wrong answer.
+///
 /// Per-worker partials sum to the serial total in parallel (cf. `parse_failures`).
-fn surface_pred_cast_fails(n: u64, preds: &[&Expr], ctx: &mut OpCtx) {
-    if n > 0 {
-        let txt = preds
+fn surface_pred_cast_fails(f: &eval::EvalFails, preds: &[&Expr], ctx: &mut OpCtx) {
+    let txt = || {
+        preds
             .iter()
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", ")
+    };
+    if f.casts > 0 {
+        let (n, t) = (f.casts, txt());
         ctx.raise(
             ErrorEvent::new(
                 Severity::Recoverable,
                 ErrorScope::Item,
                 format!(
-                    "{n} value(s) failed to evaluate in `|? {txt}` (unparseable cast or \
+                    "{n} value(s) failed to evaluate in `|? {t}` (unparseable cast or \
                      division by zero); set to null"
+                ),
+            )
+            .at_node(ctx.label.clone()),
+        );
+    }
+    surface_numeric_text_fails(f, ctx);
+}
+
+/// The S1 report: text cells that took part in a numeric comparison and could
+/// not be parsed as a number. Shared by every operator that evaluates
+/// predicates, so the wording is identical wherever it surfaces.
+pub(crate) fn surface_numeric_text_fails(f: &eval::EvalFails, ctx: &mut OpCtx) {
+    let n = f.numeric_text_total();
+    if n > 0 {
+        let detail = f.numeric_text_detail();
+        ctx.raise(
+            ErrorEvent::new(
+                Severity::Recoverable,
+                ErrorScope::Item,
+                format!(
+                    "{n} cell(s) could not be compared numerically ({detail}); \
+                     the comparison is false for those rows — declare the column's \
+                     type at the source (e.g. `(col:int)`) to parse and count them there"
                 ),
             )
             .at_node(ctx.label.clone()),
@@ -44,11 +77,11 @@ impl Operator for Filter {
         let keep = match kernel::compile(&[&self.pred], &chunk) {
             Some(plan) => kernel::run(&plan, &chunk),
             None => {
-                let mut f = 0u64;
+                let mut f = eval::EvalFails::default();
                 let keep: Vec<usize> = (0..chunk.len)
                     .filter(|&row| eval::eval_predicate_acc(&self.pred, &chunk, row, &mut f))
                     .collect();
-                self.cast_fails += f;
+                self.cast_fails += &f;
                 keep
             }
         };
@@ -62,7 +95,7 @@ impl Operator for Filter {
     }
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
-        surface_pred_cast_fails(self.cast_fails, &[&self.pred], ctx);
+        surface_pred_cast_fails(&self.cast_fails, &[&self.pred], ctx);
         Vec::new()
     }
 }
@@ -80,11 +113,11 @@ pub(crate) struct Validate {
     pub(crate) fails: u64,
     pub(crate) sample: Option<String>,
     /// Cast failures inside the predicate (BUG-D §23.6) — surfaced once on finish.
-    pub(crate) cast_fails: u64,
+    pub(crate) cast_fails: eval::EvalFails,
 }
 
 impl Validate {
-    fn passing(&self, chunk: &Chunk, cast_fails: &mut u64) -> Vec<usize> {
+    fn passing(&self, chunk: &Chunk, cast_fails: &mut eval::EvalFails) -> Vec<usize> {
         match kernel::compile(&[&self.pred], chunk) {
             Some(plan) => kernel::run(&plan, chunk),
             None => (0..chunk.len)
@@ -109,9 +142,9 @@ impl Validate {
 
 impl Operator for Validate {
     fn process(&mut self, _from: NodeId, chunk: Chunk, ctx: &mut OpCtx) -> Vec<Chunk> {
-        let mut cf = 0u64;
+        let mut cf = eval::EvalFails::default();
         let keep = self.passing(&chunk, &mut cf);
-        self.cast_fails += cf;
+        self.cast_fails += &cf;
         let n_fail = chunk.len - keep.len();
         if n_fail == 0 {
             return vec![chunk];
@@ -164,7 +197,7 @@ impl Operator for Validate {
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
         // A cast inside the predicate that failed to parse (BUG-D §23.6) is
         // surfaced too — separately from the validation summary.
-        surface_pred_cast_fails(self.cast_fails, &[&self.pred], ctx);
+        surface_pred_cast_fails(&self.cast_fails, &[&self.pred], ctx);
         // warn/reject surface one Recoverable summary on exhaustion (never silent;
         // halt already raised its fatal). The count is chunk-size independent.
         if self.fails > 0 && !matches!(self.disposition, Disposition::Halt) {
@@ -462,7 +495,7 @@ impl Operator for Sort {
         let base = cols.len();
         let mut work = Chunk::new(0, schema.clone(), cols);
         let paths: Vec<PathExpr> = self.keys.iter().map(|(k, _)| k.clone()).collect();
-        let mut nested_fails = 0u64;
+        let mut nested_fails = eval::EvalFails::default();
         let resolved = eval::resolve_key_indices(&mut work, &paths, &mut nested_fails);
         let mut key_cols: Vec<(usize, bool)> = Vec::with_capacity(self.keys.len());
         for ((k, desc), idx) in self.keys.iter().zip(&resolved) {
@@ -517,7 +550,7 @@ impl Operator for Sort {
             .iter()
             .map(|c| c.gather(&idx))
             .collect();
-        super::surface_key_path_fails(nested_fails, "sort", ctx);
+        super::surface_key_path_fails(nested_fails.casts, "sort", ctx);
         vec![Chunk::new(ctx.fresh_id(), schema, sorted)]
     }
 }
@@ -580,12 +613,12 @@ impl Operator for Distinct {
         let idxs: Vec<usize> = if self.keys.is_empty() {
             (0..base).collect()
         } else {
-            let mut nested_fails = 0u64;
+            let mut nested_fails = eval::EvalFails::default();
             let r = eval::resolve_key_indices(&mut chunk, &self.keys, &mut nested_fails)
                 .into_iter()
                 .flatten()
                 .collect();
-            self.key_fails += nested_fails;
+            self.key_fails += nested_fails.casts;
             r
         };
 
@@ -1524,11 +1557,11 @@ impl Operator for Cast {
         for (name, ty) in &self.casts {
             match chunk.schema.index_of(name) {
                 Some(i) => {
-                    let mut f = 0u64;
+                    let mut f = eval::EvalFails::default();
                     let col = slots[i].take().expect("slot is always refilled");
                     slots[i] = Some(eval::cast_column(col, *ty, &mut f));
-                    if f > 0 {
-                        self.fails.entry(name.clone()).or_insert((*ty, 0)).1 += f;
+                    if f.casts > 0 {
+                        self.fails.entry(name.clone()).or_insert((*ty, 0)).1 += f.casts;
                     }
                     fields[i] = Field::new(name.clone(), *ty);
                     changed = true;
@@ -1638,13 +1671,13 @@ impl Operator for ProjectExpr {
                     );
                 }
             }
-            let mut f = 0u64;
+            let mut f = eval::EvalFails::default();
             let col = eval::eval_column(expr, &chunk, &mut f);
-            if f > 0 {
+            if f.casts > 0 {
                 self.fails
                     .entry(alias.clone())
                     .or_insert((col.dtype(), 0))
-                    .1 += f;
+                    .1 += f.casts;
             }
             fields.push(Field::new(alias.clone(), col.dtype()));
             cols.push(col);
@@ -1698,7 +1731,7 @@ pub(crate) struct FilterProject {
     pub(crate) preds: Vec<Expr>,
     pub(crate) fields: Option<Vec<String>>,
     /// Cast failures inside the predicates (BUG-D §23.6) — surfaced once on finish.
-    pub(crate) cast_fails: u64,
+    pub(crate) cast_fails: eval::EvalFails,
 }
 
 impl Operator for FilterProject {
@@ -1709,7 +1742,7 @@ impl Operator for FilterProject {
         let keep = match kernel::compile(&pred_refs, &chunk) {
             Some(plan) => kernel::run(&plan, &chunk),
             None => {
-                let mut f = 0u64;
+                let mut f = eval::EvalFails::default();
                 let keep: Vec<usize> = (0..chunk.len)
                     .filter(|&row| {
                         self.preds
@@ -1717,7 +1750,7 @@ impl Operator for FilterProject {
                             .all(|p| eval::eval_predicate_acc(p, &chunk, row, &mut f))
                     })
                     .collect();
-                self.cast_fails += f;
+                self.cast_fails += &f;
                 keep
             }
         };
@@ -1769,7 +1802,7 @@ impl Operator for FilterProject {
 
     fn finish(&mut self, ctx: &mut OpCtx) -> Vec<Chunk> {
         let refs: Vec<&Expr> = self.preds.iter().collect();
-        surface_pred_cast_fails(self.cast_fails, &refs, ctx);
+        surface_pred_cast_fails(&self.cast_fails, &refs, ctx);
         Vec::new()
     }
 }

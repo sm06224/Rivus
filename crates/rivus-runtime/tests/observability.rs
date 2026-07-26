@@ -1503,3 +1503,156 @@ fn dict_escape_chunks_mix_with_id_loop_and_match_serial() {
         );
     }
 }
+
+// ------------------------------------------------------- S1: never-silent numeric compare
+
+/// S1 (a) — the reported repro: ONE unparseable cell must not silently zero out
+/// a numeric predicate.
+///
+/// Before the fix, a single `N/A` widened the column to the Str lane, every
+/// `a > 100` answered `false` (mixed operands fell through to equality-only
+/// semantics), and the error stream said **nothing** — 0 rows out, no report.
+/// That is the quiet wrong answer the never-silent law forbids, and it hit the
+/// most ordinary usage there is: an inferred column.
+#[test]
+fn numeric_compare_on_inferred_text_column_is_not_silent() {
+    // Control: with no dirty cell the column infers numeric and 2 rows pass.
+    let clean = TempCsv(gendata::write_temp("s1_clean", "a\n150\n50\n200\n"));
+    let res = run_src(
+        &format!("C:\n open {}\n |? a > 100\n;", clean.0.display()),
+        4096,
+    );
+    assert_eq!(res.total_rows_out(), 2, "control: 150 and 200 pass");
+
+    // The repro: one `N/A` among the numbers.
+    let dirty = TempCsv(gendata::write_temp("s1_dirty", "a\n150\n50\nN/A\n200\n"));
+    for cs in [1usize, 2, 4096] {
+        let res = run_src(
+            &format!("D:\n open {}\n |? a > 100\n;", dirty.0.display()),
+            cs,
+        );
+        assert_eq!(
+            res.total_rows_out(),
+            2,
+            "@cs={cs}: the good numbers must still compare (150, 200)"
+        );
+        let msg = res
+            .errors
+            .iter()
+            .find(|e| e.message.contains("could not be compared numerically"))
+            .unwrap_or_else(|| {
+                panic!("@cs={cs}: the uncomparable cell must be surfaced, not swallowed")
+            })
+            .message
+            .clone();
+        assert!(
+            msg.contains("1 cell(s)") && msg.contains("'a'"),
+            "@cs={cs}: the report names the count and the column: {msg}"
+        );
+    }
+}
+
+/// S1 (c) — a genuine text column keeps text semantics. The fix must only reach
+/// the *mixed* text-vs-number shape; text-vs-text ordering and `Eq`/`Ne` are
+/// untouched, including for values that happen to look numeric.
+#[test]
+fn text_column_comparisons_are_unchanged() {
+    let csv = TempCsv(gendata::write_temp(
+        "s1_text",
+        "k,n\nalpha,1\nbeta,2\n0010,3\n10,4\n",
+    ));
+    let p = csv.0.display();
+
+    // Equality against text: exact string match, so "0010" != "10".
+    let r = run_src(&format!("A:\n open {p}\n |? k == \"10\"\n;"), 4096);
+    assert_eq!(r.total_rows_out(), 1, "text Eq matches one row exactly");
+    let r = run_src(&format!("A:\n open {p}\n |? k != \"10\"\n;"), 4096);
+    assert_eq!(r.total_rows_out(), 3, "text Ne is the complement");
+
+    // Ordering against text stays lexicographic ("0010" < "10" < "alpha").
+    let r = run_src(&format!("A:\n open {p}\n |? k < \"beta\"\n;"), 4096);
+    assert_eq!(r.total_rows_out(), 3, "lexicographic order, not numeric");
+
+    // None of these are numeric comparisons, so nothing is reported.
+    assert!(
+        !r.errors
+            .iter()
+            .any(|e| e.message.contains("could not be compared numerically")),
+        "text-vs-text must not report numeric-comparison failures"
+    );
+}
+
+/// S1 (b) — the shape the verification campaign had to mark "invalid": an ETL
+/// chain whose filter column carries a dirty cell. It used to emit zero rows
+/// (so a serial/parallel byte comparison was vacuously "equal"); now it emits
+/// the real rows AND stays byte-identical across chunk sizes.
+#[test]
+fn dirty_filter_etl_is_non_vacuous_and_chunk_size_independent() {
+    let mut body = String::from("sym,price\n");
+    for i in 0..300 {
+        // Every 97th cell is unparseable — the inference-widening trigger.
+        if i % 97 == 0 {
+            body.push_str(&format!("s{i},N/A\n"));
+        } else {
+            body.push_str(&format!("s{i},{}\n", i));
+        }
+    }
+    let csv = TempCsv(gendata::write_temp("s1_etl", &body));
+    let p = csv.0.display();
+    let src = format!("E:\n open {p}\n |? price > 100\n |> sym price\n;");
+
+    let mut seen: Option<u64> = None;
+    for cs in [1usize, 7, 512, 4096] {
+        let res = run_src(&src, cs);
+        let n = res.total_rows_out();
+        assert!(n > 0, "@cs={cs}: the cell must not be vacuous (0 rows out)");
+        match seen {
+            None => seen = Some(n),
+            Some(prev) => assert_eq!(prev, n, "@cs={cs}: chunk-size independent"),
+        }
+        // 101..=299 minus the unparseable ones at 194 and 291.
+        assert_eq!(
+            n, 197,
+            "@cs={cs}: exactly the rows whose price parses and exceeds 100"
+        );
+    }
+}
+
+/// S1 (d) — prefilter integrity. The reader-side prefilter only compiles for a
+/// declared/inferred NUMERIC lane and only skips a row whose cell parses and is
+/// definitely false, so it can never hide a row the fixed comparison would keep.
+/// Declaring the column moves the accounting to the reader (parse failures are
+/// counted there, as they always were) and the row count agrees with the
+/// inferred-lane run.
+#[test]
+fn declared_and_inferred_lanes_agree_after_the_fix() {
+    let csv = TempCsv(gendata::write_temp(
+        "s1_prefilter",
+        "a\n150\n50\nN/A\n200\n",
+    ));
+    let p = csv.0.display();
+
+    let inferred = run_src(&format!("I:\n open {p}\n |? a > 100\n;"), 4096);
+    let declared = run_src(&format!("D:\n open {p} (a:int)\n |? a > 100\n;"), 4096);
+    assert_eq!(
+        inferred.total_rows_out(),
+        declared.total_rows_out(),
+        "an inferred column now answers the same question as a declared one"
+    );
+
+    // Each path reports the lost cell exactly once, in its own vocabulary.
+    assert!(
+        inferred
+            .errors
+            .iter()
+            .any(|e| e.message.contains("could not be compared numerically")),
+        "inferred lane: the comparison reports it"
+    );
+    assert!(
+        declared
+            .errors
+            .iter()
+            .any(|e| e.message.contains("could not be parsed")),
+        "declared lane: the reader reports it (unchanged behaviour)"
+    );
+}

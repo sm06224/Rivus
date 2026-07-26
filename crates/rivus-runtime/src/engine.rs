@@ -4092,128 +4092,130 @@ fn fused_feed_chunk(
     }
     let mut gcache: Vec<u32> = vec![0; cache_len];
 
-    let mut predf = 0u64;
-    let mut row = |li: usize, pre_passed: bool, predf: &mut u64, sc: &mut FusedScratch| {
-        let matched = match jctx {
-            // Join-less feed: no probe. `matched = None` + `keeps_left`
-            // (always true here) emits the row exactly once below.
-            None => None,
-            Some((_, table)) => match jdict {
-                // A null key matches nothing — the same branch `fill_join_key`
-                // takes (its bytes are never built for a null part).
-                Some((jci, _)) if ch.columns[jci].is_null(li) => None,
-                Some((_, jd)) => {
-                    let code = jd.codes[li] as usize;
-                    match jmemo[code] {
-                        Some(m) => m,
-                        None => {
-                            sc.keybuf.clear();
-                            let m = if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
-                                table.get(sc.keybuf.as_str())
-                            } else {
-                                None
-                            };
-                            jmemo[code] = Some(m);
-                            m
-                        }
-                    }
-                }
-                None => {
-                    sc.keybuf.clear();
-                    if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
-                        table.get(sc.keybuf.as_str())
-                    } else {
-                        None
-                    }
-                }
-            },
-        };
-        // Left-only predicates: one evaluation per left row covers every
-        // match (the joined row's left cells are this row's cells). The
-        // eligibility gate excludes cast-capable predicate shapes, so the
-        // fail counter provably stays 0 (asserted in debug).
-        let passes = |predf: &mut u64| {
-            pre_passed
-                || plan
-                    .preds
-                    .iter()
-                    .all(|p| crate::eval::eval_predicate_acc(p, ch, li, predf))
-        };
-        let mut emit =
-            |ri: Option<usize>, group: &mut operators::GroupBy, sc: &mut FusedScratch| {
-                *rows += 1;
-                // id fast path (design/42 stage c): the slot memoized for
-                // this (ri, codes…) tuple replays exactly what the string
-                // path below inserted for the identical composite key.
-                let mut memo_at: Option<usize> = None;
-                if !gcache.is_empty() {
-                    let mut idx = ri.map_or(right.len, |r_| r_);
-                    let mut ok = true;
-                    for &(ci, d) in &gdicts {
-                        if ch.columns[ci].is_null(li) {
-                            ok = false;
-                            break;
-                        }
-                        idx = idx * d.dict.len() + d.codes[li] as usize;
-                    }
-                    if ok {
-                        let slot = gcache[idx];
-                        if slot != 0 {
-                            sc.vals.clear();
-                            for cell in &plan.agg_cells {
-                                sc.vals.push(Some(fused_value(cell, ch, li, right, ri)));
+    let mut predf = crate::eval::EvalFails::default();
+    let mut row =
+        |li: usize, pre_passed: bool, predf: &mut crate::eval::EvalFails, sc: &mut FusedScratch| {
+            let matched = match jctx {
+                // Join-less feed: no probe. `matched = None` + `keeps_left`
+                // (always true here) emits the row exactly once below.
+                None => None,
+                Some((_, table)) => match jdict {
+                    // A null key matches nothing — the same branch `fill_join_key`
+                    // takes (its bytes are never built for a null part).
+                    Some((jci, _)) if ch.columns[jci].is_null(li) => None,
+                    Some((_, jd)) => {
+                        let code = jd.codes[li] as usize;
+                        match jmemo[code] {
+                            Some(m) => m,
+                            None => {
+                                sc.keybuf.clear();
+                                let m =
+                                    if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
+                                        table.get(sc.keybuf.as_str())
+                                    } else {
+                                        None
+                                    };
+                                jmemo[code] = Some(m);
+                                m
                             }
-                            group.observe_slot(slot - 1, &sc.vals);
-                            *id_rows += 1;
-                            return;
                         }
-                        memo_at = Some(idx);
                     }
-                }
-                sc.comp.clear();
-                // Right-only prefix: one precomputed memcpy instead of
-                // per-cell null checks + pushes (`FusedPlan::right_prefix`).
-                let mut j0 = 0usize;
-                if let Some((plen, frags)) = &plan.right_prefix {
-                    sc.comp
-                        .push_str(&frags[ri.map_or(frags.len() - 1, |r_| r_)]);
-                    j0 = *plen;
-                }
-                for (j, cell) in plan.key_cells.iter().enumerate().skip(j0) {
-                    if j > 0 {
-                        sc.comp.push('\u{1f}');
+                    None => {
+                        sc.keybuf.clear();
+                        if operators::fill_join_key(ch, &plan.lk, li, &mut sc.keybuf) {
+                            table.get(sc.keybuf.as_str())
+                        } else {
+                            None
+                        }
                     }
-                    fused_push_key(cell, ch, li, right, ri, &mut sc.comp);
-                }
-                sc.vals.clear();
-                for cell in &plan.agg_cells {
-                    sc.vals.push(Some(fused_value(cell, ch, li, right, ri)));
-                }
-                let parts = || {
-                    plan.key_cells
-                        .iter()
-                        .map(|c| fused_value(c, ch, li, right, ri).to_string())
-                        .collect::<Vec<String>>()
-                };
-                let slot = group.observe_row(&sc.comp, parts, &sc.vals);
-                if let Some(idx) = memo_at {
-                    gcache[idx] = slot + 1;
-                }
+                },
             };
-        match matched {
-            Some(rs) => {
-                if passes(predf) {
-                    for &ri in rs {
-                        emit(Some(ri), group, sc);
+            // Left-only predicates: one evaluation per left row covers every
+            // match (the joined row's left cells are this row's cells). The
+            // eligibility gate excludes cast-capable predicate shapes, so the
+            // fail counter provably stays 0 (asserted in debug).
+            let passes = |predf: &mut crate::eval::EvalFails| {
+                pre_passed
+                    || plan
+                        .preds
+                        .iter()
+                        .all(|p| crate::eval::eval_predicate_acc(p, ch, li, predf))
+            };
+            let mut emit =
+                |ri: Option<usize>, group: &mut operators::GroupBy, sc: &mut FusedScratch| {
+                    *rows += 1;
+                    // id fast path (design/42 stage c): the slot memoized for
+                    // this (ri, codes…) tuple replays exactly what the string
+                    // path below inserted for the identical composite key.
+                    let mut memo_at: Option<usize> = None;
+                    if !gcache.is_empty() {
+                        let mut idx = ri.map_or(right.len, |r_| r_);
+                        let mut ok = true;
+                        for &(ci, d) in &gdicts {
+                            if ch.columns[ci].is_null(li) {
+                                ok = false;
+                                break;
+                            }
+                            idx = idx * d.dict.len() + d.codes[li] as usize;
+                        }
+                        if ok {
+                            let slot = gcache[idx];
+                            if slot != 0 {
+                                sc.vals.clear();
+                                for cell in &plan.agg_cells {
+                                    sc.vals.push(Some(fused_value(cell, ch, li, right, ri)));
+                                }
+                                group.observe_slot(slot - 1, &sc.vals);
+                                *id_rows += 1;
+                                return;
+                            }
+                            memo_at = Some(idx);
+                        }
+                    }
+                    sc.comp.clear();
+                    // Right-only prefix: one precomputed memcpy instead of
+                    // per-cell null checks + pushes (`FusedPlan::right_prefix`).
+                    let mut j0 = 0usize;
+                    if let Some((plen, frags)) = &plan.right_prefix {
+                        sc.comp
+                            .push_str(&frags[ri.map_or(frags.len() - 1, |r_| r_)]);
+                        j0 = *plen;
+                    }
+                    for (j, cell) in plan.key_cells.iter().enumerate().skip(j0) {
+                        if j > 0 {
+                            sc.comp.push('\u{1f}');
+                        }
+                        fused_push_key(cell, ch, li, right, ri, &mut sc.comp);
+                    }
+                    sc.vals.clear();
+                    for cell in &plan.agg_cells {
+                        sc.vals.push(Some(fused_value(cell, ch, li, right, ri)));
+                    }
+                    let parts = || {
+                        plan.key_cells
+                            .iter()
+                            .map(|c| fused_value(c, ch, li, right, ri).to_string())
+                            .collect::<Vec<String>>()
+                    };
+                    let slot = group.observe_row(&sc.comp, parts, &sc.vals);
+                    if let Some(idx) = memo_at {
+                        gcache[idx] = slot + 1;
+                    }
+                };
+            match matched {
+                Some(rs) => {
+                    if passes(predf) {
+                        for &ri in rs {
+                            emit(Some(ri), group, sc);
+                        }
                     }
                 }
+                None if plan.keeps_left && passes(predf) => {
+                    emit(None, group, sc);
+                }
+                None => {}
             }
-            None if plan.keeps_left && passes(predf) => {
-                emit(None, group, sc);
-            }
-            None => {}
-        }
-    };
+        };
     match &sel {
         Some(keep) => {
             for &li in keep {
@@ -4226,7 +4228,10 @@ fn fused_feed_chunk(
             }
         }
     }
-    debug_assert_eq!(predf, 0, "eligibility excludes cast-capable predicates");
+    debug_assert!(
+        predf.is_empty(),
+        "eligibility excludes cast-capable predicates"
+    );
 }
 
 /// Per-worker fused-mode state (design/41 Stage A). `plan` resolves on the
@@ -5521,7 +5526,7 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
                 flat,
                 exprs,
             } => {
-                let mut eval_fails = 0u64;
+                let mut eval_fails = crate::eval::EvalFails::default();
                 let mut writer = crate::route::RouteWriter::new(*codec);
                 for chunk in chunks {
                     let groups = crate::route::group_by_path(
@@ -5555,7 +5560,7 @@ fn write_sink<'a>(op: &'a Op, chunks: &[Chunk]) -> Option<(&'a str, std::io::Res
                         list.join("; ")
                     )))
                 };
-                Some((template.as_str(), res, eval_fails))
+                Some((template.as_str(), res, eval_fails.casts))
             }
         },
         _ => None,
