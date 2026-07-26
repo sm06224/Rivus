@@ -1,18 +1,19 @@
 # セッション・ハンドオーバー（次セッションの担当者へ）
 
-最終更新: **2026-07-25**（#240 承認済みキュー全消化: design/42 全段（CSV+JSONL）・
-decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チェーン修正・#45 正準縮約木。
-過去の詳細は git 履歴の本ファイル参照）。
+最終更新: **2026-07-26**（#257〜#265 アーク完了時点。過去の詳細は git 履歴の
+本ファイル参照）。
 
-> **2026-07-25 追記**: その後 **#251**（`.claude/` 運用資産）と **#253**（9-PR アーク後の
-> 全体監査 hardening — 確定バグ 6 件封鎖・stress の env-race 実体化・重複一本化・
-> コメント/CHANGELOG/design 台帳/GUIDE の現実同期。監査の全結果と却下/延期リストは
-> PR #253 本文）が着地。**#252**（design/38 readbin 吸収 `open … as bin`・条件 8 点＋
-> codec×オプション整合検査）・**#254**（CLAUDE.md 乖離 3 点の改訂・指揮起案）・
-> **#255**（JSONL スキャナ SWAR/AVX2 — decode 中央値 −23%・wall floor −10%・
-> bit-identical）・**#256**（GUIDE 本文例の旧綴り正典一掃）も**すべて着地済み**。
-> **#257**（design/38 flip 本体 — 旧綴りエラー化・recognize-but-refuse）を提出済み・
-> 裁可待ち（着地順は #250 の後）。
+> **2026-07-26 のアーク（全着地済み）**: **#257** design/38 flip（旧綴り 16 サイトの
+> never-silent エラー化・recognize-but-refuse）／perf 3 連 = **#258**（JSONL scan_cell
+> 残差 μopt・group −10%/ETL −19%）・**#259**（fused を join-less read→group へ拡張・
+> plain group −26〜33%・dict 無しは負けるため runtime ガードつき）・**#260**（圧縮
+> ストリーム JSONL の block walk 化・gz group −16%）／**#261** lead 窓関数（lag の
+> 前方鏡像・遅延 emission）／**S1/S2 = #263/#264**（検証キャンペーン所見の封鎖 —
+> **実装担当が起案**。役割原則「仕様確定済みの修正は執行側」が明文化された:
+> #240 issuecomment-5083052015）／**#262+#265** design/43 rolling（メモ批准 →
+> rolling_sum/avg/min/max 実装・f64 は毎行再計算の純関数方式）。タグは
+> **v1.4.0-dev.9**（`6d36543` — 統括の cut が古い checkout に付いた経緯あり・
+> 移動せず容認）と **v1.4.0-dev.10**（`e357410`）でキュー全消化。
 
 ---
 
@@ -60,10 +61,11 @@ decode 列プルーニング・design/38 P1〜P4 移行リリース＋asof チ�
 | #248 | design/42 JSONL 側（批准スコープ完了）— JSONL group median −4〜5% |
 | #249 | **#45 正準縮約木**（方式(b)・file-major 正準）— f64 sum/avg/std が並列化: f64 集計フロー wall 2.2〜3.4×・RSS 53× 改善 |
 
-**エラー化リリース（P1〜P4 の旧綴り一括 flip）**: 前提は**全充足**（asof チェーン
-描画 = #247・readbin 文法 = #252 で `open … as bin` 着地済み）。**flip 本体は
-PR #257 として提出済み・裁可待ち**（2026-07-25・仕様正典 = #240
-issuecomment-5078743131 — recognize-but-refuse・受入条件 7 点・着地順は #250 の後）。
+**続くアーク（2026-07-25〜26）で着地した PR**: #250（HANDOVER 刷新）・#251〜#256
+（前記）・**#257 flip 完結**（仕様正典 = issuecomment-5078743131・全 16 サイト
+recognize-but-refuse・3 要素文言 pin）・#258/#259/#260（perf）・#261 lead・
+#263/#264（S1 never-silent 封鎖＝数値比較の無音 false 修正・S2 テスト正直化 —
+CI では環境理由 skip が fail）・#262/#265（design/43 rolling）。
 
 **標準フィクスチャの注意（2026-07-23）**: scratchpad がコンテナ再生成で消失し、
 10M×9 files 標準は文書仕様（BENCHMARKS「standard fixture」節・dirty mix 込み）から
@@ -76,44 +78,54 @@ issuecomment-5078743131 — recognize-but-refuse・受入条件 7 点・着地�
 - **design/41（深層融合 worker）**: Stage A・C 着地済み・B（mmap）は計測負けで破壊済み。
 - **design/42（辞書レーン）**: **批准スコープ完全着地**（(a)(b)(c) × CSV+JSONL）。
   producer 契約 2 点（空辞書×非空 codes 構成上不可能・append 物質化前の fused 消費）維持。
-- **design/38（構文簡素化）**: P1〜P4 移行リリース着地済み・**flip 本体（旧綴りの
-  never-silent エラー化）は PR #257 で提出済み・裁可待ち**。P5 は使用調査待ち（統括判断）。
+- **design/38（構文簡素化）**: **P1〜P4 flip 済み**（#257 — 旧綴りは 3 要素を教える
+  エラー・正典綴りのみ有効）。P5 は使用調査待ち（統括判断）。
+- **design/43（rolling 窓集計）**: 批准済み・実装済み（#262/#265）。保留:
+  `min_periods`・str min/max・`rolling_count`・`rolling_std`（f64 モーメント
+  決定性 = design/37 圏の別メモが先）。
 - **design/37／#45（正準縮約木）**: 方式(b) で着地。CanonTree（BLOCK=128）＋file-major
   spine。force-serial 時は plain-safe 集合→generic oracle（design/42 ガード保全）、
   f64 モーメント集合→同一機械 P=1（serial mirror）。**単一ファイル byte-range 経路は
   対象外のまま**（§37.5 プリパス＋carry = 将来スライス）。BLOCK 掃引（Q2）未実施。
 
-## 4. 現在の実測プロファイル（2026-07-24・warm・再生成 10M 標準・4 コア箱）
+## 4. 現在の実測プロファイル（2026-07-26・warm・再生成 10M 標準・4 コア箱）
 
-| 形状 | wall | RSS | worker 内訳（/file） |
-|---|---|---|---|
-| CSV group | ~420ms | 10.1MB | decode 63-78ms・feed 36-44ms（idloop 発動 ~99.5%） |
-| JSONL group | ~683ms | 10.1MB | **decode 171-174ms**・feed ~43ms（#255 SWAR で decode 中央値 −23%・wall floor −10% — 表は #255 前の snapshot） |
-| f64 集計（cast float sum/avg/std） | 675-718ms | 12.6MB | （#249 前は 1.5-2.5s / 670MB） |
+検証キャンペーン⑤（@`520158a`・best wall / peak RSS・**DuckDB 対照なし**）:
+CSV group **758ms/14.6MB**・JSONL group **714ms/9.9MB**・gz JSONL
+**1004ms/12.2MB**・CSV ETL **629ms/12.5MB**・f64 moments **838ms/14.9MB**。
+その後 #259/#260 で plain-group（cast 形状 −26〜33%）と gz JSONL（−16%）が
+さらに短縮（BENCHMARKS の同窓 interleave が正）。JSONL per-file decode 中央値は
+#258 後 **~112ms**（#255 前 222 → #255 後 170 → #258 後 112）。
 
-- **decode が feed の 2〜4 倍 = 次のレバーは decode 側**。feed は id 直引きで実質床。
+- decode は 3 スライスで大きく回収済み。feed は id 直引き＋join-less fused で実質床。
 - **計測の罠（今回実測）**: fixture 再生成直後や cache eviction 後の初回 WPROF は
   decode が 20〜30× に膨らむ（cold page cache）。**必ず warm 2 周目以降で測る**。
   箱ノイズは日内 ±40% 級 — 比較は必ず同窓 interleave。
 
 ## 5. 開いている判断（勝手に決めない）
 
-1. **P5（制御プレーン verb の整理）** — 使用調査待ち・統括判断。（readbin 文法は
-   #252 で裁可・着地済み — flip 本体は #257 提出済み・issuecomment-5078743131 が仕様正典。）
+1. **P5（制御プレーン verb の整理）** — 使用調査待ち・統括判断。
 2. **design/40 Q1-Q4**（OTel T1 / QUIC B2）— 引き続き裁可待ち。
 3. **#45 の将来スライス**: 単一ファイル byte-range の file-major 化（§37.5）・BLOCK 掃引（Q2）。
+4. **`|#` の static/runtime 乖離 2 件（台帳報告済み・裁定待ち）**: decimal avg
+   （schema_prop=F64 vs runtime=Decimal(scale+6)）・diff 非 datetime 分岐
+   （schema_prop=src vs runtime=I64/Decimal 維持他 F64）。rolling は
+   この乖離を持ち込まない設計にした（#265 裁可依頼参照）。
 5. #229 Parquet の full 搭載可否・`unbounded` full 搭載 — 従来どおり保留。
+6. **rolling 保留リスト**（design/43 §43.6 ③）: `rolling_std` は design/37 圏の
+   決定性メモが先行条件。
 
 ## 6. 次のレバー候補（優先順・2026-07-24 実測に基づく）
 
-1. **JSONL decode（最大単一レバー）**: スキャナ内 SWAR/AVX2 は #255 で着地
-   （decode 中央値 −23%）。残りは値スパンの遅延 parse・数値 parse の μopt。
-2. **CSV decode 残差（63-78ms/file）**: field parse の μopt・辞書 intern コスト
-   （+5-8ms/file — dict 列の probe 頻度削減や前行 memo は fixture 次第）。
-3. fused 対応集合の拡張（複数 join・数値 coalesce — 適用面を広げる）。
-4. 圧縮標準（csv.gz/jsonl.gz）の decode 側（Stage C 非対象だった領域）。
-5. Track C 残り: resample/gap-fill（#62 agg 側）・rolling（#63）・lead（#65 follow-up）。
-6. ~~エラー化リリース本体~~ → **#257 提出済み**（全綴り 3 要素文言 pin 込み・裁可待ち）。
+1. **Track C 最終: resample/gap-fill（#62）** — 欠損時間バケットの行生成という
+   新領域（行を「作る」最初の op）。design/44 メモ → 批准 → 実装の 2 段（先行研究が
+   メモ起案予定）。
+2. **DuckDB/Polars 対照の再セットアップ** — 検証キャンペーンで「対照なし」が
+   続いている。比率主張の再開にはコンテナへの導入経路（proxy 制約）の解決が要る。
+3. CSV decode 残差（薄い — parse_i64_fast 済み・辞書 intern +5-8ms/file の μopt 域）。
+4. fused 適用面の続き（複数 join・数値 coalesce）。
+5. f64 大窓 rolling の正準木窓版（design/43 §43.3 — **bench が要ると示すまで作らない**）。
+6. #45 将来スライス（§37.5 file-major 単一ファイル・BLOCK 掃引）・#197 fmt pretty。
 
 ## 7. 落とし穴（実際に踏んだもの）
 
@@ -129,3 +141,9 @@ issuecomment-5078743131 — recognize-but-refuse・受入条件 7 点・着地�
 - fmt の canonical は `$_.col` 展開（#197 の pretty 化提案は未着手）。
 - 出力ファイル名が入力 glob に一致するテスト fixture（`p*.csv` と `par.csv`）は
   2 回目の実行で自分の出力を読む — 命名を分ける（実績あり）。
+- **stale バイナリとの interleave**（#260 で実際に踏んだ）: 「main バイナリ」は
+  **どの commit から build したか**を毎回確認する。平文 decode 中央値のような
+  既知プロファイルと照合すると混入を検出できる（153-160 vs 110-116ms/file で発覚・
+  全数取り直し）。branch 切替を挟む計測は特に危険。
+- **`git checkout <file>` は未 commit の採用済み編集も巻き添えで消す**（負け案の
+  破壊時に勝ち案まで消した実績 — #258 作業中）。負け案の revert は hunk 単位で。
