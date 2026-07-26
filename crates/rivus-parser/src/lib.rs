@@ -756,7 +756,7 @@ impl Parser {
                 Tok::Word(w) if w == "shift" => {
                     return Err(self.err_retired(
                         "shift",
-                        "a `|>` window item (`lag`/`diff`/`pct_change`)",
+                        "a `|>` window item (`lag`/`lead`/`diff`/`pct_change`)",
                         "|> * (lag(price, 1) over sym) as prev",
                     ));
                 }
@@ -1681,7 +1681,7 @@ impl Parser {
         matches!(
             (&self.toks[self.pos].0, self.toks.get(self.pos + 1).map(|t| &t.0)),
             (Tok::LParen, Some(Tok::Word(w)))
-                if matches!(w.as_str(), "session" | "lag" | "diff" | "pct_change")
+                if matches!(w.as_str(), "session" | "lag" | "lead" | "diff" | "pct_change")
         ) && matches!(self.toks.get(self.pos + 2).map(|t| &t.0), Some(Tok::LParen))
     }
 
@@ -5499,6 +5499,44 @@ Import:
             .expect_err("window alias required")
             .to_string();
         assert!(e.contains("as <name>"), "{e}");
+    }
+
+    #[test]
+    fn lead_parses_and_round_trips() {
+        // #65 follow-up (design/38 §38.5): `lead` is a window item like `lag`
+        // — value N rows AHEAD per `over` group. Parses to the Shift op,
+        // renders canonically, and is idempotent.
+        let g =
+            parse("T:\n open t.csv (sym:str price:int)\n |> * (lead(price, 2) over sym) as nxt\n;")
+                .unwrap();
+        assert!(
+            matches!(
+                &g.nodes[1].op,
+                Op::Shift { kind: rivus_ir::ShiftKind::Lead, n: 2, out, .. } if out == "nxt"
+            ),
+            "lead must build a Shift op: {:?}",
+            g.nodes[1].op
+        );
+        let src = g.to_source();
+        assert!(
+            src.contains("|> * (lead(price, 2) over sym) as nxt"),
+            "{src}"
+        );
+        assert_eq!(src, parse(&src).unwrap().to_source(), "idempotent");
+        // N defaults to 1 and always renders (like lag).
+        let g = parse("T:\n open t.csv\n |> * (lead(price)) as nxt\n;").unwrap();
+        assert!(
+            g.to_source().contains("|> * (lead(price, 1)) as nxt"),
+            "{}",
+            g.to_source()
+        );
+        // The alias stays required.
+        let e = parse("T:\n open t.csv\n |> * (lead(price, 1) over sym)\n;")
+            .expect_err("window alias required")
+            .to_string();
+        assert!(e.contains("as <name>"), "{e}");
+        // A column named `lead` not followed by `(` is still a plain field.
+        assert!(parse("T:\n open t.csv\n |> lead price\n;").is_ok());
     }
 
     #[test]

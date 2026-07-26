@@ -18,7 +18,7 @@ fmt の自動移行パスは parse 拒否により同時消滅（専用コード
 `session`/`lag`/`diff`/`pct_change` は `|>` の窓 item＋一様な `over` 句、
 keep-all は新設の `|> *`（窓 item 専用）が担い旧 verb を機械移行。
 `sessionize`/`shift` verb は本リリース parse 可・次リリースでエラー化。
-`lead` は #65 の follow-up のまま）。**P4（`&asof`）実装済み**（同じ移行方式 —
+`lead` も窓 item として実装済み — 2026-07-25、#65 follow-up 消化）。**P4（`&asof`）実装済み**（同じ移行方式 —
 正典は `A &asof B [on k…] by ts [within]`、旧 `& … asof ts` 形は本リリース
 parse 可＋fmt 正典化・次リリースでエラー化。エラー化の前提条件だった
 asof＋同一文内チェーンの to_source 連鎖描画の穴（#233 由来）は**修正済み**

@@ -1964,10 +1964,30 @@ pub(crate) struct Shift {
     pub(crate) by: Vec<String>,
     pub(crate) out: String,
     /// Composite `by` key (0x1F-joined, like GroupBy) → ring of the last `n`
-    /// source values (most recent at the back).
+    /// source values (most recent at the back). Backward kinds only.
     pub(crate) state:
         std::collections::BTreeMap<String, std::collections::VecDeque<rivus_core::Value>>,
+    /// `lead` only: chunks delayed until their forward values arrive, emitted
+    /// strictly in arrival order. Memory is bounded by how far apart `n`
+    /// same-group rows sit in the stream (the last `n` rows of every group
+    /// resolve to null at `finish`).
+    pub(crate) pending: std::collections::VecDeque<PendingLead>,
+    /// `lead` only: per-group FIFO of unresolved `(chunk seq, row)` output
+    /// slots — the k-th row of a group resolves the group's (k − n)-th slot.
+    pub(crate) waiting:
+        std::collections::BTreeMap<String, std::collections::VecDeque<(u64, usize)>>,
+    /// `lead` only: arrival sequence number of the next chunk.
+    pub(crate) next_seq: u64,
     pub(crate) warned: bool,
+}
+
+/// One buffered chunk awaiting its forward values (`lead` only).
+pub(crate) struct PendingLead {
+    seq: u64,
+    chunk: Chunk,
+    out: Vec<rivus_core::Value>,
+    unresolved: usize,
+    out_dtype: rivus_core::DataType,
 }
 
 impl Shift {
@@ -1978,7 +1998,7 @@ impl Shift {
         use rivus_core::DataType as D;
         use rivus_ir::ShiftKind as K;
         match kind {
-            K::Lag => src,
+            K::Lag | K::Lead => src,
             K::Diff => match src {
                 D::DateTime { unit } => D::Duration { unit },
                 D::I64 => D::I64,
@@ -1987,6 +2007,101 @@ impl Shift {
             },
             K::PctChange => D::F64,
         }
+    }
+
+    /// Append the computed output column to `chunk` in the schema-declared
+    /// lane (preserved even when a whole chunk is null, so the lane never
+    /// silently degrades); a name collision takes the `_r` suffix.
+    fn append_out(
+        chunk: Chunk,
+        out_vals: &[rivus_core::Value],
+        out_dtype: rivus_core::DataType,
+        out: &str,
+    ) -> Chunk {
+        let out_col = typed_column_for(out_vals, out_dtype);
+        let name = if chunk.schema.index_of(out).is_some() {
+            format!("{out}_r")
+        } else {
+            out.to_string()
+        };
+        let mut fields = chunk.schema.fields.clone();
+        fields.push(rivus_core::Field::new(name, out_dtype));
+        let mut columns = chunk.columns.clone();
+        columns.push(out_col);
+        let mut o = Chunk::new(chunk.meta.id, Arc::new(Schema::new(fields)), columns);
+        o.meta = chunk.meta.clone();
+        o
+    }
+
+    /// `lead`: enqueue this chunk with null-initialized output slots; each row
+    /// resolves its group's slot from `n` rows earlier (possibly in an older
+    /// pending chunk), then every fully-resolved chunk at the FRONT of the
+    /// queue is emitted (arrival order is preserved by construction).
+    fn process_lead(
+        &mut self,
+        chunk: Chunk,
+        ci: usize,
+        by_idx: &[Option<usize>],
+        out_dtype: rivus_core::DataType,
+    ) -> Vec<Chunk> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let front_seq = self.pending.front().map_or(seq, |p| p.seq);
+        let mut out_vals: Vec<rivus_core::Value> = vec![rivus_core::Value::Null; chunk.len];
+        let mut unresolved = chunk.len;
+        let mut key = String::new();
+        for r in 0..chunk.len {
+            key.clear();
+            for (k, idx) in by_idx.iter().enumerate() {
+                if k > 0 {
+                    key.push('\u{1f}');
+                }
+                if let Some(i) = idx {
+                    if !chunk.columns[*i].is_null(r) {
+                        key.push_str(&chunk.value(r, *i).to_string());
+                    }
+                }
+            }
+            let cur = chunk.value(r, ci);
+            let w = self.waiting.entry(key.clone()).or_default();
+            w.push_back((seq, r));
+            if w.len() > self.n {
+                let (sq, rr) = w.pop_front().expect("len > n >= 1");
+                if sq == seq {
+                    out_vals[rr] = cur;
+                    unresolved -= 1;
+                } else {
+                    let p = &mut self.pending[(sq - front_seq) as usize];
+                    p.out[rr] = cur;
+                    p.unresolved -= 1;
+                }
+            }
+        }
+        self.pending.push_back(PendingLead {
+            seq,
+            chunk,
+            out: out_vals,
+            unresolved,
+            out_dtype,
+        });
+        let mut ready = Vec::new();
+        while self.pending.front().is_some_and(|p| p.unresolved == 0) {
+            let p = self.pending.pop_front().expect("front checked");
+            ready.push(Self::append_out(p.chunk, &p.out, p.out_dtype, &self.out));
+        }
+        ready
+    }
+
+    /// `lead`: flush every delayed chunk — unresolved slots (the last `n`
+    /// rows of each group) stay null, exactly the mirror of `lag`'s first-`n`
+    /// nulls.
+    fn flush_lead(&mut self) -> Vec<Chunk> {
+        self.waiting.clear();
+        let mut out = Vec::new();
+        while let Some(p) = self.pending.pop_front() {
+            out.push(Self::append_out(p.chunk, &p.out, p.out_dtype, &self.out));
+        }
+        out
     }
 
     /// `cur − prev`, kept in the exact lane where the lane is associative
@@ -2033,7 +2148,14 @@ impl Operator for Shift {
                     .at_node(ctx.label.clone()),
                 );
             }
-            return vec![chunk];
+            // `lead`: emit any delayed chunks first so arrival order holds.
+            let mut out = if self.kind == rivus_ir::ShiftKind::Lead {
+                self.flush_lead()
+            } else {
+                Vec::new()
+            };
+            out.push(chunk);
+            return out;
         };
         let src_dtype = chunk.schema.fields[ci].dtype;
         let out_dtype = Self::out_dtype(self.kind, src_dtype);
@@ -2055,6 +2177,11 @@ impl Operator for Shift {
                 );
             }
             by_idx.push(i);
+        }
+
+        // Forward-looking kind: delayed-emission path (its own machinery).
+        if self.kind == rivus_ir::ShiftKind::Lead {
+            return self.process_lead(chunk, ci, &by_idx, out_dtype);
         }
 
         let mut out_vals: Vec<rivus_core::Value> = Vec::with_capacity(chunk.len);
@@ -2085,6 +2212,7 @@ impl Operator for Shift {
                 (Some(prev), K::Lag) => prev,
                 (Some(prev), K::Diff) => Self::diff(&cur, &prev),
                 (Some(prev), K::PctChange) => Self::pct_change(&cur, &prev),
+                (_, K::Lead) => unreachable!("lead dispatches to process_lead"),
             };
             out_vals.push(v);
             // Advance the ring with the current source value.
@@ -2094,21 +2222,18 @@ impl Operator for Shift {
             }
         }
 
-        // Build the appended column in the schema-declared lane (preserved even
-        // when a whole chunk is null, so the lane never silently degrades).
-        let out_col = typed_column_for(&out_vals, out_dtype);
-        let name = if chunk.schema.index_of(&self.out).is_some() {
-            format!("{}_r", self.out)
+        vec![Self::append_out(chunk, &out_vals, out_dtype, &self.out)]
+    }
+
+    fn finish(&mut self, _ctx: &mut OpCtx) -> Vec<Chunk> {
+        // `lead`: the stream is exhausted — every still-unresolved slot (the
+        // last `n` rows of each group) stays null; delayed chunks flush in
+        // arrival order. Backward kinds buffer nothing.
+        if self.kind == rivus_ir::ShiftKind::Lead {
+            self.flush_lead()
         } else {
-            self.out.clone()
-        };
-        let mut fields = chunk.schema.fields.clone();
-        fields.push(rivus_core::Field::new(name, out_dtype));
-        let mut columns = chunk.columns.clone();
-        columns.push(out_col);
-        let mut out = Chunk::new(chunk.meta.id, Arc::new(Schema::new(fields)), columns);
-        out.meta = chunk.meta.clone();
-        vec![out]
+            Vec::new()
+        }
     }
 }
 
